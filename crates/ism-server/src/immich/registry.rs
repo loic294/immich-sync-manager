@@ -1,0 +1,339 @@
+//! Immich servers and accounts known to this instance, and routing of each change to the
+//! account that owns the affected library.
+
+use ism_core::dto::{DirectWrites, ImmichServerView, MaintenanceView};
+use ism_core::maintenance::{MaintenanceState, Phase};
+use sqlx::Row;
+use sqlx::postgres::PgPool;
+
+use super::api::{self, Api};
+use super::{SUPPORTED_MIGRATION, SUPPORTED_VERSION, pg};
+use crate::error::{AppError, AppResult};
+use crate::files::{STAGING_DIR, TRASH_DIR};
+use crate::state::{AppState, ServerEvent};
+
+pub const API_KEY_PURPOSE: &str = "immich-api-key";
+pub const DATABASE_URL_PURPOSE: &str = "immich-database-url";
+
+/// Library exclusions that keep ISM's own folders out of Immich.
+pub fn exclusion_patterns() -> Vec<String> {
+    vec![format!("**/{TRASH_DIR}/**"), format!("**/{STAGING_DIR}/**")]
+}
+
+#[derive(Debug, Clone)]
+pub struct Server {
+    pub id: String,
+    pub name: String,
+    pub url: String,
+    pub database_url_enc: Option<String>,
+    pub direct_writes_enabled: bool,
+    pub version: Option<String>,
+    pub compatible: bool,
+    pub compatibility_detail: Option<String>,
+    pub maintenance: MaintenanceState,
+}
+
+fn server_from_row(row: &sqlx::sqlite::SqliteRow) -> AppResult<Server> {
+    let maintenance: String = row.try_get("maintenance_json")?;
+    Ok(Server {
+        id: row.try_get("id")?,
+        name: row.try_get("name")?,
+        url: row.try_get("url")?,
+        database_url_enc: row.try_get("database_url_enc")?,
+        direct_writes_enabled: row.try_get::<i64, _>("direct_writes_enabled")? != 0,
+        version: row.try_get("version")?,
+        compatible: row.try_get::<i64, _>("compatible")? != 0,
+        compatibility_detail: row.try_get("compatibility_detail")?,
+        maintenance: serde_json::from_str(&maintenance).unwrap_or_default(),
+    })
+}
+
+const SERVER_COLUMNS: &str = "id, name, url, database_url_enc, direct_writes_enabled, version, compatible, \
+     compatibility_detail, maintenance_json";
+
+pub async fn servers(state: &AppState) -> AppResult<Vec<Server>> {
+    let sql = format!("SELECT {SERVER_COLUMNS} FROM immich_servers ORDER BY name");
+    let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+        .fetch_all(&state.db)
+        .await?;
+    rows.iter().map(server_from_row).collect()
+}
+
+pub async fn server(state: &AppState, id: &str) -> AppResult<Server> {
+    let sql = format!("SELECT {SERVER_COLUMNS} FROM immich_servers WHERE id = ?");
+    let row = sqlx::query(sqlx::AssertSqlSafe(sql))
+        .bind(id)
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or_else(|| AppError::not_found("Immich server not found"))?;
+    server_from_row(&row)
+}
+
+pub async fn save_maintenance(
+    state: &AppState,
+    server_id: &str,
+    m: &MaintenanceState,
+) -> AppResult<()> {
+    sqlx::query("UPDATE immich_servers SET maintenance_json = ? WHERE id = ?")
+        .bind(serde_json::to_string(m)?)
+        .bind(server_id)
+        .execute(&state.db)
+        .await?;
+    state.emit(ServerEvent::MaintenanceChanged {
+        server_id: server_id.to_owned(),
+    });
+    Ok(())
+}
+
+pub fn maintenance_view(m: &MaintenanceState) -> MaintenanceView {
+    MaintenanceView {
+        phase: m.phase,
+        epoch: m.epoch,
+        active_ops: m.active_ops,
+        seconds_until_reconcile: m.seconds_until_reconcile(chrono::Utc::now()),
+        affected_libraries: m.affected_libraries.clone(),
+        message: m.message.clone(),
+    }
+}
+
+pub async fn server_view(state: &AppState, s: &Server) -> AppResult<ImmichServerView> {
+    let admin: Option<String> = sqlx::query_scalar(
+        "SELECT id FROM immich_accounts WHERE server_id = ? AND is_admin = 1 AND status = 'ok' ORDER BY created_at LIMIT 1",
+    )
+    .bind(&s.id)
+    .fetch_optional(&state.db)
+    .await?;
+    Ok(ImmichServerView {
+        id: s.id.clone(),
+        name: s.name.clone(),
+        url: s.url.clone(),
+        version: s.version.clone(),
+        compatible: s.compatible,
+        compatibility_detail: s.compatibility_detail.clone(),
+        database_configured: s.database_url_enc.is_some(),
+        direct_writes_enabled: s.direct_writes_enabled,
+        admin_account_id: admin,
+        maintenance: maintenance_view(&s.maintenance),
+    })
+}
+
+/// Whether managed (direct) writes are possible on a server right now.
+pub fn direct_writes(server: &Server) -> DirectWrites {
+    if !(server.compatible && server.direct_writes_enabled && server.database_url_enc.is_some()) {
+        return DirectWrites::Disabled;
+    }
+    match server.maintenance.phase {
+        Phase::Blocked | Phase::RecoveryRequired => DirectWrites::Blocked,
+        _ if server.maintenance.unresolved_recoveries > 0 => DirectWrites::Blocked,
+        _ => DirectWrites::Enabled,
+    }
+}
+
+async fn api_for(
+    state: &AppState,
+    server: &Server,
+    account_id: &str,
+    key_enc: &str,
+) -> AppResult<Api> {
+    let key = state
+        .secrets
+        .decrypt(API_KEY_PURPOSE, key_enc)
+        .map_err(|_| {
+            AppError::internal(format!(
+                "cannot decrypt the API key of account {account_id}"
+            ))
+        })?;
+    Ok(Api::new(state.http.clone(), &server.url, key))
+}
+
+/// The first healthy administrator account; needed for config, queues and scans.
+pub async fn admin_api(state: &AppState, server: &Server) -> AppResult<Api> {
+    let row: Option<(String, String)> = sqlx::query_as(
+        "SELECT id, api_key_enc FROM immich_accounts WHERE server_id = ? AND is_admin = 1 AND status = 'ok'
+         ORDER BY created_at LIMIT 1",
+    )
+    .bind(&server.id)
+    .fetch_optional(&state.db)
+    .await?;
+    let (id, key) = row.ok_or_else(|| {
+        AppError::conflict(
+            "admin_account_required",
+            format!(
+                "connect an Immich administrator account for '{}'",
+                server.name
+            ),
+        )
+    })?;
+    api_for(state, server, &id, &key).await
+}
+
+/// The account of the Immich user `user_id`. Changes to an asset are always made as its owner.
+pub async fn api_as_user(state: &AppState, server: &Server, user_id: &str) -> AppResult<Api> {
+    let row: Option<(String, String)> = sqlx::query_as(
+        "SELECT id, api_key_enc FROM immich_accounts WHERE server_id = ? AND immich_user_id = ? AND status = 'ok'",
+    )
+    .bind(&server.id)
+    .bind(user_id)
+    .fetch_optional(&state.db)
+    .await?;
+    let (id, key) = row.ok_or_else(|| {
+        AppError::conflict(
+            "account_missing",
+            "no connected account owns this asset; add the owner's Immich account",
+        )
+    })?;
+    api_for(state, server, &id, &key).await
+}
+
+pub async fn account_label(state: &AppState, server_id: &str, user_id: &str) -> String {
+    sqlx::query_scalar(
+        "SELECT label FROM immich_accounts WHERE server_id = ? AND immich_user_id = ?",
+    )
+    .bind(server_id)
+    .bind(user_id)
+    .fetch_optional(&state.db)
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or_else(|| "unconnected user".into())
+}
+
+pub async fn library_owner(state: &AppState, library_id: &str) -> AppResult<Option<String>> {
+    Ok(
+        sqlx::query_scalar("SELECT owner_user_id FROM immich_libraries WHERE id = ?")
+            .bind(library_id)
+            .fetch_optional(&state.db)
+            .await?,
+    )
+}
+
+/// A cached connection pool to the server's PostgreSQL database.
+pub async fn pg_pool(state: &AppState, server: &Server) -> AppResult<PgPool> {
+    if let Some(pool) = state.pg_pools.lock().await.get(&server.id) {
+        return Ok(pool.clone());
+    }
+    let enc = server.database_url_enc.as_deref().ok_or_else(|| {
+        AppError::conflict(
+            "direct_writes_unavailable",
+            "no database connection configured",
+        )
+    })?;
+    let url = state
+        .secrets
+        .decrypt(DATABASE_URL_PURPOSE, enc)
+        .map_err(|_| AppError::internal("cannot decrypt the database connection"))?;
+    let pool = pg::connect(&url).await.map_err(|e| {
+        AppError::conflict(
+            "direct_writes_unavailable",
+            format!("database: {}", crate::error::redact(&e.to_string())),
+        )
+    })?;
+    state
+        .pg_pools
+        .lock()
+        .await
+        .insert(server.id.clone(), pool.clone());
+    Ok(pool)
+}
+
+pub async fn forget_pool(state: &AppState, server_id: &str) {
+    if let Some(pool) = state.pg_pools.lock().await.remove(server_id) {
+        pool.close().await;
+    }
+}
+
+/// Checks version and schema, then records the result. Direct writes stay disabled unless both
+/// match exactly.
+pub async fn check_compatibility(state: &AppState, server_id: &str) -> AppResult<Server> {
+    let server = server(state, server_id).await?;
+    let (version, mut problems) = match api::server_version(&state.http, &server.url).await {
+        Ok(v) => {
+            let mut p = Vec::new();
+            if v != SUPPORTED_VERSION {
+                p.push(format!(
+                    "Immich {v} is not supported (needs {SUPPORTED_VERSION})"
+                ));
+            }
+            (Some(v), p)
+        }
+        Err(e) => (None, vec![crate::error::redact(&e.to_string())]),
+    };
+    if server.database_url_enc.is_some() {
+        forget_pool(state, &server.id).await;
+        match pg_pool(state, &server).await {
+            Ok(pool) => match pg::latest_migration(&pool).await {
+                Ok(Some(name)) if name == SUPPORTED_MIGRATION => {}
+                Ok(Some(name)) => problems.push(format!("unexpected database schema ({name})")),
+                Ok(None) => problems.push("database has no Immich migrations".into()),
+                Err(e) => problems.push(format!(
+                    "database: {}",
+                    crate::error::redact(&e.to_string())
+                )),
+            },
+            Err(e) => problems.push(e.message().to_owned()),
+        }
+    } else {
+        problems.push("no database connection configured; direct writes are off".into());
+    }
+    let compatible = problems.is_empty();
+    let detail = if compatible {
+        format!("Immich {SUPPORTED_VERSION}, schema verified")
+    } else {
+        problems.join("; ")
+    };
+    sqlx::query("UPDATE immich_servers SET version = ?, compatible = ?, compatibility_detail = ? WHERE id = ?")
+        .bind(&version)
+        .bind(compatible as i64)
+        .bind(&detail)
+        .bind(&server.id)
+        .execute(&state.db)
+        .await?;
+    self::server(state, server_id).await
+}
+
+/// Reloads the server's libraries (admin view) and adds ISM's exclusion patterns where missing.
+pub async fn refresh_libraries(state: &AppState, server: &Server) -> AppResult<usize> {
+    let api = admin_api(state, server).await?;
+    let libraries = api
+        .libraries()
+        .await
+        .map_err(|e| AppError::conflict("immich_error", e.to_string()))?;
+    let now = crate::db::now();
+    let wanted = exclusion_patterns();
+    let mut tx = state.db.begin().await?;
+    sqlx::query("DELETE FROM immich_libraries WHERE server_id = ?")
+        .bind(&server.id)
+        .execute(&mut *tx)
+        .await?;
+    for lib in &libraries {
+        let mut patterns = lib.exclusion_patterns.clone();
+        let missing: Vec<String> = wanted
+            .iter()
+            .filter(|p| !patterns.contains(p))
+            .cloned()
+            .collect();
+        if !missing.is_empty() {
+            patterns.extend(missing);
+            if let Err(e) = api.set_exclusion_patterns(&lib.id, &patterns).await {
+                tracing::warn!(library = %lib.id, "cannot add exclusion patterns: {e}");
+                patterns = lib.exclusion_patterns.clone();
+            }
+        }
+        sqlx::query(
+            "INSERT INTO immich_libraries (id, server_id, name, owner_user_id, import_paths_json, exclusion_patterns_json, asset_count, refreshed_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&lib.id)
+        .bind(&server.id)
+        .bind(&lib.name)
+        .bind(&lib.owner_id)
+        .bind(serde_json::to_string(&lib.import_paths)?)
+        .bind(serde_json::to_string(&patterns)?)
+        .bind(lib.asset_count)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(libraries.len())
+}
