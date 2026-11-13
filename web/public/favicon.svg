@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <title>Immich Sync Manager</title>
+  <rect width="32" height="32" rx="7" fill="#4f46e5"/>
+  <path d="M9 13a7 7 0 0 1 12-3l2-2v6h-6l2-2a4 4 0 0 0-7 1z" fill="#fff"/>
+  <path d="M23 19a7 7 0 0 1-12 3l-2 2v-6h6l-2 2a4 4 0 0 0 7-1z" fill="#fff"/>
+</svg>

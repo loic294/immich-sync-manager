@@ -1,0 +1,71 @@
+/* Theme and overrides copied from Open Photo Manager (web/src/styles.css) so both admin UIs look
+   the same. Differences: no pattern-editor rule, and modal rules target every dialog.modal. */
+@import "tailwindcss" source("./");
+@source "../index.html";
+@source not "./**/*.test.ts";
+@source not "./api/generated";
+@plugin "daisyui" {
+  themes: dark --prefersdark;
+}
+@plugin "daisyui/theme" {
+  name: "light";
+  default: true;
+  --color-error: #b91c1c;
+  --color-error-content: #ffffff;
+  --color-warning-content: #422006;
+}
+
+/* Warm brand accents share a hue; all other DaisyUI theme colours stay unchanged. */
+:root {
+  --color-primary: #ffc700;
+  --color-primary-content: #211a00;
+  --color-secondary: #ffe799;
+  --color-secondary-content: #211a00;
+}
+
+/* Interpolating both foreground and background briefly makes outlined errors unreadable. */
+:where(.btn-error:is(.btn-outline, .btn-dash, .btn-soft)) {
+  transition-property: box-shadow, transform;
+}
+
+/* Preserve DaisyUI motion and dimming without fading readable modal content. */
+:where(dialog.modal) {
+  transition:
+    overlay 0.3s allow-discrete,
+    visibility 0.3s allow-discrete,
+    background-color 0.3s ease-out;
+}
+
+:where(dialog.modal .modal-box) {
+  transition:
+    translate 0.3s ease-out,
+    scale 0.3s ease-out,
+    box-shadow 0.3s ease-out;
+}
+
+/* Keep amber warning surfaces while using an accessible foreground on light soft/outline styles. */
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme]) {
+    --color-warning-text: #78350f;
+  }
+}
+
+:root[data-theme="light"] {
+  --color-warning-text: #78350f;
+}
+
+:where(
+  .alert-warning.alert-soft,
+  .badge-warning:is(.badge-outline, .badge-dash, .badge-soft),
+  .text-warning
+) {
+  color: var(--color-warning-text, var(--color-warning));
+}
+
+:where(.alert-warning:is(.alert-outline, .alert-dash)) {
+  color: var(--color-warning-content);
+}
+
+:where(.badge-warning:is(.badge-outline, .badge-dash)) {
+  border-color: var(--color-warning);
+}
