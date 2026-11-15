@@ -35,8 +35,8 @@ ghcr.io/loic294/immich-sync-manager:main
 Publication only updates these tags after both platform builds succeed. The **Docker image**
 workflow in the repository's Actions tab contains the build logs and can also be started manually
 on `main`. It uses the repository's built-in `GITHUB_TOKEN`; no registry password secret is needed.
-The package owner must make the GHCR package public once after its first publication to allow
-anonymous pulls.
+Confirm the GHCR package allows anonymous pulls before installing on another host. If its first
+publication is private, the package owner can change visibility in the package's settings.
 
 To use it, replace the example service's `image:` with the address above and remove its `build:`
 block. Then run `docker compose pull && docker compose up -d` from the directory containing your
