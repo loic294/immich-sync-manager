@@ -37,12 +37,48 @@ step cannot be verified, ISM stops writing ("fails closed") and shows what to fi
 
 ## Quick start
 
-```sh
-cp docker/compose.example.yml docker/compose.yml   # edit the CHANGE ME lines
-docker compose -f docker/compose.yml up -d --build
+Save this as `compose.yml` and replace the example paths and user ID:
+
+```yaml
+services:
+  ism:
+    image: ghcr.io/loic294/immich-sync-manager:main
+    container_name: immich-sync-manager
+    restart: unless-stopped
+    user: "1000:1000" # UID:GID that owns the library files
+    ports:
+      - "8080:8080"
+    volumes:
+      - /example/photos:/mnt/photos # The same files Immich imports; add other libraries as needed
+      - ./ism-data:/data # Persistent database and encryption key
+    environment:
+      TZ: UTC # Set your time zone
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 ```
 
-Open `http://<host>:8080`, create the administrator, then:
+Create `ism-data` and make it writable by the configured user. The library folders must be
+readable and writable by that user and accessible to Immich. On Windows, use Windows paths,
+a named volume for `/data`, and remove `user:`; see [install](docs/install.md).
+
+```sh
+docker compose pull
+docker compose up -d
+```
+
+Open `http://<host>:8080` and create the administrator immediately: anyone who can reach the
+port can create it until setup is complete. Then:
 
 1. **Servers**: add the Immich server and one or more accounts (username/password). Together they
    must own every external library you want managed; ISM routes each change through the owning account.
@@ -50,6 +86,9 @@ Open `http://<host>:8080`, create the administrator, then:
    to the Open Photo Manager path prefix.
 3. **Tokens**: create a token for each client (Open Photo Manager, Immich local app).
 4. **Peers** (optional): pair another instance and choose the shared folders.
+
+For a local build instead, use [`docker/compose.example.yml`](docker/compose.example.yml).
+See [install](docs/install.md) for PostgreSQL network access required by path and owner changes.
 
 More: [install](docs/install.md) · [Immich compatibility](docs/immich-compatibility.md) ·
 [file watching](docs/watching.md) · [peer sync](docs/peers.md) · [recovery](docs/recovery.md) · [limitations](docs/limitations.md) ·
