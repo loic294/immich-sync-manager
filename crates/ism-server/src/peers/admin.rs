@@ -299,8 +299,10 @@ pub async fn peer_view(state: &AppState, id: &str) -> AppResult<PeerView> {
 }
 
 pub async fn delete_peer(state: &AppState, id: &str) -> AppResult<()> {
+    let _guard = state.replication_operation_lock.lock().await;
     let peer = peer_view(state, id).await?;
-    let mut tx = state.db.begin().await?;
+    let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
+    discard_finished_pending(&mut tx, "peer_id", id).await?;
     sqlx::query("DELETE FROM peers WHERE id = ?")
         .bind(id)
         .execute(&mut *tx)
@@ -330,6 +332,16 @@ pub async fn delete_peer(state: &AppState, id: &str) -> AppResult<()> {
     tx.commit().await?;
     db::audit(&state.db, "admin", "peer.removed", &peer.name).await;
     state.emit(ServerEvent::SyncChanged);
+    Ok(())
+}
+
+pub async fn retry_peer(state: &AppState, id: &str) -> AppResult<()> {
+    let _guard = state.replication_operation_lock.lock().await;
+    peer_view(state, id).await?;
+    let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
+    discard_finished_pending(&mut tx, "peer_id", id).await?;
+    tx.commit().await?;
+    state.sync_wake.notify_waiters();
     Ok(())
 }
 
@@ -412,8 +424,10 @@ async fn validate_share(
 }
 
 pub async fn create_share(state: &AppState, input: ShareInput) -> AppResult<ShareView> {
+    let _guard = state.replication_operation_lock.lock().await;
     let (name, path) = validate_share(state, None, &input).await?;
     let id = crate::crypto::new_id("share");
+    let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
     sqlx::query("INSERT INTO shares (id, name, root_id, path, peer_ids_json, enabled) VALUES (?, ?, ?, ?, ?, ?)")
         .bind(&id)
         .bind(&name)
@@ -421,8 +435,13 @@ pub async fn create_share(state: &AppState, input: ShareInput) -> AppResult<Shar
         .bind(&path)
         .bind(serde_json::to_string(&input.peer_ids)?)
         .bind(input.enabled as i64)
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await?;
+    if input.enabled {
+        super::request_backfill_in(&mut tx, &state.instance_id, &id, &name, &input.peer_ids)
+            .await?;
+    }
+    tx.commit().await?;
     db::audit(&state.db, "admin", "share.created", &name).await;
     state.sync_wake.notify_one();
     share_view(state, &id).await
@@ -439,6 +458,18 @@ async fn share_view(state: &AppState, id: &str) -> AppResult<ShareView> {
 /// Updates peers and the enabled flag. The name and folder identify the share on every
 /// instance, so they cannot change once created.
 pub async fn update_share(state: &AppState, id: &str, input: ShareInput) -> AppResult<ShareView> {
+    let _guard = state.replication_operation_lock.lock().await;
+    let pending: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pending_peer_events WHERE share_id = ?)")
+            .bind(id)
+            .fetch_one(&state.db)
+            .await?;
+    if pending {
+        return Err(AppError::conflict(
+            "peer_operation_pending",
+            "wait for the pending peer operation before changing this share",
+        ));
+    }
     let current = share_view(state, id).await?;
     if current.name != input.name.trim() || current.location != input.location {
         return Err(AppError::bad_request(
@@ -447,29 +478,80 @@ pub async fn update_share(state: &AppState, id: &str, input: ShareInput) -> AppR
         ));
     }
     validate_share(state, Some(id), &input).await?;
+    // Peers for which the share becomes active catch up with what they missed.
+    let activated: Vec<String> = if input.enabled {
+        input
+            .peer_ids
+            .iter()
+            .filter(|p| !current.enabled || !current.peer_ids.contains(p))
+            .cloned()
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
     sqlx::query("UPDATE shares SET peer_ids_json = ?, enabled = ? WHERE id = ?")
         .bind(serde_json::to_string(&input.peer_ids)?)
         .bind(input.enabled as i64)
         .bind(id)
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await?;
+    super::request_backfill_in(&mut tx, &state.instance_id, id, &current.name, &activated).await?;
+    tx.commit().await?;
     db::audit(&state.db, "admin", "share.updated", &current.name).await;
     state.sync_wake.notify_one();
     share_view(state, id).await
 }
 
 pub async fn delete_share(state: &AppState, id: &str) -> AppResult<()> {
+    let _guard = state.replication_operation_lock.lock().await;
     let share = share_view(state, id).await?;
+    let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
+    discard_finished_pending(&mut tx, "share_id", id).await?;
     sqlx::query("DELETE FROM shares WHERE id = ?")
         .bind(id)
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await?;
     sqlx::query("DELETE FROM overrides WHERE share_id = ?")
         .bind(id)
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await?;
+    tx.commit().await?;
     db::audit(&state.db, "admin", "share.removed", &share.name).await;
     state.emit(ServerEvent::SyncChanged);
+    Ok(())
+}
+
+async fn discard_finished_pending(
+    conn: &mut sqlx::SqliteConnection,
+    scope: &str,
+    id: &str,
+) -> AppResult<()> {
+    let sql = match scope {
+        "peer_id" => {
+            "SELECT p.operation_id, o.status, o.recovery_resolved FROM pending_peer_events p JOIN operations o ON o.id = p.operation_id WHERE p.peer_id = ?"
+        }
+        "share_id" => {
+            "SELECT p.operation_id, o.status, o.recovery_resolved FROM pending_peer_events p JOIN operations o ON o.id = p.operation_id WHERE p.share_id = ?"
+        }
+        _ => return Err(AppError::internal("invalid pending event scope")),
+    };
+    let rows: Vec<(String, String, i64)> =
+        sqlx::query_as(sql).bind(id).fetch_all(&mut *conn).await?;
+    for (operation_id, status, resolved) in rows {
+        if !(matches!(status.as_str(), "failed" | "cancelled")
+            || status == "recovery_required" && resolved != 0)
+        {
+            return Err(AppError::conflict(
+                "peer_operation_pending",
+                "finish or cancel the pending peer operation before removing its share or peer",
+            ));
+        }
+        sqlx::query("DELETE FROM pending_peer_events WHERE operation_id = ?")
+            .bind(operation_id)
+            .execute(&mut *conn)
+            .await?;
+    }
     Ok(())
 }
 
@@ -477,13 +559,21 @@ pub async fn delete_share(state: &AppState, id: &str) -> AppResult<()> {
 // Schedule, overrides and transfers
 
 pub async fn schedule(state: &AppState) -> AppResult<ScheduleView> {
-    Ok(db::get_setting(&state.db, SCHEDULE_KEY)
-        .await?
-        .and_then(|raw| serde_json::from_str(&raw).ok())
-        .unwrap_or(ScheduleView {
+    let Some(raw) = db::get_setting(&state.db, SCHEDULE_KEY).await? else {
+        return Ok(ScheduleView {
             timezone: "UTC".into(),
             windows: Vec::new(),
-        }))
+        });
+    };
+    let invalid = || {
+        AppError::conflict(
+            "invalid_schedule",
+            "the stored sync schedule is invalid; save a valid schedule before transfers can resume",
+        )
+    };
+    let view: ScheduleView = serde_json::from_str(&raw).map_err(|_| invalid())?;
+    Schedule::new(&view.timezone, &view.windows).map_err(|_| invalid())?;
+    Ok(view)
 }
 
 pub async fn set_schedule(state: &AppState, view: ScheduleView) -> AppResult<ScheduleView> {
@@ -733,16 +823,27 @@ struct Conflict {
     remote_vv: VersionVector,
     peer_id: String,
     status: String,
+    remote_from: Option<String>,
 }
 
 async fn load_conflict(state: &AppState, id: &str) -> AppResult<Conflict> {
-    let r: Option<(String, String, String, String, String, String, String)> = sqlx::query_as(
-        "SELECT share_id, rel_path, kind, remote_json, remote_vv_json, peer_id, status FROM conflicts WHERE id = ?",
+    type R = (
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+    );
+    let r: Option<R> = sqlx::query_as(
+        "SELECT share_id, rel_path, kind, remote_json, remote_vv_json, peer_id, status, remote_from FROM conflicts WHERE id = ?",
     )
     .bind(id)
     .fetch_optional(&state.db)
     .await?;
-    let (share_id, rel, kind, remote, vv, peer_id, status) =
+    let (share_id, rel, kind, remote, vv, peer_id, status, remote_from) =
         r.ok_or_else(|| AppError::not_found("conflict not found"))?;
     let share = super::shares(state)
         .await?
@@ -755,9 +856,10 @@ async fn load_conflict(state: &AppState, id: &str) -> AppResult<Conflict> {
         rel,
         kind,
         remote: serde_json::from_str(&remote)?,
-        remote_vv: serde_json::from_str(&vv).unwrap_or_default(),
+        remote_vv: serde_json::from_str(&vv)?,
         peer_id,
         status,
+        remote_from,
     })
 }
 
@@ -776,35 +878,51 @@ pub async fn list_conflicts(
         String,
         String,
         String,
+        Option<String>,
     );
     let rows: Vec<R> = sqlx::query_as(
-        "SELECT id, share_id, rel_path, kind, detail, local_json, remote_json, peer_id, status, created_at FROM conflicts
+        "SELECT id, share_id, rel_path, kind, detail, local_json, remote_json, peer_id, status, created_at, remote_from FROM conflicts
          WHERE status != 'resolved' OR ? ORDER BY created_at DESC LIMIT 500",
     )
     .bind(include_resolved)
     .fetch_all(&state.db)
     .await?;
     let shares = super::shares(state).await?;
-    Ok(rows
-        .into_iter()
-        .filter_map(
-            |(id, share_id, rel, kind, detail, local, remote, peer_id, status, created_at)| {
-                let share = shares.iter().find(|s| s.id == share_id)?;
-                Some(ConflictView {
+    rows.into_iter()
+        .map(
+            |(
+                id,
+                share_id,
+                rel,
+                kind,
+                detail,
+                local,
+                remote,
+                peer_id,
+                status,
+                created_at,
+                from,
+            )| {
+                let share = shares
+                    .iter()
+                    .find(|s| s.id == share_id)
+                    .ok_or_else(|| AppError::internal("conflict references a missing share"))?;
+                Ok(ConflictView {
                     id,
                     share_name: share.name.clone(),
                     location: super::display(share, &rel),
                     kind,
                     detail,
-                    local: serde_json::from_str(&local).ok()?,
-                    remote: serde_json::from_str(&remote).ok()?,
+                    local: serde_json::from_str(&local)?,
+                    remote: serde_json::from_str(&remote)?,
                     peer_id,
                     status,
                     created_at,
+                    moved_from: from.map(|f| super::display(share, &f)),
                 })
             },
         )
-        .collect())
+        .collect()
 }
 
 async fn mark_resolved(state: &AppState, id: &str, resolution: &str) -> AppResult<()> {
@@ -820,12 +938,15 @@ async fn mark_resolved(state: &AppState, id: &str, resolution: &str) -> AppResul
     Ok(())
 }
 
-/// Submits a managed operation whose replica bookkeeping runs when it finishes.
+/// Submits a managed operation whose replica bookkeeping runs when it finishes, and marks the
+/// conflict as resolving in the same transaction. The operation's outcome settles the conflict:
+/// resolved when it succeeds, open again when it fails.
 #[allow(clippy::too_many_arguments)]
 async fn submit_pending(
     state: &AppState,
     actor: &str,
     c: &Conflict,
+    resolution: &str,
     action: OperationAction,
     kind: &str,
     from: Option<&str>,
@@ -833,15 +954,30 @@ async fn submit_pending(
     vv: &VersionVector,
 ) -> AppResult<()> {
     let req = OperationRequest {
-        idempotency_key: format!("conflict:{}:{kind}", c.id),
+        idempotency_key: crate::crypto::new_id(&format!("conflict-{kind}")),
         label: Some(format!("Resolve conflict on {}", c.rel)),
         actions: vec![action],
         allow_owner_transfer: false,
+        allow_partial: false,
     };
     let principal = Principal::Admin {
         username: actor.to_owned(),
     };
-    let accepted = crate::ops::insert(state, &principal, &req).await?;
+    let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
+    let marked = sqlx::query(
+        "UPDATE conflicts SET status = 'resolving', resolution = COALESCE(resolution, ?) WHERE id = ? AND status IN ('open', 'resolving')",
+    )
+    .bind(resolution)
+    .bind(&c.id)
+    .execute(&mut *tx)
+    .await?;
+    if marked.rows_affected() != 1 {
+        return Err(AppError::conflict(
+            "not_open",
+            "this conflict is already resolved",
+        ));
+    }
+    let accepted = crate::ops::insert_in(&mut tx, &principal, &req, None).await?;
     sqlx::query(
         "INSERT INTO pending_peer_ops (operation_id, idx, share_id, kind, from_path, to_path, vv_json, peer_id, conflict_id)
          VALUES (?, 0, ?, ?, ?, ?, ?, ?, ?)",
@@ -854,8 +990,11 @@ async fn submit_pending(
     .bind(serde_json::to_string(vv)?)
     .bind(&c.peer_id)
     .bind(&c.id)
-    .execute(&state.db)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
+    crate::ops::announce_queued(state, &accepted);
+    state.emit(ServerEvent::ConflictsChanged);
     Ok(())
 }
 
@@ -890,6 +1029,8 @@ pub async fn resolve(
     id: &str,
     resolution: ConflictResolution,
 ) -> AppResult<()> {
+    let _operation_guard = state.replication_operation_lock.lock().await;
+    super::require_stable_operations(state).await?;
     let c = load_conflict(state, id).await?;
     if c.status != "open" {
         return Err(AppError::conflict(
@@ -897,14 +1038,15 @@ pub async fn resolve(
             "this conflict is already being resolved",
         ));
     }
+    let is_move = matches!(c.kind.as_str(), "move" | "folder_move");
     let root = files::root(&state.db, &c.share.root_id).await?;
     root.ensure_available()?;
     let abs = root.abs(&c.share.root_rel(&c.rel)?)?;
-    let is_move = matches!(c.kind.as_str(), "move" | "folder_move");
     let label = match resolution {
         ConflictResolution::KeepLocal => "keep_local",
         ConflictResolution::KeepRemote => "keep_remote",
         ConflictResolution::KeepBoth => "keep_both",
+        ConflictResolution::Skip => "skip",
     };
     db::audit(
         &state.db,
@@ -914,33 +1056,30 @@ pub async fn resolve(
     )
     .await;
 
-    if is_move {
-        // The local layout stays; keeping the remote side fetches its copy at the new path.
-        if matches!(resolution, ConflictResolution::KeepRemote)
-            && c.kind == "move"
-            && !abs.exists()
-            && let Some(sha) = &c.remote.sha256
-        {
-            super::queue_transfer(
-                state,
-                &c.peer_id,
-                &c.share,
-                &c.rel,
-                sha,
-                c.remote.size.unwrap_or(0),
-                &c.remote_vv,
-            )
-            .await?;
-        }
+    if resolution == ConflictResolution::Skip {
+        // Neither side changes; the next change to this path is compared again.
         return mark_resolved(state, id, label).await;
     }
+    if is_move {
+        return resolve_move(state, actor, &c, &root, &abs, resolution, label).await;
+    }
 
-    let local = if abs.is_file() {
+    let local_present = match std::fs::metadata(&abs) {
+        Ok(meta) if meta.is_file() => true,
+        Ok(_) => {
+            return Err(AppError::conflict(
+                "wrong_kind",
+                "conflict target is not a regular file",
+            ));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => return Err(e.into()),
+    };
+    let local = if local_present {
         super::register_local(state, &c.share, &root, &c.rel).await?
     } else {
         super::row(state, &c.share.id, &c.rel).await?
     };
-    let local_present = abs.is_file();
     let resolution = match resolution {
         ConflictResolution::KeepBoth if !local_present || c.remote.deleted => {
             if local_present {
@@ -964,7 +1103,6 @@ pub async fn resolve(
             });
             r.vv = vv.clone();
             r.deleted = !local_present;
-            super::put_row(state, &c.share.id, &c.rel, &r).await?;
             let (kind, data) = if local_present {
                 (
                     "file_changed",
@@ -987,10 +1125,30 @@ pub async fn resolve(
                     },
                 )
             };
-            super::append_local(state, &c.share.name, kind, &data).await?;
-            mark_resolved(state, id, label).await
+            let mut tx = state.db.begin().await?;
+            let updated = sqlx::query(
+                "UPDATE conflicts SET status = 'resolved', resolution = ?, resolved_at = ? WHERE id = ? AND status = 'open'",
+            )
+            .bind(label)
+            .bind(db::now())
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+            if updated.rows_affected() != 1 {
+                return Err(AppError::conflict(
+                    "not_open",
+                    "this conflict is already being resolved",
+                ));
+            }
+            super::put_row_in(&mut tx, &c.share.id, &c.rel, &r).await?;
+            super::append_local_in(&mut tx, &state.instance_id, &c.share.name, kind, &data).await?;
+            tx.commit().await?;
+            state.emit(ServerEvent::SyncChanged);
+            state.emit(ServerEvent::ConflictsChanged);
+            Ok(())
         }
         ConflictResolution::KeepRemote => take_remote(state, id).await,
+        ConflictResolution::Skip => mark_resolved(state, id, label).await,
         ConflictResolution::KeepBoth => {
             let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
             let mut n = 1;
@@ -1016,6 +1174,7 @@ pub async fn resolve(
                 state,
                 actor,
                 &c,
+                label,
                 OperationAction::Rename {
                     source: c.share.location(&c.rel)?,
                     target: c.share.location(&target)?,
@@ -1026,19 +1185,106 @@ pub async fn resolve(
                 &target,
                 &vv,
             )
-            .await?;
-            sqlx::query("UPDATE conflicts SET status = 'resolving', resolution = ? WHERE id = ?")
-                .bind(label)
-                .bind(id)
-                .execute(&state.db)
-                .await?;
-            state.emit(ServerEvent::ConflictsChanged);
-            Ok(())
+            .await
         }
     }
 }
 
-/// Makes the remote side win: deletes the local copy, or downloads the remote version.
+/// Resolves a move that could not be applied here (the source changed or the destination was
+/// taken). Keeping the local side leaves this layout as it is. Keeping the remote side applies
+/// the peer's layout: a folder is moved when it can be, and a file is fetched at its new path
+/// while the local source goes to the ISM trash. Keeping both fetches the peer's copy at the
+/// new path and leaves the local source in place.
+async fn resolve_move(
+    state: &AppState,
+    actor: &str,
+    c: &Conflict,
+    root: &files::Root,
+    abs: &std::path::Path,
+    resolution: ConflictResolution,
+    label: &str,
+) -> AppResult<()> {
+    if resolution == ConflictResolution::KeepLocal {
+        return mark_resolved(state, &c.id, label).await;
+    }
+    let from = c.remote_from.clone().unwrap_or_default();
+    let from_abs = if from.is_empty() {
+        None
+    } else {
+        Some(root.abs(&c.share.root_rel(&from)?)?)
+    };
+    if c.kind == "folder_move" {
+        let movable = resolution == ConflictResolution::KeepRemote
+            && from_abs.as_ref().is_some_and(|p| p.is_dir())
+            && abs.symlink_metadata().is_err();
+        if !movable {
+            return Err(AppError::conflict(
+                "resolution_unavailable",
+                "the folder can only take the peer's layout when its source exists here and the destination is free; keep this side or skip",
+            ));
+        }
+        let vv = merged(None, &c.remote_vv);
+        return submit_pending(
+            state,
+            actor,
+            c,
+            label,
+            OperationAction::MoveFolder {
+                source: c.share.location(&from)?,
+                target: c.share.location(&c.rel)?,
+            },
+            "folder_move",
+            Some(&from),
+            &c.rel,
+            &vv,
+        )
+        .await;
+    }
+    let Some(sha) = c.remote.sha256.clone() else {
+        return Err(AppError::conflict(
+            "resolution_unavailable",
+            "the peer's version of this file is unknown; keep this side or skip",
+        ));
+    };
+    if abs.symlink_metadata().is_ok() {
+        return Err(AppError::conflict(
+            "destination_exists",
+            "a different file already exists at the peer's destination; keep this side or skip",
+        ));
+    }
+    let local_source = super::row(state, &c.share.id, &from).await?;
+    super::queue_transfer(
+        state,
+        &c.peer_id,
+        &c.share,
+        &c.rel,
+        &sha,
+        c.remote.size.unwrap_or(0),
+        &c.remote_vv,
+    )
+    .await?;
+    if resolution == ConflictResolution::KeepRemote && from_abs.is_some_and(|p| p.is_file()) {
+        let vv = merged(local_source.as_ref(), &c.remote_vv);
+        return submit_pending(
+            state,
+            actor,
+            c,
+            label,
+            OperationAction::Trash {
+                source: c.share.location(&from)?,
+                expected_revision: None,
+            },
+            "delete",
+            None,
+            &from,
+            &vv,
+        )
+        .await;
+    }
+    mark_resolved(state, &c.id, label).await
+}
+
+/// Makes the remote side win: trashes the local copy, or downloads the remote version.
 pub async fn take_remote(state: &AppState, id: &str) -> AppResult<()> {
     let c = load_conflict(state, id).await?;
     let root = files::root(&state.db, &c.share.root_id).await?;
@@ -1046,48 +1292,56 @@ pub async fn take_remote(state: &AppState, id: &str) -> AppResult<()> {
     let local = super::row(state, &c.share.id, &c.rel).await?;
     let vv = merged(local.as_ref(), &c.remote_vv);
     if c.remote.deleted {
+        // The deletion is announced once the trash operation succeeded.
         if abs.is_dir() {
-            submit_pending(
+            return submit_pending(
                 state,
                 "conflict",
                 &c,
+                "keep_remote",
                 OperationAction::TrashFolder {
                     source: c.share.location(&c.rel)?,
+                    expected_entries: None,
                 },
                 "folder_trash",
                 None,
                 &c.rel,
                 &vv,
             )
-            .await?;
-        } else if abs.is_file() {
-            submit_pending(
+            .await;
+        }
+        if abs.is_file() {
+            return submit_pending(
                 state,
                 "conflict",
                 &c,
+                "keep_remote",
                 OperationAction::Trash {
                     source: c.share.location(&c.rel)?,
+                    expected_revision: None,
                 },
                 "delete",
                 None,
                 &c.rel,
                 &vv,
             )
-            .await?;
-        } else {
-            let mut r = local.unwrap_or(Row {
-                size: 0,
-                mtime_ns: 0,
-                sha256: None,
-                deleted: true,
-                vv: VersionVector::default(),
-            });
-            r.deleted = true;
-            r.vv = vv.clone();
-            super::put_row(state, &c.share.id, &c.rel, &r).await?;
+            .await;
         }
-        super::append_local(
-            state,
+        let mut r = local.unwrap_or(Row {
+            size: 0,
+            mtime_ns: 0,
+            sha256: None,
+            deleted: true,
+            vv: VersionVector::default(),
+        });
+        r.deleted = true;
+        r.vv = vv.clone();
+        let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
+        resolved_in(&mut tx, id, "keep_remote").await?;
+        super::put_row_in(&mut tx, &c.share.id, &c.rel, &r).await?;
+        super::append_local_in(
+            &mut tx,
+            &state.instance_id,
             &c.share.name,
             "file_deleted",
             &EventData {
@@ -1097,12 +1351,10 @@ pub async fn take_remote(state: &AppState, id: &str) -> AppResult<()> {
             },
         )
         .await?;
+        tx.commit().await?;
     } else if let Some(sha) = &c.remote.sha256 {
-        sqlx::query("UPDATE conflicts SET status = 'resolved', resolution = COALESCE(resolution, 'keep_remote'), resolved_at = ? WHERE id = ?")
-            .bind(db::now())
-            .bind(id)
-            .execute(&state.db)
-            .await?;
+        // The download replaces the local copy through a managed upload (old version to the
+        // ISM trash) once transfers are allowed.
         super::queue_transfer(
             state,
             &c.peer_id,
@@ -1113,8 +1365,11 @@ pub async fn take_remote(state: &AppState, id: &str) -> AppResult<()> {
             &vv,
         )
         .await?;
-        super::append_local(
-            state,
+        let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
+        resolved_in(&mut tx, id, "keep_remote").await?;
+        super::append_local_in(
+            &mut tx,
+            &state.instance_id,
             &c.share.name,
             "file_changed",
             &EventData {
@@ -1126,15 +1381,38 @@ pub async fn take_remote(state: &AppState, id: &str) -> AppResult<()> {
             },
         )
         .await?;
-        state.emit(ServerEvent::ConflictsChanged);
-        return Ok(());
+        tx.commit().await?;
+    } else {
+        let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
+        resolved_in(&mut tx, id, "keep_remote").await?;
+        tx.commit().await?;
     }
-    sqlx::query("UPDATE conflicts SET status = 'resolved', resolution = COALESCE(resolution, 'keep_remote'), resolved_at = ? WHERE id = ?")
-        .bind(db::now())
-        .bind(id)
-        .execute(&state.db)
-        .await?;
+    state.emit(ServerEvent::SyncChanged);
     state.emit(ServerEvent::ConflictsChanged);
+    Ok(())
+}
+
+/// Marks a conflict resolved unless another resolution already finished it.
+pub(super) async fn resolved_in(
+    conn: &mut sqlx::SqliteConnection,
+    id: &str,
+    resolution: &str,
+) -> AppResult<()> {
+    let updated = sqlx::query(
+        "UPDATE conflicts SET status = 'resolved', resolution = COALESCE(resolution, ?), resolved_at = ?
+         WHERE id = ? AND status IN ('open', 'resolving')",
+    )
+    .bind(resolution)
+    .bind(db::now())
+    .bind(id)
+    .execute(conn)
+    .await?;
+    if updated.rows_affected() != 1 {
+        return Err(AppError::conflict(
+            "not_open",
+            "this conflict is already resolved",
+        ));
+    }
     Ok(())
 }
 

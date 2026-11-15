@@ -12,6 +12,7 @@ mod ops;
 mod peers;
 mod routes;
 mod state;
+mod watch;
 
 use std::time::Duration;
 
@@ -38,13 +39,19 @@ async fn main() -> anyhow::Result<()> {
     let listen = config.listen;
     let state = AppState::new(config, pool, secrets).await?;
 
-    if let Err(e) = maintenance::recover_after_restart(&state).await {
-        tracing::error!("restart recovery failed: {}", e.message());
-    }
+    maintenance::recover_after_restart(&state)
+        .await
+        .context("restart recovery failed")?;
+    peers::transfer::recover_after_restart(&state)
+        .await
+        .context("peer transfer restart recovery failed")?;
     tokio::spawn(maintenance::run(state.clone()));
     tokio::spawn(ops::exec::run(state.clone()));
     tokio::spawn(peers::run(state.clone()));
+    tokio::spawn(peers::scan_worker(state.clone()));
     tokio::spawn(peers::transfer::run(state.clone()));
+    tokio::spawn(watch::run(state.clone()));
+    tokio::spawn(watch::scheduler::run(state.clone()));
     let janitor = state.clone();
     tokio::spawn(async move {
         loop {

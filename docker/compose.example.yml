@@ -21,13 +21,13 @@ services:
 
     ports:
       # The admin UI, the client API (Open Photo Manager, Immich local app) and the peer API.
-      # To expose it only on the Netbird interface, prefix the Netbird IP: "100.64.0.10:8080:8080".
+      # To expose it only on a private interface, prefix its IP (example: "192.0.2.10:8080:8080").
       - "8080:8080"
 
     volumes:
       # CHANGE ME: every library folder Immich imports, mounted under /mnt. The paths do not need to
       # match Immich's: the Mappings page links each folder to its Immich import path.
-      - /volume1/photo:/mnt/photo
+      - /example/photos:/mnt/photos
       # Database and encryption key. Must be writable by the user above.
       - ./ism-data:/data
 

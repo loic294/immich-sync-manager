@@ -6,8 +6,10 @@ import type { LibraryView } from '@/api/generated/LibraryView';
 import type { MappingInput } from '@/api/generated/MappingInput';
 import type { MappingView } from '@/api/generated/MappingView';
 import type { MountView } from '@/api/generated/MountView';
+import type { WatchMode } from '@/api/generated/WatchMode';
 import { IsmPage } from '@/base/ism-page';
 import { confirmAction } from '@/components/confirm';
+import { formatDate, humanize } from '@/util/format';
 
 const ROOT_ID = /^[a-z0-9_-]{1,64}$/;
 
@@ -27,7 +29,10 @@ export class IsmMappingsPage extends IsmPage {
     serverId: { state: true },
     libraryId: { state: true },
     containerPath: { state: true },
+    watching: { state: true },
   };
+
+  protected override reloadOn = ['watch_changed'] as const;
 
   declare mappings: MappingView[];
   declare mounts: MountView[];
@@ -37,7 +42,10 @@ export class IsmMappingsPage extends IsmPage {
   declare serverId: string;
   declare libraryId: string;
   declare containerPath: string;
+  /** The mapping whose watch settings are being edited. */
+  declare watching: MappingView | null;
   private dialog = createRef<HTMLDialogElement>();
+  private watchDialog = createRef<HTMLDialogElement>();
 
   constructor() {
     super();
@@ -49,6 +57,7 @@ export class IsmMappingsPage extends IsmPage {
     this.serverId = '';
     this.libraryId = '';
     this.containerPath = '';
+    this.watching = null;
   }
 
   protected override async load() {
@@ -105,6 +114,106 @@ export class IsmMappingsPage extends IsmPage {
         () => admin.deleteMapping(mapping.root_id),
         'Mapping removed.',
       );
+  }
+
+  private openWatch(mapping: MappingView) {
+    this.watching = mapping;
+    this.watchDialog.value?.querySelector('form')?.reset();
+    this.watchDialog.value?.showModal();
+  }
+
+  private async onWatchSubmit(event: SubmitEvent) {
+    event.preventDefault();
+    const mapping = this.watching;
+    if (!mapping) return;
+    const form = new FormData(event.target as HTMLFormElement);
+    const minutes = Number(form.get('poll_minutes'));
+    const ok = await this.act(
+      'watch',
+      () =>
+        admin.setMappingWatch(mapping.root_id, {
+          mode: String(form.get('mode')) as WatchMode,
+          poll_interval_secs: Math.round(minutes * 60),
+        }),
+      'Watch settings saved.',
+    );
+    if (ok) this.watchDialog.value?.close();
+  }
+
+  private async resetWatch(mapping: MappingView) {
+    const ok = await confirmAction({
+      title: 'Accept the current folder contents',
+      message: `Detection for “${mapping.name}” paused because the folder looked unreachable or suddenly empty. Continue only if you checked that what is there now is correct: ISM records it as the new starting point without reporting deletions.`,
+      confirmLabel: 'Accept and resume',
+      danger: true,
+    });
+    if (ok)
+      await this.act(
+        `reset:${mapping.root_id}`,
+        () => admin.resetMappingWatch(mapping.root_id),
+        'Change detection resumed.',
+      );
+  }
+
+  private renderWatch(m: MappingView) {
+    const w = m.watch;
+    if (!w.watched) return html`<span class="text-xs text-base-content/60">Not watched</span>`;
+    const mode = w.effective_mode ? humanize(w.effective_mode) : 'Starting';
+    return html`
+      <div class="text-sm">
+        ${mode}${w.mode === 'auto' ? ' (auto)' : ''}
+        ${w.effective_mode === 'poll' ? html`<span class="text-xs text-base-content/60">every ${Math.round(w.poll_interval_secs / 60)} min</span>` : nothing}
+      </div>
+      <div class="text-xs text-base-content/60">Last pass ${formatDate(w.last_pass_at)}</div>
+      ${w.paused ? html`<span class="badge badge-warning badge-soft">Paused</span>` : nothing}
+      ${w.warnings.map((warning) => html`<div class="text-xs text-warning">${warning}</div>`)}
+      ${
+        w.paused
+          ? html`<button type="button" class="btn btn-xs" @click=${() => this.resetWatch(m)}>
+              ${this.spin(`reset:${m.root_id}`)}Accept contents
+            </button>`
+          : nothing
+      }
+    `;
+  }
+
+  private renderWatchDialog() {
+    const w = this.watching?.watch;
+    return html`
+      <dialog class="modal" ${ref(this.watchDialog)}>
+        <div class="modal-box">
+          <h3 class="text-lg font-semibold">Change detection${this.watching ? ` for ${this.watching.name}` : ''}</h3>
+          <form class="flex flex-col gap-1" @submit=${this.onWatchSubmit}>
+            <fieldset class="fieldset">
+              <legend class="fieldset-legend">Mode</legend>
+              <select name="mode" class="select w-full">
+                <option value="auto" ?selected=${w?.mode === 'auto'}>Automatic (polling on network shares)</option>
+                <option value="native" ?selected=${w?.mode === 'native'}>Change events (local disks)</option>
+                <option value="poll" ?selected=${w?.mode === 'poll'}>Polling</option>
+              </select>
+              <p class="label">Network shares (SMB, NFS) do not report changes reliably, so they are polled.</p>
+            </fieldset>
+            <fieldset class="fieldset">
+              <legend class="fieldset-legend">Polling interval (minutes)</legend>
+              <input
+                name="poll_minutes"
+                type="number"
+                class="input w-full"
+                required
+                min="1"
+                max="1440"
+                .value=${String(Math.round((w?.poll_interval_secs ?? 300) / 60))}
+              />
+            </fieldset>
+            <div class="modal-action">
+              <button type="button" class="btn btn-ghost" @click=${() => this.watchDialog.value?.close()}>Cancel</button>
+              <button class="btn btn-primary" ?disabled=${this.busy !== undefined}>${this.spin('watch')}Save</button>
+            </div>
+          </form>
+        </div>
+        <form method="dialog" class="modal-backdrop"><button>close</button></form>
+      </dialog>
+    `;
   }
 
   private renderDialog() {
@@ -220,11 +329,11 @@ export class IsmMappingsPage extends IsmPage {
               <h2 class="card-title text-base">Mappings</h2>
               <div class="overflow-x-auto">
                 <table class="table table-sm">
-                  <thead><tr><th>Root</th><th>Container folder</th><th>Immich</th><th>Open Photo Manager</th><th>Status</th><th></th></tr></thead>
+                  <thead><tr><th>Root</th><th>Container folder</th><th>Immich</th><th>Open Photo Manager</th><th>Status</th><th>Watching</th><th></th></tr></thead>
                   <tbody>
                     ${
                       this.mappings.length === 0
-                        ? html`<tr><td colspan="6" class="text-base-content/60">No mapping yet. Pick a mounted folder below.</td></tr>`
+                        ? html`<tr><td colspan="7" class="text-base-content/60">No mapping yet. Pick a mounted folder below.</td></tr>`
                         : this.mappings.map(
                             (m) => html`<tr>
                               <td><div class="font-medium">${m.name}</div><code class="text-xs">${m.root_id}</code></td>
@@ -241,7 +350,15 @@ export class IsmMappingsPage extends IsmPage {
                                         <div class="text-xs text-error">${m.availability_detail ?? ''}</div>`
                                 }
                               </td>
+                              <td>${this.renderWatch(m)}</td>
                               <td class="whitespace-nowrap text-right">
+                                ${
+                                  m.watch.watched
+                                    ? html`<button type="button" class="btn btn-ghost btn-sm btn-square" aria-label="Change detection" @click=${() => this.openWatch(m)}>
+                                        <ism-icon name="eye" size="sm"></ism-icon>
+                                      </button>`
+                                    : nothing
+                                }
                                 <button type="button" class="btn btn-ghost btn-sm btn-square" aria-label="Edit" @click=${() => this.open(m)}>
                                   <ism-icon name="pencil" size="sm"></ism-icon>
                                 </button>
@@ -295,7 +412,7 @@ export class IsmMappingsPage extends IsmPage {
           <ism-icon name="plus" size="sm"></ism-icon>Add mapping
         </button>`,
       )}
-      ${this.renderDialog()}
+      ${this.renderDialog()} ${this.renderWatchDialog()}
     `;
   }
 }

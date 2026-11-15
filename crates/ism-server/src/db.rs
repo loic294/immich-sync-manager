@@ -72,3 +72,74 @@ pub async fn audit(pool: &SqlitePool, actor: &str, action: &str, detail: &str) {
 pub fn json_vec(raw: &str) -> Vec<String> {
     serde_json::from_str(raw).unwrap_or_default()
 }
+
+#[cfg(test)]
+mod tests {
+    #[tokio::test]
+    async fn upload_idempotency_migration_preserves_existing_uploads() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = super::connect(dir.path()).await.unwrap();
+        sqlx::query(
+            "INSERT INTO uploads (id, principal, request_json, status, created_at)
+             VALUES ('old-upload', 'token:example', '{}', 'receiving', '2024-01-01')",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query("DROP INDEX uploads_principal_idempotency")
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::query("ALTER TABLE uploads DROP COLUMN idempotency_key")
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 3")
+            .execute(&db)
+            .await
+            .unwrap();
+        db.close().await;
+
+        let migrated = super::connect(dir.path()).await.unwrap();
+        let row: (String, String, Option<String>) = sqlx::query_as(
+            "SELECT id, status, idempotency_key FROM uploads WHERE id = 'old-upload'",
+        )
+        .fetch_one(&migrated)
+        .await
+        .unwrap();
+        assert_eq!(row, ("old-upload".into(), "receiving".into(), None));
+        migrated.close().await;
+    }
+
+    #[tokio::test]
+    async fn trash_inventory_migration_preserves_existing_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = super::connect(dir.path()).await.unwrap();
+        sqlx::query(
+            "INSERT INTO trash (id, root_id, path, quarantine_rel, is_folder, size, trashed_at)
+             VALUES ('old-trash', 'photos', 'a.jpg', '.ism-trash/old-trash', 0, 5, '2024-01-01')",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query("ALTER TABLE trash DROP COLUMN file_inventory_json")
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 2")
+            .execute(&db)
+            .await
+            .unwrap();
+        db.close().await;
+
+        let migrated = super::connect(dir.path()).await.unwrap();
+        let row: (String, String, Option<String>) = sqlx::query_as(
+            "SELECT root_id, path, file_inventory_json FROM trash WHERE id = 'old-trash'",
+        )
+        .fetch_one(&migrated)
+        .await
+        .unwrap();
+        assert_eq!(row, ("photos".into(), "a.jpg".into(), None));
+        migrated.close().await;
+    }
+}

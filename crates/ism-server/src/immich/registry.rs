@@ -1,7 +1,7 @@
 //! Immich servers and accounts known to this instance, and routing of each change to the
 //! account that owns the affected library.
 
-use ism_core::dto::{DirectWrites, ImmichServerView, MaintenanceView};
+use ism_core::dto::{DirectWritesReason, ImmichServerView, MaintenanceView};
 use ism_core::maintenance::{MaintenanceState, Phase};
 use sqlx::Row;
 use sqlx::postgres::PgPool;
@@ -44,7 +44,7 @@ fn server_from_row(row: &sqlx::sqlite::SqliteRow) -> AppResult<Server> {
         version: row.try_get("version")?,
         compatible: row.try_get::<i64, _>("compatible")? != 0,
         compatibility_detail: row.try_get("compatibility_detail")?,
-        maintenance: serde_json::from_str(&maintenance).unwrap_or_default(),
+        maintenance: serde_json::from_str(&maintenance)?,
     })
 }
 
@@ -90,8 +90,8 @@ pub fn maintenance_view(m: &MaintenanceState) -> MaintenanceView {
         phase: m.phase,
         epoch: m.epoch,
         active_ops: m.active_ops,
-        seconds_until_reconcile: m.seconds_until_reconcile(chrono::Utc::now()),
-        affected_libraries: m.affected_libraries.clone(),
+        queue_paused: m.queue_paused_by_ism,
+        drift: m.drift.clone(),
         message: m.message.clone(),
     }
 }
@@ -117,15 +117,29 @@ pub async fn server_view(state: &AppState, s: &Server) -> AppResult<ImmichServer
     })
 }
 
-/// Whether managed (direct) writes are possible on a server right now.
-pub fn direct_writes(server: &Server) -> DirectWrites {
+/// Why managed (direct) writes are refused on a server right now; `None` when they can run.
+pub fn write_block(server: &Server) -> Option<(DirectWritesReason, String)> {
     if !(server.compatible && server.direct_writes_enabled && server.database_url_enc.is_some()) {
-        return DirectWrites::Disabled;
+        return Some((
+            DirectWritesReason::NotConfigured,
+            "the Immich compatibility check, database access and direct writes are required".into(),
+        ));
     }
-    match server.maintenance.phase {
-        Phase::Blocked | Phase::RecoveryRequired => DirectWrites::Blocked,
-        _ if server.maintenance.unresolved_recoveries > 0 => DirectWrites::Blocked,
-        _ => DirectWrites::Enabled,
+    let m = &server.maintenance;
+    let detail = |fallback: &str| m.message.clone().unwrap_or_else(|| fallback.to_owned());
+    if let Some(drift) = &m.drift {
+        return Some((DirectWritesReason::Drift, drift.clone()));
+    }
+    match m.phase {
+        Phase::RecoveryRequired => Some((
+            DirectWritesReason::RecoveryRequired,
+            detail("a change needs an admin to resolve it"),
+        )),
+        Phase::Blocked => Some((
+            DirectWritesReason::Maintenance,
+            detail("Immich's library queue could not be paused or resumed"),
+        )),
+        _ => None,
     }
 }
 

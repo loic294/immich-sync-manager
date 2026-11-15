@@ -29,15 +29,26 @@ pub struct Config {
 pub struct Timing {
     /// How often queue counters are polled.
     pub poll: std::time::Duration,
-    /// `ISM_QUIESCE_TIMEOUT_SECS`, default 600. Longest wait for Immich queues to drain before
-    /// an epoch starts; on timeout nothing is changed and the server is blocked.
+    /// `ISM_QUIESCE_TIMEOUT_SECS`, default 600. Longest wait for Immich's `library` queue to
+    /// drain and stay idle while paused; on timeout the queue is resumed and the server blocked.
     pub quiesce_timeout: std::time::Duration,
-    /// Extra wait after watchers are off, for in-flight watcher events to be queued.
+    /// Wait after pausing the queue before the idle confirmations start.
     pub settle: std::time::Duration,
-    /// `ISM_SCAN_TIMEOUT_SECS`, default 7200. Longest wait for the reconciliation scan.
+    /// `ISM_SCAN_TIMEOUT_SECS`, default 7200. Longest wait for a library scan to finish.
     pub scan_timeout: std::time::Duration,
     /// Longest wait of an operation for maintenance admission.
     pub admission_timeout: std::time::Duration,
+    /// `ISM_SCAN_DELAY_SECS`, default 120. A library scan runs this long after the last detected
+    /// change; every further change restarts the timer.
+    pub scan_delay: std::time::Duration,
+    /// How often Immich's watcher and scheduled-scan settings are checked for drift.
+    pub drift_check: std::time::Duration,
+    /// Minimum lifetime of a self-write record (raised to cover twice the longest poll interval).
+    pub self_write_ttl: std::time::Duration,
+    /// Native change events are collected this long before they are checked.
+    pub watch_debounce: std::time::Duration,
+    /// Minimum gap between full passes triggered by lost native events.
+    pub full_pass_gap: std::time::Duration,
 }
 
 impl Default for Timing {
@@ -49,6 +60,11 @@ impl Default for Timing {
             settle: Duration::from_secs(5),
             scan_timeout: Duration::from_secs(7200),
             admission_timeout: Duration::from_secs(900),
+            scan_delay: Duration::from_secs(120),
+            drift_check: Duration::from_secs(60),
+            self_write_ttl: Duration::from_secs(900),
+            watch_debounce: Duration::from_secs(2),
+            full_pass_gap: Duration::from_secs(30),
         }
     }
 }
@@ -86,6 +102,9 @@ impl Config {
                 if let Some(v) = env("ISM_SCAN_TIMEOUT_SECS").and_then(|v| v.parse().ok()) {
                     t.scan_timeout = std::time::Duration::from_secs(v);
                 }
+                if let Some(v) = env("ISM_SCAN_DELAY_SECS").and_then(|v| v.parse().ok()) {
+                    t.scan_delay = std::time::Duration::from_secs(v);
+                }
                 t
             },
         })
@@ -111,6 +130,11 @@ impl Config {
                 settle: Duration::from_millis(10),
                 scan_timeout: Duration::from_millis(500),
                 admission_timeout: Duration::from_secs(5),
+                scan_delay: Duration::from_millis(200),
+                drift_check: Duration::ZERO,
+                self_write_ttl: Duration::from_secs(60),
+                watch_debounce: Duration::from_millis(50),
+                full_pass_gap: Duration::ZERO,
             },
         }
     }

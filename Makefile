@@ -8,7 +8,7 @@ ISM_LISTEN ?= 127.0.0.1:8080
 
 .DEFAULT_GOAL := check
 
-.PHONY: check check-rust check-web fmt gen-api dev-server dev-web image
+.PHONY: check check-rust check-web fmt gen-api dev-server dev-web image clean
 
 check: check-rust check-web
 
@@ -37,3 +37,6 @@ dev-web:
 
 image:
 	docker build -f docker/Dockerfile -t immich-sync-manager:local .
+
+clean:
+	cargo clean

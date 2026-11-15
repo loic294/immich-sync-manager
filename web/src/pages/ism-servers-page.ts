@@ -141,7 +141,7 @@ export class IsmServersPage extends IsmPage {
     const ok = await confirmAction({
       title: 'Mark recovery as done',
       message:
-        'Confirm that you checked the Immich library settings and the folders listed in the message, and that scanning and the file watcher can be restored.',
+        'Confirm that you checked the folders and Immich assets listed in the message and that writes can resume.',
       confirmLabel: 'Mark as done',
     });
     if (ok)
@@ -159,11 +159,7 @@ export class IsmServersPage extends IsmPage {
         <span class="font-medium">Library maintenance</span>
         <span class=${statusBadge(m.phase)}>${humanize(m.phase)}</span>
         ${m.active_ops > 0 ? html`<span>${m.active_ops} operation(s) running</span>` : nothing}
-        ${
-          m.seconds_until_reconcile !== null
-            ? html`<span>Rescan and watcher restore in ${Math.ceil(m.seconds_until_reconcile / 60)} min</span>`
-            : nothing
-        }
+        ${m.queue_paused ? html`<span class="badge badge-info badge-soft">Library queue paused</span>` : nothing}
         ${
           m.phase === 'blocked'
             ? html`<button type="button" class="btn btn-xs" @click=${() => this.act(`retry:${server.id}`, () => admin.retryMaintenance(server.id), 'Retrying.')}>
@@ -180,6 +176,20 @@ export class IsmServersPage extends IsmPage {
         }
       </div>
       ${m.message ? html`<p class="text-sm text-base-content/70">${m.message}</p>` : nothing}
+      ${
+        m.drift
+          ? html`<div role="alert" class="alert alert-warning alert-soft">
+              <ism-icon name="triangle-alert"></ism-icon>
+              <div>
+                <div class="font-medium">Writes are blocked: ${m.drift}</div>
+                <div class="text-sm">ISM detects file changes itself; Immich's file watcher and scheduled library scan must stay off.</div>
+              </div>
+              <button type="button" class="btn btn-sm" @click=${() => this.act(`reapply:${server.id}`, () => admin.reapplyImmichSettings(server.id), 'Immich settings re-applied.')}>
+                ${this.spin(`reapply:${server.id}`)}Turn them off again
+              </button>
+            </div>`
+          : nothing
+      }
     `;
   }
 

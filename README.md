@@ -1,26 +1,34 @@
 # Immich Sync Manager
 
 A companion service for [Immich](https://immich.app) **v3.4.1** external libraries. It runs as one
-Docker container on a Synology NAS, a Linux host or Docker Desktop on Windows, and gives other tools
-a safe way to change library files without breaking Immich:
+Docker container on a Synology NAS, a Linux host or Docker Desktop on Windows.
+
+Immich-linked writes are enabled. They run under the library write barrier, which was verified end
+to end against stock Immich v3.4.1 (`docker/immich-proof/RESULTS.md`). Peer sync publishes and
+applies changes through the same managed operations. Read [limitations](docs/limitations.md) before
+relying on it, and keep backups.
 
 - **Offline downloads for the Immich local app.** Clients ask for originals *and* their sidecars
   (`.xmp`, `.aae`, …) with resumable downloads, and upload new files into their original folder
   instead of the user's upload library. Thumbnails and previews still come from Immich.
 - **Managed file operations.** Moves, renames, folder create/move/delete and trash/restore, sent in
-  batches by Open Photo Manager or the local app, with progress streamed back. Immich keeps asset IDs,
-  albums, faces and favourites because ISM updates the asset paths instead of letting Immich see a
-  delete and a new file.
+  batches by Open Photo Manager or the local app, with progress streamed back. Asset IDs, albums
+  and favorites are preserved, rather than treating moves as deletes and new files.
 - **Peer sync between instances.** Several ISM instances (each next to its own Immich) replicate
   chosen folders over a private network such as Netbird: management events right away, file contents
   during allowed hours, conflicts resolved in the UI.
 
-## How it changes files safely
+## Maintenance barrier
 
-1. Immich's file watching and periodic library scans are switched off and its queues must drain.
+ISM, not Immich, detects file changes: Immich's file watcher and scheduled library scan stay off
+permanently, and ISM watches the mapped folders itself (see [file watching](docs/watching.md)).
+
+1. Before a batch, ISM checks that Immich's watcher and scheduled scan are still off, pauses Immich's
+   `library` queue and waits until no library job is running.
 2. The batch runs. Every step can be undone; a failing item rolls back and never half-applies.
-3. After **15 minutes** without new work, ISM scans the affected libraries, waits for the scan, then
-   restores exactly the settings it changed.
+   Moves update Immich's database directly and need no scan.
+3. When the last batch finishes, the queue is resumed. Uploads, peer copies and outside changes get
+   a library scan **2 minutes** after the last change.
 
 The Immich API is always preferred. Immich has no API to change the path or owner of an
 external-library asset, so those few updates go straight to Immich's PostgreSQL, guarded by row locks
@@ -44,13 +52,16 @@ Open `http://<host>:8080`, create the administrator, then:
 4. **Peers** (optional): pair another instance and choose the shared folders.
 
 More: [install](docs/install.md) · [Immich compatibility](docs/immich-compatibility.md) ·
-[peer sync](docs/peers.md) · [recovery](docs/recovery.md) · [limitations](docs/limitations.md) ·
+[file watching](docs/watching.md) · [peer sync](docs/peers.md) · [recovery](docs/recovery.md) · [limitations](docs/limitations.md) ·
 [client API](docs/client-api.md).
 
 ## Development
 
 Rust (Axum, SQLx/SQLite) in `crates/`, Lit + DaisyUI web UI in `web/`, the same layout as
-Open Photo Manager. `make check` runs every gate; see [AGENTS.md](AGENTS.md).
+Open Photo Manager. `make check` runs every gate; `make clean` removes generated Rust build
+artifacts. See [AGENTS.md](AGENTS.md).
+Development and test builds disable debug symbols and incremental compilation to limit disk use.
+Set `CARGO_PROFILE_DEV_DEBUG=1` or `CARGO_PROFILE_TEST_DEBUG=1` for line-level debugging.
 
 ## License
 

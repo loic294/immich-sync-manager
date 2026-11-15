@@ -1,69 +1,66 @@
-//! The maintenance state machine of one connected Immich server.
+//! The write barrier of one connected Immich server.
 //!
-//! Immich's library watcher deletes the asset row when a watched file disappears, so file
-//! watching and scheduled scans must be off before any managed file changes, and must stay off
-//! until every change has settled. This module decides *what* to do; the server performs it and
-//! persists [`MaintenanceState`] after every transition so a restart resumes the same phase.
-//!
-//! Lifecycle of one epoch:
+//! ISM owns file detection: Immich's library watcher and scheduled library scan stay off
+//! permanently (they are turned off at enrollment, and ISM alerts when either comes back on).
+//! Before a managed operation touches library files, the server pauses Immich's `library` queue
+//! (the only queue that imports files or marks them offline) and confirms it idle on several
+//! consecutive polls. Overlapping operations share one pause through a reference count; the last
+//! release resumes the queue, after which due library scans may start. This module decides
+//! *what* to do; the server performs it and persists [`MaintenanceState`] after every transition
+//! so a restart resumes from the same place.
 //!
 //! ```text
-//! Idle --admit--> Preparing --prepared--> Active --(no work for 15 min)--> Reconciling
-//!   ^                 |                     ^  |                               |
-//!   |              failure                admit settle                       scanned
-//!   |                 v                                                        v
-//!   +---- restored -- Blocked                        Idle <---- restored --- Restoring
+//! Idle --admit--> Preparing --paused + idle--> Active (active_ops > 0) --last release--> Resuming
+//!   ^                 |                                                                    |
+//!   |              failure --> Blocked --retry--> Idle / Resuming                          |
+//!   +------------------------------------- resumed ---------------------------------------+
 //! ```
 //!
-//! Work that arrives during `Reconciling`/`Restoring` waits for the next epoch: files never
-//! change while a reconciliation scan may be reading them.
+//! Settings drift (watcher or scheduled scan turned back on) and unresolved recoveries refuse
+//! new work until an administrator acts.
 
-use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
-/// The user-specified quiet period: 15 minutes without admitted work before scanning.
-pub const QUIET_PERIOD_SECS: i64 = 15 * 60;
+/// Consecutive idle reads of the paused `library` queue required before work is admitted.
+pub const IDLE_CONFIRMATIONS: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 #[ts(export)]
 pub enum Phase {
     Idle,
+    /// Pausing the library queue and confirming it idle.
     Preparing,
+    /// The library queue is paused and `active_ops` operations hold the barrier.
     Active,
-    Reconciling,
-    Restoring,
-    /// Preparation failed and nothing was changed; writes are refused until an admin retries.
+    /// The last operation released; the library queue is being resumed.
+    Resuming,
+    /// The queue could not be paused, confirmed idle or resumed; writes are refused until an
+    /// admin retries.
     Blocked,
     /// Something changed on disk but could not be completed or verified; writes are refused and
-    /// watchers stay off until an admin resolves it.
+    /// the library queue stays paused until an admin resolves it.
     RecoveryRequired,
-}
-
-/// Settings this coordinator changed, with the values they had before, so restoration puts back
-/// exactly what the administrator had and nothing else.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SavedSettings {
-    /// `library.watch.enabled` before we turned it off; `None` when we did not change it.
-    pub watch_enabled: Option<bool>,
-    /// `library.scan.enabled` before we turned it off; `None` when we did not change it.
-    pub scan_enabled: Option<bool>,
-    /// Queues we paused (and must resume).
-    pub paused_queues: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MaintenanceState {
     pub phase: Phase,
+    #[serde(default)]
     pub epoch: u64,
+    #[serde(default)]
     pub active_ops: u32,
+    #[serde(default)]
     pub unresolved_recoveries: u32,
-    pub last_activity: Option<DateTime<Utc>>,
-    pub quiet_deadline: Option<DateTime<Utc>>,
-    pub saved: SavedSettings,
-    /// Immich library ids touched during this epoch; each gets a reconciliation scan.
-    pub affected_libraries: Vec<String>,
+    /// ISM paused (or was about to pause) the `library` queue and still has to resume it.
+    #[serde(default)]
+    pub queue_paused_by_ism: bool,
+    /// Immich's watcher or scheduled scan was found on; writes are refused until an admin
+    /// re-applies ISM's settings.
+    #[serde(default)]
+    pub drift: Option<String>,
+    #[serde(default)]
     pub message: Option<String>,
 }
 
@@ -74,10 +71,8 @@ impl Default for MaintenanceState {
             epoch: 0,
             active_ops: 0,
             unresolved_recoveries: 0,
-            last_activity: None,
-            quiet_deadline: None,
-            saved: SavedSettings::default(),
-            affected_libraries: Vec::new(),
+            queue_paused_by_ism: false,
+            drift: None,
             message: None,
         }
     }
@@ -85,22 +80,25 @@ impl Default for MaintenanceState {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Admission {
-    /// Watchers are off and queues quiet: go ahead.
+    /// The queue is paused for other operations: share the pause.
     Admit,
-    /// Start an epoch (turn watchers off, drain queues) and ask again.
+    /// Pause the library queue, confirm it idle and ask again.
     Prepare,
-    /// Another phase is in progress; ask again later.
+    /// Another transition is in progress; ask again later.
     Wait,
-    /// Writes are refused (blocked or recovery required).
+    /// Writes are refused (drift, blocked or recovery required).
     Deny(String),
 }
 
 impl MaintenanceState {
     pub fn admission(&self) -> Admission {
+        if let Some(drift) = &self.drift {
+            return Admission::Deny(drift.clone());
+        }
         match self.phase {
             Phase::Active => Admission::Admit,
             Phase::Idle => Admission::Prepare,
-            Phase::Preparing | Phase::Reconciling | Phase::Restoring => Admission::Wait,
+            Phase::Preparing | Phase::Resuming => Admission::Wait,
             Phase::Blocked | Phase::RecoveryRequired => Admission::Deny(
                 self.message
                     .clone()
@@ -109,19 +107,39 @@ impl MaintenanceState {
         }
     }
 
+    /// Starts pausing. The pause intent is recorded first so a crash mid-way still resumes.
     pub fn begin_prepare(&mut self) {
         self.phase = Phase::Preparing;
         self.epoch += 1;
-        self.saved = SavedSettings::default();
-        self.affected_libraries.clear();
+        self.queue_paused_by_ism = true;
         self.message = None;
     }
 
-    pub fn prepared(&mut self, saved: SavedSettings, now: DateTime<Utc>) {
+    /// The queue is paused and idle: the preparing operation is admitted.
+    pub fn prepared(&mut self) {
         self.phase = Phase::Active;
-        self.saved = saved;
-        self.last_activity = Some(now);
-        self.quiet_deadline = Some(now + Duration::seconds(QUIET_PERIOD_SECS));
+        self.active_ops += 1;
+    }
+
+    /// Another operation shares the pause. Only valid in `Active`.
+    pub fn admit(&mut self) {
+        self.active_ops += 1;
+    }
+
+    /// One operation released. Returns true when the queue must now be resumed.
+    pub fn settle(&mut self) -> bool {
+        self.active_ops = self.active_ops.saturating_sub(1);
+        if self.active_ops == 0 && self.phase == Phase::Active {
+            self.phase = Phase::Resuming;
+            return true;
+        }
+        false
+    }
+
+    pub fn resumed(&mut self) {
+        self.phase = Phase::Idle;
+        self.queue_paused_by_ism = false;
+        self.message = None;
     }
 
     pub fn block(&mut self, reason: impl Into<String>) {
@@ -134,155 +152,187 @@ impl MaintenanceState {
         self.message = Some(reason.into());
     }
 
-    /// One managed operation starts touching files. Only valid in `Active`.
-    pub fn admit(&mut self, now: DateTime<Utc>, library_ids: &[String]) {
-        self.active_ops += 1;
-        self.last_activity = Some(now);
-        self.quiet_deadline = None;
-        for id in library_ids {
-            if !self.affected_libraries.contains(id) {
-                self.affected_libraries.push(id.clone());
-            }
+    /// Where an admin retry of a blocked barrier goes: resume first if ISM still holds a pause.
+    pub fn retry(&mut self) -> bool {
+        if self.phase != Phase::Blocked {
+            return false;
         }
-    }
-
-    /// One managed operation finished. The quiet timer restarts from now.
-    pub fn settle(&mut self, now: DateTime<Utc>) {
-        self.active_ops = self.active_ops.saturating_sub(1);
-        self.last_activity = Some(now);
-        if self.active_ops == 0 {
-            self.quiet_deadline = Some(now + Duration::seconds(QUIET_PERIOD_SECS));
-        }
-    }
-
-    /// True exactly when the 15-minute quiet period has fully elapsed with nothing running.
-    pub fn ready_to_reconcile(&self, now: DateTime<Utc>) -> bool {
-        self.phase == Phase::Active
-            && self.active_ops == 0
-            && self.unresolved_recoveries == 0
-            && self.quiet_deadline.is_some_and(|deadline| now >= deadline)
-    }
-
-    pub fn seconds_until_reconcile(&self, now: DateTime<Utc>) -> Option<i64> {
-        if self.phase != Phase::Active || self.active_ops > 0 {
-            return None;
-        }
-        self.quiet_deadline
-            .map(|deadline| (deadline - now).num_seconds().max(0))
-    }
-
-    pub fn begin_reconcile(&mut self) {
-        self.phase = Phase::Reconciling;
-    }
-
-    pub fn begin_restore(&mut self) {
-        self.phase = Phase::Restoring;
-    }
-
-    pub fn restored(&mut self) {
-        self.phase = Phase::Idle;
-        self.saved = SavedSettings::default();
-        self.affected_libraries.clear();
-        self.quiet_deadline = None;
+        self.phase = if self.queue_paused_by_ism {
+            Phase::Resuming
+        } else {
+            Phase::Idle
+        };
         self.message = None;
+        true
+    }
+
+    /// One recovery was handled. With none left, operations still running keep the pause and
+    /// otherwise the queue is resumed.
+    pub fn resolve_one(&mut self) {
+        self.unresolved_recoveries = self.unresolved_recoveries.saturating_sub(1);
+        if self.unresolved_recoveries == 0 && self.phase == Phase::RecoveryRequired {
+            self.message = None;
+            self.phase = if self.active_ops > 0 {
+                Phase::Active
+            } else if self.queue_paused_by_ism {
+                Phase::Resuming
+            } else {
+                Phase::Idle
+            };
+        }
+    }
+
+    /// After a restart nothing holds the barrier any more; interrupted operations were already
+    /// turned into recoveries by the caller.
+    pub fn after_restart(&mut self) {
+        self.active_ops = 0;
+        match self.phase {
+            Phase::RecoveryRequired | Phase::Blocked => {}
+            _ if self.queue_paused_by_ism => self.phase = Phase::Resuming,
+            _ => self.phase = Phase::Idle,
+        }
+    }
+
+    /// Whether a library scan may start now: nothing holds or is about to hold the pause.
+    pub fn scans_allowed(&self) -> bool {
+        self.phase == Phase::Idle && self.active_ops == 0 && !self.queue_paused_by_ism
     }
 }
 
-/// What restoring one boolean setting should do. Only a value this coordinator changed is put
-/// back, and only when nobody changed it meanwhile (it still holds the value we wrote).
-pub fn restore_value(
-    saved_before: Option<bool>,
-    value_we_wrote: bool,
-    current: bool,
-) -> Option<bool> {
-    match saved_before {
-        Some(before) if current == value_we_wrote && before != current => Some(before),
-        _ => None,
+/// The drift message when Immich's watcher or scheduled scan is not off.
+pub fn settings_drift(watch: Option<bool>, scan: Option<bool>) -> Option<String> {
+    let mut on = Vec::new();
+    match watch {
+        Some(false) => {}
+        Some(true) => on.push("file watching"),
+        None => on.push("file watching (unreadable)"),
+    }
+    match scan {
+        Some(false) => {}
+        Some(true) => on.push("scheduled library scan"),
+        None => on.push("scheduled library scan (unreadable)"),
+    }
+    (!on.is_empty()).then(|| {
+        format!(
+            "Immich {} must stay off while ISM detects file changes; re-apply ISM's Immich settings",
+            on.join(" and ")
+        )
+    })
+}
+
+/// Counts consecutive idle reads; any busy read starts over.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct IdleConfirmation {
+    seen: u32,
+}
+
+impl IdleConfirmation {
+    /// Records one read; true once [`IDLE_CONFIRMATIONS`] consecutive reads were idle.
+    pub fn observe(&mut self, idle: bool) -> bool {
+        self.seen = if idle { self.seen + 1 } else { 0 };
+        self.seen >= IDLE_CONFIRMATIONS
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use chrono::TimeZone;
+    #![allow(clippy::expect_used)]
 
     use super::*;
-
-    fn t(secs: i64) -> DateTime<Utc> {
-        Utc.timestamp_opt(1_700_000_000 + secs, 0).single().unwrap()
-    }
 
     fn active() -> MaintenanceState {
         let mut s = MaintenanceState::default();
         assert_eq!(s.admission(), Admission::Prepare);
         s.begin_prepare();
         assert_eq!(s.admission(), Admission::Wait);
-        s.prepared(SavedSettings::default(), t(0));
+        s.prepared();
         s
     }
 
     #[test]
-    fn reconciles_only_after_exactly_900_idle_seconds() {
+    fn overlapping_operations_share_one_pause() {
         let mut s = active();
-        s.admit(t(10), &["lib".into()]);
-        assert!(
-            !s.ready_to_reconcile(t(5000)),
-            "never while work is running"
-        );
-        s.settle(t(100));
-        assert!(!s.ready_to_reconcile(t(100 + 899)));
-        assert!(s.ready_to_reconcile(t(100 + 900)));
-        assert_eq!(s.seconds_until_reconcile(t(100 + 600)), Some(300));
+        assert_eq!(s.admission(), Admission::Admit);
+        s.admit();
+        assert_eq!(s.active_ops, 2);
+        assert!(!s.settle(), "one operation still holds the pause");
+        assert!(!s.scans_allowed());
+        assert!(s.settle(), "the last release resumes the queue");
+        assert_eq!(s.phase, Phase::Resuming);
+        assert_eq!(s.admission(), Admission::Wait);
+        s.resumed();
+        assert!(s.scans_allowed());
+        assert!(!s.queue_paused_by_ism);
     }
 
     #[test]
-    fn new_work_restarts_the_quiet_period() {
-        let mut s = active();
-        s.admit(t(0), &[]);
-        s.settle(t(10));
-        s.admit(t(800), &[]);
-        s.settle(t(850));
-        assert!(!s.ready_to_reconcile(t(910)));
-        assert!(s.ready_to_reconcile(t(850 + 900)));
+    fn drift_refuses_work_until_cleared() {
+        let mut s = MaintenanceState {
+            drift: settings_drift(Some(true), Some(false)),
+            ..Default::default()
+        };
+        assert!(matches!(s.admission(), Admission::Deny(m) if m.contains("file watching")));
+        s.drift = None;
+        assert_eq!(s.admission(), Admission::Prepare);
+        assert_eq!(settings_drift(Some(false), Some(false)), None);
+        assert!(settings_drift(None, Some(false)).is_some());
     }
 
     #[test]
-    fn concurrent_operations_all_have_to_settle() {
-        let mut s = active();
-        s.admit(t(0), &[]);
-        s.admit(t(1), &[]);
-        s.settle(t(2));
-        assert!(!s.ready_to_reconcile(t(2000)));
-        s.settle(t(3));
-        assert!(s.ready_to_reconcile(t(903)));
-    }
-
-    #[test]
-    fn unresolved_recovery_keeps_maintenance_on() {
+    fn recovery_keeps_the_pause_until_resolved() {
         let mut s = active();
         s.unresolved_recoveries = 1;
-        assert!(!s.ready_to_reconcile(t(100_000)));
-    }
-
-    #[test]
-    fn work_waits_during_reconciliation_and_blocks_on_failure() {
-        let mut s = active();
-        s.begin_reconcile();
-        assert_eq!(s.admission(), Admission::Wait);
-        s.begin_restore();
-        assert_eq!(s.admission(), Admission::Wait);
-        s.restored();
-        assert_eq!(s.admission(), Admission::Prepare);
-        s.block("config file managed");
+        s.require_recovery("broken");
+        assert!(!s.settle(), "a recovery never resumes the queue by itself");
         assert!(matches!(s.admission(), Admission::Deny(_)));
+        s.resolve_one();
+        assert_eq!(s.phase, Phase::Resuming);
     }
 
     #[test]
-    fn restoration_respects_admin_changes() {
-        // We turned watching off (it was on): put it back.
-        assert_eq!(restore_value(Some(true), false, false), Some(true));
-        // An admin turned it on meanwhile: leave it.
-        assert_eq!(restore_value(Some(true), false, true), None);
-        // We never changed it: leave it.
-        assert_eq!(restore_value(None, false, false), None);
+    fn restart_resumes_a_pause_nobody_holds() {
+        let mut s = active();
+        s.after_restart();
+        assert_eq!((s.phase, s.active_ops), (Phase::Resuming, 0));
+        let mut crashed_while_pausing = MaintenanceState::default();
+        crashed_while_pausing.begin_prepare();
+        crashed_while_pausing.after_restart();
+        assert_eq!(crashed_while_pausing.phase, Phase::Resuming);
+        let mut idle = MaintenanceState::default();
+        idle.after_restart();
+        assert_eq!(idle.phase, Phase::Idle);
+    }
+
+    #[test]
+    fn retry_resumes_before_allowing_work() {
+        let mut s = MaintenanceState::default();
+        s.begin_prepare();
+        s.block("queue busy");
+        assert!(s.retry());
+        assert_eq!(s.phase, Phase::Resuming);
+        s.resumed();
+        s.block("other");
+        assert!(s.retry());
+        assert_eq!(s.phase, Phase::Idle);
+    }
+
+    #[test]
+    fn idle_needs_consecutive_reads() {
+        let mut c = IdleConfirmation::default();
+        assert!(!c.observe(true));
+        assert!(!c.observe(true));
+        assert!(!c.observe(false));
+        assert!(!c.observe(true));
+        assert!(!c.observe(true));
+        assert!(c.observe(true));
+    }
+
+    #[test]
+    fn old_states_deserialize() {
+        let s: MaintenanceState = serde_json::from_str(
+            r#"{"phase":"idle","epoch":3,"active_ops":0,"unresolved_recoveries":0,"last_activity":null,"quiet_deadline":null,"saved":{"watch_enabled":null,"scan_enabled":null,"paused_queues":[]},"affected_libraries":[],"message":null}"#,
+        )
+        .expect("pre-0006 state");
+        assert_eq!(s.epoch, 3);
     }
 }

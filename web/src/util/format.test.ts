@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { formatBytes, formatLocation, humanize, percent } from '@/util/format';
+import { formatBytes, formatCountdown, formatLocation, humanize, percent } from '@/util/format';
 
 describe('format', () => {
   it('formats sizes', () => {
@@ -19,5 +19,12 @@ describe('format', () => {
     expect(percent(1, 0)).toBe(0);
     expect(percent(5, 4)).toBe(100);
     expect(percent(1, 3)).toBe(33);
+  });
+
+  it('formats countdowns', () => {
+    const now = Date.parse('2024-01-01T00:00:00Z');
+    expect(formatCountdown('2024-01-01T00:01:05Z', now)).toBe('1:05');
+    expect(formatCountdown('2023-12-31T23:59:00Z', now)).toBe('0:00');
+    expect(formatCountdown(null, now)).toBe('—');
   });
 });

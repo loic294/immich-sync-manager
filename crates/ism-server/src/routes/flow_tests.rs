@@ -124,7 +124,276 @@ impl Harness {
     fn admin(&self) -> Vec<(&str, &str)> {
         vec![("cookie", self.cookie.as_str()), ("x-ism-request", "1")]
     }
+}
 
+#[tokio::test]
+async fn cancellation_by_key_blocks_late_submission_and_is_principal_scoped() {
+    let h = harness().await;
+    h.map_root().await;
+    let first = h.token(&["manage"]).await;
+    let second = h.token(&["manage"]).await;
+    let request = json!({
+        "idempotency_key": "late-request",
+        "actions": [{ "kind": "create_folder", "target": { "root_id": "photos", "path": "2024/new" } }]
+    });
+    let cancel = json!({ "idempotency_key": "late-request", "expected_request": request });
+    let response = send(
+        &h.app,
+        json_req(
+            "POST",
+            "/api/v1/operations/cancel-by-key",
+            &[("authorization", &first)],
+            &cancel,
+        ),
+    )
+    .await;
+    assert_eq!(response.status, StatusCode::OK, "{:?}", response.json());
+    assert_eq!(response.json()["status"], "cancelled_before_submission");
+    let reopened_pool = crate::db::connect(h._dir.path()).await.unwrap();
+    let reopened_state = AppState::new(
+        h.state.config.clone(),
+        reopened_pool,
+        SecretBox::open_or_create(h._dir.path()).unwrap(),
+    )
+    .await
+    .unwrap();
+    let reopened_app = super::router(reopened_state);
+    let late = send(
+        &reopened_app,
+        json_req(
+            "POST",
+            "/api/v1/operations",
+            &[("authorization", &first)],
+            &request,
+        ),
+    )
+    .await;
+    assert_eq!(late.status, StatusCode::CONFLICT);
+    assert_eq!(late.json()["error"]["code"], "operation_key_cancelled");
+    let other = send(
+        &h.app,
+        json_req(
+            "POST",
+            "/api/v1/operations",
+            &[("authorization", &second)],
+            &request,
+        ),
+    )
+    .await;
+    assert_eq!(other.status, StatusCode::ACCEPTED, "{:?}", other.json());
+}
+
+#[tokio::test]
+async fn instance_scoped_operations_refuse_a_different_instance() {
+    let h = harness().await;
+    h.map_root().await;
+    let bearer = h.token(&["manage"]).await;
+    let request = json!({
+        "idempotency_key": "instance-check",
+        "actions": [{ "kind": "create_folder", "target": { "root_id": "photos", "path": "2024/new" } }]
+    });
+    for (url, body) in [
+        ("/api/v1/instances/other/operations", request.clone()),
+        (
+            "/api/v1/instances/other/operations/cancel-by-key",
+            json!({"idempotency_key": "instance-check", "expected_request": request}),
+        ),
+    ] {
+        let response = send(
+            &h.app,
+            json_req("POST", url, &[("authorization", &bearer)], &body),
+        )
+        .await;
+        assert_eq!(response.status, StatusCode::CONFLICT);
+        assert_eq!(response.json()["error"]["code"], "instance_mismatch");
+    }
+    let response = send(
+        &h.app,
+        json_req(
+            "POST",
+            &format!("/api/v1/instances/{}/operations", h.state.instance_id),
+            &[("authorization", &bearer)],
+            &request,
+        ),
+    )
+    .await;
+    assert_eq!(
+        response.status,
+        StatusCode::ACCEPTED,
+        "{:?}",
+        response.json()
+    );
+}
+
+#[tokio::test]
+async fn cancellation_by_key_prevents_queued_operation_from_executing() {
+    let h = harness().await;
+    h.map_root().await;
+    let bearer = h.token(&["manage"]).await;
+    let request = json!({
+        "idempotency_key": "cancel-queued",
+        "actions": [{ "kind": "create_folder", "target": { "root_id": "photos", "path": "2024/new" } }]
+    });
+    let accepted = send(
+        &h.app,
+        json_req(
+            "POST",
+            "/api/v1/operations",
+            &[("authorization", &bearer)],
+            &request,
+        ),
+    )
+    .await;
+    let id = accepted.json()["operation_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let gate = h.state.replication_operation_lock.lock().await;
+    let state = h.state.clone();
+    let worker_id = id.clone();
+    let worker =
+        tokio::spawn(async move { crate::ops::exec::run_operation(&state, &worker_id).await });
+    tokio::task::yield_now().await;
+    let wrong = json!({
+        "idempotency_key": "cancel-queued",
+        "actions": [{ "kind": "create_folder", "target": { "root_id": "photos", "path": "2024/other" } }]
+    });
+    let rejected = send(
+        &h.app,
+        json_req(
+            "POST",
+            "/api/v1/operations/cancel-by-key",
+            &[("authorization", &bearer)],
+            &json!({ "idempotency_key": "cancel-queued", "expected_request": wrong }),
+        ),
+    )
+    .await;
+    assert_eq!(rejected.status, StatusCode::CONFLICT);
+    assert_eq!(rejected.json()["error"]["code"], "idempotency_key_conflict");
+    assert_eq!(
+        crate::ops::load(&h.state, &id).await.unwrap().0.status,
+        ism_core::dto::OperationStatus::Queued
+    );
+    let response = send(
+        &h.app,
+        json_req(
+            "POST",
+            "/api/v1/operations/cancel-by-key",
+            &[("authorization", &bearer)],
+            &json!({ "idempotency_key": "cancel-queued", "expected_request": request }),
+        ),
+    )
+    .await;
+    assert_eq!(response.status, StatusCode::OK, "{:?}", response.json());
+    assert_eq!(response.json()["operation"]["status"], "cancelled");
+    assert_eq!(
+        response.json()["operation"]["items"][0]["status"],
+        "skipped"
+    );
+    drop(gate);
+    worker.await.unwrap().unwrap();
+    assert!(!h.root.join("2024/new").exists());
+    assert_eq!(
+        crate::ops::load(&h.state, &id).await.unwrap().0.status,
+        ism_core::dto::OperationStatus::Cancelled
+    );
+}
+
+#[tokio::test]
+async fn cancellation_rolls_back_if_skipping_queued_items_fails() {
+    let h = harness().await;
+    h.map_root().await;
+    let bearer = h.token(&["manage"]).await;
+    let auth = [("authorization", bearer.as_str())];
+    let request = json!({
+        "idempotency_key": "cancel-rollback",
+        "actions": [{ "kind": "create_folder", "target": { "root_id": "photos", "path": "2024/new" } }]
+    });
+    let accepted = send(
+        &h.app,
+        json_req("POST", "/api/v1/operations", &auth, &request),
+    )
+    .await;
+    assert_eq!(accepted.status, StatusCode::ACCEPTED);
+    let id = accepted.json()["operation_id"].as_str().unwrap().to_owned();
+    sqlx::query(
+        "CREATE TRIGGER fail_cancel_skip BEFORE UPDATE OF status ON operation_items
+         WHEN NEW.status = 'skipped' BEGIN SELECT RAISE(FAIL, 'test failure'); END",
+    )
+    .execute(&h.state.db)
+    .await
+    .unwrap();
+    let response = send(
+        &h.app,
+        json_req(
+            "POST",
+            &format!("/api/v1/operations/{id}/cancel"),
+            &auth,
+            &json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(response.status, StatusCode::INTERNAL_SERVER_ERROR);
+    let state: (String, i64, String) = sqlx::query_as(
+        "SELECT o.status, o.cancel_requested, i.status FROM operations o
+         JOIN operation_items i ON i.operation_id = o.id WHERE o.id = ?",
+    )
+    .bind(id)
+    .fetch_one(&h.state.db)
+    .await
+    .unwrap();
+    assert_eq!(state, ("queued".into(), 0, "pending".into()));
+}
+
+#[tokio::test]
+async fn cancellation_by_key_does_not_claim_a_running_operation_was_cancelled() {
+    let h = harness().await;
+    h.map_root().await;
+    let bearer = h.token(&["manage"]).await;
+    let request = json!({
+        "idempotency_key": "active",
+        "actions": [{ "kind": "create_folder", "target": { "root_id": "photos", "path": "2024/new" } }]
+    });
+    let accepted = send(
+        &h.app,
+        json_req(
+            "POST",
+            "/api/v1/operations",
+            &[("authorization", &bearer)],
+            &request,
+        ),
+    )
+    .await;
+    let id = accepted.json()["operation_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    sqlx::query("UPDATE operations SET status = 'running' WHERE id = ?")
+        .bind(&id)
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    let response = send(
+        &h.app,
+        json_req(
+            "POST",
+            "/api/v1/operations/cancel-by-key",
+            &[("authorization", &bearer)],
+            &json!({ "idempotency_key": "active", "expected_request": request }),
+        ),
+    )
+    .await;
+    assert_eq!(response.status, StatusCode::OK);
+    assert_eq!(response.json()["operation"]["status"], "running");
+    let flag: i64 = sqlx::query_scalar("SELECT cancel_requested FROM operations WHERE id = ?")
+        .bind(&id)
+        .fetch_one(&h.state.db)
+        .await
+        .unwrap();
+    assert_eq!(flag, 0);
+}
+
+impl Harness {
     async fn map_root(&self) {
         let body = json!({ "root_id": "photos", "name": "Photos", "container_path": self.root.to_string_lossy() });
         let r = send(
@@ -142,8 +411,12 @@ impl Harness {
     }
 
     async fn token(&self, actions: &[&str]) -> String {
+        self.token_for("opm", actions).await
+    }
+
+    async fn token_for(&self, kind: &str, actions: &[&str]) -> String {
         let body =
-            json!({ "name": "client", "kind": "ila", "roots": ["photos"], "actions": actions });
+            json!({ "name": "client", "kind": kind, "roots": ["photos"], "actions": actions });
         let r = send(
             &self.app,
             json_req("POST", "/api/admin/tokens", &self.admin(), &body),
@@ -205,6 +478,268 @@ async fn admin_session_and_login() {
 }
 
 #[tokio::test]
+async fn immich_writes_are_enabled_for_a_ready_server() {
+    let mut maintenance = ism_core::maintenance::MaintenanceState::default();
+    maintenance.phase = ism_core::maintenance::Phase::Active;
+    let server = crate::immich::registry::Server {
+        id: "server".into(),
+        name: "Example".into(),
+        url: "https://immich.example".into(),
+        database_url_enc: Some("encrypted".into()),
+        direct_writes_enabled: true,
+        version: Some("3.4.1".into()),
+        compatible: true,
+        compatibility_detail: None,
+        maintenance,
+    };
+    assert_eq!(crate::immich::registry::write_block(&server), None);
+}
+
+#[tokio::test]
+async fn immich_linked_changes_fail_closed_when_the_barrier_cannot_be_taken() {
+    let h = harness().await;
+    h.map_root().await;
+    // No administrator account: ISM cannot pause Immich's library queue.
+    sqlx::query("INSERT INTO immich_servers (id, name, url, database_url_enc, direct_writes_enabled, version, compatible, maintenance_json, created_at) VALUES ('server', 'Example', 'https://immich.example', 'encrypted', 1, '3.4.1', 1, ?, ?)")
+        .bind(serde_json::to_string(&ism_core::maintenance::MaintenanceState::default()).unwrap())
+        .bind(crate::db::now())
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE mappings SET server_id = 'server' WHERE root_id = 'photos'")
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    let request = json!({
+        "idempotency_key": "folder",
+        "actions": [{ "kind": "create_folder", "target": { "root_id": "photos", "path": "2024/new" } }]
+    });
+    let principal = crate::auth::Principal::Admin {
+        username: "test".into(),
+    };
+    let request: ism_core::dto::OperationRequest = serde_json::from_value(request).unwrap();
+    let accepted = crate::ops::insert(&h.state, &principal, &request)
+        .await
+        .unwrap();
+    crate::ops::exec::run_operation(&h.state, &accepted.operation_id)
+        .await
+        .unwrap();
+    let (operation, _) = crate::ops::load(&h.state, &accepted.operation_id)
+        .await
+        .unwrap();
+    assert_eq!(operation.status, ism_core::dto::OperationStatus::Failed);
+    assert_eq!(
+        operation.items[0].error.as_ref().unwrap().code,
+        "maintenance_blocked"
+    );
+    assert!(!h.root.join("2024/new").exists());
+}
+
+#[tokio::test]
+async fn a_move_into_an_immich_library_runs_under_the_write_barrier() {
+    let h = harness().await;
+    h.map_root().await;
+    let inbox = h._dir.path().join("inbox");
+    std::fs::create_dir_all(&inbox).unwrap();
+    std::fs::write(inbox.join("IMG_0001.jpg"), b"jpeg").unwrap();
+    std::fs::write(inbox.join("IMG_0001.jpg.xmp"), b"xmp").unwrap();
+    let body =
+        json!({ "root_id": "inbox", "name": "Inbox", "container_path": inbox.to_string_lossy() });
+    let r = send(
+        &h.app,
+        json_req("POST", "/api/admin/mappings", &h.admin(), &body),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{:?}", r.json());
+    let (_server, fake) = crate::maintenance::tests::fake_server(&h.state).await;
+    sqlx::query("INSERT INTO immich_libraries (id, server_id, name, owner_user_id, import_paths_json, refreshed_at) VALUES ('lib1', 's1', 'Photos', 'u1', '[\"/library/photos\"]', ?)")
+        .bind(crate::db::now())
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE immich_servers SET direct_writes_enabled = 1, database_url_enc = 'unused' WHERE id = 's1'")
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE mappings SET server_id = 's1', library_id = 'lib1', immich_import_path = '/library/photos' WHERE root_id = 'photos'")
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    let bearer = h.token(&["read"]).await;
+    let auth = [("authorization", bearer.as_str())];
+    let states = |info: &serde_json::Value| -> Vec<(String, String)> {
+        let mut v: Vec<_> = info["roots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                (
+                    r["root_id"].as_str().unwrap().to_owned(),
+                    r["direct_writes"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect();
+        v.sort();
+        v
+    };
+    let info = send(&h.app, get("/api/v1/client/info", &auth)).await.json();
+    assert_eq!(states(&info), [("photos".to_owned(), "enabled".to_owned())]);
+    let target = h.root.join("2024/IMG_0001.jpg");
+    *fake.probe.lock().unwrap() = Some(target.clone());
+
+    let request: ism_core::dto::OperationRequest = serde_json::from_value(json!({
+        "idempotency_key": "move-in",
+        "actions": [{ "kind": "move",
+            "source": { "root_id": "inbox", "path": "IMG_0001.jpg" },
+            "target": { "root_id": "photos", "path": "2024/IMG_0001.jpg" } }]
+    }))
+    .unwrap();
+    let principal = crate::auth::Principal::Admin {
+        username: "test".into(),
+    };
+    let accepted = crate::ops::insert(&h.state, &principal, &request)
+        .await
+        .unwrap();
+    crate::ops::exec::run_operation(&h.state, &accepted.operation_id)
+        .await
+        .unwrap();
+    let (operation, _) = crate::ops::load(&h.state, &accepted.operation_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        operation.status,
+        ism_core::dto::OperationStatus::Completed,
+        "{operation:?}"
+    );
+    assert!(target.exists() && h.root.join("2024/IMG_0001.jpg.xmp").exists());
+    assert!(!inbox.join("IMG_0001.jpg").exists());
+    // Paused before the file moved, resumed after it was in place.
+    assert_eq!(
+        *fake.queue_log.lock().unwrap(),
+        [(true, false), (false, true)]
+    );
+    assert!(fake.paused.lock().unwrap().is_empty());
+    let server = crate::immich::registry::server(&h.state, "s1")
+        .await
+        .unwrap();
+    assert_eq!(server.maintenance.active_ops, 0);
+    // The file has no asset yet: Immich imports it with the next scan of its library.
+    let due: Option<i64> =
+        sqlx::query_scalar("SELECT due_at FROM scan_schedule WHERE library_id = 'lib1'")
+            .fetch_optional(&h.state.db)
+            .await
+            .unwrap()
+            .flatten();
+    assert!(due.is_some());
+    // ISM's own writes are not reported as outside changes.
+    let expected: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM self_writes")
+        .fetch_one(&h.state.db)
+        .await
+        .unwrap();
+    assert!(expected > 0);
+
+    // Settings drift blocks the linked root with a reason; the plain root is unaffected.
+    let mut maintenance = server.maintenance.clone();
+    maintenance.drift = Some("the library watcher was re-enabled".into());
+    sqlx::query("UPDATE immich_servers SET maintenance_json = ? WHERE id = 's1'")
+        .bind(serde_json::to_string(&maintenance).unwrap())
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    let info = send(&h.app, get("/api/v1/client/info", &auth)).await.json();
+    let photos = info["roots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["root_id"] == "photos")
+        .unwrap();
+    assert_eq!(photos["direct_writes"], "blocked");
+    assert_eq!(photos["direct_writes_reason"], "drift");
+    assert_eq!(
+        photos["direct_writes_detail"],
+        "the library watcher was re-enabled"
+    );
+}
+
+#[tokio::test]
+async fn ila_trash_requires_asset_identity_and_rejects_legacy_retry() {
+    let h = harness().await;
+    h.map_root().await;
+    let path = h.root.join("2024/a.jpg");
+    std::fs::write(&path, b"photo").unwrap();
+    let bearer = h.token_for("ila", &["read", "trash"]).await;
+    let auth = [("authorization", bearer.as_str())];
+    let info = send(&h.app, get("/api/v1/client/info", &auth)).await;
+    assert!(
+        info.json()["capabilities"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("trash_if_asset_matches"))
+    );
+    let legacy = json!({
+        "idempotency_key": "ila-local-deletion:1",
+        "actions": [{ "kind": "trash", "source": { "root_id": "photos", "path": "2024/a.jpg" } }]
+    });
+    let new = json!({
+        "idempotency_key": "ila-local-deletion:1",
+        "actions": [{ "kind": "trash_if_asset_matches", "source": { "root_id": "photos", "path": "2024/a.jpg" },
+                      "expected_asset_id": "asset-1" }]
+    });
+    let rejected = send(&h.app, json_req("POST", "/api/v1/operations", &auth, &new)).await;
+    assert_eq!(rejected.status, StatusCode::CONFLICT);
+    assert_eq!(
+        rejected.json()["error"]["code"],
+        "asset_identity_unverified"
+    );
+    assert!(path.exists());
+
+    let token_id: String = sqlx::query_scalar("SELECT id FROM client_tokens WHERE kind = 'ila'")
+        .fetch_one(&h.state.db)
+        .await
+        .unwrap();
+    let principal = crate::ops::exec::principal_from_key(&h.state, &format!("token:{token_id}"))
+        .await
+        .unwrap();
+    let legacy_request: ism_core::dto::OperationRequest = serde_json::from_value(legacy).unwrap();
+    let accepted = crate::ops::insert(&h.state, &principal, &legacy_request)
+        .await
+        .unwrap();
+    crate::ops::exec::run_operation(&h.state, &accepted.operation_id)
+        .await
+        .unwrap();
+    let (operation, _) = crate::ops::load(&h.state, &accepted.operation_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        operation.items[0].error.as_ref().unwrap().code,
+        "asset_identity_required"
+    );
+    assert!(path.exists());
+    let retry = send(&h.app, json_req("POST", "/api/v1/operations", &auth, &new)).await;
+    assert_eq!(retry.status, StatusCode::CONFLICT);
+    assert_eq!(retry.json()["error"]["code"], "idempotency_key_conflict");
+
+    sqlx::query("INSERT INTO immich_servers (id, name, url, direct_writes_enabled, maintenance_json, created_at) VALUES ('server', 'Example', 'https://immich.example', 0, ?, ?)")
+        .bind(serde_json::to_string(&ism_core::maintenance::MaintenanceState::default()).unwrap())
+        .bind(crate::db::now())
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE mappings SET server_id = 'server' WHERE root_id = 'photos'")
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    let ctx = crate::ops::plan::Ctx::new(&h.state, &principal, false)
+        .await
+        .unwrap();
+    let plan = crate::ops::plan::plan(&ctx, &legacy_request.actions[0])
+        .await
+        .unwrap();
+    assert_eq!(plan.blockers[0].code, "asset_identity_required");
+    assert!(path.exists());
+}
+
+#[tokio::test]
 async fn browse_manifest_and_download() {
     let h = harness().await;
     h.map_root().await;
@@ -253,10 +788,7 @@ async fn browse_manifest_and_download() {
 
     let r = send(&h.app, get(&uri, &auth)).await;
     assert_eq!(&r.body[..], b"0123456789");
-    assert_eq!(
-        r.headers["x-ism-sha256"].to_str().unwrap(),
-        original["sha256"].as_str().unwrap()
-    );
+    assert!(!r.headers.contains_key("x-ism-sha256"));
 
     std::thread::sleep(Duration::from_millis(5));
     std::fs::write(h.root.join("2024/a.CR3"), b"changed!!!!").unwrap();
@@ -277,6 +809,128 @@ async fn browse_manifest_and_download() {
         StatusCode::FORBIDDEN,
         "read-only token cannot submit"
     );
+}
+
+#[tokio::test]
+async fn manifest_rehashes_when_content_changes_without_metadata_change() {
+    let h = harness().await;
+    h.map_root().await;
+    let path = h.root.join("2024/a.jpg");
+    std::fs::write(&path, b"old-content").unwrap();
+    let bearer = h.token(&["read", "download"]).await;
+    let auth = [("authorization", bearer.as_str())];
+    let uri = "/api/v1/manifest?root_id=photos&path=2024/a.jpg";
+    let first = send(&h.app, get(uri, &auth)).await;
+    assert_eq!(first.status, StatusCode::OK);
+    let before = first.json()["files"][0].clone();
+    let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+    std::fs::write(&path, b"new-content").unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(modified)
+        .unwrap();
+    let second = send(&h.app, get(uri, &auth)).await;
+    assert_eq!(second.status, StatusCode::OK);
+    let after = second.json()["files"][0].clone();
+    assert_eq!(before["revision"], after["revision"]);
+    assert_ne!(before["sha256"], after["sha256"]);
+    assert_eq!(after["sha256"], crate::crypto::sha256_hex(b"new-content"));
+}
+
+#[tokio::test]
+async fn operation_retries_reject_changed_requests_and_share_one_submission() {
+    let h = harness().await;
+    h.map_root().await;
+    let bearer = h.token(&["read", "manage"]).await;
+    let auth = [("authorization", bearer.as_str())];
+    let body = json!({
+        "idempotency_key": "create-folder-1",
+        "actions": [{ "kind": "create_folder", "target": { "root_id": "photos", "path": "2024/Trip" } }]
+    });
+    let (first, retry) = tokio::join!(
+        send(&h.app, json_req("POST", "/api/v1/operations", &auth, &body)),
+        send(&h.app, json_req("POST", "/api/v1/operations", &auth, &body))
+    );
+    assert_eq!(first.status, StatusCode::ACCEPTED, "{:?}", first.json());
+    assert_eq!(retry.status, StatusCode::ACCEPTED, "{:?}", retry.json());
+    let id = first.json()["operation_id"].as_str().unwrap().to_owned();
+    assert_eq!(retry.json()["operation_id"], id);
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM operations WHERE idempotency_key = ?")
+            .bind("create-folder-1")
+            .fetch_one(&h.state.db)
+            .await
+            .unwrap();
+    assert_eq!(count, 1);
+
+    let mut changed = body.clone();
+    changed["actions"][0]["target"]["path"] = json!("2024/Other");
+    let conflict = send(
+        &h.app,
+        json_req("POST", "/api/v1/operations", &auth, &changed),
+    )
+    .await;
+    assert_eq!(conflict.status, StatusCode::CONFLICT);
+    assert_eq!(conflict.json()["error"]["code"], "idempotency_key_conflict");
+    assert_eq!(h.wait_finished(&bearer, &id).await["status"], "completed");
+    assert!(!h.root.join("2024/Other").exists());
+}
+
+#[tokio::test]
+async fn operation_submission_and_key_cancellation_wait_for_sqlite_writer() {
+    let h = harness().await;
+    let mut writer = h.state.db.begin().await.unwrap();
+    sqlx::query("INSERT INTO settings (key, value) VALUES ('test-writer', 'held')")
+        .execute(&mut *writer)
+        .await
+        .unwrap();
+    let principal = crate::auth::Principal::Admin {
+        username: "admin".into(),
+    };
+    let request: ism_core::dto::OperationRequest = serde_json::from_value(json!({
+        "idempotency_key": "writer-test",
+        "actions": [{ "kind": "create_folder", "target": { "root_id": "photos", "path": "2024/new" } }]
+    }))
+    .unwrap();
+    let state = h.state.clone();
+    let actor = principal.clone();
+    let mut submission =
+        tokio::spawn(async move { crate::ops::insert(&state, &actor, &request).await });
+
+    let cancel_request: ism_core::dto::CancelOperationByKey = serde_json::from_value(json!({
+        "idempotency_key": "cancel-writer-test",
+        "expected_request": {
+            "idempotency_key": "cancel-writer-test",
+            "actions": [{ "kind": "create_folder", "target": { "root_id": "photos", "path": "2024/new" } }]
+        }
+    }))
+    .unwrap();
+    let state = h.state.clone();
+    let mut cancellation =
+        tokio::spawn(
+            async move { crate::ops::cancel_by_key(&state, &principal, cancel_request).await },
+        );
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(250), &mut submission)
+            .await
+            .is_err(),
+        "submission must wait for the other writer rather than fail"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(250), &mut cancellation)
+            .await
+            .is_err(),
+        "cancellation must wait for the other writer rather than fail"
+    );
+    writer.commit().await.unwrap();
+    submission.await.unwrap().unwrap();
+    assert!(matches!(
+        cancellation.await.unwrap().unwrap(),
+        ism_core::dto::CancelOperationByKeyResult::CancelledBeforeSubmission
+    ));
 }
 
 #[tokio::test]
@@ -362,10 +1016,960 @@ async fn move_group_trash_and_restore() {
 }
 
 #[tokio::test]
-async fn upload_keeps_the_folder() {
+async fn restore_rejects_missing_quarantined_original() {
+    let h = harness().await;
+    h.map_root().await;
+    std::fs::write(h.root.join("2024/a.jpg"), b"photo").unwrap();
+    std::fs::write(h.root.join("2024/a.jpg.xmp"), b"sidecar").unwrap();
+    let bearer = h.token(&["read", "trash", "purge"]).await;
+    let auth = [("authorization", bearer.as_str())];
+    let trash = json!({
+        "idempotency_key": "trash-missing-original",
+        "actions": [{ "kind": "trash", "source": { "root_id": "photos", "path": "2024/a.jpg" } }]
+    });
+    let submitted = send(
+        &h.app,
+        json_req("POST", "/api/v1/operations", &auth, &trash),
+    )
+    .await;
+    let operation = submitted.json()["operation_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        h.wait_finished(&bearer, &operation).await["status"],
+        "completed"
+    );
+    let (trash_id, quarantine): (String, String) =
+        sqlx::query_as("SELECT id, quarantine_rel FROM trash")
+            .fetch_one(&h.state.db)
+            .await
+            .unwrap();
+    sqlx::query("UPDATE trash SET quarantine_rel = '.ism-trash/unexpected' WHERE id = ?")
+        .bind(&trash_id)
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    let restore = json!({
+        "idempotency_key": "restore-invalid-quarantine",
+        "actions": [{ "kind": "restore", "trash_id": trash_id }]
+    });
+    let preview = send(
+        &h.app,
+        json_req("POST", "/api/v1/operations/preview", &auth, &restore),
+    )
+    .await;
+    assert_eq!(preview.status, StatusCode::OK);
+    assert_eq!(preview.json()["ok"], false);
+    assert_eq!(
+        preview.json()["items"][0]["blockers"][0]["code"],
+        "trash_corrupt"
+    );
+    let rejected = send(
+        &h.app,
+        json_req("POST", "/api/v1/operations", &auth, &restore),
+    )
+    .await;
+    assert_eq!(rejected.status, StatusCode::CONFLICT);
+    assert_eq!(rejected.json()["error"]["code"], "trash_corrupt");
+    let purge = json!({
+        "idempotency_key": "purge-invalid-quarantine",
+        "actions": [{ "kind": "purge", "trash_id": trash_id }]
+    });
+    let rejected = send(
+        &h.app,
+        json_req("POST", "/api/v1/operations", &auth, &purge),
+    )
+    .await;
+    assert_eq!(rejected.status, StatusCode::CONFLICT);
+    assert_eq!(rejected.json()["error"]["code"], "trash_corrupt");
+    sqlx::query("UPDATE trash SET quarantine_rel = ? WHERE id = ?")
+        .bind(format!(".ism-trash/{trash_id}"))
+        .bind(&trash_id)
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    std::fs::remove_file(h.root.join(&quarantine).join("2024/a.jpg")).unwrap();
+    let restore = json!({
+        "idempotency_key": "restore-missing-original",
+        "actions": [{ "kind": "restore", "trash_id": trash_id }]
+    });
+    let preview = send(
+        &h.app,
+        json_req("POST", "/api/v1/operations/preview", &auth, &restore),
+    )
+    .await;
+    assert_eq!(preview.status, StatusCode::OK);
+    assert_eq!(preview.json()["ok"], false);
+    assert_eq!(
+        preview.json()["items"][0]["blockers"][0]["code"],
+        "trash_missing"
+    );
+    let restored: Option<String> = sqlx::query_scalar("SELECT restored_at FROM trash")
+        .fetch_one(&h.state.db)
+        .await
+        .unwrap();
+    assert!(restored.is_none());
+    assert!(h.root.join(&quarantine).join("2024/a.jpg.xmp").is_file());
+}
+
+#[tokio::test]
+async fn restore_requires_complete_file_group_inventory() {
+    let h = harness().await;
+    h.map_root().await;
+    std::fs::write(h.root.join("2024/a.jpg"), b"photo").unwrap();
+    std::fs::write(h.root.join("2024/a.jpg.xmp"), b"sidecar").unwrap();
+    let bearer = h.token(&["read", "trash"]).await;
+    let auth = [("authorization", bearer.as_str())];
+    let trash = json!({
+        "idempotency_key": "inventory-trash",
+        "actions": [{ "kind": "trash", "source": { "root_id": "photos", "path": "2024/a.jpg" } }]
+    });
+    let submitted = send(
+        &h.app,
+        json_req("POST", "/api/v1/operations", &auth, &trash),
+    )
+    .await;
+    let operation = submitted.json()["operation_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        h.wait_finished(&bearer, &operation).await["status"],
+        "completed"
+    );
+    let (trash_id, quarantine, inventory): (String, String, String) =
+        sqlx::query_as("SELECT id, quarantine_rel, file_inventory_json FROM trash")
+            .fetch_one(&h.state.db)
+            .await
+            .unwrap();
+    let held = h.root.join(&quarantine).join("2024");
+    let restore = json!({
+        "idempotency_key": "inventory-restore",
+        "actions": [{ "kind": "restore", "trash_id": trash_id }]
+    });
+
+    std::fs::remove_file(held.join("a.jpg.xmp")).unwrap();
+    let preview = send(
+        &h.app,
+        json_req("POST", "/api/v1/operations/preview", &auth, &restore),
+    )
+    .await;
+    assert_eq!(
+        preview.json()["items"][0]["blockers"][0]["code"],
+        "trash_inventory_changed"
+    );
+    let refused = send(
+        &h.app,
+        json_req("POST", "/api/v1/operations", &auth, &restore),
+    )
+    .await;
+    assert_eq!(refused.status, StatusCode::CONFLICT);
+    assert!(held.join("a.jpg").is_file());
+    assert!(!h.root.join("2024/a.jpg").exists());
+    std::fs::write(held.join("a.jpg.xmp"), b"sidecar").unwrap();
+
+    std::fs::write(held.join("a.jpg.xmp"), b"changed").unwrap();
+    let preview = send(
+        &h.app,
+        json_req("POST", "/api/v1/operations/preview", &auth, &restore),
+    )
+    .await;
+    assert_eq!(
+        preview.json()["items"][0]["blockers"][0]["code"],
+        "trash_inventory_changed"
+    );
+    std::fs::write(held.join("a.jpg.xmp"), b"sidecar").unwrap();
+
+    std::fs::write(held.join("unexpected.txt"), b"unexpected").unwrap();
+    let preview = send(
+        &h.app,
+        json_req("POST", "/api/v1/operations/preview", &auth, &restore),
+    )
+    .await;
+    assert_eq!(
+        preview.json()["items"][0]["blockers"][0]["code"],
+        "trash_inventory_changed"
+    );
+    std::fs::remove_file(held.join("unexpected.txt")).unwrap();
+
+    sqlx::query("UPDATE trash SET file_inventory_json = NULL WHERE id = ?")
+        .bind(&trash_id)
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    let preview = send(
+        &h.app,
+        json_req("POST", "/api/v1/operations/preview", &auth, &restore),
+    )
+    .await;
+    assert_eq!(
+        preview.json()["items"][0]["blockers"][0]["code"],
+        "trash_inventory_missing"
+    );
+    sqlx::query("UPDATE trash SET file_inventory_json = ? WHERE id = ?")
+        .bind(inventory)
+        .bind(&trash_id)
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE trash SET asset_ids_json = 'broken' WHERE id = ?")
+        .bind(&trash_id)
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    let preview = send(
+        &h.app,
+        json_req("POST", "/api/v1/operations/preview", &auth, &restore),
+    )
+    .await;
+    assert_eq!(preview.status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(held.join("a.jpg").is_file());
+    sqlx::query("UPDATE trash SET asset_ids_json = '[]' WHERE id = ?")
+        .bind(&trash_id)
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    let submitted = send(
+        &h.app,
+        json_req("POST", "/api/v1/operations", &auth, &restore),
+    )
+    .await;
+    assert_eq!(
+        submitted.status,
+        StatusCode::ACCEPTED,
+        "{:?}",
+        submitted.json()
+    );
+    let operation = submitted.json()["operation_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        h.wait_finished(&bearer, &operation).await["status"],
+        "completed"
+    );
+    assert_eq!(std::fs::read(h.root.join("2024/a.jpg")).unwrap(), b"photo");
+    assert_eq!(
+        std::fs::read(h.root.join("2024/a.jpg.xmp")).unwrap(),
+        b"sidecar"
+    );
+}
+
+#[tokio::test]
+async fn folder_trash_restores_only_a_complete_unchanged_tree() {
+    let h = harness().await;
+    h.map_root().await;
+    let folder = h.root.join("2024/trip");
+    std::fs::create_dir_all(folder.join("nested/empty")).unwrap();
+    std::fs::write(folder.join("nested/a.jpg"), b"photo").unwrap();
+    std::fs::write(folder.join("nested/a.jpg.xmp"), b"sidecar").unwrap();
+    let bearer = h.token(&["read", "trash"]).await;
+    let auth = [("authorization", bearer.as_str())];
+    let trash = json!({
+        "idempotency_key": "folder-inventory-trash",
+        "actions": [{ "kind": "trash_folder", "source": { "root_id": "photos", "path": "2024/trip" } }]
+    });
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink("a.jpg", folder.join("nested/link")).unwrap();
+        let preview = send(
+            &h.app,
+            json_req("POST", "/api/v1/operations/preview", &auth, &trash),
+        )
+        .await;
+        assert_eq!(
+            preview.json()["items"][0]["blockers"][0]["code"],
+            "trash_inventory_unverifiable"
+        );
+        assert!(folder.join("nested/a.jpg").exists());
+        std::fs::remove_file(folder.join("nested/link")).unwrap();
+    }
+    let submitted = send(
+        &h.app,
+        json_req("POST", "/api/v1/operations", &auth, &trash),
+    )
+    .await;
+    assert_eq!(
+        submitted.status,
+        StatusCode::ACCEPTED,
+        "{:?}",
+        submitted.json()
+    );
+    let op = submitted.json()["operation_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(h.wait_finished(&bearer, &op).await["status"], "completed");
+    let (trash_id, quarantine, inventory): (String, String, String) =
+        sqlx::query_as("SELECT id, quarantine_rel, file_inventory_json FROM trash")
+            .fetch_one(&h.state.db)
+            .await
+            .unwrap();
+    let held = h.root.join(&quarantine).join("2024");
+    let tree = held.join("trip");
+    let restore = json!({
+        "idempotency_key": "folder-inventory-restore",
+        "actions": [{ "kind": "restore", "trash_id": trash_id }]
+    });
+
+    std::fs::remove_file(tree.join("nested/a.jpg.xmp")).unwrap();
+    let preview = send(
+        &h.app,
+        json_req("POST", "/api/v1/operations/preview", &auth, &restore),
+    )
+    .await;
+    assert_eq!(
+        preview.json()["items"][0]["blockers"][0]["code"],
+        "trash_inventory_changed"
+    );
+    assert_eq!(
+        send(
+            &h.app,
+            json_req("POST", "/api/v1/operations", &auth, &restore)
+        )
+        .await
+        .status,
+        StatusCode::CONFLICT
+    );
+    std::fs::write(tree.join("nested/a.jpg.xmp"), b"sidecar").unwrap();
+
+    std::fs::write(tree.join("nested/a.jpg"), b"edited").unwrap();
+    let preview = send(
+        &h.app,
+        json_req("POST", "/api/v1/operations/preview", &auth, &restore),
+    )
+    .await;
+    assert_eq!(
+        preview.json()["items"][0]["blockers"][0]["code"],
+        "trash_inventory_changed"
+    );
+    std::fs::write(tree.join("nested/a.jpg"), b"photo").unwrap();
+
+    std::fs::remove_dir(tree.join("nested/empty")).unwrap();
+    let preview = send(
+        &h.app,
+        json_req("POST", "/api/v1/operations/preview", &auth, &restore),
+    )
+    .await;
+    assert_eq!(
+        preview.json()["items"][0]["blockers"][0]["code"],
+        "trash_inventory_changed"
+    );
+    std::fs::create_dir(tree.join("nested/empty")).unwrap();
+
+    std::fs::write(held.join("unexpected.txt"), b"unexpected").unwrap();
+    let preview = send(
+        &h.app,
+        json_req("POST", "/api/v1/operations/preview", &auth, &restore),
+    )
+    .await;
+    assert_eq!(
+        preview.json()["items"][0]["blockers"][0]["code"],
+        "trash_inventory_changed"
+    );
+    std::fs::remove_file(held.join("unexpected.txt")).unwrap();
+
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink("a.jpg", tree.join("nested/link")).unwrap();
+        let preview = send(
+            &h.app,
+            json_req("POST", "/api/v1/operations/preview", &auth, &restore),
+        )
+        .await;
+        assert_eq!(
+            preview.json()["items"][0]["blockers"][0]["code"],
+            "trash_inventory_unverifiable"
+        );
+        std::fs::remove_file(tree.join("nested/link")).unwrap();
+    }
+
+    sqlx::query("UPDATE trash SET file_inventory_json = NULL WHERE id = ?")
+        .bind(&trash_id)
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    let preview = send(
+        &h.app,
+        json_req("POST", "/api/v1/operations/preview", &auth, &restore),
+    )
+    .await;
+    assert_eq!(
+        preview.json()["items"][0]["blockers"][0]["code"],
+        "trash_inventory_missing"
+    );
+    sqlx::query("UPDATE trash SET file_inventory_json = ? WHERE id = ?")
+        .bind(inventory)
+        .bind(&trash_id)
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+
+    let submitted = send(
+        &h.app,
+        json_req("POST", "/api/v1/operations", &auth, &restore),
+    )
+    .await;
+    assert_eq!(
+        submitted.status,
+        StatusCode::ACCEPTED,
+        "{:?}",
+        submitted.json()
+    );
+    let op = submitted.json()["operation_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(h.wait_finished(&bearer, &op).await["status"], "completed");
+    assert_eq!(
+        std::fs::read(folder.join("nested/a.jpg")).unwrap(),
+        b"photo"
+    );
+    assert_eq!(
+        std::fs::read(folder.join("nested/a.jpg.xmp")).unwrap(),
+        b"sidecar"
+    );
+    assert!(folder.join("nested/empty").is_dir());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn client_requests_reject_symlinks_inside_a_mapped_root() {
+    let h = harness().await;
+    h.map_root().await;
+    std::fs::write(h.root.join("2024/a.jpg"), b"photo").unwrap();
+    std::os::unix::fs::symlink(h.root.join("2024"), h.root.join("alias")).unwrap();
+    let bearer = h.token(&["read", "download", "manage"]).await;
+    let auth = [("authorization", bearer.as_str())];
+    let content = send(
+        &h.app,
+        get("/api/v1/content?root_id=photos&path=alias/a.jpg", &auth),
+    )
+    .await;
+    assert_eq!(content.status, StatusCode::BAD_REQUEST);
+    assert_eq!(content.json()["error"]["code"], "invalid_location");
+
+    let request = json!({
+        "idempotency_key": "symlink-move",
+        "actions": [{
+            "kind": "move",
+            "source": { "root_id": "photos", "path": "alias/a.jpg" },
+            "target": { "root_id": "photos", "path": "2024/b.jpg" }
+        }]
+    });
+    let response = send(
+        &h.app,
+        json_req("POST", "/api/v1/operations", &auth, &request),
+    )
+    .await;
+    assert_ne!(response.status, StatusCode::ACCEPTED);
+    assert_eq!(std::fs::read(h.root.join("2024/a.jpg")).unwrap(), b"photo");
+    assert!(!h.root.join("2024/b.jpg").exists());
+}
+
+#[tokio::test]
+async fn receiving_upload_does_not_hide_missing_staging_files() {
     let h = harness().await;
     h.map_root().await;
     let bearer = h.token(&["read", "upload"]).await;
+    let auth = [("authorization", bearer.as_str())];
+    let body = json!({
+        "target": { "root_id": "photos", "path": "2024" },
+        "files": [{ "name": "a.jpg", "role": "original", "size": 5,
+                    "sha256": crate::crypto::sha256_hex(b"photo") }],
+        "on_conflict": "fail"
+    });
+    let response = send(&h.app, json_req("POST", "/api/v1/uploads", &auth, &body)).await;
+    assert_eq!(response.status, StatusCode::CREATED);
+    let id = response.json()["upload_id"].as_str().unwrap().to_owned();
+    std::fs::remove_file(h.root.join(".ism-staging/uploads").join(&id).join("0")).unwrap();
+    let response = send(&h.app, get(&format!("/api/v1/uploads/{id}"), &auth)).await;
+    assert_eq!(response.status, StatusCode::CONFLICT);
+    assert_eq!(response.json()["error"]["code"], "upload_staging_missing");
+    let request = Request::builder()
+        .method("PUT")
+        .uri(format!("/api/v1/uploads/{id}/files/0"))
+        .header("authorization", &bearer)
+        .body(Body::from("photo"))
+        .unwrap();
+    let response = send(&h.app, request).await;
+    assert_eq!(response.status, StatusCode::CONFLICT);
+    assert_eq!(response.json()["error"]["code"], "upload_staging_missing");
+    let response = send(
+        &h.app,
+        json_req(
+            "POST",
+            &format!("/api/v1/uploads/{id}/commit"),
+            &auth,
+            &json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(response.status, StatusCode::CONFLICT);
+    assert_eq!(response.json()["error"]["code"], "upload_staging_missing");
+    assert!(
+        !h.root
+            .join(".ism-staging/uploads")
+            .join(&id)
+            .join("0")
+            .exists()
+    );
+}
+
+#[tokio::test]
+async fn cancelling_receiving_upload_is_idempotent_and_preserves_ownership() {
+    let h = harness().await;
+    h.map_root().await;
+    let bearer = h.token(&["read", "upload"]).await;
+    let auth = [("authorization", bearer.as_str())];
+    let body = json!({
+        "idempotency_key": "import-job",
+        "target": { "root_id": "photos", "path": "2024" },
+        "files": [{ "name": "a.jpg", "role": "original", "size": 5,
+                    "sha256": crate::crypto::sha256_hex(b"photo") }],
+        "on_conflict": "fail"
+    });
+    let created = send(&h.app, json_req("POST", "/api/v1/uploads", &auth, &body)).await;
+    let id = created.json()["upload_id"].as_str().unwrap().to_owned();
+    let staged = h.root.join(".ism-staging/uploads").join(&id);
+    std::fs::write(staged.join("0"), b"photo").unwrap();
+
+    let other = h.token(&["read", "upload"]).await;
+    let delete = |token: &str| {
+        Request::builder()
+            .method("DELETE")
+            .uri(format!("/api/v1/uploads/{id}"))
+            .header("authorization", token)
+            .body(Body::empty())
+            .unwrap()
+    };
+    assert_eq!(
+        send(&h.app, delete(&other)).await.status,
+        StatusCode::NOT_FOUND
+    );
+    assert!(staged.exists());
+
+    let guard = h.state.lock_upload(&id).await;
+    let app = h.app.clone();
+    let request = delete(&bearer);
+    let mut cancel = tokio::spawn(async move { send(&app, request).await });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut cancel)
+            .await
+            .is_err()
+    );
+    drop(guard);
+    assert_eq!(cancel.await.unwrap().status, StatusCode::NO_CONTENT);
+    assert!(!staged.exists());
+    assert_eq!(
+        send(&h.app, delete(&bearer)).await.status,
+        StatusCode::NO_CONTENT
+    );
+    let retry = send(&h.app, json_req("POST", "/api/v1/uploads", &auth, &body)).await;
+    assert_eq!(retry.json()["upload_id"], id);
+    assert_eq!(retry.json()["status"], "cancelled");
+    let commit = send(
+        &h.app,
+        json_req(
+            "POST",
+            &format!("/api/v1/uploads/{id}/commit"),
+            &auth,
+            &json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(commit.status, StatusCode::CONFLICT);
+    assert_eq!(commit.json()["error"]["code"], "upload_closed");
+}
+
+#[tokio::test]
+async fn cancelled_upload_cleanup_can_be_retried_after_root_recovers() {
+    let h = harness().await;
+    h.map_root().await;
+    let bearer = h.token(&["upload"]).await;
+    let auth = [("authorization", bearer.as_str())];
+    let body = json!({
+        "target": { "root_id": "photos", "path": "2024" },
+        "files": [{ "name": "a.jpg", "role": "original", "size": 0,
+                    "sha256": crate::crypto::sha256_hex(b"") }],
+        "on_conflict": "fail"
+    });
+    let created = send(&h.app, json_req("POST", "/api/v1/uploads", &auth, &body)).await;
+    let id = created.json()["upload_id"].as_str().unwrap().to_owned();
+    let staged = h.root.join(".ism-staging/uploads").join(&id);
+    let sentinel = h.root.join(".ism-root");
+    std::fs::remove_file(&sentinel).unwrap();
+    let delete = || {
+        Request::builder()
+            .method("DELETE")
+            .uri(format!("/api/v1/uploads/{id}"))
+            .header("authorization", &bearer)
+            .body(Body::empty())
+            .unwrap()
+    };
+    assert!(!send(&h.app, delete()).await.status.is_success());
+    assert!(staged.exists());
+    let status: String = sqlx::query_scalar("SELECT status FROM uploads WHERE id = ?")
+        .bind(&id)
+        .fetch_one(&h.state.db)
+        .await
+        .unwrap();
+    assert_eq!(status, "cancelled");
+    std::fs::write(&sentinel, "photos\n").unwrap();
+    assert_eq!(send(&h.app, delete()).await.status, StatusCode::NO_CONTENT);
+    assert!(!staged.exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn upload_cancellation_refuses_symlinked_staging_parent() {
+    let h = harness().await;
+    h.map_root().await;
+    let bearer = h.token(&["upload"]).await;
+    let auth = [("authorization", bearer.as_str())];
+    let body = json!({
+        "target": { "root_id": "photos", "path": "2024" },
+        "files": [{ "name": "a.jpg", "role": "original", "size": 0,
+                    "sha256": crate::crypto::sha256_hex(b"") }],
+        "on_conflict": "fail"
+    });
+    let created = send(&h.app, json_req("POST", "/api/v1/uploads", &auth, &body)).await;
+    let id = created.json()["upload_id"].as_str().unwrap().to_owned();
+    let uploads = h.root.join(".ism-staging/uploads");
+    let backup = h.root.join(".ism-staging/uploads-backup");
+    let outside = h._dir.path().join("outside");
+    std::fs::create_dir_all(outside.join(&id)).unwrap();
+    std::fs::write(outside.join(&id).join("0"), b"preserve").unwrap();
+    std::fs::rename(&uploads, &backup).unwrap();
+    std::os::unix::fs::symlink(&outside, &uploads).unwrap();
+    let delete = || {
+        Request::builder()
+            .method("DELETE")
+            .uri(format!("/api/v1/uploads/{id}"))
+            .header("authorization", &bearer)
+            .body(Body::empty())
+            .unwrap()
+    };
+    let rejected = send(&h.app, delete()).await;
+    assert_eq!(rejected.json()["error"]["code"], "invalid_location");
+    assert_eq!(
+        std::fs::read(outside.join(&id).join("0")).unwrap(),
+        b"preserve"
+    );
+    std::fs::remove_file(&uploads).unwrap();
+    std::fs::rename(&backup, &uploads).unwrap();
+    assert_eq!(send(&h.app, delete()).await.status, StatusCode::NO_CONTENT);
+    assert!(!uploads.join(&id).exists());
+}
+
+#[tokio::test]
+async fn upload_status_waits_for_a_complete_chunk() {
+    let h = harness().await;
+    h.map_root().await;
+    let bearer = h.token(&["read", "upload"]).await;
+    let auth = [("authorization", bearer.as_str())];
+    let body = json!({
+        "target": { "root_id": "photos", "path": "2024" },
+        "files": [{ "name": "a.jpg", "role": "original", "size": 5,
+                    "sha256": crate::crypto::sha256_hex(b"photo") }],
+        "on_conflict": "fail"
+    });
+    let response = send(&h.app, json_req("POST", "/api/v1/uploads", &auth, &body)).await;
+    let id = response.json()["upload_id"].as_str().unwrap().to_owned();
+
+    let guard = h.state.lock_upload(&id).await;
+    let staged_file = h.root.join(".ism-staging/uploads").join(&id).join("0");
+    std::fs::write(&staged_file, b"ph").unwrap();
+    let request = get(&format!("/api/v1/uploads/{id}"), &auth);
+    let app = h.app.clone();
+    let mut status = tokio::spawn(async move { send(&app, request).await });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut status)
+            .await
+            .is_err()
+    );
+    std::fs::write(&staged_file, b"photo").unwrap();
+    drop(guard);
+    let response = status.await.unwrap();
+    assert_eq!(response.status, StatusCode::OK);
+    assert_eq!(response.json()["files"][0]["received"], 5);
+}
+
+#[tokio::test]
+async fn upload_chunks_and_commit_are_serialized() {
+    let h = harness().await;
+    h.map_root().await;
+    let bearer = h.token(&["read", "upload"]).await;
+    let auth = [("authorization", bearer.as_str())];
+    let body = json!({
+        "target": { "root_id": "photos", "path": "2024" },
+        "files": [{ "name": "a.jpg", "role": "original", "size": 5,
+                    "sha256": crate::crypto::sha256_hex(b"photo") }],
+        "on_conflict": "fail"
+    });
+    let response = send(&h.app, json_req("POST", "/api/v1/uploads", &auth, &body)).await;
+    assert_eq!(response.status, StatusCode::CREATED);
+    let id = response.json()["upload_id"].as_str().unwrap().to_owned();
+
+    let guard = h.state.lock_upload(&id).await;
+    let request = Request::builder()
+        .method("PUT")
+        .uri(format!("/api/v1/uploads/{id}/files/0"))
+        .header("authorization", &bearer)
+        .body(Body::from("photo"))
+        .unwrap();
+    let app = h.app.clone();
+    let mut put = tokio::spawn(async move { send(&app, request).await });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut put)
+            .await
+            .is_err()
+    );
+    drop(guard);
+    assert!(put.await.unwrap().status.is_success());
+
+    let guard = h.state.lock_upload(&id).await;
+    let request = json_req(
+        "POST",
+        &format!("/api/v1/uploads/{id}/commit"),
+        &auth,
+        &json!({}),
+    );
+    let app = h.app.clone();
+    let mut commit = tokio::spawn(async move { send(&app, request).await });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut commit)
+            .await
+            .is_err()
+    );
+    drop(guard);
+    let response = commit.await.unwrap();
+    assert_eq!(
+        response.status,
+        StatusCode::ACCEPTED,
+        "{:?}",
+        response.json()
+    );
+    let operation = response.json()["operation_id"].as_str().unwrap().to_owned();
+
+    let cancel = Request::builder()
+        .method("DELETE")
+        .uri(format!("/api/v1/uploads/{id}"))
+        .header("authorization", &bearer)
+        .body(Body::empty())
+        .unwrap();
+    let refused = send(&h.app, cancel).await;
+    assert_eq!(refused.status, StatusCode::CONFLICT);
+    assert_eq!(refused.json()["error"]["code"], "upload_closed");
+    assert_eq!(
+        std::fs::read(h.root.join(".ism-staging/uploads").join(&id).join("0")).unwrap(),
+        b"photo"
+    );
+
+    let late = Request::builder()
+        .method("PUT")
+        .uri(format!("/api/v1/uploads/{id}/files/0"))
+        .header("authorization", &bearer)
+        .body(Body::from("other"))
+        .unwrap();
+    assert_eq!(send(&h.app, late).await.status, StatusCode::CONFLICT);
+    assert_eq!(
+        h.wait_finished(&bearer, &operation).await["status"],
+        "completed"
+    );
+    assert_eq!(std::fs::read(h.root.join("2024/a.jpg")).unwrap(), b"photo");
+}
+
+#[tokio::test]
+async fn upload_expiry_rechecks_status_before_removing_staged_files() {
+    let h = harness().await;
+    h.map_root().await;
+    let bearer = h.token(&["read", "upload"]).await;
+    let auth = [("authorization", bearer.as_str())];
+    let body = json!({
+        "target": { "root_id": "photos", "path": "2024" },
+        "files": [{ "name": "a.jpg", "role": "original", "size": 5,
+                    "sha256": crate::crypto::sha256_hex(b"photo") }],
+        "on_conflict": "fail"
+    });
+    let response = send(&h.app, json_req("POST", "/api/v1/uploads", &auth, &body)).await;
+    let id = response.json()["upload_id"].as_str().unwrap().to_owned();
+    sqlx::query("UPDATE uploads SET created_at = '2000-01-01T00:00:00Z' WHERE id = ?")
+        .bind(&id)
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    let guard = h.state.lock_upload(&id).await;
+    let state = h.state.clone();
+    let mut expiry = tokio::spawn(async move { crate::ops::uploads::expire(&state).await });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut expiry)
+            .await
+            .is_err()
+    );
+    sqlx::query("UPDATE uploads SET status = 'publishing' WHERE id = ?")
+        .bind(&id)
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    drop(guard);
+    expiry.await.unwrap();
+    let status: String = sqlx::query_scalar("SELECT status FROM uploads WHERE id = ?")
+        .bind(&id)
+        .fetch_one(&h.state.db)
+        .await
+        .unwrap();
+    assert_eq!(status, "publishing");
+    assert!(
+        h.root
+            .join(".ism-staging/uploads")
+            .join(&id)
+            .join("0")
+            .exists()
+    );
+}
+
+#[tokio::test]
+async fn upload_creation_retries_are_idempotent_per_credential() {
+    let h = harness().await;
+    h.map_root().await;
+    let bearer = h.token(&["read", "upload"]).await;
+    let auth = [("authorization", bearer.as_str())];
+    let body = json!({
+        "idempotency_key": "import-job-1",
+        "target": { "root_id": "photos", "path": "2024" },
+        "files": [{ "name": "a.jpg", "role": "original", "size": 5,
+                    "sha256": crate::crypto::sha256_hex(b"photo") }],
+        "on_conflict": "fail"
+    });
+    let (first, retry) = tokio::join!(
+        send(&h.app, json_req("POST", "/api/v1/uploads", &auth, &body)),
+        send(&h.app, json_req("POST", "/api/v1/uploads", &auth, &body))
+    );
+    assert_eq!(first.status, StatusCode::CREATED);
+    assert_eq!(retry.status, StatusCode::CREATED);
+    let id = first.json()["upload_id"].as_str().unwrap().to_owned();
+    assert_eq!(retry.json()["upload_id"], id);
+
+    let put = Request::builder()
+        .method("PUT")
+        .uri(format!("/api/v1/uploads/{id}/files/0"))
+        .header("authorization", &bearer)
+        .body(Body::from("photo"))
+        .unwrap();
+    assert!(send(&h.app, put).await.status.is_success());
+    let retry = send(&h.app, json_req("POST", "/api/v1/uploads", &auth, &body)).await;
+    assert_eq!(retry.json()["upload_id"], id);
+    assert_eq!(retry.json()["files"][0]["received"], 5);
+
+    let old_request: String = sqlx::query_scalar("SELECT request_json FROM uploads WHERE id = ?")
+        .bind(&id)
+        .fetch_one(&h.state.db)
+        .await
+        .unwrap();
+    let mut old_request: Value = serde_json::from_str(&old_request).unwrap();
+    old_request["files"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("expected_revision");
+    sqlx::query("UPDATE uploads SET request_json = ? WHERE id = ?")
+        .bind(old_request.to_string())
+        .bind(&id)
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    let retry = send(&h.app, json_req("POST", "/api/v1/uploads", &auth, &body)).await;
+    assert_eq!(retry.status, StatusCode::CREATED);
+    assert_eq!(retry.json()["upload_id"], id);
+
+    let mut changed = body.clone();
+    changed["files"][0]["name"] = json!("b.jpg");
+    let conflict = send(&h.app, json_req("POST", "/api/v1/uploads", &auth, &changed)).await;
+    assert_eq!(conflict.status, StatusCode::CONFLICT);
+    assert_eq!(conflict.json()["error"]["code"], "idempotency_key_conflict");
+
+    sqlx::query("UPDATE uploads SET status = 'failed' WHERE id = ?")
+        .bind(&id)
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    let failed = send(&h.app, json_req("POST", "/api/v1/uploads", &auth, &body)).await;
+    assert_eq!(failed.json()["upload_id"], id);
+    assert_eq!(failed.json()["status"], "failed");
+
+    let other_bearer = h.token(&["read", "upload"]).await;
+    let other_auth = [("authorization", other_bearer.as_str())];
+    let other = send(
+        &h.app,
+        json_req("POST", "/api/v1/uploads", &other_auth, &body),
+    )
+    .await;
+    assert_eq!(other.status, StatusCode::CREATED);
+    assert_ne!(other.json()["upload_id"], id);
+
+    let mut legacy = body.clone();
+    legacy.as_object_mut().unwrap().remove("idempotency_key");
+    let first = send(&h.app, json_req("POST", "/api/v1/uploads", &auth, &legacy)).await;
+    let second = send(&h.app, json_req("POST", "/api/v1/uploads", &auth, &legacy)).await;
+    assert_eq!(first.status, StatusCode::CREATED);
+    assert_eq!(second.status, StatusCode::CREATED);
+    assert_ne!(first.json()["upload_id"], second.json()["upload_id"]);
+
+    for key in ["", "   ", &"x".repeat(201)] {
+        let mut invalid = body.clone();
+        invalid["idempotency_key"] = json!(key);
+        let response = send(&h.app, json_req("POST", "/api/v1/uploads", &auth, &invalid)).await;
+        assert_eq!(response.status, StatusCode::BAD_REQUEST);
+        assert_eq!(response.json()["error"]["code"], "bad_idempotency_key");
+    }
+}
+
+#[tokio::test]
+async fn upload_commit_rejects_an_existing_operation_key() {
+    let h = harness().await;
+    h.map_root().await;
+    let bearer = h.token(&["read", "upload", "manage"]).await;
+    let auth = [("authorization", bearer.as_str())];
+    let body = json!({
+        "target": { "root_id": "photos", "path": "2024" },
+        "files": [{ "name": "a.jpg", "role": "original", "size": 0,
+                    "sha256": crate::crypto::sha256_hex(b"") }],
+        "on_conflict": "fail"
+    });
+    let upload = send(&h.app, json_req("POST", "/api/v1/uploads", &auth, &body)).await;
+    let id = upload.json()["upload_id"].as_str().unwrap().to_owned();
+    let operation = json!({
+        "idempotency_key": format!("upload:{id}"),
+        "actions": [{ "kind": "create_folder", "target": { "root_id": "photos", "path": "2024/Trip" } }]
+    });
+    let operation = send(
+        &h.app,
+        json_req("POST", "/api/v1/operations", &auth, &operation),
+    )
+    .await;
+    assert_eq!(operation.status, StatusCode::ACCEPTED);
+    let commit = send(
+        &h.app,
+        json_req(
+            "POST",
+            &format!("/api/v1/uploads/{id}/commit"),
+            &auth,
+            &json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(commit.status, StatusCode::CONFLICT);
+    assert_eq!(commit.json()["error"]["code"], "idempotency_key_conflict");
+    let upload = send(&h.app, get(&format!("/api/v1/uploads/{id}"), &auth)).await;
+    assert_eq!(upload.json()["status"], "receiving");
+}
+
+#[tokio::test]
+async fn upload_keeps_the_folder() {
+    let h = harness().await;
+    h.map_root().await;
+    let bearer = h.token(&["read", "upload", "manage"]).await;
     let auth = [("authorization", bearer.as_str())];
     let photo = b"photo-bytes";
     let xmp = b"<x/>";
@@ -413,6 +2017,17 @@ async fn upload_keeps_the_folder() {
     .await;
     assert_eq!(r.status, StatusCode::ACCEPTED, "{:?}", r.json());
     let op = r.json()["operation_id"].as_str().unwrap().to_owned();
+    let different = json!({
+        "idempotency_key": format!("upload:{id}"),
+        "actions": [{ "kind": "create_folder", "target": { "root_id": "photos", "path": "2024/Other" } }]
+    });
+    let conflict = send(
+        &h.app,
+        json_req("POST", "/api/v1/operations", &auth, &different),
+    )
+    .await;
+    assert_eq!(conflict.status, StatusCode::CONFLICT);
+    assert_eq!(conflict.json()["error"]["code"], "idempotency_key_conflict");
     let done = h.wait_finished(&bearer, &op).await;
     assert_eq!(done["status"], "completed", "{done}");
     assert_eq!(std::fs::read(h.root.join("2024/New/c.jpg")).unwrap(), photo);
@@ -420,6 +2035,172 @@ async fn upload_keeps_the_folder() {
         std::fs::read(h.root.join("2024/New/c.jpg.xmp")).unwrap(),
         xmp
     );
+}
+
+#[tokio::test]
+async fn replacement_checks_each_destination_revision() {
+    for scenario in [
+        "unchanged",
+        "changed",
+        "same_mtime",
+        "omitted",
+        "new_sidecar",
+    ] {
+        let h = harness().await;
+        h.map_root().await;
+        let original = h.root.join("2024/a.jpg");
+        let sidecar = h.root.join("2024/a.jpg.xmp");
+        std::fs::write(&original, b"old-original").unwrap();
+        if scenario != "new_sidecar" {
+            std::fs::write(&sidecar, b"old-sidecar").unwrap();
+        }
+        let revision = |p: &std::path::Path| crate::files::revision(&std::fs::metadata(p).unwrap());
+        let original_revision = revision(&original);
+        let sidecar_revision =
+            (scenario != "new_sidecar" && scenario != "omitted").then(|| revision(&sidecar));
+        if scenario == "changed" {
+            std::fs::write(&sidecar, b"changed-on-server").unwrap();
+        }
+        if scenario == "same_mtime" {
+            let modified = std::fs::metadata(&sidecar).unwrap().modified().unwrap();
+            std::fs::write(&sidecar, b"bad-sidecar").unwrap();
+            std::fs::File::open(&sidecar)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(modified))
+                .unwrap();
+        }
+        let bearer = h.token(&["read", "upload"]).await;
+        let auth = [("authorization", bearer.as_str())];
+        let sha = |b: &[u8]| crate::crypto::sha256_hex(b);
+        let body = json!({
+            "target": { "root_id": "photos", "path": "2024" },
+            "provenance": { "source": "ila", "expected_revision": original_revision },
+            "files": [
+                { "name": "a.jpg", "role": "original", "size": 3, "sha256": sha(b"new"),
+                  "expected_sha256": sha(b"old-original") },
+                { "name": "a.jpg.xmp", "role": "sidecar", "size": 3, "sha256": sha(b"xmp"),
+                  "expected_revision": sidecar_revision,
+                  "expected_sha256": if scenario == "new_sidecar" { None } else { Some(sha(b"old-sidecar")) } }
+            ],
+            "on_conflict": "replace_if_expected"
+        });
+        let r = send(&h.app, json_req("POST", "/api/v1/uploads", &auth, &body)).await;
+        assert_eq!(r.status, StatusCode::CREATED, "{scenario}: {:?}", r.json());
+        let id = r.json()["upload_id"].as_str().unwrap().to_owned();
+        for (index, bytes) in [b"new", b"xmp"].into_iter().enumerate() {
+            let request = Request::builder()
+                .method("PUT")
+                .uri(format!("/api/v1/uploads/{id}/files/{index}"))
+                .header("authorization", bearer.as_str())
+                .body(Body::from(bytes.as_slice()))
+                .unwrap();
+            let r = send(&h.app, request).await;
+            assert!(r.status.is_success(), "{scenario}: {:?}", r.json());
+        }
+        let r = send(
+            &h.app,
+            json_req(
+                "POST",
+                &format!("/api/v1/uploads/{id}/commit"),
+                &auth,
+                &json!({}),
+            ),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::ACCEPTED, "{scenario}: {:?}", r.json());
+        let op = r.json()["operation_id"].as_str().unwrap().to_owned();
+        let done = h.wait_finished(&bearer, &op).await;
+        if scenario == "changed" || scenario == "same_mtime" || scenario == "omitted" {
+            assert_eq!(done["status"], "failed", "{scenario}: {done}");
+            assert_eq!(done["items"][0]["error"]["code"], "revision_changed");
+            let status = send(&h.app, get(&format!("/api/v1/uploads/{id}"), &auth)).await;
+            assert_eq!(status.json()["status"], "failed", "{scenario}");
+            let retry = send(
+                &h.app,
+                json_req(
+                    "POST",
+                    &format!("/api/v1/uploads/{id}/commit"),
+                    &auth,
+                    &json!({}),
+                ),
+            )
+            .await;
+            assert_eq!(retry.json()["operation_id"], op, "{scenario}");
+            assert_eq!(retry.json()["status"], "failed", "{scenario}");
+            assert_eq!(std::fs::read(&original).unwrap(), b"old-original");
+            let expected: &[u8] = if scenario == "changed" {
+                b"changed-on-server"
+            } else if scenario == "same_mtime" {
+                b"bad-sidecar"
+            } else {
+                b"old-sidecar"
+            };
+            assert_eq!(std::fs::read(&sidecar).unwrap(), expected);
+        } else {
+            assert_eq!(done["status"], "completed", "{scenario}: {done}");
+            assert_eq!(std::fs::read(&original).unwrap(), b"new");
+            assert_eq!(std::fs::read(&sidecar).unwrap(), b"xmp");
+            let inventory: String = sqlx::query_scalar("SELECT file_inventory_json FROM trash")
+                .fetch_one(&h.state.db)
+                .await
+                .unwrap();
+            let files: Vec<Value> = serde_json::from_str(&inventory).unwrap();
+            let mut names: Vec<&str> = files
+                .iter()
+                .map(|file| file["name"].as_str().unwrap())
+                .collect();
+            names.sort();
+            let expected = if scenario == "new_sidecar" {
+                vec!["a.jpg"]
+            } else {
+                vec!["a.jpg", "a.jpg.xmp"]
+            };
+            assert_eq!(names, expected, "{scenario}");
+            for file in files {
+                let expected_hash = if file["name"] == "a.jpg" {
+                    sha(b"old-original")
+                } else {
+                    sha(b"old-sidecar")
+                };
+                assert_eq!(file["sha256"], expected_hash, "{scenario}");
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn bookkeeping_failure_is_reported_as_recovery_required() {
+    let h = harness().await;
+    h.map_root().await;
+    std::fs::write(h.root.join("2024/a.jpg"), b"original").unwrap();
+    sqlx::query(
+        "CREATE TRIGGER reject_trash BEFORE INSERT ON trash BEGIN SELECT RAISE(FAIL, 'test failure'); END",
+    )
+    .execute(&h.state.db)
+    .await
+    .unwrap();
+    let bearer = h.token(&["read", "trash"]).await;
+    let body = json!({
+        "idempotency_key": "test-bookkeeping",
+        "label": "Trash",
+        "actions": [{ "kind": "trash", "source": { "root_id": "photos", "path": "2024/a.jpg" } }]
+    });
+    let r = send(
+        &h.app,
+        json_req(
+            "POST",
+            "/api/v1/operations",
+            &[("authorization", &bearer)],
+            &body,
+        ),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::ACCEPTED, "{:?}", r.json());
+    let op = r.json()["operation_id"].as_str().unwrap().to_owned();
+    let done = h.wait_finished(&bearer, &op).await;
+    assert_eq!(done["status"], "recovery_required", "{done}");
+    assert_eq!(done["items"][0]["error"]["code"], "recovery_required");
+    assert!(!h.root.join("2024/a.jpg").exists());
 }
 
 #[tokio::test]
@@ -434,4 +2215,436 @@ async fn mapping_rejects_claimed_folder() {
     .await;
     assert_eq!(r.status, StatusCode::CONFLICT);
     assert_eq!(r.json()["error"]["code"], "folder_claimed");
+}
+
+#[tokio::test]
+async fn mapping_does_not_overwrite_an_empty_existing_marker() {
+    let h = harness().await;
+    std::fs::write(h.root.join(".ism-root"), "").unwrap();
+    let body = json!({ "root_id": "photos", "name": "Photos", "container_path": h.root.to_string_lossy() });
+    let response = send(
+        &h.app,
+        json_req("POST", "/api/admin/mappings", &h.admin(), &body),
+    )
+    .await;
+    assert_eq!(response.status, StatusCode::CONFLICT);
+    assert_eq!(
+        std::fs::read_to_string(h.root.join(".ism-root")).unwrap(),
+        ""
+    );
+}
+
+#[tokio::test]
+async fn wrong_volume_marker_blocks_reads_and_managed_operations() {
+    let h = harness().await;
+    h.map_root().await;
+    std::fs::write(h.root.join(".ism-root"), "other\n").unwrap();
+    let bearer = h.token(&["read", "manage"]).await;
+    let auth = [("authorization", bearer.as_str())];
+    let info = send(&h.app, get("/api/v1/client/info", &auth)).await;
+    assert_eq!(info.status, StatusCode::OK);
+    assert_eq!(info.json()["roots"][0]["available"], false);
+    assert_eq!(info.json()["roots"][0]["direct_writes"], "not_linked");
+    assert_eq!(info.json()["roots"][0]["direct_writes_reason"], Value::Null);
+    let browse = send(
+        &h.app,
+        get("/api/v1/folders?root_id=photos&path=2024", &auth),
+    )
+    .await;
+    assert_eq!(browse.status, StatusCode::SERVICE_UNAVAILABLE);
+    let request = json!({
+        "idempotency_key": "wrong-volume",
+        "actions": [{ "kind": "create_folder", "target": { "root_id": "photos", "path": "2024/new" } }]
+    });
+    let operation = send(
+        &h.app,
+        json_req("POST", "/api/v1/operations", &auth, &request),
+    )
+    .await;
+    assert_eq!(operation.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(!h.root.join("2024/new").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn mapping_rejects_symlinked_volume_marker() {
+    let h = harness().await;
+    let target = h._dir.path().join("marker");
+    std::fs::write(&target, "photos\n").unwrap();
+    std::os::unix::fs::symlink(&target, h.root.join(".ism-root")).unwrap();
+    let body = json!({ "root_id": "photos", "name": "Photos", "container_path": h.root.to_string_lossy() });
+    let response = send(
+        &h.app,
+        json_req("POST", "/api/admin/mappings", &h.admin(), &body),
+    )
+    .await;
+    assert_eq!(response.status, StatusCode::CONFLICT);
+    assert_eq!(std::fs::read_to_string(target).unwrap(), "photos\n");
+}
+
+/// Creates, fills and commits an upload; returns the finished operation (or the error response).
+async fn run_upload(h: &Harness, bearer: &str, body: &Value, contents: &[&[u8]]) -> Value {
+    let auth = [("authorization", bearer)];
+    let r = send(&h.app, json_req("POST", "/api/v1/uploads", &auth, body)).await;
+    if r.status != StatusCode::CREATED {
+        return json!({ "http": r.status.as_u16(), "body": r.json() });
+    }
+    let id = r.json()["upload_id"].as_str().unwrap().to_owned();
+    for (index, bytes) in contents.iter().enumerate() {
+        let request = Request::builder()
+            .method("PUT")
+            .uri(format!("/api/v1/uploads/{id}/files/{index}"))
+            .header("authorization", bearer)
+            .body(Body::from(bytes.to_vec()))
+            .unwrap();
+        let r = send(&h.app, request).await;
+        assert!(r.status.is_success(), "{:?}", r.json());
+    }
+    let r = send(
+        &h.app,
+        json_req(
+            "POST",
+            &format!("/api/v1/uploads/{id}/commit"),
+            &auth,
+            &json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::ACCEPTED, "{:?}", r.json());
+    let op = r.json()["operation_id"].as_str().unwrap().to_owned();
+    h.wait_finished(bearer, &op).await
+}
+
+#[tokio::test]
+async fn sidecar_only_upload_replaces_just_the_sidecar() {
+    let sha = |b: &[u8]| crate::crypto::sha256_hex(b);
+    for scenario in [
+        "replace",
+        "new_sidecar",
+        "original_changed",
+        "unexpected_sidecar",
+    ] {
+        let h = harness().await;
+        h.map_root().await;
+        let original = h.root.join("2024/a.jpg");
+        let sidecar = h.root.join("2024/a.jpg.xmp");
+        std::fs::write(&original, b"original").unwrap();
+        if scenario != "new_sidecar" {
+            std::fs::write(&sidecar, b"old-xmp").unwrap();
+        }
+        let revision = |p: &std::path::Path| crate::files::revision(&std::fs::metadata(p).unwrap());
+        let original_revision = revision(&original);
+        let sidecar_revision =
+            (scenario == "replace" || scenario == "original_changed").then(|| revision(&sidecar));
+        if scenario == "original_changed" {
+            std::fs::write(&original, b"edited-on-server").unwrap();
+        }
+        let bearer = h.token(&["read", "upload"]).await;
+        let body = json!({
+            "target": { "root_id": "photos", "path": "2024" },
+            "existing_original": { "name": "a.jpg", "expected_revision": original_revision },
+            "files": [
+                { "name": "a.jpg.xmp", "role": "sidecar", "size": 7, "sha256": sha(b"new-xmp"),
+                  "expected_revision": sidecar_revision,
+                  "expected_sha256": sidecar_revision.as_ref().map(|_| sha(b"old-xmp")) }
+            ],
+            "on_conflict": "replace_if_expected"
+        });
+        let done = run_upload(&h, &bearer, &body, &[b"new-xmp"]).await;
+        let trashed: Vec<(String, String)> =
+            sqlx::query_as("SELECT path, file_inventory_json FROM trash")
+                .fetch_all(&h.state.db)
+                .await
+                .unwrap();
+        match scenario {
+            "replace" | "new_sidecar" => {
+                assert_eq!(done["status"], "completed", "{scenario}: {done}");
+                assert_eq!(std::fs::read(&sidecar).unwrap(), b"new-xmp");
+                assert_eq!(std::fs::read(&original).unwrap(), b"original");
+                if scenario == "replace" {
+                    // Only the replaced sidecar is kept in trash, never a copy of the original.
+                    assert_eq!(trashed.len(), 1, "{scenario}");
+                    assert_eq!(trashed[0].0, "2024/a.jpg.xmp");
+                    let files: Vec<Value> = serde_json::from_str(&trashed[0].1).unwrap();
+                    assert_eq!(files.len(), 1);
+                    assert_eq!(files[0]["name"], "a.jpg.xmp");
+                    assert_eq!(files[0]["sha256"], sha(b"old-xmp"));
+                } else {
+                    assert!(trashed.is_empty(), "{scenario}");
+                }
+            }
+            _ => {
+                assert_eq!(done["status"], "failed", "{scenario}: {done}");
+                assert_eq!(
+                    done["items"][0]["error"]["code"], "revision_changed",
+                    "{scenario}"
+                );
+                assert_eq!(std::fs::read(&sidecar).unwrap(), b"old-xmp");
+                assert!(trashed.is_empty(), "{scenario}");
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn sidecar_only_and_provenance_uploads_are_validated() {
+    let h = harness().await;
+    h.map_root().await;
+    std::fs::write(h.root.join("2024/a.jpg"), b"original").unwrap();
+    let revision = crate::files::revision(&std::fs::metadata(h.root.join("2024/a.jpg")).unwrap());
+    let bearer = h.token(&["read", "upload"]).await;
+    let sha = crate::crypto::sha256_hex(b"xmp");
+    let existing = json!({ "name": "a.jpg", "expected_revision": revision });
+    let sidecar = json!({ "name": "a.jpg.xmp", "role": "sidecar", "size": 3, "sha256": sha });
+    let original = json!({ "name": "a.jpg", "role": "original", "size": 3, "sha256": sha });
+    let rejected = [
+        json!({ "target": { "root_id": "photos", "path": "2024" }, "existing_original": existing,
+                "files": [sidecar], "on_conflict": "fail" }),
+        json!({ "target": { "root_id": "photos", "path": "2024" }, "existing_original": existing,
+                "files": [original, sidecar], "on_conflict": "replace_if_expected" }),
+        json!({ "target": { "root_id": "photos", "path": "2024" },
+                "files": [sidecar], "on_conflict": "fail" }),
+        json!({ "target": { "root_id": "photos", "path": "2025" },
+                "provenance": { "source": "ila", "original_location": { "root_id": "photos", "path": "2024/a.jpg" } },
+                "files": [original], "on_conflict": "fail" }),
+    ];
+    for body in rejected {
+        let done = run_upload(&h, &bearer, &body, &[]).await;
+        assert_eq!(done["http"], 400, "{body}: {done}");
+    }
+    // A file that does not belong to the original is refused before anything moves.
+    let stranger = json!({
+        "target": { "root_id": "photos", "path": "2024" }, "existing_original": existing,
+        "files": [{ "name": "b.jpg.xmp", "role": "sidecar", "size": 3, "sha256": sha }],
+        "on_conflict": "replace_if_expected"
+    });
+    let done = run_upload(&h, &bearer, &stranger, &[b"xmp"]).await;
+    assert_eq!(done["status"], "failed", "{done}");
+    assert_eq!(done["items"][0]["error"]["code"], "not_a_companion");
+    assert!(!h.root.join("2024/b.jpg.xmp").exists());
+}
+
+#[tokio::test]
+async fn an_upload_gets_its_asset_id_after_the_library_scan() {
+    let h = harness().await;
+    h.map_root().await;
+    let (_server, fake) = crate::maintenance::tests::fake_server(&h.state).await;
+    sqlx::query("INSERT INTO immich_libraries (id, server_id, name, owner_user_id, import_paths_json, refreshed_at) VALUES ('lib1', 's1', 'Photos', 'u1', '[\"/library/photos\"]', ?)")
+        .bind(crate::db::now())
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE immich_servers SET direct_writes_enabled = 1, database_url_enc = 'unused' WHERE id = 's1'")
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE mappings SET server_id = 's1', library_id = 'lib1', immich_import_path = '/library/photos' WHERE root_id = 'photos'")
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    let bearer = h.token(&["read", "upload"]).await;
+    let photo: &[u8] = b"photo";
+    let body = json!({
+        "target": { "root_id": "photos", "path": "2024/Trip" },
+        "provenance": { "source": "ila", "original_location": { "root_id": "photos", "path": "2024/Trip/c.jpg" } },
+        "files": [{ "name": "c.jpg", "role": "original", "size": 5, "sha256": crate::crypto::sha256_hex(photo) }],
+        "on_conflict": "fail"
+    });
+    let done = run_upload(&h, &bearer, &body, &[photo]).await;
+    assert_eq!(done["status"], "completed", "{done}");
+    assert_eq!(done["items"][0]["result"]["asset_id"], Value::Null);
+    assert!(h.root.join("2024/Trip/c.jpg").exists());
+    let due: Option<i64> =
+        sqlx::query_scalar("SELECT due_at FROM scan_schedule WHERE library_id = 'lib1'")
+            .fetch_optional(&h.state.db)
+            .await
+            .unwrap()
+            .flatten();
+    assert!(due.is_some(), "the upload schedules a library scan");
+
+    // Not imported yet: nothing to fill.
+    let filled = crate::ops::uploads::fill_asset_ids(&h.state, "s1", "lib1")
+        .await
+        .unwrap();
+    assert_eq!(filled, 0);
+    let operation_id = done["operation_id"].as_str().unwrap();
+    let auth = [("authorization", bearer.as_str())];
+    // A live listener stays connected past `finished` until the asset id arrives.
+    let listener = {
+        let app = h.app.clone();
+        let req = get(&format!("/api/v1/operations/{operation_id}/events"), &auth);
+        tokio::spawn(async move { send(&app, req).await })
+    };
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!listener.is_finished(), "the stream waits for the import");
+    fake.assets
+        .lock()
+        .unwrap()
+        .push(("/library/photos/2024/Trip/c.jpg".into(), "asset-1".into()));
+    let mut events = h.state.events.subscribe();
+    let filled = crate::ops::uploads::fill_asset_ids(&h.state, "s1", "lib1")
+        .await
+        .unwrap();
+    assert_eq!(filled, 1);
+    let mut announced = false;
+    while let Ok(event) = events.try_recv() {
+        announced |= matches!(event, crate::state::ServerEvent::OperationUpdated { operation_id: ref id } if id == operation_id);
+    }
+    assert!(announced, "SSE subscribers hear about the filled asset id");
+    let streamed = tokio::time::timeout(Duration::from_secs(20), listener)
+        .await
+        .expect("the stream ends once the asset id is known")
+        .unwrap();
+    let streamed = String::from_utf8_lossy(&streamed.body).into_owned();
+    let tail = streamed.split("event: finished").nth(1).unwrap_or_default();
+    assert!(
+        tail.contains("event: item") && tail.contains("asset-1"),
+        "{streamed}"
+    );
+    let r = send(
+        &h.app,
+        get(&format!("/api/v1/operations/{operation_id}"), &auth),
+    )
+    .await;
+    assert_eq!(
+        r.json()["items"][0]["result"]["asset_id"],
+        "asset-1",
+        "{:?}",
+        r.json()
+    );
+    let again = crate::ops::uploads::fill_asset_ids(&h.state, "s1", "lib1")
+        .await
+        .unwrap();
+    assert_eq!(again, 0);
+}
+
+#[tokio::test]
+async fn opm_trash_expectations_partial_submit_and_lookup_by_key() {
+    let h = harness().await;
+    h.map_root().await;
+    std::fs::create_dir_all(h.root.join("2024/album/sub")).unwrap();
+    std::fs::write(h.root.join("2024/a.jpg"), b"photo a").unwrap();
+    std::fs::write(h.root.join("2024/album/b.jpg"), b"photo b").unwrap();
+    std::fs::write(h.root.join("2024/album/sub/c.jpg"), b"photo c").unwrap();
+    let bearer = h.token(&["read", "manage", "trash"]).await;
+    let auth = [("authorization", bearer.as_str())];
+    let listing = |path: &str| {
+        let uri = format!("/api/v1/folders?root_id=photos&path={path}");
+        let app = h.app.clone();
+        async move { send(&app, get(&uri, &auth)).await.json() }
+    };
+    let revision_of = |listing: &Value, name: &str| -> String {
+        listing["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["name"] == name)
+            .unwrap()["revision"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let submit = |body: Value| {
+        let app = h.app.clone();
+        async move { send(&app, json_req("POST", "/api/v1/operations", &auth, &body)).await }
+    };
+
+    // Lookup by key has no side effects: unknown keys stay usable.
+    let r = send(
+        &h.app,
+        get("/api/v1/operations?idempotency_key=trash-a", &auth),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND);
+    assert_eq!(r.json()["error"]["code"], "not_found");
+
+    // A stale file revision is refused and nothing moves.
+    let year = listing("2024").await;
+    let a_rev = revision_of(&year, "a.jpg");
+    std::thread::sleep(Duration::from_millis(5));
+    std::fs::write(h.root.join("2024/a.jpg"), b"photo a, edited").unwrap();
+    let r = submit(json!({ "idempotency_key": "trash-a", "actions": [
+        { "kind": "trash", "source": { "root_id": "photos", "path": "2024/a.jpg" }, "expected_revision": a_rev }
+    ]}))
+    .await;
+    assert_eq!(r.status, StatusCode::CONFLICT);
+    assert_eq!(r.json()["error"]["code"], "revision_changed");
+    assert!(h.root.join("2024/a.jpg").exists());
+
+    // A folder whose contents differ from the expected entries is not touched.
+    let album = listing("2024/album").await;
+    let sub = listing("2024/album/sub").await;
+    let mut entries = vec![
+        json!({ "path": "b.jpg", "revision": revision_of(&album, "b.jpg") }),
+        json!({ "path": "sub/c.jpg", "revision": revision_of(&sub, "c.jpg") }),
+    ];
+    std::fs::write(h.root.join("2024/album/new.jpg"), b"added later").unwrap();
+    let trash_album = |entries: &Vec<Value>, key: &str| {
+        json!({ "idempotency_key": key, "actions": [
+            { "kind": "trash_folder", "source": { "root_id": "photos", "path": "2024/album" },
+              "expected_entries": entries }
+        ]})
+    };
+    let r = submit(trash_album(&entries, "album-1")).await;
+    assert_eq!(r.status, StatusCode::CONFLICT);
+    assert_eq!(r.json()["error"]["code"], "revision_changed");
+    assert!(
+        r.json()["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("1 added")
+    );
+    assert!(h.root.join("2024/album/new.jpg").exists());
+
+    // Partial submit: the blocked trash fails as an item, the rest runs.
+    let r = submit(json!({ "idempotency_key": "partial", "allow_partial": true, "actions": [
+        { "kind": "trash", "source": { "root_id": "photos", "path": "2024/a.jpg" }, "expected_revision": a_rev },
+        { "kind": "create_folder", "target": { "root_id": "photos", "path": "2024/made" } }
+    ]}))
+    .await;
+    assert_eq!(r.status, StatusCode::ACCEPTED, "{:?}", r.json());
+    let op = r.json()["operation_id"].as_str().unwrap().to_owned();
+    let done = h.wait_finished(&bearer, &op).await;
+    assert_eq!(done["items"][0]["status"], "failed", "{done}");
+    assert_eq!(done["items"][0]["error"]["code"], "revision_changed");
+    assert_eq!(done["items"][1]["status"], "done", "{done}");
+    assert!(h.root.join("2024/made").is_dir() && h.root.join("2024/a.jpg").exists());
+
+    // The same submission can be found by its key, without being re-run.
+    let r = send(
+        &h.app,
+        get("/api/v1/operations?idempotency_key=partial", &auth),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert_eq!(r.json()["operation_id"], op.as_str());
+    assert_eq!(r.json()["status"], done["status"]);
+
+    // With matching entries the folder goes to the trash.
+    entries.push(json!({ "path": "new.jpg", "revision": revision_of(&listing("2024/album").await, "new.jpg") }));
+    let r = submit(trash_album(&entries, "album-2")).await;
+    assert_eq!(r.status, StatusCode::ACCEPTED, "{:?}", r.json());
+    let op = r.json()["operation_id"].as_str().unwrap().to_owned();
+    let done = h.wait_finished(&bearer, &op).await;
+    assert_eq!(done["status"], "completed", "{done}");
+    assert!(!h.root.join("2024/album").exists());
+
+    // A key cancelled before submission is reported as such.
+    let cancel = json!({ "idempotency_key": "never", "expected_request": {
+    "idempotency_key": "never", "actions": [
+        { "kind": "create_folder", "target": { "root_id": "photos", "path": "2024/never" } }
+    ]}});
+    let r = send(
+        &h.app,
+        json_req("POST", "/api/v1/operations/cancel-by-key", &auth, &cancel),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.json());
+    let r = send(
+        &h.app,
+        get("/api/v1/operations?idempotency_key=never", &auth),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND);
+    assert_eq!(r.json()["error"]["code"], "cancelled_before_submission");
 }

@@ -5,9 +5,12 @@ Immich API/DB access, workers) plus the web UI in `web/` (its own rules: `web/AG
 
 ## Commands
 - `make check`: rustfmt, clippy (`-D warnings`), all Rust tests, then the web gate. Must be green.
-- `make fmt`, `make dev-server` (data in `.data/`), `make dev-web`, `make image`.
+- `make fmt`, `make dev-server` (data in `.data/`), `make dev-web`, `make image`, `make clean`.
 - `make gen-api` after changing any DTO in `ism-core::dto`; commit the regenerated
   `web/src/api/generated/*.ts`.
+- Keep Rust build artifacts small: dev/test profiles disable debug symbols and incremental
+  compilation. Do not override these settings for routine validation; opt in to line tables only
+  when debugging requires them, then remove generated targets when the work is finished.
 
 ## Invariants
 - Target Immich v3.4.1 only. Any new direct database statement goes in `immich/pg.rs`, runs in a

@@ -35,6 +35,7 @@ export function serversNeedAttention(): boolean {
     value.servers.some(
       (server) =>
         !server.compatible ||
+        server.maintenance.drift !== null ||
         server.maintenance.phase === 'blocked' ||
         server.maintenance.phase === 'recovery_required',
     )

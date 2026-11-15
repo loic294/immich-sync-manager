@@ -12,10 +12,16 @@ const EXPLAIN: Readonly<Record<string, string>> = {
   changed_on_both: 'The file changed on both instances since they last agreed.',
   changed_here_deleted_there: 'The file changed on one instance and was deleted on the other.',
   apply_failed: 'A change from the peer could not be applied here.',
+  move: 'The peer moved a file that changed here, or its destination is taken.',
+  folder_move: 'The peer moved a folder that cannot be moved the same way here.',
 };
 
 const RESOLUTIONS: readonly { value: ConflictResolution; label: string; hint: string }[] = [
-  { value: 'keep_local', label: 'Keep this instance', hint: 'The peer receives this version.' },
+  {
+    value: 'keep_local',
+    label: 'Keep this instance',
+    hint: 'Record this version as the decision.',
+  },
   {
     value: 'keep_remote',
     label: 'Keep the peer',
@@ -26,9 +32,14 @@ const RESOLUTIONS: readonly { value: ConflictResolution; label: string; hint: st
     label: 'Keep both',
     hint: "The peer's version is saved next to this one under a new name.",
   },
+  {
+    value: 'skip',
+    label: 'Skip',
+    hint: 'Dismiss without changing either side; the next change to this path is compared again.',
+  },
 ];
 
-/** Replication conflicts, side by side, with the three ways to settle them. */
+/** Replication conflicts, side by side, with the ways to settle them. */
 export class IsmConflictsPage extends IsmPage {
   static override properties = {
     ...IsmPage.properties,
@@ -84,6 +95,8 @@ export class IsmConflictsPage extends IsmPage {
 
   private card(c: ConflictView) {
     const open = c.status === 'open';
+    const choices =
+      c.kind === 'folder_move' ? RESOLUTIONS.filter((r) => r.value !== 'keep_both') : RESOLUTIONS;
     return html`
       <article class="card card-border bg-base-100">
         <div class="card-body gap-3 p-4">
@@ -95,13 +108,14 @@ export class IsmConflictsPage extends IsmPage {
             ${c.share_name} · ${EXPLAIN[c.kind] ?? humanize(c.kind)} · ${formatDate(c.created_at)}
           </p>
           ${c.detail ? html`<p class="text-sm">${c.detail}</p>` : nothing}
+          ${c.moved_from ? html`<p class="text-sm">Moved by the peer from <span class="break-all font-mono text-xs">${formatLocation(c.moved_from)}</span></p>` : nothing}
           <div class="grid grid-cols-1 gap-3 md:grid-cols-2">
             ${this.side('This instance', c.local)} ${this.side('Peer', c.remote)}
           </div>
           ${
             open
               ? html`<div class="card-actions">
-                  ${RESOLUTIONS.map(
+                  ${choices.map(
                     (r) => html`<div class="tooltip" data-tip=${r.hint}>
                       <button type="button" class="btn btn-sm" ?disabled=${this.busy !== undefined} @click=${() => this.resolve(c, r.value)}>
                         ${this.spin(`${c.id}:${r.value}`)}${r.label}
@@ -123,7 +137,7 @@ export class IsmConflictsPage extends IsmPage {
           ? html`<div class="card card-border bg-base-100"><div class="card-body items-center text-center">
               <ism-icon name="circle-check" size="xl" class="text-success"></ism-icon>
               <h2 class="card-title">No conflicts</h2>
-              <p class="text-sm text-base-content/70">Every share agrees with its peers.</p>
+              <p class="text-sm text-base-content/70">No conflicts have been recorded.</p>
             </div></div>`
           : html`${this.conflicts.map((c) => this.card(c))}`,
       html`<label class="label">

@@ -2,4 +2,8 @@
 import type { ConflictSide } from "./ConflictSide";
 import type { Location } from "./Location";
 
-export type ConflictView = { id: string, share_name: string, location: Location, kind: string, detail: string, local: ConflictSide, remote: ConflictSide, peer_id: string, status: string, created_at: string, };
+export type ConflictView = { id: string, share_name: string, location: Location, kind: string, detail: string, local: ConflictSide, remote: ConflictSide, peer_id: string, status: string, created_at: string, 
+/**
+ * For a move that conflicted: where the peer moved the file or folder from.
+ */
+moved_from: Location | null, };

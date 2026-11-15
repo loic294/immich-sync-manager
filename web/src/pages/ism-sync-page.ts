@@ -1,6 +1,7 @@
 import { html, nothing } from 'lit';
 import { createRef, ref } from 'lit/directives/ref.js';
 import { admin } from '@/api/admin';
+import { isApiError } from '@/api/errors';
 import type { OverrideView } from '@/api/generated/OverrideView';
 import type { PeerView } from '@/api/generated/PeerView';
 import type { ScheduleView } from '@/api/generated/ScheduleView';
@@ -28,6 +29,7 @@ export class IsmSyncPage extends IsmPage {
     ...IsmPage.properties,
     status: { state: true },
     schedule: { state: true },
+    scheduleInvalid: { state: true },
     overrides: { state: true },
     shares: { state: true },
     peers: { state: true },
@@ -35,6 +37,7 @@ export class IsmSyncPage extends IsmPage {
 
   declare status: SyncStatus | undefined;
   declare schedule: ScheduleView | undefined;
+  declare scheduleInvalid: boolean;
   declare overrides: OverrideView[];
   declare shares: ShareView[];
   declare peers: PeerView[];
@@ -46,6 +49,7 @@ export class IsmSyncPage extends IsmPage {
     super();
     this.status = undefined;
     this.schedule = undefined;
+    this.scheduleInvalid = false;
     this.overrides = [];
     this.shares = [];
     this.peers = [];
@@ -53,14 +57,26 @@ export class IsmSyncPage extends IsmPage {
 
   protected override async load() {
     const [status, schedule, overrides, shares, peers] = await Promise.all([
-      admin.sync(),
-      admin.schedule(),
+      admin.sync().catch((error: unknown) => {
+        if (isApiError(error) && error.code === 'invalid_schedule') return undefined;
+        throw error;
+      }),
+      admin.schedule().catch((error: unknown) => {
+        if (isApiError(error) && error.code === 'invalid_schedule') return undefined;
+        throw error;
+      }),
       admin.overrides(),
       admin.shares(),
       admin.peers(),
     ]);
     this.status = status;
-    if (!this.scheduleDirty) this.schedule = schedule;
+    this.scheduleInvalid = !schedule;
+    if (!this.scheduleDirty) {
+      this.schedule = schedule ?? {
+        timezone: 'UTC',
+        windows: [{ days: [], start: '00:00', end: '00:00' }],
+      };
+    }
     this.overrides = overrides;
     this.shares = shares;
     this.peers = peers;
@@ -324,6 +340,15 @@ export class IsmSyncPage extends IsmPage {
       ${this.frame(
         () => {
           const s = this.status;
+          if (!s && this.scheduleInvalid) {
+            return html`
+              <div role="alert" class="alert alert-error alert-soft">
+                The saved schedule is invalid. File transfers are paused unless an override is active.
+                Choose replacement hours and save them to resume scheduling.
+              </div>
+              ${this.renderSchedule()}
+            `;
+          }
           if (!s) return html``;
           return html`
             <div role="status" class=${s.allowed_now || s.override_active ? 'alert alert-success alert-soft' : 'alert alert-info alert-soft'}>

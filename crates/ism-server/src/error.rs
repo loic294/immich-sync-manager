@@ -70,7 +70,9 @@ impl AppError {
         Self::new(
             StatusCode::SERVICE_UNAVAILABLE,
             "root_unavailable",
-            format!("root '{root_id}' is not mounted or its .ism-root marker is missing"),
+            format!(
+                "root '{root_id}' is not mounted or its .ism-root marker is missing or invalid"
+            ),
         )
     }
 
@@ -115,6 +117,33 @@ pub fn redact(text: &str) -> String {
             }
             None => out.push_str(authority),
         }
+        rest = &tail[end..];
+    }
+    out.push_str(rest);
+    redact_password_params(&out)
+}
+
+/// Masks `password=` query or key/value parameters, e.g. in libpq connection strings.
+fn redact_password_params(text: &str) -> String {
+    const KEY: &str = "password=";
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(pos) = rest.to_ascii_lowercase().find(KEY) {
+        let at_boundary = pos == 0
+            || matches!(
+                rest.as_bytes()[pos - 1],
+                b'?' | b'&' | b' ' | b'\t' | b'\n' | b';' | b'"' | b'\''
+            );
+        let (head, tail) = rest.split_at(pos + KEY.len());
+        out.push_str(head);
+        if !at_boundary {
+            rest = tail;
+            continue;
+        }
+        let end = tail
+            .find(|c: char| c.is_whitespace() || matches!(c, '&' | ';' | '"' | '\''))
+            .unwrap_or(tail.len());
+        out.push_str("***");
         rest = &tail[end..];
     }
     out.push_str(rest);
@@ -171,5 +200,14 @@ mod tests {
             "connect postgres://***@db.example:5432/immich failed"
         );
         assert_eq!(redact("http://ism.example/x"), "http://ism.example/x");
+        assert_eq!(
+            redact("postgres://db.example/immich?user=u&password=secret&sslmode=require"),
+            "postgres://db.example/immich?user=u&password=***&sslmode=require"
+        );
+        assert_eq!(
+            redact("host=db.example Password=secret dbname=immich"),
+            "host=db.example Password=*** dbname=immich"
+        );
+        assert_eq!(redact("old_password=x"), "old_password=x");
     }
 }

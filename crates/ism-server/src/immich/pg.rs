@@ -9,7 +9,7 @@
 //! Ids are handled as text and cast in SQL, so this module does not depend on a UUID type.
 
 use sqlx::postgres::{PgPool, PgPoolOptions};
-use sqlx::{PgConnection, Row};
+use sqlx::{Connection, PgConnection, Row};
 use thiserror::Error;
 
 use ism_core::checksum::immich_path_checksum;
@@ -22,6 +22,8 @@ pub enum PgError {
     Stale(String),
     #[error("another Immich asset already uses {0}")]
     PathTaken(String),
+    #[error("the asset can no longer change owner: {0}")]
+    TransferBlocked(String),
 }
 
 pub async fn connect(url: &str) -> Result<PgPool, sqlx::Error> {
@@ -79,6 +81,45 @@ pub async fn asset_by_path(
         .fetch_optional(&mut *conn)
         .await?;
     row.as_ref().map(asset_row).transpose()
+}
+
+/// Checks that exactly the expected asset uses this path, under row locks.
+pub async fn asset_identity_matches(
+    conn: &mut PgConnection,
+    path: &str,
+    expected: &str,
+) -> Result<bool, sqlx::Error> {
+    let mut tx = conn.begin().await?;
+    let ids: Vec<String> = sqlx::query_scalar(
+        r#"SELECT id::text FROM asset WHERE "originalPath" = $1 LIMIT 2 FOR UPDATE"#,
+    )
+    .bind(path)
+    .fetch_all(&mut *tx)
+    .await?;
+    let matches = unique_asset_matches(&ids, expected);
+    tx.commit().await?;
+    Ok(matches)
+}
+
+fn unique_asset_matches(ids: &[String], expected: &str) -> bool {
+    !expected.is_empty() && ids.len() == 1 && ids[0] == expected
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::unique_asset_matches;
+
+    #[test]
+    fn identity_requires_one_matching_asset() {
+        assert!(unique_asset_matches(&["asset-1".into()], "asset-1"));
+        assert!(!unique_asset_matches(&[], "asset-1"));
+        assert!(!unique_asset_matches(&["asset-2".into()], "asset-1"));
+        assert!(!unique_asset_matches(
+            &["asset-1".into(), "asset-2".into()],
+            "asset-1"
+        ));
+        assert!(!unique_asset_matches(&["".into()], ""));
+    }
 }
 
 pub async fn asset_by_id(
@@ -312,6 +353,25 @@ pub async fn transfer_owner(
     to_owner: &str,
     to_library: &str,
 ) -> Result<(), PgError> {
+    // Lock the row (this also holds off new rows referencing it) and re-check, inside the
+    // transaction, everything the plan relied on.
+    let sql = format!(r#"SELECT {ASSET_COLUMNS} FROM asset WHERE id = $1::uuid FOR UPDATE"#);
+    let locked = sqlx::query(sqlx::AssertSqlSafe(sql))
+        .bind(asset_id)
+        .fetch_optional(&mut *conn)
+        .await?;
+    let Some(row) = locked.as_ref().map(asset_row).transpose()? else {
+        return Err(PgError::Stale(asset_id.to_owned()));
+    };
+    if row.owner_id != from_owner || row.trashed {
+        return Err(PgError::Stale(asset_id.to_owned()));
+    }
+    if from_owner != to_owner {
+        let blockers = transfer_blockers(conn, &row).await?;
+        if !blockers.is_empty() {
+            return Err(PgError::TransferBlocked(blockers.join("; ")));
+        }
+    }
     let result = sqlx::query(
         r#"UPDATE asset SET "ownerId" = $3::uuid, "libraryId" = $4::uuid
            WHERE id = $1::uuid AND "ownerId" = $2::uuid"#,
@@ -345,5 +405,84 @@ mod tests {
         assert_eq!(like_prefix("/external/a_b%"), "/external/a\\_b\\%/%");
         assert_eq!(like_prefix("/external/x/"), "/external/x/%");
         assert_eq!(file_name("/a/b/c.jpg"), "c.jpg");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a disposable PostgreSQL database named ismtest"]
+    async fn disposable_trash_identity_checks_unique_path() {
+        let url = std::env::var("ISM_DISPOSABLE_IMMICH_DATABASE_URL")
+            .expect("set the disposable proof database URL");
+        assert!(url.ends_with("/ismtest"), "use only the proof database");
+        let pool = connect(&url).await.unwrap();
+        let mut conn = pool.acquire().await.unwrap();
+        sqlx::query(r#"CREATE TEMP TABLE asset (id uuid NOT NULL, "originalPath" text NOT NULL)"#)
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        sqlx::query(
+            r#"INSERT INTO asset (id, "originalPath") VALUES
+               ('00000000-0000-0000-0000-000000000001', '/example/a.jpg'),
+               ('00000000-0000-0000-0000-000000000002', '/example/b.jpg')"#,
+        )
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+        let id = "00000000-0000-0000-0000-000000000001";
+        assert!(
+            asset_identity_matches(&mut conn, "/example/a.jpg", id)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !asset_identity_matches(&mut conn, "/example/b.jpg", id)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !asset_identity_matches(&mut conn, "/example/missing.jpg", id)
+                .await
+                .unwrap()
+        );
+        sqlx::query(r#"UPDATE asset SET "originalPath" = '/example/a.jpg' WHERE id = '00000000-0000-0000-0000-000000000002'"#)
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        assert!(
+            !asset_identity_matches(&mut conn, "/example/a.jpg", id)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the disposable Immich v3.4.1 proof database and synthetic fixture"]
+    async fn disposable_immich_path_update_is_guarded() {
+        let url = std::env::var("ISM_DISPOSABLE_IMMICH_DATABASE_URL")
+            .expect("set the disposable proof database URL");
+        assert!(url.ends_with("/ismtest"), "use only the proof database");
+        let pool = connect(&url).await.unwrap();
+        assert_eq!(
+            latest_migration(&pool).await.unwrap().as_deref(),
+            Some(super::super::SUPPORTED_MIGRATION)
+        );
+        let from = "/tmp/ism-proof-photos/a.png";
+        let to = "/tmp/ism-proof-photos/b.png";
+        let mut tx = pool.begin().await.unwrap();
+        let asset = asset_by_path(&mut tx, from).await.unwrap().unwrap();
+        move_asset(&mut tx, &asset.id, from, to).await.unwrap();
+        let moved = asset_by_id(&mut tx, &asset.id).await.unwrap().unwrap();
+        assert_eq!(moved.original_path, to);
+        assert_eq!(moved.owner_id, asset.owner_id);
+        assert_eq!(moved.library_id, asset.library_id);
+        assert!(matches!(
+            move_asset(&mut tx, &asset.id, from, to).await,
+            Err(PgError::Stale(_))
+        ));
+        tx.rollback().await.unwrap();
+        let mut conn = pool.acquire().await.unwrap();
+        assert_eq!(
+            asset_by_path(&mut conn, from).await.unwrap().unwrap().id,
+            asset.id
+        );
     }
 }

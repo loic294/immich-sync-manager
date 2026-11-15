@@ -37,6 +37,8 @@ client.
   "api_version": 1,
   "token_kind": "ila",
   "actions": ["read", "download", "upload", "manage", "trash"],
+  "capabilities": ["trash_if_asset_matches", "cancel_receiving_upload", "cancel_operation_by_key", "instance_scoped_operations",
+                   "find_operation_by_key", "trash_expectations", "partial_submit"],
   "roots": [
     {
       "root_id": "photos",
@@ -44,15 +46,32 @@ client.
       "immich_import_path": "/external/photos",
       "opm_prefix": "/volumes/photos",
       "available": true,
-      "direct_writes": "enabled"
+      "direct_writes": "enabled",
+      "direct_writes_reason": null,
+      "direct_writes_detail": null
     }
   ]
 }
 ```
 
-`direct_writes` is `enabled`, `disabled` (compatibility gate not passed or turned off) or
-`blocked` (maintenance/recovery). When not `enabled`, `manage` operations on that root are
-rejected with `409 direct_writes_unavailable`; downloads keep working.
+Each root also carries `direct_writes_reason` and `direct_writes_detail` (both `null` unless
+blocked). `direct_writes` is one of:
+
+| Value | Meaning |
+|---|---|
+| `enabled` | The root is inside an Immich external library and managed writes can run now. Moves, renames, folder moves, trash and uploads run under the library write barrier (see [immich-compatibility.md](immich-compatibility.md) and the proof in `docker/immich-proof/RESULTS.md`). |
+| `not_linked` | The root is not inside any Immich library. Plain file operations are allowed; there is no Immich side to update. |
+| `blocked` | The root is linked, but Immich-linked writes are refused. Downloads keep working. |
+
+`direct_writes_reason` for a blocked root:
+
+| Reason | Cause | Writes fail with |
+|---|---|---|
+| `not_configured` | Compatibility check not passed, no database access configured, or direct writes turned off | `direct_writes_unavailable` |
+| `unknown_server` | The root points to an Immich server that is no longer registered | `direct_writes_unavailable` |
+| `drift` | Immich's watcher or scheduled scan was turned back on | `maintenance_blocked` |
+| `maintenance` | The library queue could not be paused or resumed | `maintenance_blocked` |
+| `recovery_required` | A change could not be completed or verified; an admin must resolve it | `maintenance_blocked` |
 
 ## Logical locations
 
@@ -104,29 +123,76 @@ unrelated to Immich's checksum. Clients must download **every** file of the mani
 - Streams the bytes; supports `Range: bytes=…` (single range) and returns `ETag: "<revision>"`.
 - When the file changed since the manifest: `412 revision_changed`. Never combine ranges of
   different revisions; restart with a fresh manifest.
-- Response header `x-ism-sha256` is set when the hash is already known.
+- Verify each completed download against the manifest SHA-256 before publishing it. Metadata
+  revisions alone cannot detect every content change, including writes that preserve size and mtime.
 
 ## Uploads that keep the original folder
 
 1. `POST /api/v1/uploads`
    ```json
-   { "target": { "root_id": "photos", "path": "2024/Trip" },
+   { "idempotency_key": "client-generated-unique-string",
+     "target": { "root_id": "photos", "path": "2024/Trip" },
      "provenance": { "source": "ila", "original_location": { "root_id": "photos", "path": "2024/Trip/a.jpg" }, "expected_revision": "123-1700…" },
      "files": [ { "name": "a.jpg", "role": "original", "size": 123, "sha256": "…" },
                 { "name": "a.jpg.xmp", "role": "sidecar", "size": 10, "sha256": "…" } ],
      "on_conflict": "fail" }
    ```
    → `201 { "upload_id": "…", "status": "receiving", "files": [{ "index": 0, "received": 0 }, …] }`
-   (`status`: `receiving` | `publishing` | `committed` | `failed`; `publishing` means the commit was
+   (`status`: `receiving` | `publishing` | `committed` | `failed` | `cancelled`; `publishing` means the commit was
    accepted and the managed operation that moves the files into the library is running).
-   `provenance.expected_revision` is set when replacing an existing file; ISM rejects the commit
-   with a conflict if the server copy changed meanwhile. `on_conflict`: `fail` | `rename` | `replace_if_expected`.
+   Persist the optional `idempotency_key` before sending the request. Retrying the identical request
+   with the same credential and key returns the existing upload and its current status; using that
+   key for a different request returns `idempotency_key_conflict`. A failed, cancelled or expired upload keeps
+   its key, so starting a new upload requires a new key. Without a key, each request creates an upload.
+   With `replace_if_expected`, each existing destination file must include its own
+   `expected_revision` and `expected_sha256` from the manifest. For the original,
+   `provenance.expected_revision` remains supported. Omit both fields only for a file that
+   must not already exist.
+   ISM rejects changed, removed, or unexpectedly existing files rather than replacing them.
+   `on_conflict`: `fail` | `rename` | `replace_if_expected`.
 2. `PUT /api/v1/uploads/{upload_id}/files/{index}` with `Content-Range: bytes start-end/total`
    (or the whole body). Resumable: `GET /api/v1/uploads/{upload_id}` returns `received` per file.
+   Status reads wait for in-flight chunk writes and expiry checks before reporting offsets.
+   If a receiving upload's staging file is missing, status, chunk writes and commit return
+   `upload_staging_missing` instead of recreating it; start a new upload.
 3. `POST /api/v1/uploads/{upload_id}/commit` → `202 { "operation_id": "…", "status": "queued" }`. ISM verifies sizes
    and hashes, then publishes into the mapped external-library folder through a managed
-   operation. The new asset appears in Immich after the post-maintenance library scan;
-   `GET /api/v1/operations/{id}` reports `items[].asset_id` once known, `null` before.
+   operation, never into an Immich upload library. When `provenance.original_location` is set,
+   `target` must be that file's folder (`upload_target_mismatch` otherwise). ISM records its own
+   writes so the watcher does not report them, and schedules a scan of the library about 2 minutes
+   later. The operation result's `items[].result.asset_id` is `null` until Immich imports the
+   file; when that scan finishes, ISM looks the asset up by path (as the library owner) and fills
+   in `asset_id`, announcing the updated item on the operation's event stream
+   (`GET /api/v1/operations/{id}/events`) and in `GET /api/v1/operations/{id}`. Clients no longer
+   need to poll the manifest for the new asset id.
+
+### Sidecar-only uploads
+
+To sync an edited sidecar without re-uploading an unchanged original, name the original that
+stays in place instead of sending it:
+
+```json
+{ "idempotency_key": "…",
+  "target": { "root_id": "photos", "path": "2024/Trip" },
+  "existing_original": { "name": "a.jpg", "expected_revision": "123-1700…" },
+  "files": [ { "name": "a.jpg.xmp", "role": "sidecar", "size": 10, "sha256": "…",
+               "expected_revision": "11-1700…", "expected_sha256": "…" } ],
+  "on_conflict": "replace_if_expected" }
+```
+
+- `files` holds only `sidecar`/`companion` roles, each a sidecar or companion of the named
+  original (`not_a_companion` otherwise); `on_conflict` must be `replace_if_expected`.
+- The original must still have `expected_revision`, else the operation fails with
+  `revision_changed` and nothing changes.
+- Each sidecar being replaced needs its `expected_revision`/`expected_sha256`; omit them for a
+  sidecar that must not exist yet (an existing file then fails with `revision_changed`).
+- Only the replaced sidecars go to the ISM trash; the original is never copied.
+- ISM schedules a library scan so Immich re-reads the sidecar; `asset_id` is filled as above.
+
+`DELETE /api/v1/uploads/{upload_id}` cancels a receiving upload and removes its staged files.
+It is safe to retry after an interrupted request or a cleanup error. Once publishing has started,
+cancellation is refused; the operation and its recovery state must be handled separately. Check
+the `cancel_receiving_upload` capability before using this endpoint.
 
 ## Managed operations (moves, renames, folders, trash)
 
@@ -144,20 +210,44 @@ unrelated to Immich's checksum. Clients must download **every** file of the mani
     { "kind": "create_folder", "target": { "root_id": "photos", "path": "2024/New" } },
     { "kind": "move_folder", "source": { "root_id": "photos", "path": "2024/Old" },
       "target": { "root_id": "archive", "path": "2024/Old" } },
-    { "kind": "trash", "source": { "root_id": "photos", "path": "2024/c.jpg" } },
-    { "kind": "trash_folder", "source": { "root_id": "photos", "path": "2023/Empty" } },
+    { "kind": "trash_if_asset_matches", "source": { "root_id": "photos", "path": "2024/c.jpg" },
+      "expected_asset_id": "immich-asset-id", "expected_revision": "…" },
+    { "kind": "trash", "source": { "root_id": "photos", "path": "2024/d.jpg" }, "expected_revision": "…" },
+    { "kind": "trash_folder", "source": { "root_id": "photos", "path": "2023/Old" },
+      "expected_entries": [ { "path": "e.jpg", "revision": "…" }, { "path": "sub/f.jpg", "revision": "…" } ] },
     { "kind": "restore", "trash_id": "…" },
     { "kind": "purge", "trash_id": "…" }
   ],
-  "allow_owner_transfer": false
+  "allow_owner_transfer": false,
+  "allow_partial": false
 }
 ```
 
 - Moving or renaming a file always moves its whole sidecar/companion group; clients send only the
   original. Targets name the new path of the original; companions follow the same stem.
+- ILA file trash actions must use `trash_if_asset_matches` with `expected_asset_id`; ISM verifies
+  that exactly that asset occupies the path when planning and again before execution.
+  Clients must require the `trash_if_asset_matches` capability; older servers reject this distinct
+  action rather than ignoring an unknown field. Legacy retries with a previously submitted request lacking
+  the ID conflict rather than silently changing the existing request. This check does not exclude
+  concurrent external writers; access to managed roots must still be coordinated.
+- `trash` and `trash_if_asset_matches` accept an optional `expected_revision` (from a listing or manifest). If the file changed,
+  the item fails with `revision_changed`.
+- `trash_folder` accepts an optional `expected_entries`: every file below the folder, as a path
+  relative to it (`/` separators) and its revision. If any file was added, changed or removed, the
+  item fails with `revision_changed` and nothing is touched. Without it, the folder is trashed as
+  it is. Both checks run when planning and again when the item executes. Servers with the
+  `trash_expectations` capability support them.
+- By default, a request with any blocker is refused as a whole (`409` with the first blocker's
+  code) and nothing is queued. With `"allow_partial": true` (capability `partial_submit`), the
+  operation is queued anyway: blocked items are recorded as `failed` with their blocker's code and
+  are never run, and the other items run as usual. The operation then ends `partial` (or `failed`
+  if nothing could run).
 - `allow_owner_transfer` must be `true` (and the token must hold `transfer_owner`) when a move
   crosses into a library owned by another Immich user.
-- The same `idempotency_key` returns the existing operation instead of running twice.
+- Retrying the identical request with the same credential and `idempotency_key` returns the existing
+  operation instead of running twice. Reusing the key for a different request returns
+  `idempotency_key_conflict`.
 
 Preview response:
 
@@ -183,12 +273,41 @@ Submit → `202 { "operation_id": "op_…", "status": "queued" }`.
 
 `POST /api/v1/operations/{id}/cancel` stops before the next item; started items finish safely.
 
+`GET /api/v1/operations?idempotency_key=…` (capability `find_operation_by_key`) returns the
+operation this credential submitted under that key, with the same JSON as above. It has no side
+effects: unlike `cancel-by-key`, it never reserves the key. Without an operation, it returns
+`404` with code `not_found`, or `cancelled_before_submission` if the key was cancelled first. The
+instance-scoped form is `GET /api/v1/instances/{instance_id}/operations?idempotency_key=…`.
+
+For uncertain submissions, clients with `cancel_operation_by_key` may send
+`POST /api/v1/operations/cancel-by-key` with
+`{"idempotency_key":"…","expected_request":{…}}`, where `expected_request` is the complete
+original operation request. If no operation has been inserted, the server durably reserves the
+key and replies `{"status":"cancelled_before_submission"}`; a later submission under that
+credential and key fails with `operation_key_cancelled`. If an operation exists, a mismatched
+request is refused, otherwise the response is `{"status":"operation","operation":{…}}`.
+Only a still-queued operation is cancelled by this endpoint. For running or terminal operations,
+the response reports its actual state; cancellation is not implied. Even a `cancelled` batch may
+have completed earlier items, so inspect every item before treating it as having made no changes.
+Key reservations are scoped to the credential and do not expire.
+
+Clients that require server identity fencing must check `instance_scoped_operations` and use
+`/api/v1/instances/{instance_id}/operations` for submission,
+`/api/v1/instances/{instance_id}/operations/{id}` for status, and
+`/api/v1/instances/{instance_id}/operations/cancel-by-key` for cancellation. A different
+instance rejects these requests with `instance_mismatch`. Persist the instance identity and
+credential association before submission; a different or unverified credential cannot prove that
+an earlier submission was cancelled.
+
 ### Progress stream
 
 `GET /api/v1/operations/{id}/events` is Server-Sent Events. Each event has `id: <seq>` and
 `event: progress|item|finished`. `progress` and `finished` carry the full operation (same JSON as
 `GET /operations/{id}`); `item` carries one `items[]` entry (it has `index`, no `operation_id`). Reconnect with `Last-Event-ID`; when the cursor is too old the server sends
-`event: resync` and the client must refetch `GET /operations/{id}`.
+`event: resync` and the client must refetch `GET /operations/{id}`. The stream ends after
+`finished`, except while a published upload still waits for its `asset_id`: it then stays open
+until the `item` carrying the asset id is sent (at most about 30 minutes after the scan delay;
+afterwards read `GET /operations/{id}`).
 
 `GET /api/v1/events` (SSE) streams `operation_committed` events for all operations visible to the
 token so OPM can refresh its index:
@@ -213,7 +332,8 @@ automatically.
 | `invalid_location` | Path escapes the root, has bad segments, or root unknown |
 | `root_unavailable` | Volume not mounted/unreadable (never treated as empty) |
 | `revision_changed` | Source changed since the client last saw it |
+| `asset_identity_required`, `asset_identity_changed`, `asset_identity_unverified` | The asset at a trash location is missing, changed, or cannot be verified |
 | `destination_exists` | Target already exists |
 | `direct_writes_unavailable` | Immich compatibility gate not passed or disabled for that root |
 | `owner_transfer_required` / `owner_transfer_blocked` | Cross-owner move needs approval / is unsafe |
-| `maintenance_blocked` | Immich watcher/queues could not be quiesced; nothing was changed |
+| `maintenance_blocked` | Immich's library queue could not be paused and confirmed idle, or its watcher/scheduled scan was turned back on; nothing was changed |

@@ -56,9 +56,29 @@ impl ClientAction {
 #[serde(rename_all = "snake_case")]
 #[ts(export)]
 pub enum DirectWrites {
+    /// Linked to an Immich library and managed writes can run now.
     Enabled,
-    Disabled,
+    /// Not inside any Immich library: plain file operations, no Immich side.
+    NotLinked,
+    /// Linked, but Immich-linked writes are refused; see `direct_writes_reason`.
     Blocked,
+}
+
+/// Why writes to an Immich-linked root are refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum DirectWritesReason {
+    /// Compatibility check not passed, no database configured, or direct writes turned off.
+    NotConfigured,
+    /// The root points to an Immich server that is no longer registered.
+    UnknownServer,
+    /// Immich settings drifted from what ISM requires (watcher or scheduled scan re-enabled).
+    Drift,
+    /// The write barrier could not pause or resume Immich's library queue.
+    Maintenance,
+    /// A change could not be completed or verified; an admin must resolve it.
+    RecoveryRequired,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -70,6 +90,10 @@ pub struct ClientRoot {
     pub opm_prefix: Option<String>,
     pub available: bool,
     pub direct_writes: DirectWrites,
+    /// Set when `direct_writes` is `blocked`.
+    pub direct_writes_reason: Option<DirectWritesReason>,
+    /// Human-readable detail for a blocked root.
+    pub direct_writes_detail: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -82,6 +106,7 @@ pub struct ClientInfo {
     pub token_kind: String,
     pub actions: Vec<ClientAction>,
     pub roots: Vec<ClientRoot>,
+    pub capabilities: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -168,15 +193,37 @@ pub struct UploadFileSpec {
     pub role: FileRole,
     pub size: u64,
     pub sha256: String,
+    #[serde(default)]
+    pub expected_revision: Option<String>,
+    #[serde(default)]
+    pub expected_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct CreateUpload {
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    pub idempotency_key: Option<String>,
     pub target: Location,
     pub provenance: Option<UploadProvenance>,
     pub files: Vec<UploadFileSpec>,
     pub on_conflict: OnConflict,
+    /// Sidecar-only uploads: the original already in the target folder that the uploaded
+    /// sidecars/companions belong to. `files` must then hold no `original`.
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    pub existing_original: Option<ExistingOriginal>,
+}
+
+/// An original that stays in place while its sidecars are replaced.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct ExistingOriginal {
+    pub name: String,
+    /// Revision of the original as listed in its manifest; the upload fails with
+    /// `revision_changed` if the file changed since.
+    pub expected_revision: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -192,6 +239,15 @@ pub struct UploadState {
     pub upload_id: String,
     pub status: String,
     pub files: Vec<UploadFileState>,
+}
+
+/// One file expected inside a folder, as returned by the browse API.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct ExpectedEntry {
+    /// Path relative to the folder, with `/` separators.
+    pub path: String,
+    pub revision: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -219,9 +275,23 @@ pub enum OperationAction {
     },
     Trash {
         source: Location,
+        /// When set, the trash fails with `revision_changed` if the file changed.
+        #[serde(default)]
+        expected_revision: Option<String>,
+    },
+    TrashIfAssetMatches {
+        source: Location,
+        expected_asset_id: String,
+        /// When set, the trash also fails with `revision_changed` if the file changed.
+        #[serde(default)]
+        expected_revision: Option<String>,
     },
     TrashFolder {
         source: Location,
+        /// When set, the folder's files (relative to it) must be exactly these with these
+        /// revisions, or the trash fails with `revision_changed` and touches nothing.
+        #[serde(default)]
+        expected_entries: Option<Vec<ExpectedEntry>>,
     },
     Restore {
         trash_id: String,
@@ -245,6 +315,7 @@ impl OperationAction {
             Self::CreateFolder { .. } => "create_folder",
             Self::MoveFolder { .. } => "move_folder",
             Self::Trash { .. } => "trash",
+            Self::TrashIfAssetMatches { .. } => "trash_if_asset_matches",
             Self::TrashFolder { .. } => "trash_folder",
             Self::Restore { .. } => "restore",
             Self::Purge { .. } => "purge",
@@ -262,6 +333,25 @@ pub struct OperationRequest {
     pub actions: Vec<OperationAction>,
     #[serde(default)]
     pub allow_owner_transfer: bool,
+    /// Runs the actions that can run and reports blocked ones as failed items instead of
+    /// rejecting the whole request.
+    #[serde(default)]
+    pub allow_partial: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct CancelOperationByKey {
+    pub idempotency_key: String,
+    pub expected_request: OperationRequest,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(tag = "status", rename_all = "snake_case")]
+#[ts(export)]
+pub enum CancelOperationByKeyResult {
+    CancelledBeforeSubmission,
+    Operation { operation: Operation },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]

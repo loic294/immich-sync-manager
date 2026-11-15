@@ -5,12 +5,13 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
-use std::path::PathBuf;
+use std::io;
+use std::path::{Path, PathBuf};
 
-use ism_core::dto::DirectWrites;
+use ism_core::dto::DirectWritesReason;
 use ism_core::dto::{
-    Change, ClientAction, CreateUpload, FileRole, Issue, Location, OnConflict, OperationAction,
-    PlannedAsset, PlannedFile, PreviewItem,
+    Change, ClientAction, CreateUpload, ExpectedEntry, FileRole, Issue, Location, OnConflict,
+    OperationAction, PlannedAsset, PlannedFile, PreviewItem,
 };
 use ism_core::paths::{RelPath, split_ext};
 use ism_core::sidecar::{CompanionRole, companions_of, is_companion_name, renamed_companion};
@@ -69,6 +70,15 @@ pub struct ApiStep {
 #[derive(Debug, Clone)]
 pub enum Step {
     Mkdir(PathBuf),
+    CheckRevision {
+        path: PathBuf,
+        expected: Option<String>,
+        expected_sha256: Option<String>,
+    },
+    CheckTree {
+        path: PathBuf,
+        expected: Vec<TrashEntry>,
+    },
     Fs(FsMove),
     Api(ApiStep),
     /// Irreversible; always last.
@@ -85,6 +95,15 @@ pub struct TrashRecord {
     pub size: u64,
     pub asset_ids: Vec<String>,
     pub server_id: Option<String>,
+    /// File-group or recursive folder contents, absent for legacy trash.
+    pub file_inventory: Option<Vec<TrashEntry>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TrashEntry {
+    name: String,
+    /// None denotes a directory, including empty directories.
+    sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -197,10 +216,12 @@ impl<'a> Ctx<'a> {
                 roots.push(source.root_id.clone());
                 roots.push(target.root_id.clone());
             }
-            OperationAction::Trash { source } | OperationAction::TrashFolder { source } => {
+            OperationAction::Trash { source, .. }
+            | OperationAction::TrashIfAssetMatches { source, .. }
+            | OperationAction::TrashFolder { source, .. } => {
                 roots.push(source.root_id.clone());
             }
-            OperationAction::CreateFolder { .. } => {}
+            OperationAction::CreateFolder { target } => roots.push(target.root_id.clone()),
             OperationAction::Restore { trash_id } | OperationAction::Purge { trash_id } => {
                 if let Some(root) =
                     sqlx::query_scalar::<_, String>("SELECT root_id FROM trash WHERE id = ?")
@@ -256,9 +277,9 @@ fn immich_side<'c>(ctx: &'c Ctx<'_>, root: &Root, plan: &mut Plan) -> Option<&'c
         );
         return None;
     };
-    match registry::direct_writes(server) {
-        DirectWrites::Enabled => Some(server),
-        DirectWrites::Disabled => {
+    match registry::write_block(server) {
+        None => Some(server),
+        Some((DirectWritesReason::NotConfigured, _)) => {
             plan.block(
                 "direct_writes_unavailable",
                 format!(
@@ -268,15 +289,8 @@ fn immich_side<'c>(ctx: &'c Ctx<'_>, root: &Root, plan: &mut Plan) -> Option<&'c
             );
             None
         }
-        DirectWrites::Blocked => {
-            plan.block(
-                "maintenance_blocked",
-                server
-                    .maintenance
-                    .message
-                    .clone()
-                    .unwrap_or_else(|| "Immich maintenance needs attention".into()),
-            );
+        Some((_, detail)) => {
+            plan.block("maintenance_blocked", detail);
             None
         }
     }
@@ -336,8 +350,36 @@ pub async fn plan(ctx: &Ctx<'_>, action: &OperationAction) -> AppResult<Plan> {
         OperationAction::MoveFolder { source, target } => {
             plan_move_folder(ctx, &mut plan, source, target).await
         }
-        OperationAction::Trash { source } => plan_trash(ctx, &mut plan, source, false).await,
-        OperationAction::TrashFolder { source } => plan_trash(ctx, &mut plan, source, true).await,
+        OperationAction::Trash {
+            source,
+            expected_revision,
+        } => {
+            let expected = TrashExpect::Revision(expected_revision.as_deref());
+            plan_trash(ctx, &mut plan, source, false, None, expected).await
+        }
+        OperationAction::TrashIfAssetMatches {
+            source,
+            expected_asset_id,
+            expected_revision,
+        } => {
+            let expected = TrashExpect::Revision(expected_revision.as_deref());
+            plan_trash(
+                ctx,
+                &mut plan,
+                source,
+                false,
+                Some(expected_asset_id),
+                expected,
+            )
+            .await
+        }
+        OperationAction::TrashFolder {
+            source,
+            expected_entries,
+        } => {
+            let expected = TrashExpect::Entries(expected_entries.as_deref());
+            plan_trash(ctx, &mut plan, source, true, None, expected).await
+        }
         OperationAction::Restore { trash_id } => plan_restore(ctx, &mut plan, trash_id).await,
         OperationAction::Purge { trash_id } => plan_purge(ctx, &mut plan, trash_id).await,
         OperationAction::PublishUpload { upload_id } => {
@@ -626,7 +668,10 @@ async fn owner_change(
 }
 
 fn plan_create_folder(ctx: &Ctx<'_>, plan: &mut Plan, target: &Location) -> AppResult<()> {
-    let (_, rel, abs) = ctx.locate(target, ClientAction::Manage)?;
+    let (root, rel, abs) = ctx.locate(target, ClientAction::Manage)?;
+    if root.server_id.is_some() {
+        immich_side(ctx, root, plan);
+    }
     let parent = abs.parent().map(ToOwned::to_owned).unwrap_or_default();
     let name = rel.name().unwrap_or_default();
     if abs.exists() || (parent.is_dir() && collides(&parent, name, &HashSet::new())) {
@@ -770,13 +815,172 @@ fn by_owner(assets: &[AssetRow], want_trashed: bool) -> BTreeMap<String, Vec<Str
     out
 }
 
+async fn trash_fingerprint(path: PathBuf) -> AppResult<(String, String)> {
+    tokio::task::spawn_blocking(move || files::replacement_fingerprint(&path))
+        .await
+        .map_err(AppError::internal)?
+        .map_err(|e| {
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidInput
+            ) {
+                AppError::conflict("revision_changed", "a trash file could not be verified")
+            } else {
+                e.into()
+            }
+        })?
+        .ok_or_else(|| AppError::conflict("revision_changed", "a trash file disappeared"))
+}
+
+pub(super) fn folder_inventory(path: &Path) -> io::Result<Vec<TrashEntry>> {
+    let mut inventory = Vec::new();
+    for entry in walkdir::WalkDir::new(path).follow_links(false) {
+        let entry = entry.map_err(io::Error::other)?;
+        let name = entry
+            .path()
+            .strip_prefix(path)
+            .map_err(io::Error::other)?
+            .components()
+            .map(|component| {
+                component
+                    .as_os_str()
+                    .to_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "non-UTF-8 name"))
+            })
+            .collect::<io::Result<Vec<_>>>()?
+            .join("/");
+        let kind = entry.file_type();
+        let sha256 = if kind.is_dir() {
+            None
+        } else if kind.is_file() {
+            Some(
+                files::replacement_fingerprint(entry.path())?
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "file disappeared"))?
+                    .1,
+            )
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "folder contains a symlink or special file",
+            ));
+        };
+        inventory.push(TrashEntry { name, sha256 });
+    }
+    if inventory
+        .first()
+        .is_none_or(|entry| !entry.name.is_empty() || entry.sha256.is_some())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a directory",
+        ));
+    }
+    inventory.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(inventory)
+}
+
+async fn load_folder_inventory(path: PathBuf) -> AppResult<Vec<TrashEntry>> {
+    tokio::task::spawn_blocking(move || folder_inventory(&path))
+        .await
+        .map_err(AppError::internal)?
+        .map_err(|error| {
+            if matches!(
+                error.kind(),
+                io::ErrorKind::InvalidInput | io::ErrorKind::NotFound
+            ) {
+                AppError::conflict(
+                    "trash_inventory_unverifiable",
+                    "folder contents cannot be verified; check for symlinks, special files, or concurrent changes",
+                )
+            } else {
+                error.into()
+            }
+        })
+}
+
+/// What the client last saw of a file or folder it asks to trash.
+enum TrashExpect<'a> {
+    Revision(Option<&'a str>),
+    Entries(Option<&'a [ExpectedEntry]>),
+}
+
+/// Revisions of every file below `path`, keyed by `/`-separated path relative to it.
+pub(super) fn folder_revisions(path: &Path) -> io::Result<BTreeMap<String, String>> {
+    let mut out = BTreeMap::new();
+    for entry in walkdir::WalkDir::new(path).follow_links(false) {
+        let entry = entry.map_err(io::Error::other)?;
+        let kind = entry.file_type();
+        if kind.is_dir() {
+            continue;
+        }
+        if !kind.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "folder holds a symlink or special file",
+            ));
+        }
+        let rel = entry
+            .path()
+            .strip_prefix(path)
+            .map_err(io::Error::other)?
+            .components()
+            .map(|c| {
+                c.as_os_str()
+                    .to_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "non-UTF-8 name"))
+            })
+            .collect::<io::Result<Vec<_>>>()?
+            .join("/");
+        out.insert(
+            rel,
+            files::revision(&entry.metadata().map_err(io::Error::other)?),
+        );
+    }
+    Ok(out)
+}
+
+/// Describes how a folder differs from what the client expected, or `None` if it matches.
+fn entries_differ(actual: &BTreeMap<String, String>, expected: &[ExpectedEntry]) -> Option<String> {
+    let expected: BTreeMap<&str, &str> = expected
+        .iter()
+        .map(|e| (e.path.as_str(), e.revision.as_str()))
+        .collect();
+    let added = actual
+        .keys()
+        .filter(|k| !expected.contains_key(k.as_str()))
+        .count();
+    let removed = expected
+        .keys()
+        .filter(|k| !actual.contains_key(**k))
+        .count();
+    let changed = actual
+        .iter()
+        .filter(|(k, v)| expected.get(k.as_str()).is_some_and(|e| e != v))
+        .count();
+    (added + removed + changed > 0)
+        .then(|| format!("the folder changed: {added} added, {changed} changed, {removed} removed"))
+}
+
 async fn plan_trash(
     ctx: &Ctx<'_>,
     plan: &mut Plan,
     source: &Location,
     folder: bool,
+    expected_asset_id: Option<&str>,
+    expect: TrashExpect<'_>,
 ) -> AppResult<()> {
     let (root, rel, abs) = ctx.locate(source, ClientAction::Trash)?;
+    if !folder
+        && matches!(ctx.principal, Principal::Client(grant) if grant.kind == "ila")
+        && expected_asset_id.is_none()
+    {
+        return Err(AppError::conflict(
+            "asset_identity_required",
+            "ILA trash requests must include the expected Immich asset ID",
+        ));
+    }
     let meta = fs::metadata(&abs)
         .map_err(|_| AppError::not_found(format!("{} does not exist", source.path)))?;
     if meta.is_dir() != folder {
@@ -791,7 +995,6 @@ async fn plan_trash(
     }
     let trash_id = crate::crypto::new_id("trash");
     let quarantine = |r: &RelPath| format!("{TRASH_DIR}/{trash_id}/{r}");
-    let base = root.base();
     let mut moved: Vec<(RelPath, FileRole)> = vec![(rel.clone(), FileRole::Original)];
     if !folder {
         let name = rel.name().unwrap_or_default();
@@ -817,8 +1020,54 @@ async fn plan_trash(
         }
     }
     let mut size = 0;
+    let mut inventory = Vec::new();
     for (r, role) in &moved {
         let from = root.abs(r)?;
+        let to_rel = RelPath::parse(&quarantine(r))
+            .map_err(|e| AppError::invalid_location(e.to_string()))?;
+        let to = root.abs(&to_rel)?;
+        if folder {
+            inventory = load_folder_inventory(from.clone()).await?;
+            if let TrashExpect::Entries(Some(expected)) = &expect {
+                let path = from.clone();
+                let actual = tokio::task::spawn_blocking(move || folder_revisions(&path))
+                    .await
+                    .map_err(AppError::internal)?
+                    .map_err(|_| {
+                        AppError::conflict("revision_changed", "the folder could not be verified")
+                    })?;
+                if let Some(message) = entries_differ(&actual, expected) {
+                    plan.block("revision_changed", message);
+                }
+            }
+            plan.steps.push(Step::CheckTree {
+                path: from.clone(),
+                expected: inventory.clone(),
+            });
+        } else {
+            let (revision, sha256) = trash_fingerprint(from.clone()).await?;
+            if let TrashExpect::Revision(Some(expected)) = &expect
+                && *r == rel
+                && revision != *expected
+            {
+                plan.block(
+                    "revision_changed",
+                    format!("{} changed since it was listed", source.path),
+                );
+            }
+            inventory.push(TrashEntry {
+                name: r
+                    .name()
+                    .ok_or_else(|| AppError::invalid_location("trash file has no name"))?
+                    .to_owned(),
+                sha256: Some(sha256.clone()),
+            });
+            plan.steps.push(Step::CheckRevision {
+                path: from.clone(),
+                expected: Some(revision),
+                expected_sha256: Some(sha256),
+            });
+        }
         size += files::tree_size(&from);
         plan.files.push(PlannedFile {
             from: Some(root.location(r)),
@@ -828,11 +1077,18 @@ async fn plan_trash(
         });
         plan.steps.push(Step::Fs(FsMove {
             from,
-            to: base.join(quarantine(r)),
+            to: to.clone(),
             copy: false,
         }));
+        if folder {
+            plan.steps.push(Step::CheckTree {
+                path: to,
+                expected: inventory.clone(),
+            });
+        }
     }
     let mut asset_ids = Vec::new();
+    let mut identity_checked = false;
     if root.server_id.is_some()
         && let Some(server) = immich_side(ctx, root, plan)
         && let Some(immich_path) = root.immich_path(&rel)
@@ -847,6 +1103,17 @@ async fn plan_trash(
                 .collect()
         };
         asset_ids = assets.iter().map(|a| a.id.clone()).collect();
+        if let Some(expected) = expected_asset_id {
+            let matches = pg::asset_identity_matches(&mut conn, &immich_path, expected).await?
+                && asset_ids.first().is_some_and(|id| id == expected);
+            if !matches {
+                return Err(AppError::conflict(
+                    "asset_identity_changed",
+                    "the expected Immich asset is no longer uniquely at this location",
+                ));
+            }
+            identity_checked = true;
+        }
         plan.asset_id = (!folder).then(|| asset_ids.first().cloned()).flatten();
         // Immich trash first: if moving the files then fails, the assets are restored.
         let mut api_steps: Vec<Step> = by_owner(&assets, false)
@@ -871,6 +1138,12 @@ async fn plan_trash(
         api_steps.append(&mut plan.steps);
         plan.steps = api_steps;
     }
+    if expected_asset_id.is_some() && !identity_checked {
+        plan.block(
+            "asset_identity_unverified",
+            "the expected Immich asset at this location could not be verified",
+        );
+    }
     plan.trash_new = Some(TrashRecord {
         id: trash_id.clone(),
         root_id: root.mapping.root_id.clone(),
@@ -882,6 +1155,7 @@ async fn plan_trash(
         size,
         asset_ids,
         server_id: root.server_id.clone(),
+        file_inventory: Some(inventory),
     });
     plan.changes.push(Change::Trashed {
         location: source.clone(),
@@ -896,17 +1170,30 @@ struct TrashRow {
     quarantine_rel: String,
     asset_ids: Vec<String>,
     server_id: Option<String>,
+    is_folder: bool,
+    file_inventory: Option<Vec<TrashEntry>>,
 }
 
 #[allow(clippy::type_complexity)]
 async fn trash_row(ctx: &Ctx<'_>, trash_id: &str) -> AppResult<TrashRow> {
-    let row: Option<(String, String, String, String, Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
-        "SELECT root_id, path, quarantine_rel, asset_ids_json, server_id, restored_at, purged_at FROM trash WHERE id = ?",
+    let row: Option<(String, String, String, String, Option<String>, Option<String>, Option<String>, i64, Option<String>)> = sqlx::query_as(
+        "SELECT root_id, path, quarantine_rel, asset_ids_json, server_id, restored_at, purged_at, is_folder, file_inventory_json FROM trash WHERE id = ?",
     )
     .bind(trash_id)
     .fetch_optional(&ctx.state.db)
     .await?;
-    let Some((root_id, path, quarantine_rel, ids, server_id, restored, purged)) = row else {
+    let Some((
+        root_id,
+        path,
+        quarantine_rel,
+        ids,
+        server_id,
+        restored,
+        purged,
+        is_folder,
+        inventory,
+    )) = row
+    else {
         return Err(AppError::not_found("trash item not found"));
     };
     if restored.is_some() || purged.is_some() {
@@ -915,12 +1202,22 @@ async fn trash_row(ctx: &Ctx<'_>, trash_id: &str) -> AppResult<TrashRow> {
             "this trash item was already restored or purged",
         ));
     }
+    if quarantine_rel != format!("{TRASH_DIR}/{trash_id}") {
+        return Err(AppError::conflict(
+            "trash_corrupt",
+            "the trash item's quarantine path is invalid",
+        ));
+    }
     Ok(TrashRow {
         root_id,
         path,
         quarantine_rel,
-        asset_ids: crate::db::json_vec(&ids),
+        asset_ids: serde_json::from_str(&ids)?,
         server_id,
+        is_folder: is_folder != 0,
+        file_inventory: inventory
+            .map(|json| serde_json::from_str(&json))
+            .transpose()?,
     })
 }
 
@@ -960,23 +1257,114 @@ async fn plan_restore(ctx: &Ctx<'_>, plan: &mut Plan, trash_id: &str) -> AppResu
         path: row.path.clone(),
     };
     let (root, rel, target) = ctx.locate(&location, ClientAction::Trash)?;
-    let quarantine = root.base().join(&row.quarantine_rel);
+    let quarantine_rel = RelPath::parse(&row.quarantine_rel)
+        .map_err(|e| AppError::invalid_location(e.to_string()))?;
+    let quarantine = root.abs(&quarantine_rel)?;
     if !quarantine.exists() {
         plan.block("trash_missing", "the quarantined files are gone");
         return Ok(());
     }
     // The quarantine keeps the root-relative layout: `<quarantine>/<parent>/<names>`.
     let parent = rel.parent().unwrap_or_else(RelPath::root);
-    let held = quarantine.join(parent.as_str());
+    let held_rel = if parent.is_root() {
+        quarantine_rel
+    } else {
+        RelPath::parse(&format!("{}/{}", row.quarantine_rel, parent))
+            .map_err(|e| AppError::invalid_location(e.to_string()))?
+    };
+    let held = root.abs(&held_rel)?;
     let dest_dir = target.parent().map(ToOwned::to_owned).unwrap_or_default();
-    let mut names: Vec<String> = fs::read_dir(&held)
-        .map(|e| {
-            e.filter_map(Result::ok)
-                .filter_map(|e| e.file_name().into_string().ok())
-                .collect()
-        })
-        .unwrap_or_default();
+    let entries = match fs::read_dir(&held) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            plan.block("trash_missing", "the quarantined files are gone");
+            return Ok(());
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let mut names = Vec::new();
+    for entry in entries {
+        let name = entry?
+            .file_name()
+            .into_string()
+            .map_err(|_| AppError::internal("trash contains a non-UTF-8 name"))?;
+        names.push(name);
+    }
     names.sort();
+    if rel
+        .name()
+        .is_none_or(|name| !names.iter().any(|n| n == name))
+    {
+        plan.block("trash_missing", "the quarantined original is gone");
+        return Ok(());
+    }
+    if row.is_folder {
+        let Some(expected) = &row.file_inventory else {
+            plan.block(
+                "trash_inventory_missing",
+                "this folder predates recursive inventories; its contents cannot be verified",
+            );
+            return Ok(());
+        };
+        if names.len() != 1 {
+            plan.block(
+                "trash_inventory_changed",
+                "the quarantine has unexpected entries",
+            );
+            return Ok(());
+        }
+        let folder = held.join(&names[0]);
+        let actual = load_folder_inventory(folder.clone()).await?;
+        if &actual != expected {
+            plan.block(
+                "trash_inventory_changed",
+                "the quarantined folder contents changed",
+            );
+            return Ok(());
+        }
+        plan.steps.push(Step::CheckTree {
+            path: folder,
+            expected: expected.clone(),
+        });
+    } else {
+        let Some(expected) = &row.file_inventory else {
+            plan.block(
+                "trash_inventory_missing",
+                "this trash item predates file inventories; its companions cannot be verified",
+            );
+            return Ok(());
+        };
+        let mut expected_names: Vec<&str> =
+            expected.iter().map(|file| file.name.as_str()).collect();
+        expected_names.sort();
+        if names.iter().map(String::as_str).collect::<Vec<_>>() != expected_names
+            || names
+                .iter()
+                .any(|name| !fs::symlink_metadata(held.join(name)).is_ok_and(|meta| meta.is_file()))
+        {
+            plan.block(
+                "trash_inventory_changed",
+                "the quarantined file group is incomplete or has unexpected entries",
+            );
+            return Ok(());
+        }
+        for file in expected {
+            let path = held.join(&file.name);
+            let (revision, sha256) = trash_fingerprint(path.clone()).await?;
+            if file.sha256.as_deref() != Some(sha256.as_str()) {
+                plan.block(
+                    "trash_inventory_changed",
+                    "the quarantined file group contents changed",
+                );
+                return Ok(());
+            }
+            plan.steps.push(Step::CheckRevision {
+                path,
+                expected: Some(revision),
+                expected_sha256: Some(sha256),
+            });
+        }
+    }
     for name in names {
         let back = parent
             .join(&name)
@@ -1001,6 +1389,14 @@ async fn plan_restore(ctx: &Ctx<'_>, plan: &mut Plan, trash_id: &str) -> AppResu
             to: dest_dir.join(&name),
             copy: false,
         }));
+        if row.is_folder
+            && let Some(expected) = &row.file_inventory
+        {
+            plan.steps.push(Step::CheckTree {
+                path: dest_dir.join(&name),
+                expected: expected.clone(),
+            });
+        }
     }
     let (server_id, assets) = trash_assets(ctx, plan, root, &row).await?;
     if let Some(server_id) = server_id {
@@ -1026,7 +1422,9 @@ async fn plan_purge(ctx: &Ctx<'_>, plan: &mut Plan, trash_id: &str) -> AppResult
     ctx.principal.require(ClientAction::Purge, &row.root_id)?;
     let root = ctx.root(&row.root_id)?;
     root.ensure_available()?;
-    let quarantine = root.base().join(&row.quarantine_rel);
+    let quarantine_rel = RelPath::parse(&row.quarantine_rel)
+        .map_err(|e| AppError::invalid_location(e.to_string()))?;
+    let quarantine = root.abs(&quarantine_rel)?;
     let (server_id, assets) = trash_assets(ctx, plan, root, &row).await?;
     if let Some(server_id) = server_id {
         for (owner, ids) in by_owner(&assets, true) {
@@ -1062,11 +1460,10 @@ async fn plan_purge(ctx: &Ctx<'_>, plan: &mut Plan, trash_id: &str) -> AppResult
     Ok(())
 }
 
-pub fn staging_dir(root: &Root, upload_id: &str) -> PathBuf {
-    root.base()
-        .join(STAGING_DIR)
-        .join("uploads")
-        .join(upload_id)
+pub fn staging_dir(root: &Root, upload_id: &str) -> AppResult<PathBuf> {
+    let rel = RelPath::parse(&format!("{STAGING_DIR}/uploads/{upload_id}"))
+        .map_err(|error| AppError::invalid_location(error.to_string()))?;
+    root.abs(&rel)
 }
 
 /// Picks `stem (n).ext` names for the original so the whole group lands without collisions.
@@ -1088,6 +1485,53 @@ fn free_name(dir: &std::path::Path, names: &[String], original: &str) -> String 
     original.to_owned()
 }
 
+/// A sidecar-only upload: the original must still be the listed revision, and every uploaded
+/// file must be one of its sidecars or companions.
+fn check_existing_original(
+    ctx: &Ctx<'_>,
+    plan: &mut Plan,
+    dir: &std::path::Path,
+    existing: &ism_core::dto::ExistingOriginal,
+    names: &[String],
+) -> AppResult<()> {
+    let path = dir.join(&existing.name);
+    match files::replacement_fingerprint(&path) {
+        Ok(Some((revision, sha256))) if revision == existing.expected_revision => {
+            plan.steps.push(Step::CheckRevision {
+                path,
+                expected: Some(revision),
+                expected_sha256: Some(sha256),
+            });
+        }
+        Ok(Some(_)) => plan.block(
+            "revision_changed",
+            format!("{} changed since it was listed", existing.name),
+        ),
+        Ok(None) => plan.block(
+            "revision_changed",
+            format!("{} is no longer in the target folder", existing.name),
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => plan.block(
+            "revision_changed",
+            format!("{} could not be verified", existing.name),
+        ),
+        Err(e) => return Err(e.into()),
+    }
+    let belongs: HashSet<String> = companions_of(&existing.name, names, &ctx.companions)
+        .into_iter()
+        .map(|c| c.name)
+        .collect();
+    for name in names {
+        if !belongs.contains(name) {
+            plan.block(
+                "not_a_companion",
+                format!("{name} is not a sidecar or companion of {}", existing.name),
+            );
+        }
+    }
+    Ok(())
+}
+
 async fn plan_publish(ctx: &Ctx<'_>, plan: &mut Plan, upload_id: &str) -> AppResult<()> {
     let raw: Option<String> = sqlx::query_scalar("SELECT request_json FROM uploads WHERE id = ?")
         .bind(upload_id)
@@ -1101,19 +1545,25 @@ async fn plan_publish(ctx: &Ctx<'_>, plan: &mut Plan, upload_id: &str) -> AppRes
     root.ensure_available()?;
     let folder = files::parse_rel(&req.target.path)?;
     let dir = root.abs(&folder)?;
-    let staging = staging_dir(root, upload_id);
+    let staging = staging_dir(root, upload_id)?;
     let names: Vec<String> = req.files.iter().map(|f| f.name.clone()).collect();
+    let sidecar_only = req.existing_original.as_ref();
     let original = req
         .files
         .iter()
         .find(|f| f.role == FileRole::Original)
         .map(|f| f.name.clone())
+        .or_else(|| sidecar_only.map(|o| o.name.clone()))
         .unwrap_or_else(|| names[0].clone());
-    let exists = names
-        .iter()
-        .any(|n| dir.join(n).exists() || collides(&dir, n, &HashSet::new()));
+    if let Some(existing) = sidecar_only {
+        check_existing_original(ctx, plan, &dir, existing, &names)?;
+    }
+    let exists = sidecar_only.is_some()
+        || names
+            .iter()
+            .any(|n| dir.join(n).exists() || collides(&dir, n, &HashSet::new()));
     let mut final_original = original.clone();
-    if exists {
+    if exists || req.on_conflict == OnConflict::ReplaceIfExpected {
         match req.on_conflict {
             OnConflict::Fail => plan.block(
                 "destination_exists",
@@ -1121,43 +1571,109 @@ async fn plan_publish(ctx: &Ctx<'_>, plan: &mut Plan, upload_id: &str) -> AppRes
             ),
             OnConflict::Rename => final_original = free_name(&dir, &names, &original),
             OnConflict::ReplaceIfExpected => {
-                let expected = req
-                    .provenance
-                    .as_ref()
-                    .and_then(|p| p.expected_revision.clone());
-                let current = fs::metadata(dir.join(&original))
-                    .ok()
-                    .map(|m| files::revision(&m));
-                if expected.is_none() || expected != current {
+                let original_revision =
+                    sidecar_only
+                        .map(|o| o.expected_revision.as_str())
+                        .or_else(|| {
+                            req.provenance
+                                .as_ref()
+                                .and_then(|p| p.expected_revision.as_deref())
+                        });
+                let original_spec = req.files.iter().find(|f| f.role == FileRole::Original);
+                let spec_revision = original_spec.and_then(|f| f.expected_revision.as_deref());
+                if spec_revision.is_some()
+                    && original_revision.is_some()
+                    && spec_revision != original_revision
+                {
                     plan.block(
                         "revision_changed",
-                        format!("{original} changed on the server; not replacing it"),
+                        "conflicting expected revisions for the original",
                     );
-                } else {
-                    // The replaced versions are kept as a recoverable trash item.
+                }
+                if spec_revision.or(original_revision).is_none() {
+                    plan.block(
+                        "revision_changed",
+                        "original revision is required for replacement",
+                    );
+                }
+                let mut existing_files = Vec::new();
+                for file in &req.files {
+                    let path = dir.join(&file.name);
+                    let expected = file.expected_revision.as_deref().or_else(|| {
+                        (file.role == FileRole::Original)
+                            .then_some(original_revision)
+                            .flatten()
+                    });
+                    let actual = match files::replacement_fingerprint(&path) {
+                        Ok(actual) => actual,
+                        Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
+                            plan.block(
+                                "revision_changed",
+                                format!("{} could not be verified", file.name),
+                            );
+                            continue;
+                        }
+                        Err(e) => return Err(e.into()),
+                    };
+                    let hash_matches = match (&actual, &file.expected_sha256) {
+                        (Some((_, actual)), Some(expected)) => {
+                            actual.eq_ignore_ascii_case(expected)
+                        }
+                        (None, None) => true,
+                        _ => false,
+                    };
+                    if actual.as_ref().map(|(revision, _)| revision.as_str()) != expected
+                        || !hash_matches
+                        || (actual.is_none() && collides(&dir, &file.name, &HashSet::new()))
+                    {
+                        plan.block(
+                            "revision_changed",
+                            format!("{} changed on the server; not replacing it", file.name),
+                        );
+                    }
+                    plan.steps.push(Step::CheckRevision {
+                        path: path.clone(),
+                        expected: expected.map(str::to_owned),
+                        expected_sha256: file.expected_sha256.clone(),
+                    });
+                    if let Some((_, sha256)) = actual {
+                        existing_files.push((file.name.as_str(), sha256));
+                    }
+                }
+                if plan.blockers.is_empty() && !existing_files.is_empty() {
+                    // The replaced versions are kept as a recoverable trash item; a sidecar-only
+                    // upload keeps only the replaced sidecars, never the untouched original.
+                    let trashed_name = if sidecar_only.is_some() {
+                        existing_files[0].0.to_owned()
+                    } else {
+                        original.clone()
+                    };
                     let trash_id = crate::crypto::new_id("trash");
                     let q = format!("{TRASH_DIR}/{trash_id}");
                     let mut size = 0;
-                    for name in &names {
+                    let mut inventory = Vec::new();
+                    for (name, sha256) in existing_files {
+                        inventory.push(TrashEntry {
+                            name: name.to_owned(),
+                            sha256: Some(sha256),
+                        });
                         let existing = dir.join(name);
-                        if existing.exists() {
-                            size += files::tree_size(&existing);
-                            let r = folder
-                                .join(name)
-                                .map_err(|e| AppError::invalid_location(e.to_string()))?;
-                            plan.steps.push(Step::Fs(FsMove {
-                                from: existing,
-                                to: root.base().join(&q).join(r.as_str()),
-                                copy: false,
-                            }));
-                        }
+                        size += files::tree_size(&existing);
+                        let r = folder
+                            .join(name)
+                            .map_err(|e| AppError::invalid_location(e.to_string()))?;
+                        plan.steps.push(Step::Fs(FsMove {
+                            from: existing,
+                            to: root.base().join(&q).join(r.as_str()),
+                            copy: false,
+                        }));
                     }
                     let path = folder
-                        .join(&original)
+                        .join(&trashed_name)
                         .map_err(|e| AppError::invalid_location(e.to_string()))?;
                     plan.warn(
                         "replaces_existing",
-                        format!("the current {original} is kept in trash"),
+                        format!("the current {trashed_name} is kept in trash"),
                     );
                     plan.trash_new = Some(TrashRecord {
                         id: trash_id,
@@ -1168,6 +1684,7 @@ async fn plan_publish(ctx: &Ctx<'_>, plan: &mut Plan, upload_id: &str) -> AppRes
                         size,
                         asset_ids: Vec::new(),
                         server_id: None,
+                        file_inventory: Some(inventory),
                     });
                 }
             }

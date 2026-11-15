@@ -13,8 +13,9 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use futures_util::{StreamExt, stream};
 use ism_core::dto::{
-    Change, ClientAction, ClientInfo, ClientRoot, CreateUpload, FileRole, FolderEntry,
-    FolderListing, Location, Manifest, ManifestFile, OperationRequest,
+    CancelOperationByKey, Change, ClientAction, ClientInfo, ClientRoot, CreateUpload, DirectWrites,
+    DirectWritesReason, FileRole, FolderEntry, FolderListing, Location, Manifest, ManifestFile,
+    OperationRequest,
 };
 use ism_core::paths::{RelPath, split_ext};
 use ism_core::sidecar::{CompanionRole, companions_of};
@@ -40,11 +41,24 @@ pub fn router() -> Router<AppState> {
         .route("/manifest", get(path_manifest))
         .route("/content", get(content))
         .route("/uploads", post(create_upload))
-        .route("/uploads/{id}", get(get_upload))
+        .route("/uploads/{id}", get(get_upload).delete(cancel_upload))
         .route("/uploads/{id}/files/{index}", put(put_upload_chunk))
         .route("/uploads/{id}/commit", post(commit_upload))
         .route("/operations/preview", post(preview))
-        .route("/operations", post(submit))
+        .route("/operations", get(find_operation).post(submit))
+        .route("/operations/cancel-by-key", post(cancel_by_key))
+        .route(
+            "/instances/{instance_id}/operations",
+            get(find_operation_for_instance).post(submit_for_instance),
+        )
+        .route(
+            "/instances/{instance_id}/operations/{id}",
+            get(get_operation_for_instance),
+        )
+        .route(
+            "/instances/{instance_id}/operations/cancel-by-key",
+            post(cancel_by_key_for_instance),
+        )
         .route("/operations/{id}", get(get_operation))
         .route("/operations/{id}/cancel", post(cancel_operation))
         .route("/operations/{id}/events", get(operation_events))
@@ -66,12 +80,23 @@ async fn info(State(state): State<AppState>, Client(p): Client) -> AppResult<Jso
         .into_iter()
         .filter(|r| p.sees_root(&r.mapping.root_id))
         .map(|r| {
-            let direct_writes = r
-                .server_id
-                .as_deref()
-                .and_then(|id| servers.iter().find(|s| s.id == id))
-                .map(registry::direct_writes)
-                .unwrap_or(ism_core::dto::DirectWrites::Disabled);
+            let (direct_writes, reason) = match r.server_id.as_deref() {
+                None => (DirectWrites::NotLinked, None),
+                Some(id) => match servers.iter().find(|s| s.id == id) {
+                    None => (
+                        DirectWrites::Blocked,
+                        Some((
+                            DirectWritesReason::UnknownServer,
+                            "the root points to an unknown Immich server".to_owned(),
+                        )),
+                    ),
+                    Some(server) => match registry::write_block(server) {
+                        None => (DirectWrites::Enabled, None),
+                        block => (DirectWrites::Blocked, block),
+                    },
+                },
+            };
+            let (direct_writes_reason, direct_writes_detail) = reason.unzip();
             ClientRoot {
                 available: r.available(),
                 root_id: r.mapping.root_id.clone(),
@@ -79,6 +104,8 @@ async fn info(State(state): State<AppState>, Client(p): Client) -> AppResult<Jso
                 immich_import_path: r.mapping.immich_import_path.clone(),
                 opm_prefix: r.mapping.opm_prefix.clone(),
                 direct_writes,
+                direct_writes_reason,
+                direct_writes_detail,
             }
         })
         .collect();
@@ -90,6 +117,15 @@ async fn info(State(state): State<AppState>, Client(p): Client) -> AppResult<Jso
         token_kind: p.source(),
         actions: actions_of(&p),
         roots,
+        capabilities: vec![
+            "trash_if_asset_matches".into(),
+            "cancel_receiving_upload".into(),
+            "cancel_operation_by_key".into(),
+            "instance_scoped_operations".into(),
+            "find_operation_by_key".into(),
+            "trash_expectations".into(),
+            "partial_submit".into(),
+        ],
     }))
 }
 
@@ -188,9 +224,13 @@ pub async fn build_manifest(
         .to_owned();
     let folder = rel.parent().unwrap_or_else(RelPath::root);
     let abs = root.abs(rel)?;
-    let meta = tokio::fs::metadata(&abs)
-        .await
-        .map_err(|_| AppError::not_found("file not found"))?;
+    let meta = tokio::fs::metadata(&abs).await.map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            AppError::not_found("file not found")
+        } else {
+            e.into()
+        }
+    })?;
     if !meta.is_file() {
         return Err(AppError::invalid_location("not a file"));
     }
@@ -234,15 +274,52 @@ pub async fn build_manifest(
         (role, c.name, c.shared)
     }));
     for (role, file_name, shared) in entries {
-        let Some((_, meta)) = siblings.iter().find(|(n, _)| *n == file_name) else {
-            continue;
-        };
+        let (_, meta) = siblings
+            .iter()
+            .find(|(n, _)| *n == file_name)
+            .ok_or_else(|| {
+                AppError::new(
+                    StatusCode::PRECONDITION_FAILED,
+                    "revision_changed",
+                    "a file disappeared while building its manifest",
+                )
+            })?;
         let file_rel = folder
             .join(&file_name)
             .map_err(|e| AppError::invalid_location(e.to_string()))?;
         let file_abs = root.abs(&file_rel)?;
-        let sha =
-            files::cached_sha256(&state.db, &root.mapping.root_id, &file_rel, &file_abs).await?;
+        let (revision, sha) =
+            tokio::task::spawn_blocking(move || files::replacement_fingerprint(&file_abs))
+                .await
+                .map_err(AppError::internal)?
+                .map_err(|e| {
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidInput
+                    ) {
+                        AppError::new(
+                            StatusCode::PRECONDITION_FAILED,
+                            "revision_changed",
+                            "a file changed while building its manifest",
+                        )
+                    } else {
+                        e.into()
+                    }
+                })?
+                .ok_or_else(|| {
+                    AppError::new(
+                        StatusCode::PRECONDITION_FAILED,
+                        "revision_changed",
+                        "a file disappeared while building its manifest",
+                    )
+                })?;
+        if revision != files::revision(meta) {
+            return Err(AppError::new(
+                StatusCode::PRECONDITION_FAILED,
+                "revision_changed",
+                "a file changed while building its manifest",
+            ));
+        }
         let immich_linked = match (role, conn.as_mut(), root.immich_path(&file_rel)) {
             (FileRole::Sidecar, Some(c), Some(path)) => {
                 pg::sidecar_by_path(c, &path).await.ok().flatten().is_some()
@@ -254,7 +331,7 @@ pub async fn build_manifest(
             name: file_name,
             path: file_rel.as_str().to_owned(),
             size: meta.len(),
-            revision: files::revision(meta),
+            revision,
             sha256: Some(sha),
             immich_linked,
             shared,
@@ -347,13 +424,18 @@ async fn content(
     Query(q): Query<ContentQuery>,
     headers: HeaderMap,
 ) -> AppResult<Response> {
-    let (root, rel, abs) = located(&state, &p, ClientAction::Download, &q.root_id, &q.path).await?;
+    let (_root, rel, abs) =
+        located(&state, &p, ClientAction::Download, &q.root_id, &q.path).await?;
     if rel.is_root() {
         return Err(AppError::invalid_location("not a file"));
     }
-    let meta = tokio::fs::metadata(&abs)
-        .await
-        .map_err(|_| AppError::not_found("file not found"))?;
+    let meta = tokio::fs::metadata(&abs).await.map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            AppError::not_found("file not found")
+        } else {
+            e.into()
+        }
+    })?;
     if !meta.is_file() {
         return Err(AppError::invalid_location("not a file"));
     }
@@ -365,19 +447,8 @@ async fn content(
             "the file changed; fetch a fresh manifest",
         ));
     }
-    let known: Option<String> = sqlx::query_scalar(
-        "SELECT sha256 FROM file_hashes WHERE root_id = ? AND path = ? AND size = ? AND mtime_ns = ?",
-    )
-    .bind(&root.mapping.root_id)
-    .bind(rel.as_str())
-    .bind(meta.len() as i64)
-    .bind(files::mtime_ns(&meta))
-    .fetch_optional(&state.db)
-    .await?;
-    let extra: Vec<(&'static str, String)> =
-        known.map(|s| ("x-ism-sha256", s)).into_iter().collect();
-    let resp = serve_file(&abs, &headers, &revision, &extra).await?;
-    // The file may have changed while we opened it; never serve a mix of revisions.
+    let resp = serve_file(&abs, &headers, &revision, &[]).await?;
+    // Detect ordinary metadata changes while opening; clients verify the manifest hash as well.
     let after = tokio::fs::metadata(&abs).await?;
     if files::revision(&after) != revision {
         return Err(AppError::new(
@@ -404,6 +475,15 @@ async fn get_upload(
     Path(id): Path<String>,
 ) -> AppResult<Response> {
     Ok(Json(uploads::get(&state, &p, &id).await?).into_response())
+}
+
+async fn cancel_upload(
+    State(state): State<AppState>,
+    Client(p): Client,
+    Path(id): Path<String>,
+) -> AppResult<Response> {
+    uploads::cancel(&state, &p, &id).await?;
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 async fn put_upload_chunk(
@@ -442,12 +522,83 @@ async fn submit(
     Ok((StatusCode::ACCEPTED, Json(accepted)).into_response())
 }
 
+fn check_instance(state: &AppState, instance_id: &str) -> AppResult<()> {
+    if instance_id != state.instance_id {
+        return Err(AppError::conflict(
+            "instance_mismatch",
+            "request is addressed to a different ISM instance",
+        ));
+    }
+    Ok(())
+}
+
+async fn submit_for_instance(
+    State(state): State<AppState>,
+    Client(p): Client,
+    Path(instance_id): Path<String>,
+    Json(req): Json<OperationRequest>,
+) -> AppResult<Response> {
+    check_instance(&state, &instance_id)?;
+    let accepted = ops::submit(&state, &p, req).await?;
+    Ok((StatusCode::ACCEPTED, Json(accepted)).into_response())
+}
+
+#[derive(Deserialize)]
+struct OperationKeyQuery {
+    idempotency_key: String,
+}
+
+async fn find_operation(
+    State(state): State<AppState>,
+    Client(p): Client,
+    Query(q): Query<OperationKeyQuery>,
+) -> AppResult<Response> {
+    Ok(Json(ops::find_by_key(&state, &p, &q.idempotency_key).await?).into_response())
+}
+
+async fn find_operation_for_instance(
+    State(state): State<AppState>,
+    Client(p): Client,
+    Path(instance_id): Path<String>,
+    Query(q): Query<OperationKeyQuery>,
+) -> AppResult<Response> {
+    check_instance(&state, &instance_id)?;
+    Ok(Json(ops::find_by_key(&state, &p, &q.idempotency_key).await?).into_response())
+}
+
 async fn get_operation(
     State(state): State<AppState>,
     Client(p): Client,
     Path(id): Path<String>,
 ) -> AppResult<Response> {
     Ok(Json(ops::get(&state, &p, &id).await?).into_response())
+}
+
+async fn get_operation_for_instance(
+    State(state): State<AppState>,
+    Client(p): Client,
+    Path((instance_id, id)): Path<(String, String)>,
+) -> AppResult<Response> {
+    check_instance(&state, &instance_id)?;
+    Ok(Json(ops::get(&state, &p, &id).await?).into_response())
+}
+
+async fn cancel_by_key(
+    State(state): State<AppState>,
+    Client(p): Client,
+    Json(req): Json<CancelOperationByKey>,
+) -> AppResult<Response> {
+    Ok(Json(ops::cancel_by_key(&state, &p, req).await?).into_response())
+}
+
+async fn cancel_by_key_for_instance(
+    State(state): State<AppState>,
+    Client(p): Client,
+    Path(instance_id): Path<String>,
+    Json(req): Json<CancelOperationByKey>,
+) -> AppResult<Response> {
+    check_instance(&state, &instance_id)?;
+    Ok(Json(ops::cancel_by_key(&state, &p, req).await?).into_response())
 }
 
 async fn cancel_operation(
@@ -465,6 +616,27 @@ struct OpStream {
     rx: broadcast::Receiver<ServerEvent>,
     resync: bool,
     done: bool,
+}
+
+/// How long after the library scan delay a finished upload's stream waits for Immich's import.
+const ASSET_ID_WAIT_SECS: i64 = 30 * 60;
+
+/// True while a finished operation has a published upload whose asset id is not known yet: its
+/// stream stays open (for a bounded time) so the `item` carrying the asset id reaches listeners.
+async fn awaiting_asset_id(state: &AppState, id: &str) -> bool {
+    let wait = state.config.timing.scan_delay.as_secs().cast_signed() + ASSET_ID_WAIT_SECS;
+    let cutoff = crate::db::ts(chrono::Utc::now() - chrono::Duration::seconds(wait));
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM operation_items i JOIN operations o ON o.id = i.operation_id
+         WHERE i.operation_id = ? AND i.kind = 'publish_upload' AND i.status = 'done'
+           AND i.result_json IS NOT NULL AND json_extract(i.result_json, '$.asset_id') IS NULL
+           AND (o.finished_at IS NULL OR o.finished_at >= ?))",
+    )
+    .bind(id)
+    .bind(cutoff)
+    .fetch_one(&state.db)
+    .await
+    .unwrap_or(false)
 }
 
 async fn next_op_events(mut s: OpStream) -> Option<(Vec<Event>, OpStream)> {
@@ -488,7 +660,7 @@ async fn next_op_events(mut s: OpStream) -> Option<(Vec<Event>, OpStream)> {
             let mut out = Vec::with_capacity(rows.len());
             for (seq, event, data) in rows {
                 s.cursor = seq;
-                if event == "finished" {
+                if event == "finished" && !awaiting_asset_id(&s.state, &s.id).await {
                     s.done = true;
                 }
                 out.push(Event::default().id(seq.to_string()).event(event).data(data));
@@ -502,7 +674,7 @@ async fn next_op_events(mut s: OpStream) -> Option<(Vec<Event>, OpStream)> {
             .0
             .status
             .is_terminal();
-        if finished {
+        if finished && !awaiting_asset_id(&s.state, &s.id).await {
             return None;
         }
         loop {

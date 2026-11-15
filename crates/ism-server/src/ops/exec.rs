@@ -41,11 +41,24 @@ pub async fn run(state: AppState) {
             let Some(id) = next else { break };
             if let Err(e) = run_operation(&state, &id).await {
                 tracing::error!(operation = %id, "operation failed: {}", e.message());
-                let _ = sqlx::query("UPDATE operations SET status = 'failed', finished_at = ? WHERE id = ? AND status IN ('queued', 'waiting_maintenance')")
-                    .bind(db::now())
-                    .bind(&id)
-                    .execute(&state.db)
-                    .await;
+                let result = async {
+                    let mut tx = state.db.begin().await?;
+                    let updated = sqlx::query("UPDATE operations SET status = 'failed', finished_at = ? WHERE id = ? AND status IN ('queued', 'waiting_maintenance')")
+                        .bind(db::now())
+                        .bind(&id)
+                        .execute(&mut *tx)
+                        .await?;
+                    if updated.rows_affected() != 0 {
+                        sqlx::query("UPDATE uploads SET status = 'failed' WHERE operation_id = ? AND status = 'publishing'")
+                            .bind(&id)
+                            .execute(&mut *tx)
+                            .await?;
+                    }
+                    tx.commit().await
+                }.await;
+                if let Err(error) = result {
+                    tracing::error!(operation = %id, "could not record operation failure: {error}");
+                }
             }
         }
         tokio::select! {
@@ -93,14 +106,30 @@ pub async fn principal_from_key(state: &AppState, key: &str) -> AppResult<Princi
 
 async fn set_status(state: &AppState, id: &str, status: OperationStatus) -> AppResult<()> {
     let finished = status.is_terminal().then(db::now);
+    let mut tx = state.db.begin().await?;
     sqlx::query(
         "UPDATE operations SET status = ?, finished_at = COALESCE(?, finished_at) WHERE id = ?",
     )
     .bind(status.as_str())
     .bind(finished)
     .bind(id)
-    .execute(&state.db)
+    .execute(&mut *tx)
     .await?;
+    if matches!(
+        status,
+        OperationStatus::Partial
+            | OperationStatus::Failed
+            | OperationStatus::Cancelled
+            | OperationStatus::RecoveryRequired
+    ) {
+        sqlx::query(
+            "UPDATE uploads SET status = 'failed' WHERE operation_id = ? AND status = 'publishing'",
+        )
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
     let (op, _) = super::load(state, id).await?;
     let event = if status.is_terminal() {
         "finished"
@@ -139,6 +168,16 @@ async fn set_item(
 }
 
 pub async fn run_operation(state: &AppState, id: &str) -> AppResult<()> {
+    let _replication_guard = state.replication_operation_lock.lock().await;
+    let claimed = sqlx::query(
+        "UPDATE operations SET status = 'waiting_maintenance' WHERE id = ? AND status = 'queued'",
+    )
+    .bind(id)
+    .execute(&state.db)
+    .await?;
+    if claimed.rows_affected() == 0 {
+        return Ok(());
+    }
     let (request_json, principal_key): (String, String) =
         sqlx::query_as("SELECT request_json, principal FROM operations WHERE id = ?")
             .bind(id)
@@ -158,6 +197,13 @@ pub async fn run_operation(state: &AppState, id: &str) -> AppResult<()> {
             .map(|a| parse_action(a))
             .collect::<Result<_, _>>()?
     };
+    // Items refused at submission (`allow_partial`) stay failed and are not run.
+    let rejected: Vec<i64> = sqlx::query_scalar(
+        "SELECT idx FROM operation_items WHERE operation_id = ? AND status = 'failed'",
+    )
+    .bind(id)
+    .fetch_all(&state.db)
+    .await?;
     let principal = match principal_from_key(state, &principal_key).await {
         Ok(p) => p,
         Err(e) => {
@@ -169,7 +215,10 @@ pub async fn run_operation(state: &AppState, id: &str) -> AppResult<()> {
 
     // Maintenance admission for every Immich server the operation touches.
     let mut servers: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for action in &actions {
+    for (index, action) in actions.iter().enumerate() {
+        if rejected.contains(&(index as i64)) {
+            continue;
+        }
         for (server, library) in ctx.touched_servers(action).await? {
             let libs = servers.entry(server).or_default();
             if let Some(l) = library
@@ -183,10 +232,10 @@ pub async fn run_operation(state: &AppState, id: &str) -> AppResult<()> {
         set_status(state, id, OperationStatus::WaitingMaintenance).await?;
     }
     let mut admitted: Vec<String> = Vec::new();
-    for (server, libs) in &servers {
-        if let Err(e) = crate::maintenance::acquire(state, server, libs).await {
-            for s in &admitted {
-                crate::maintenance::release(state, s).await?;
+    for server in servers.keys() {
+        if let Err(e) = crate::maintenance::acquire(state, server).await {
+            for server in &admitted {
+                crate::maintenance::release(state, server).await?;
             }
             fail_all(state, id, e.code(), e.message()).await?;
             return Ok(());
@@ -208,6 +257,10 @@ pub async fn run_operation(state: &AppState, id: &str) -> AppResult<()> {
     let (mut done, mut failed, mut recovery, mut cancelled) = (0, 0, 0, false);
     for (index, action) in actions.iter().enumerate() {
         let index = index as i64;
+        if rejected.contains(&index) {
+            failed += 1;
+            continue;
+        }
         let cancel: i64 =
             sqlx::query_scalar("SELECT cancel_requested FROM operations WHERE id = ?")
                 .bind(id)
@@ -255,6 +308,21 @@ pub async fn run_operation(state: &AppState, id: &str) -> AppResult<()> {
         match execute(state, id, &plan).await {
             Ok(()) => {
                 done += 1;
+                if needs_scan(action, &plan) {
+                    for (server, library) in ctx.touched_servers(action).await? {
+                        if let Some(library) = library
+                            && let Err(e) = crate::watch::scheduler::request_scan(
+                                state,
+                                &server,
+                                &library,
+                                &format!("operation {id}"),
+                            )
+                            .await
+                        {
+                            tracing::warn!(operation = %id, "cannot schedule a library scan: {}", e.message());
+                        }
+                    }
+                }
                 changes.extend(plan.changes.clone());
                 local_changes.extend(local_changes_of(action, &plan));
                 let result = json!({ "files": plan.files, "asset_id": plan.asset_id, "warnings": plan.warnings });
@@ -271,15 +339,17 @@ pub async fn run_operation(state: &AppState, id: &str) -> AppResult<()> {
                     ItemStatus::Failed
                 };
                 if needs {
-                    recovery += 1;
-                    for s in &admitted {
-                        crate::maintenance::report_recovery(
-                            state,
-                            s,
-                            &format!("operation {id}: {message}"),
-                        )
-                        .await?;
+                    if recovery == 0 {
+                        for s in &admitted {
+                            crate::maintenance::report_recovery(
+                                state,
+                                s,
+                                &format!("operation {id}: {message}"),
+                            )
+                            .await?;
+                        }
                     }
+                    recovery += 1;
                 } else {
                     failed += 1;
                 }
@@ -287,8 +357,35 @@ pub async fn run_operation(state: &AppState, id: &str) -> AppResult<()> {
             }
         }
     }
-    for s in &admitted {
-        crate::maintenance::release(state, s).await?;
+    if let Err(error) = crate::peers::operation_finished(state, id, &local_changes).await {
+        tracing::error!(operation = %id, "peer bookkeeping failed: {}", error.message());
+        let message = "filesystem changes may have completed, but peer bookkeeping failed; reconcile replica state and events before resolving recovery";
+        let index: Option<i64> = sqlx::query_scalar(
+            "SELECT idx FROM operation_items WHERE operation_id = ? AND status != 'pending' ORDER BY CASE status WHEN 'done' THEN 0 ELSE 1 END, idx DESC LIMIT 1",
+        )
+        .bind(id)
+        .fetch_optional(&state.db)
+        .await?;
+        if let Some(index) = index {
+            set_item(
+                state,
+                id,
+                index,
+                ItemStatus::RecoveryRequired,
+                Some(("peer_bookkeeping_failed", message)),
+                None,
+            )
+            .await?;
+        }
+        if recovery == 0 {
+            for server in &admitted {
+                crate::maintenance::report_recovery(state, server, message).await?;
+            }
+        }
+        recovery += 1;
+    }
+    for server in &admitted {
+        crate::maintenance::release(state, server).await?;
     }
     let status = if recovery > 0 {
         OperationStatus::RecoveryRequired
@@ -301,7 +398,6 @@ pub async fn run_operation(state: &AppState, id: &str) -> AppResult<()> {
     } else {
         OperationStatus::Failed
     };
-    crate::peers::operation_finished(state, id, &local_changes).await;
     set_status(state, id, status).await?;
     if !changes.is_empty() {
         state.emit(ServerEvent::OperationCommitted(OperationCommitted {
@@ -312,8 +408,8 @@ pub async fn run_operation(state: &AppState, id: &str) -> AppResult<()> {
     Ok(())
 }
 
-/// What a completed item changed, for replication to peers. New files (restores, uploads) and
-/// trashed files are found by the next share scan instead.
+/// What a completed item changed, for replication to peers. New files (restores, uploads) are
+/// found by the next share scan instead.
 fn local_changes_of(action: &OperationAction, plan: &Plan) -> Vec<LocalChange> {
     match action {
         OperationAction::Move { .. } | OperationAction::Rename { .. } => plan
@@ -327,6 +423,16 @@ fn local_changes_of(action: &OperationAction, plan: &Plan) -> Vec<LocalChange> {
                 })
             })
             .collect(),
+        OperationAction::Trash { .. } | OperationAction::TrashIfAssetMatches { .. } => plan
+            .files
+            .iter()
+            .filter(|f| !f.copy)
+            .filter_map(|f| {
+                Some(LocalChange::FileTrashed {
+                    at: f.from.clone()?,
+                })
+            })
+            .collect(),
         OperationAction::MoveFolder { source, target } => vec![LocalChange::FolderMoved {
             from: source.clone(),
             to: target.clone(),
@@ -334,9 +440,14 @@ fn local_changes_of(action: &OperationAction, plan: &Plan) -> Vec<LocalChange> {
         OperationAction::CreateFolder { target } => {
             vec![LocalChange::FolderCreated { at: target.clone() }]
         }
-        OperationAction::TrashFolder { source } => {
+        OperationAction::TrashFolder { source, .. } => {
             vec![LocalChange::FolderTrashed { at: source.clone() }]
         }
+        OperationAction::PublishUpload { .. } | OperationAction::Restore { .. } => plan
+            .files
+            .iter()
+            .filter_map(|f| Some(LocalChange::FileWritten { at: f.to.clone()? }))
+            .collect(),
         _ => Vec::new(),
     }
 }
@@ -368,6 +479,8 @@ async fn journal(state: &AppState, id: &str, index: i64, plan: &Plan) -> AppResu
         .iter()
         .map(|s| match s {
             Step::Mkdir(p) => format!("mkdir {}", p.display()),
+            Step::CheckRevision { path, .. } => format!("check revision {}", path.display()),
+            Step::CheckTree { path, .. } => format!("check folder inventory {}", path.display()),
             Step::Fs(m) => format!(
                 "{} {} -> {}",
                 if m.copy { "copy" } else { "move" },
@@ -447,6 +560,48 @@ async fn apply(state: &AppState, step: &Step) -> Result<Option<Undo>, Failure> {
         }
     };
     match step {
+        Step::CheckTree { path, expected } => {
+            let path = path.clone();
+            let actual = blocking(move || plan::folder_inventory(&path))
+                .await
+                .map_err(io)?;
+            if &actual != expected {
+                return Err(Failure::new(
+                    "revision_changed",
+                    "folder contents changed during the operation",
+                ));
+            }
+            Ok(None)
+        }
+        Step::CheckRevision {
+            path,
+            expected,
+            expected_sha256,
+        } => {
+            let path = path.clone();
+            let actual = match blocking(move || files::replacement_fingerprint(&path)).await {
+                Ok(actual) => actual,
+                Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
+                    return Err(Failure::new(
+                        "revision_changed",
+                        "destination could not be verified",
+                    ));
+                }
+                Err(e) => return Err(io(e)),
+            };
+            let hash_matches = match (&actual, expected_sha256) {
+                (Some((_, actual)), Some(expected)) => actual.eq_ignore_ascii_case(expected),
+                (None, None) => true,
+                _ => false,
+            };
+            if actual.as_ref().map(|(revision, _)| revision) != expected.as_ref() || !hash_matches {
+                return Err(Failure::new(
+                    "revision_changed",
+                    "file changed before the operation",
+                ));
+            }
+            Ok(None)
+        }
         Step::Mkdir(p) => {
             if p.exists() {
                 return Ok(None);
@@ -579,6 +734,7 @@ async fn apply_db(state: &AppState, server_id: &str, steps: &[DbStep]) -> Result
         let code = match e {
             pg::PgError::Stale(_) => "revision_changed",
             pg::PgError::PathTaken(_) => "destination_exists",
+            pg::PgError::TransferBlocked(_) => "owner_transfer_blocked",
             pg::PgError::Db(_) => "database_error",
         };
         Failure::new(code, crate::error::redact(&e.to_string()))
@@ -605,7 +761,43 @@ async fn apply_db(state: &AppState, server_id: &str, steps: &[DbStep]) -> Result
     Ok(())
 }
 
+/// What the plan's file steps will change, announced to the watcher before touching anything.
+fn expected_writes(plan: &Plan) -> Vec<crate::watch::Expected> {
+    use crate::watch::Expected;
+    let mut out = Vec::new();
+    for step in &plan.steps {
+        match step {
+            Step::Mkdir(p) | Step::Remove(p) => out.push(Expected::tree(p.clone())),
+            Step::Fs(m) => out.extend(Expected::moved(&m.from, &m.to)),
+            Step::CheckRevision { .. } | Step::CheckTree { .. } | Step::Api(_) => {}
+        }
+    }
+    out
+}
+
+/// Whether Immich must scan to see the result: new or restored files, or files moved without
+/// a direct database update (no asset yet). Moves of known assets update Immich directly.
+fn needs_scan(action: &OperationAction, plan: &Plan) -> bool {
+    let touches_files = plan
+        .steps
+        .iter()
+        .any(|s| matches!(s, Step::Fs(_) | Step::Mkdir(_)));
+    match action {
+        OperationAction::PublishUpload { .. } | OperationAction::Restore { .. } => true,
+        OperationAction::Move { .. }
+        | OperationAction::Rename { .. }
+        | OperationAction::MoveFolder { .. } => touches_files && plan.db.is_empty(),
+        _ => false,
+    }
+}
+
 async fn execute(state: &AppState, op_id: &str, plan: &Plan) -> Result<(), Failure> {
+    if let Err(e) = crate::watch::expect_writes(state, &expected_writes(plan)).await {
+        return Err(Failure::new(
+            "internal",
+            format!("cannot record the expected file changes: {}", e.message()),
+        ));
+    }
     let mut done = Vec::new();
     for step in &plan.steps {
         match apply(state, step).await {
@@ -621,8 +813,11 @@ async fn execute(state: &AppState, op_id: &str, plan: &Plan) -> Result<(), Failu
         }
     }
     if let Err(e) = bookkeeping(state, op_id, plan).await {
-        // Files and Immich are consistent; only ISM's own records lag behind.
-        tracing::error!("bookkeeping after operation {op_id}: {}", e.message());
+        return Err(Failure {
+            code: "recovery_required".into(),
+            message: format!("operation bookkeeping failed: {}", e.message()),
+            recovery: true,
+        });
     }
     Ok(())
 }
@@ -631,8 +826,8 @@ async fn bookkeeping(state: &AppState, op_id: &str, plan: &Plan) -> AppResult<()
     let now = db::now();
     if let Some(t) = &plan.trash_new {
         sqlx::query(
-            "INSERT INTO trash (id, root_id, path, quarantine_rel, is_folder, size, trashed_at, operation_id, asset_ids_json, server_id)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO trash (id, root_id, path, quarantine_rel, is_folder, size, trashed_at, operation_id, asset_ids_json, server_id, file_inventory_json)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&t.id)
         .bind(&t.root_id)
@@ -644,6 +839,12 @@ async fn bookkeeping(state: &AppState, op_id: &str, plan: &Plan) -> AppResult<()
         .bind(op_id)
         .bind(serde_json::to_string(&t.asset_ids)?)
         .bind(&t.server_id)
+        .bind(
+            t.file_inventory
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?,
+        )
         .execute(&state.db)
         .await?;
     }
@@ -692,4 +893,50 @@ async fn bookkeeping(state: &AppState, op_id: &str, plan: &Plan) -> AppResult<()
         super::uploads::cleanup(state, upload_id).await;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    #[tokio::test]
+    async fn folder_inventory_failure_rolls_back_the_move() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        let target = dir.path().join("quarantine");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("photo.jpg"), b"original").unwrap();
+        let expected = plan::folder_inventory(&source).unwrap();
+        fs::write(source.join("photo.jpg"), b"changed").unwrap();
+        let state = AppState::new(
+            crate::config::Config::for_tests(dir.path()),
+            crate::db::connect(dir.path()).await.unwrap(),
+            crate::crypto::SecretBox::open_or_create(dir.path()).unwrap(),
+        )
+        .await
+        .unwrap();
+        let plan = Plan {
+            steps: vec![
+                Step::Fs(plan::FsMove {
+                    from: source.clone(),
+                    to: target.clone(),
+                    copy: false,
+                }),
+                Step::CheckTree {
+                    path: target.clone(),
+                    expected,
+                },
+            ],
+            ..Plan::default()
+        };
+        let Err(failure) = execute(&state, "unused", &plan).await else {
+            panic!("changed folder should fail verification");
+        };
+        assert_eq!(failure.code, "revision_changed");
+        assert!(!failure.recovery);
+        assert_eq!(fs::read(source.join("photo.jpg")).unwrap(), b"changed");
+        assert!(!target.exists());
+    }
 }

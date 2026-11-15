@@ -2,7 +2,7 @@
 
 export type PeerAcceptInput = { name: string, 
 /**
- * Address of the other instance as reachable from here, e.g. `http://100.64.0.2:8080`.
+ * Address of the other instance as reachable from here, e.g. `http://192.0.2.2:8080`.
  */
 url: string, invite: string, 
 /**

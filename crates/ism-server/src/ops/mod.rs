@@ -5,8 +5,9 @@ pub mod plan;
 pub mod uploads;
 
 use ism_core::dto::{
-    ClientAction, Issue, ItemStatus, Location, Operation, OperationAccepted, OperationAction,
-    OperationItem, OperationRequest, OperationStatus, PreviewResponse, Progress, TrashEntry,
+    CancelOperationByKey, CancelOperationByKeyResult, ClientAction, Issue, ItemStatus, Location,
+    Operation, OperationAccepted, OperationAction, OperationItem, OperationRequest,
+    OperationStatus, PreviewResponse, Progress, TrashEntry,
 };
 
 use crate::auth::Principal;
@@ -15,6 +16,16 @@ use crate::error::{AppError, AppResult};
 use crate::state::{AppState, ServerEvent};
 
 pub const MAX_ACTIONS: usize = 5000;
+
+fn validate_key(key: &str) -> AppResult<()> {
+    if key.trim().is_empty() || key.len() > 200 {
+        return Err(AppError::bad_request(
+            "bad_idempotency_key",
+            "idempotency_key must be 1-200 characters",
+        ));
+    }
+    Ok(())
+}
 
 fn required_actions(action: &OperationAction) -> Vec<(ClientAction, Option<&Location>)> {
     match action {
@@ -27,7 +38,9 @@ fn required_actions(action: &OperationAction) -> Vec<(ClientAction, Option<&Loca
             ]
         }
         OperationAction::CreateFolder { target } => vec![(ClientAction::Manage, Some(target))],
-        OperationAction::Trash { source } | OperationAction::TrashFolder { source } => {
+        OperationAction::Trash { source, .. }
+        | OperationAction::TrashIfAssetMatches { source, .. }
+        | OperationAction::TrashFolder { source, .. } => {
             vec![(ClientAction::Trash, Some(source))]
         }
         OperationAction::Restore { .. } => vec![(ClientAction::Trash, None)],
@@ -91,40 +104,102 @@ pub async fn preview(
     })
 }
 
-/// Validates, plans and queues an operation. The same idempotency key returns the first
-/// operation. Requests with blockers are refused as a whole; nothing is queued.
+/// Validates, plans and queues an operation. Identical retries return the first operation.
+/// Requests with blockers are refused as a whole and nothing is queued, unless
+/// `allow_partial` is set: then blocked items are recorded as failed and the rest run.
 pub async fn submit(
     state: &AppState,
     principal: &Principal,
     req: OperationRequest,
 ) -> AppResult<OperationAccepted> {
-    if req.idempotency_key.trim().is_empty() || req.idempotency_key.len() > 200 {
-        return Err(AppError::bad_request(
-            "bad_idempotency_key",
-            "idempotency_key must be 1-200 characters",
+    validate_key(&req.idempotency_key)?;
+    let guard = state
+        .lock_operation_submission(&principal.key(), &req.idempotency_key)
+        .await;
+    let (state, principal) = (state.clone(), principal.clone());
+    tokio::spawn(async move {
+        let _guard = guard;
+        submit_locked(&state, &principal, req).await
+    })
+    .await
+    .map_err(AppError::internal)?
+}
+
+async fn submit_locked(
+    state: &AppState,
+    principal: &Principal,
+    req: OperationRequest,
+) -> AppResult<OperationAccepted> {
+    let cancelled: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM operation_cancellations WHERE principal = ? AND idempotency_key = ?)",
+    )
+    .bind(principal.key())
+    .bind(&req.idempotency_key)
+    .fetch_one(&state.db)
+    .await?;
+    if cancelled {
+        return Err(AppError::conflict(
+            "operation_key_cancelled",
+            "this operation key was cancelled before submission",
         ));
     }
-    if let Some((id, status)) = sqlx::query_as::<_, (String, String)>(
-        "SELECT id, status FROM operations WHERE principal = ? AND idempotency_key = ?",
+    if let Some((id, status, stored)) = sqlx::query_as::<_, (String, String, String)>(
+        "SELECT id, status, request_json FROM operations WHERE principal = ? AND idempotency_key = ?",
     )
     .bind(principal.key())
     .bind(&req.idempotency_key)
     .fetch_optional(&state.db)
     .await?
     {
+        let value: serde_json::Value = serde_json::from_str(&stored)?;
+        if value["actions"].as_array().is_some_and(|actions| {
+            actions.iter().any(|action| action["kind"] == "publish_upload")
+        }) {
+            return Err(AppError::conflict(
+                "idempotency_key_conflict",
+                "idempotency key was already used for a different operation",
+            ));
+        }
+        let stored: OperationRequest = serde_json::from_value(value)?;
+        if serde_json::to_value(&stored)? != serde_json::to_value(&req)? {
+            return Err(AppError::conflict(
+                "idempotency_key_conflict",
+                "idempotency key was already used for a different operation",
+            ));
+        }
         return Ok(OperationAccepted {
             operation_id: id,
             status: OperationStatus::parse(&status),
         });
     }
     let preview = preview(state, principal, &req).await?;
-    if let Some(first) = preview.blockers.first() {
-        return Err(AppError::conflict_dynamic(
-            first.code.clone(),
-            first.message.clone(),
-        ));
+    if !req.allow_partial {
+        if let Some(first) = preview.blockers.first() {
+            return Err(AppError::conflict_dynamic(
+                first.code.clone(),
+                first.message.clone(),
+            ));
+        }
+        return insert(state, principal, &req).await;
     }
-    insert(state, principal, &req).await
+    let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
+    let accepted = insert_in(&mut tx, principal, &req, None).await?;
+    for item in &preview.items {
+        if let Some(blocker) = item.blockers.first() {
+            sqlx::query(
+                "UPDATE operation_items SET status = 'failed', error_code = ?, error_message = ? WHERE operation_id = ? AND idx = ?",
+            )
+            .bind(&blocker.code)
+            .bind(&blocker.message)
+            .bind(&accepted.operation_id)
+            .bind(item.index as i64)
+            .execute(&mut *tx)
+            .await?;
+        }
+    }
+    tx.commit().await?;
+    announce_queued(state, &accepted);
+    Ok(accepted)
 }
 
 /// Queues an operation without a preview (internal use, e.g. upload publishing).
@@ -133,9 +208,59 @@ pub async fn insert(
     principal: &Principal,
     req: &OperationRequest,
 ) -> AppResult<OperationAccepted> {
+    insert_inner(state, principal, req, None).await
+}
+
+async fn insert_inner(
+    state: &AppState,
+    principal: &Principal,
+    req: &OperationRequest,
+    upload_id: Option<&str>,
+) -> AppResult<OperationAccepted> {
+    let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
+    let accepted = insert_in(&mut tx, principal, req, upload_id).await?;
+    tx.commit().await?;
+    announce_queued(state, &accepted);
+    Ok(accepted)
+}
+
+pub(crate) async fn insert_in(
+    conn: &mut sqlx::SqliteConnection,
+    principal: &Principal,
+    req: &OperationRequest,
+    upload_id: Option<&str>,
+) -> AppResult<OperationAccepted> {
     let id = crate::crypto::new_id("op");
     let now = db::now();
-    let mut tx = state.db.begin().await?;
+    let cancelled: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM operation_cancellations WHERE principal = ? AND idempotency_key = ?)",
+    )
+    .bind(principal.key())
+    .bind(&req.idempotency_key)
+    .fetch_one(&mut *conn)
+    .await?;
+    if cancelled {
+        return Err(AppError::conflict(
+            "operation_key_cancelled",
+            "this operation key was cancelled before submission",
+        ));
+    }
+    if let Some(upload_id) = upload_id {
+        let updated = sqlx::query(
+            "UPDATE uploads SET status = 'publishing', operation_id = ? WHERE id = ? AND principal = ? AND status = 'receiving'",
+        )
+        .bind(&id)
+        .bind(upload_id)
+        .bind(principal.key())
+        .execute(&mut *conn)
+        .await?;
+        if updated.rows_affected() != 1 {
+            return Err(AppError::conflict(
+                "upload_closed",
+                "the upload is no longer receiving data",
+            ));
+        }
+    }
     sqlx::query(
         "INSERT INTO operations (id, idempotency_key, principal, source, label, request_json, status, created_at)
          VALUES (?, ?, ?, ?, ?, ?, 'queued', ?)",
@@ -147,7 +272,7 @@ pub async fn insert(
     .bind(&req.label)
     .bind(serde_json::to_string(req)?)
     .bind(&now)
-    .execute(&mut *tx)
+    .execute(&mut *conn)
     .await?;
     for (index, action) in req.actions.iter().enumerate() {
         sqlx::query(
@@ -157,18 +282,20 @@ pub async fn insert(
         .bind(index as i64)
         .bind(action.kind())
         .bind(serde_json::to_string(action)?)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
     }
-    tx.commit().await?;
-    state.ops_wake.notify_one();
-    state.emit(ServerEvent::OperationUpdated {
-        operation_id: id.clone(),
-    });
     Ok(OperationAccepted {
         operation_id: id,
         status: OperationStatus::Queued,
     })
+}
+
+pub(crate) fn announce_queued(state: &AppState, accepted: &OperationAccepted) {
+    state.ops_wake.notify_one();
+    state.emit(ServerEvent::OperationUpdated {
+        operation_id: accepted.operation_id.clone(),
+    });
 }
 
 type OpRow = (
@@ -251,6 +378,41 @@ pub async fn get(state: &AppState, principal: &Principal, id: &str) -> AppResult
     Ok(op)
 }
 
+/// The caller's operation submitted under `key`, read without side effects.
+pub async fn find_by_key(
+    state: &AppState,
+    principal: &Principal,
+    key: &str,
+) -> AppResult<Operation> {
+    validate_key(key)?;
+    let id: Option<String> =
+        sqlx::query_scalar("SELECT id FROM operations WHERE principal = ? AND idempotency_key = ?")
+            .bind(principal.key())
+            .bind(key)
+            .fetch_optional(&state.db)
+            .await?;
+    if let Some(id) = id {
+        return Ok(load(state, &id).await?.0);
+    }
+    let cancelled: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM operation_cancellations WHERE principal = ? AND idempotency_key = ?)",
+    )
+    .bind(principal.key())
+    .bind(key)
+    .fetch_one(&state.db)
+    .await?;
+    if cancelled {
+        return Err(AppError::new(
+            axum::http::StatusCode::NOT_FOUND,
+            "cancelled_before_submission",
+            "the key was cancelled before an operation was submitted",
+        ));
+    }
+    Err(AppError::not_found(
+        "no operation was submitted with this key",
+    ))
+}
+
 pub async fn list(state: &AppState, status: Option<&str>, limit: i64) -> AppResult<Vec<Operation>> {
     let ids: Vec<String> = match status {
         Some(s) => {
@@ -280,21 +442,28 @@ pub async fn list(state: &AppState, status: Option<&str>, limit: i64) -> AppResu
 
 pub async fn cancel(state: &AppState, principal: &Principal, id: &str) -> AppResult<Operation> {
     get(state, principal, id).await?;
+    let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
     sqlx::query("UPDATE operations SET cancel_requested = 1 WHERE id = ?")
         .bind(id)
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await?;
     sqlx::query("UPDATE operations SET status = 'cancelled', finished_at = ? WHERE id = ? AND status = 'queued'")
         .bind(db::now())
         .bind(id)
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await?;
-    let (op, _) = load(state, id).await?;
-    if op.status == OperationStatus::Cancelled {
+    let status: String = sqlx::query_scalar("SELECT status FROM operations WHERE id = ?")
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
+    if status == "cancelled" {
         sqlx::query("UPDATE operation_items SET status = 'skipped' WHERE operation_id = ? AND status = 'pending'")
             .bind(id)
-            .execute(&state.db)
+            .execute(&mut *tx)
             .await?;
+    }
+    tx.commit().await?;
+    if status == "cancelled" {
         record(
             state,
             id,
@@ -307,41 +476,89 @@ pub async fn cancel(state: &AppState, principal: &Principal, id: &str) -> AppRes
     Ok(load(state, id).await?.0)
 }
 
-/// Admin: the files were checked by hand; release the server barrier.
-pub async fn resolve_recovery(state: &AppState, id: &str) -> AppResult<()> {
-    let row: Option<(String, String, i64)> = sqlx::query_as(
-        "SELECT status, admitted_server_ids_json, recovery_resolved FROM operations WHERE id = ?",
-    )
-    .bind(id)
-    .fetch_optional(&state.db)
-    .await?;
-    let Some((status, servers, resolved)) = row else {
-        return Err(AppError::not_found("operation not found"));
-    };
-    if status != "recovery_required"
-        && !(status == "partial" && resolved == 0 && !db::json_vec(&servers).is_empty())
-    {
-        return Err(AppError::conflict(
-            "not_recoverable",
-            "this operation does not need recovery",
+pub async fn cancel_by_key(
+    state: &AppState,
+    principal: &Principal,
+    request: CancelOperationByKey,
+) -> AppResult<CancelOperationByKeyResult> {
+    let key = request.idempotency_key;
+    validate_key(&key)?;
+    if request.expected_request.idempotency_key != key {
+        return Err(AppError::bad_request(
+            "bad_idempotency_key",
+            "expected request must use the same idempotency key",
         ));
     }
-    if resolved != 0 {
-        return Ok(());
-    }
-    sqlx::query("UPDATE operations SET recovery_resolved = 1 WHERE id = ?")
-        .bind(id)
-        .execute(&state.db)
+    check_grants(principal, &request.expected_request)?;
+    let guard = state
+        .lock_operation_submission(&principal.key(), &key)
+        .await;
+    let (state, principal) = (state.clone(), principal.clone());
+    tokio::spawn(async move {
+        let _guard = guard;
+        let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
+        let row: Option<(String, String)> = sqlx::query_as(
+            "SELECT id, request_json FROM operations WHERE principal = ? AND idempotency_key = ?",
+        )
+        .bind(principal.key())
+        .bind(&key)
+        .fetch_optional(&mut *tx)
         .await?;
-    let recovery_servers: Vec<String> = sqlx::query_scalar(
-        "SELECT DISTINCT value FROM operations, json_each(operations.admitted_server_ids_json) WHERE id = ?",
-    )
-    .bind(id)
-    .fetch_all(&state.db)
-    .await?;
-    for server in recovery_servers {
-        crate::maintenance::resolve_recovery(state, &server).await?;
-    }
+        let Some((id, stored)) = row else {
+            sqlx::query(
+                "INSERT OR IGNORE INTO operation_cancellations (principal, idempotency_key, created_at) VALUES (?, ?, ?)",
+            )
+            .bind(principal.key())
+            .bind(&key)
+            .bind(db::now())
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            return Ok(CancelOperationByKeyResult::CancelledBeforeSubmission);
+        };
+        let stored: serde_json::Value = serde_json::from_str(&stored)?;
+        let stored: OperationRequest = serde_json::from_value(stored).map_err(|_| {
+            AppError::conflict(
+                "idempotency_key_conflict",
+                "idempotency key was already used for a different operation",
+            )
+        })?;
+        if serde_json::to_value(stored)? != serde_json::to_value(request.expected_request)? {
+            return Err(AppError::conflict(
+                "idempotency_key_conflict",
+                "idempotency key was already used for a different operation",
+            ));
+        }
+        let updated = sqlx::query(
+            "UPDATE operations SET status = 'cancelled', cancel_requested = 1, finished_at = ? WHERE id = ? AND status = 'queued'",
+        )
+        .bind(db::now())
+        .bind(&id)
+        .execute(&mut *tx)
+        .await?;
+        if updated.rows_affected() != 0 {
+            sqlx::query(
+                "UPDATE operation_items SET status = 'skipped' WHERE operation_id = ? AND status = 'pending'",
+            )
+            .bind(&id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        let (operation, _) = load(&state, &id).await?;
+        if updated.rows_affected() != 0 {
+            record(&state, &id, "finished", &serde_json::to_value(&operation)?).await?;
+            state.ops_wake.notify_one();
+        }
+        Ok(CancelOperationByKeyResult::Operation { operation })
+    })
+    .await
+    .map_err(AppError::internal)?
+}
+
+/// Admin: the files were checked by hand; release the server barrier.
+pub async fn resolve_recovery(state: &AppState, id: &str) -> AppResult<()> {
+    crate::maintenance::resolve_operation_recovery(state, id).await?;
     db::audit(&state.db, "admin", "operation.resolve", id).await;
     Ok(())
 }

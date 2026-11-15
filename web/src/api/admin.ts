@@ -27,6 +27,7 @@ import type { ShareInput } from '@/api/generated/ShareInput';
 import type { ShareView } from '@/api/generated/ShareView';
 import type { SyncStatus } from '@/api/generated/SyncStatus';
 import type { TrashEntry } from '@/api/generated/TrashEntry';
+import type { WatchSettingsInput } from '@/api/generated/WatchSettingsInput';
 
 /** Instance-wide settings (`GET/PUT /api/admin/settings`). */
 export interface Settings {
@@ -56,6 +57,9 @@ export const admin = {
     api.post<{ libraries: number }>(`${A}/servers/${enc(id)}/libraries/refresh`),
   retryMaintenance: (id: string) => api.post<void>(`${A}/servers/${enc(id)}/maintenance/retry`),
   resolveMaintenance: (id: string) => api.post<void>(`${A}/servers/${enc(id)}/maintenance/resolve`),
+  /** Turns Immich's file watcher and scheduled scan off again and clears the drift block. */
+  reapplyImmichSettings: (id: string) =>
+    api.post<void>(`${A}/servers/${enc(id)}/maintenance/reapply`),
 
   accounts: () => api.get<AccountView[]>(`${A}/accounts`),
   createAccount: (body: AccountInput) => api.post<AccountView>(`${A}/accounts`, { body }),
@@ -68,6 +72,11 @@ export const admin = {
   updateMapping: (rootId: string, body: MappingInput) =>
     api.put<MappingView>(`${A}/mappings/${enc(rootId)}`, { body }),
   deleteMapping: (rootId: string) => api.delete<void>(`${A}/mappings/${enc(rootId)}`),
+  setMappingWatch: (rootId: string, body: WatchSettingsInput) =>
+    api.put<MappingView>(`${A}/mappings/${enc(rootId)}/watch`, { body }),
+  /** Forgets the change-detection snapshot after a pause the administrator checked. */
+  resetMappingWatch: (rootId: string) =>
+    api.post<MappingView>(`${A}/mappings/${enc(rootId)}/watch/reset`),
 
   tokens: () => api.get<ClientTokenView[]>(`${A}/tokens`),
   createToken: (body: ClientTokenInput) => api.post<ClientTokenCreated>(`${A}/tokens`, { body }),
@@ -90,6 +99,7 @@ export const admin = {
   invite: () => api.post<PeerInvite>(`${A}/peers/invite`),
   acceptInvite: (body: PeerAcceptInput) => api.post<PeerView>(`${A}/peers/accept`, { body }),
   deletePeer: (id: string) => api.delete<void>(`${A}/peers/${enc(id)}`),
+  retryPeer: (id: string) => api.post<void>(`${A}/peers/${enc(id)}/retry`),
   shares: () => api.get<ShareView[]>(`${A}/shares`),
   createShare: (body: ShareInput) => api.post<ShareView>(`${A}/shares`, { body }),
   updateShare: (id: string, body: ShareInput) =>

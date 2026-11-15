@@ -14,7 +14,7 @@ use super::serve_file;
 use crate::auth::{PEER_HEADER, verify_peer_signature};
 use crate::error::{AppError, AppResult};
 use crate::files;
-use crate::peers::{self, EventPage, admin, net};
+use crate::peers::{self, EventPage, InventoryPage, admin, net};
 use crate::state::AppState;
 
 pub fn router() -> Router<AppState> {
@@ -22,6 +22,7 @@ pub fn router() -> Router<AppState> {
         .route("/pair", post(pair))
         .route("/hello", get(hello))
         .route("/events", get(events))
+        .route("/inventory", get(inventory))
         .route("/content", get(content))
 }
 
@@ -109,6 +110,23 @@ async fn events(
 }
 
 #[derive(Deserialize)]
+struct InventoryQuery {
+    share: String,
+    #[serde(default)]
+    after: String,
+}
+
+async fn inventory(
+    State(state): State<AppState>,
+    PeerAuth(peer): PeerAuth,
+    Query(q): Query<InventoryQuery>,
+) -> AppResult<Json<InventoryPage>> {
+    Ok(Json(
+        peers::inventory_for(&state, &peer.id, &q.share, &q.after).await?,
+    ))
+}
+
+#[derive(Deserialize)]
 struct ContentQuery {
     share: String,
     path: String,
@@ -133,13 +151,38 @@ async fn content(
     let root = files::root(&state.db, &share.root_id).await?;
     root.ensure_available()?;
     let abs = root.abs(&rel)?;
-    let meta = tokio::fs::metadata(&abs)
-        .await
-        .map_err(|_| AppError::not_found("file not found"))?;
+    let meta = tokio::fs::metadata(&abs).await.map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            AppError::not_found("file not found")
+        } else {
+            e.into()
+        }
+    })?;
     if !meta.is_file() {
         return Err(AppError::not_found("file not found"));
     }
-    let sha = files::cached_sha256(&state.db, &share.root_id, &rel, &abs).await?;
+    let path = abs.clone();
+    let (revision, sha) =
+        tokio::task::spawn_blocking(move || files::replacement_fingerprint(&path))
+            .await
+            .map_err(AppError::internal)?
+            .map_err(|e| {
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidInput
+                ) {
+                    AppError::conflict("content_changed", "the file changed during the request")
+                } else {
+                    e.into()
+                }
+            })?
+            .ok_or_else(|| AppError::not_found("file not found"))?;
+    if revision != files::revision(&meta) {
+        return Err(AppError::conflict(
+            "content_changed",
+            "the file changed during the request",
+        ));
+    }
     if !sha.eq_ignore_ascii_case(&q.sha256) {
         return Err(AppError::conflict(
             "content_changed",

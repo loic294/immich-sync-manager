@@ -8,11 +8,3 @@ pub mod registry;
 pub const SUPPORTED_VERSION: &str = "3.4.1";
 /// The last schema migration of Immich v3.4.1.
 pub const SUPPORTED_MIGRATION: &str = "1792568637987-AddAssetOwnerIdUpdateIdIndex";
-
-/// Queues whose jobs read or write library files and must be idle while files change.
-pub const INTERFERING_QUEUES: &[&str] = &[
-    "library",
-    "sidecar",
-    "metadataExtraction",
-    "storageTemplateMigration",
-];

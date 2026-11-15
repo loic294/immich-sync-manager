@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::auth::{PEER_HEADER, SIGNATURE_HEADER, TIMESTAMP_HEADER};
 use crate::error::{AppError, AppResult};
-use crate::state::AppState;
+use crate::state::{AppState, ServerEvent};
 
 pub const SECRET_PURPOSE: &str = "peer-secret";
 
@@ -119,20 +119,64 @@ pub async fn get_json<T: serde::de::DeserializeOwned>(
 
 pub async fn mark(state: &AppState, peer_id: &str, result: Result<(), String>) {
     let now = crate::db::now();
-    let _ = match result {
-        Ok(()) => sqlx::query(
-            "UPDATE peers SET status = 'online', last_seen_at = ?, last_error = NULL WHERE id = ?",
-        )
-        .bind(now)
-        .bind(peer_id)
-        .execute(&state.db)
-        .await,
-        Err(e) => {
-            sqlx::query("UPDATE peers SET status = 'offline', last_error = ? WHERE id = ?")
-                .bind(e)
+    let updated = match result {
+        Ok(()) => {
+            let changed = sqlx::query(
+                "UPDATE peers SET status = 'online', last_seen_at = ? WHERE id = ? AND status != 'online'",
+            )
+            .bind(&now)
+            .bind(peer_id)
+            .execute(&state.db)
+            .await;
+            if changed
+                .as_ref()
+                .is_ok_and(|result| result.rows_affected() == 0)
+                && let Err(error) = sqlx::query(
+                    "UPDATE peers SET last_seen_at = ? WHERE id = ? AND status = 'online'",
+                )
+                .bind(now)
                 .bind(peer_id)
                 .execute(&state.db)
                 .await
+            {
+                tracing::error!(peer = %peer_id, "could not record peer last-seen time: {error}");
+            }
+            changed
+        }
+        Err(e) => {
+            sqlx::query(
+                "UPDATE peers SET status = 'offline', last_error = ?
+                 WHERE id = ? AND (status != 'offline' OR last_error IS NOT ?)",
+            )
+            .bind(&e)
+            .bind(peer_id)
+            .bind(&e)
+            .execute(&state.db)
+            .await
         }
     };
+    match updated {
+        Ok(result) if result.rows_affected() > 0 => state.emit(ServerEvent::SyncChanged),
+        Ok(_) => {}
+        Err(error) => {
+            tracing::error!(peer = %peer_id, "could not record peer connection status: {error}");
+        }
+    }
+}
+
+pub async fn mark_processing_result(state: &AppState, peer_id: &str, error: Option<&str>) {
+    let updated =
+        sqlx::query("UPDATE peers SET last_error = ? WHERE id = ? AND last_error IS NOT ?")
+            .bind(error)
+            .bind(peer_id)
+            .bind(error)
+            .execute(&state.db)
+            .await;
+    match updated {
+        Ok(result) if result.rows_affected() > 0 => state.emit(ServerEvent::SyncChanged),
+        Ok(_) => {}
+        Err(error) => {
+            tracing::error!(peer = %peer_id, "could not record peer processing status: {error}");
+        }
+    }
 }

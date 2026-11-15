@@ -15,7 +15,7 @@ use ism_core::dto::{
     AccountInput, AccountView, AuditEntry, ClientAction, ClientTokenCreated, ClientTokenInput,
     ClientTokenView, ImmichServerInput, ImmichServerView, LibraryView, LoginRequest, MappingInput,
     MappingView, MountView, OverrideInput, Overview, PeerAcceptInput, ResolveConflictInput,
-    ScheduleView, SessionInfo, SetupRequest, ShareInput,
+    ScheduleView, SessionInfo, SetupRequest, ShareInput, WatchSettingsInput, WatchStatusView,
 };
 use ism_core::maintenance::{MaintenanceState, Phase};
 use ism_core::mapping::{RootMapping, validate_set};
@@ -51,6 +51,10 @@ pub fn router() -> Router<AppState> {
             "/servers/{id}/maintenance/resolve",
             post(maintenance_resolve),
         )
+        .route(
+            "/servers/{id}/maintenance/reapply",
+            post(maintenance_reapply),
+        )
         .route("/accounts", get(list_accounts).post(create_account))
         .route("/accounts/{id}", delete(delete_account))
         .route("/libraries", get(list_libraries))
@@ -60,6 +64,8 @@ pub fn router() -> Router<AppState> {
             "/mappings/{root_id}",
             put(update_mapping).delete(delete_mapping),
         )
+        .route("/mappings/{root_id}/watch", put(put_mapping_watch))
+        .route("/mappings/{root_id}/watch/reset", post(reset_mapping_watch))
         .route("/tokens", get(list_tokens).post(create_token))
         .route("/tokens/{id}", delete(revoke_token))
         .route("/operations", get(list_operations))
@@ -71,6 +77,7 @@ pub fn router() -> Router<AppState> {
         .route("/peers/invite", post(create_invite))
         .route("/peers/accept", post(accept_invite))
         .route("/peers/{id}", delete(delete_peer))
+        .route("/peers/{id}/retry", post(retry_peer))
         .route("/shares", get(list_shares).post(create_share))
         .route("/shares/{id}", put(update_share).delete(delete_share))
         .route("/sync", get(sync_status))
@@ -296,6 +303,16 @@ async fn overview(State(state): State<AppState>, Admin(_): Admin) -> AppResult<J
              WHERE a.server_id = l.server_id AND a.immich_user_id = l.owner_user_id AND a.status = 'ok')",
         )
         .await?,
+        watchers: {
+            let mut views: Vec<_> = crate::watch::status_views(&state)
+                .await?
+                .into_values()
+                .filter(|v| v.watched)
+                .collect();
+            views.sort_by(|a, b| a.name.cmp(&b.name));
+            views
+        },
+        scans: crate::watch::scheduler::views(&state).await?,
     }))
 }
 
@@ -548,6 +565,16 @@ async fn maintenance_retry(
     Ok(no_content())
 }
 
+async fn maintenance_reapply(
+    State(state): State<AppState>,
+    Admin(p): Admin,
+    Path(id): Path<String>,
+) -> AppResult<Response> {
+    crate::maintenance::reapply_settings(&state, &id).await?;
+    db::audit(&state.db, &actor(&p), "maintenance.reapply", &id).await;
+    Ok(no_content())
+}
+
 async fn maintenance_resolve(
     State(state): State<AppState>,
     Admin(p): Admin,
@@ -646,11 +673,16 @@ async fn create_account(
     .execute(&state.db)
     .await?;
     db::audit(&state.db, &actor(&p), "account.connect", label).await;
-    if is_admin && let Err(e) = registry::refresh_libraries(&state, &server).await {
-        tracing::warn!(
-            "library refresh after connecting an admin failed: {}",
-            e.message()
-        );
+    if is_admin {
+        if let Err(e) = registry::refresh_libraries(&state, &server).await {
+            tracing::warn!(
+                "library refresh after connecting an admin failed: {}",
+                e.message()
+            );
+        }
+        if let Err(e) = crate::maintenance::enroll(&state, &server.id).await {
+            tracing::warn!("enrolling '{}' failed: {}", server.name, e.message());
+        }
     }
     let sql = format!(
         "SELECT {ACCOUNT_COLUMNS} FROM immich_accounts WHERE server_id = ? AND immich_user_id = ?"
@@ -767,7 +799,7 @@ async fn list_mounts(
     ))
 }
 
-fn mapping_view(r: &files::Root) -> MappingView {
+fn mapping_view(r: &files::Root, watch: WatchStatusView) -> MappingView {
     let available = r.available();
     MappingView {
         root_id: r.mapping.root_id.clone(),
@@ -779,19 +811,51 @@ fn mapping_view(r: &files::Root) -> MappingView {
         opm_prefix: r.mapping.opm_prefix.clone(),
         available,
         availability_detail: (!available)
-            .then(|| format!("{SENTINEL} is missing; the volume may not be mounted")),
+            .then(|| format!("{SENTINEL} is missing or invalid; check the mounted volume")),
+        watch,
     }
+}
+
+async fn mapping_view_of(state: &AppState, root_id: &str) -> AppResult<MappingView> {
+    let root = files::root(&state.db, root_id).await?;
+    let mut watch = crate::watch::status_views(state).await?;
+    let view = watch
+        .remove(root_id)
+        .ok_or_else(|| AppError::not_found("unknown mapping"))?;
+    Ok(mapping_view(&root, view))
+}
+
+async fn put_mapping_watch(
+    State(state): State<AppState>,
+    Admin(p): Admin,
+    Path(root_id): Path<String>,
+    Json(input): Json<WatchSettingsInput>,
+) -> AppResult<Json<MappingView>> {
+    crate::watch::set_settings(&state, &root_id, &input).await?;
+    db::audit(&state.db, &actor(&p), "mapping.watch", &root_id).await;
+    Ok(Json(mapping_view_of(&state, &root_id).await?))
+}
+
+async fn reset_mapping_watch(
+    State(state): State<AppState>,
+    Admin(p): Admin,
+    Path(root_id): Path<String>,
+) -> AppResult<Json<MappingView>> {
+    crate::watch::reset_baseline(&state, &root_id).await?;
+    db::audit(&state.db, &actor(&p), "mapping.watch_reset", &root_id).await;
+    Ok(Json(mapping_view_of(&state, &root_id).await?))
 }
 
 async fn list_mappings(
     State(state): State<AppState>,
     Admin(_): Admin,
 ) -> AppResult<Json<Vec<MappingView>>> {
+    let mut watch = crate::watch::status_views(&state).await?;
     Ok(Json(
         files::load_roots(&state.db)
             .await?
             .iter()
-            .map(mapping_view)
+            .filter_map(|r| watch.remove(&r.mapping.root_id).map(|w| mapping_view(r, w)))
             .collect(),
     ))
 }
@@ -862,24 +926,44 @@ async fn validate_mapping(
         (None, Some(_)) => return Err(bad("a library needs a server".into())),
         (None, None) => {}
     }
-    // Claim the folder; a sentinel naming another root means two mappings would share it.
+    // Claim the folder; never overwrite or follow an existing marker.
     let sentinel = dir.join(SENTINEL);
-    match std::fs::read_to_string(&sentinel) {
-        Ok(owner) if owner.trim() != mapping.root_id && !owner.trim().is_empty() => {
+    match std::fs::symlink_metadata(&sentinel) {
+        Ok(meta) if !meta.is_file() || meta.len() > 128 => {
             return Err(AppError::conflict(
-                "folder_claimed",
-                format!(
-                    "this folder is already claimed by root '{}'; remove {SENTINEL} if that is stale",
-                    owner.trim()
-                ),
+                "invalid_root_marker",
+                format!("{SENTINEL} must be a regular marker file for this root"),
             ));
         }
-        Ok(_) => {}
-        Err(_) => std::fs::write(&sentinel, format!("{}\n", mapping.root_id)).map_err(|e| {
-            bad(format!(
-                "cannot write {SENTINEL} (is the volume writable?): {e}"
-            ))
-        })?,
+        Ok(_) => {
+            let owner = std::fs::read_to_string(&sentinel).map_err(|error| {
+                AppError::conflict(
+                    "invalid_root_marker",
+                    format!("cannot read {SENTINEL}: {error}"),
+                )
+            })?;
+            if owner.trim() != mapping.root_id {
+                return Err(AppError::conflict(
+                    "folder_claimed",
+                    format!("this folder has a different or empty {SENTINEL} marker"),
+                ));
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            use std::io::Write;
+            let mut marker = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&sentinel)
+                .map_err(|e| bad(format!("cannot create {SENTINEL}: {e}")))?;
+            marker
+                .write_all(format!("{}\n", mapping.root_id).as_bytes())
+                .and_then(|()| marker.sync_all())
+                .map_err(|e| bad(format!("cannot write {SENTINEL}: {e}")))?;
+        }
+        Err(error) => {
+            return Err(AppError::internal(error));
+        }
     }
     Ok(mapping)
 }
@@ -926,8 +1010,12 @@ async fn create_mapping(
     .execute(&state.db)
     .await?;
     db::audit(&state.db, &actor(&p), "mapping.create", &m.root_id).await;
-    let root = files::root(&state.db, &m.root_id).await?;
-    Ok((StatusCode::CREATED, Json(mapping_view(&root))).into_response())
+    state.watch_wake.notify_one();
+    Ok((
+        StatusCode::CREATED,
+        Json(mapping_view_of(&state, &m.root_id).await?),
+    )
+        .into_response())
 }
 
 async fn update_mapping(
@@ -936,6 +1024,7 @@ async fn update_mapping(
     Path(root_id): Path<String>,
     Json(input): Json<MappingInput>,
 ) -> AppResult<Json<MappingView>> {
+    let _guard = state.replication_operation_lock.lock().await;
     let current = files::root(&state.db, &root_id).await?;
     if input.root_id.trim() != root_id {
         return Err(AppError::bad_request(
@@ -975,7 +1064,8 @@ async fn update_mapping(
         .execute(&state.db)
         .await?;
     db::audit(&state.db, &actor(&p), "mapping.update", &root_id).await;
-    Ok(Json(mapping_view(&files::root(&state.db, &root_id).await?)))
+    state.watch_wake.notify_one();
+    Ok(Json(mapping_view_of(&state, &root_id).await?))
 }
 
 async fn delete_mapping(
@@ -983,6 +1073,7 @@ async fn delete_mapping(
     Admin(p): Admin,
     Path(root_id): Path<String>,
 ) -> AppResult<Response> {
+    let _guard = state.replication_operation_lock.lock().await;
     let root = files::root(&state.db, &root_id).await?;
     busy_root(&state).await?;
     let shares: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM shares WHERE root_id = ?")
@@ -1223,6 +1314,16 @@ async fn delete_peer(
 ) -> AppResult<Response> {
     peers::delete_peer(&state, &id).await?;
     db::audit(&state.db, &actor(&p), "peer.remove", &id).await;
+    Ok(no_content())
+}
+
+async fn retry_peer(
+    State(state): State<AppState>,
+    Admin(p): Admin,
+    Path(id): Path<String>,
+) -> AppResult<Response> {
+    peers::retry_peer(&state, &id).await?;
+    db::audit(&state.db, &actor(&p), "peer.retry", &id).await;
     Ok(no_content())
 }
 

@@ -37,7 +37,9 @@ impl Root {
     }
 
     pub fn available(&self) -> bool {
-        self.base().join(SENTINEL).is_file()
+        let marker = self.base().join(SENTINEL);
+        fs::symlink_metadata(&marker).is_ok_and(|meta| meta.is_file() && meta.len() <= 128)
+            && fs::read_to_string(marker).is_ok_and(|owner| owner.trim() == self.mapping.root_id)
     }
 
     pub fn ensure_available(&self) -> AppResult<()> {
@@ -48,27 +50,27 @@ impl Root {
         }
     }
 
-    /// The absolute path of `rel`, refusing anything that escapes the root through symlinks.
+    /// The absolute path of `rel`, refusing symlinks in existing path components.
     pub fn abs(&self, rel: &RelPath) -> AppResult<PathBuf> {
         let base = self.base();
-        let path = base.join(rel.as_str());
-        let canonical_base = base.canonicalize()?;
-        // Check the deepest existing ancestor: the path itself may not exist yet.
-        let mut probe = path.as_path();
-        loop {
-            match probe.canonicalize() {
-                Ok(real) => {
-                    if real.starts_with(&canonical_base) {
-                        return Ok(path);
-                    }
-                    return Err(AppError::invalid_location("path leaves its root"));
+        base.canonicalize()?;
+        let mut path = base;
+        let mut missing = false;
+        for segment in rel.segments() {
+            path.push(segment);
+            if missing {
+                continue;
+            }
+            match fs::symlink_metadata(&path) {
+                Ok(meta) if meta.file_type().is_symlink() => {
+                    return Err(AppError::invalid_location("symlinks are not allowed"));
                 }
-                Err(_) => match probe.parent() {
-                    Some(parent) => probe = parent,
-                    None => return Err(AppError::invalid_location("path leaves its root")),
-                },
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => missing = true,
+                Err(e) => return Err(e.into()),
             }
         }
+        Ok(path)
     }
 
     pub fn location(&self, rel: &RelPath) -> Location {
@@ -164,7 +166,7 @@ pub fn mtime_ns(meta: &Metadata) -> i64 {
         .unwrap_or(0)
 }
 
-/// `"{size}-{mtime_ns}"`: changes whenever the content is rewritten.
+/// `"{size}-{mtime_ns}"`: a metadata revision, not a content hash.
 pub fn revision(meta: &Metadata) -> String {
     format!("{}-{}", meta.len(), mtime_ns(meta))
 }
@@ -188,44 +190,28 @@ pub fn sha256_file(path: &Path) -> io::Result<String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
-/// The sha256 of a file, cached by (root, path, size, mtime).
-pub async fn cached_sha256(
-    pool: &SqlitePool,
-    root_id: &str,
-    rel: &RelPath,
-    abs: &Path,
-) -> AppResult<String> {
-    let meta = fs::metadata(abs)?;
-    let (size, mtime) = (meta.len() as i64, mtime_ns(&meta));
-    let cached: Option<String> = sqlx::query_scalar(
-        "SELECT sha256 FROM file_hashes WHERE root_id = ? AND path = ? AND size = ? AND mtime_ns = ?",
-    )
-    .bind(root_id)
-    .bind(rel.as_str())
-    .bind(size)
-    .bind(mtime)
-    .fetch_optional(pool)
-    .await?;
-    if let Some(hash) = cached {
-        return Ok(hash);
+/// Reads a fresh fingerprint without trusting the metadata-keyed hash cache.
+pub fn replacement_fingerprint(path: &Path) -> io::Result<Option<(String, String)>> {
+    let before = match fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_file() => meta,
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "not a regular file",
+            ));
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let hash = sha256_file(path)?;
+    let after = fs::symlink_metadata(path)?;
+    if !after.is_file() || revision(&before) != revision(&after) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "file changed while calculating its hash",
+        ));
     }
-    let owned = abs.to_owned();
-    let hash = tokio::task::spawn_blocking(move || sha256_file(&owned))
-        .await
-        .map_err(AppError::internal)??;
-    sqlx::query(
-        "INSERT INTO file_hashes (root_id, path, size, mtime_ns, sha256) VALUES (?, ?, ?, ?, ?)
-         ON CONFLICT(root_id, path) DO UPDATE SET size = excluded.size, mtime_ns = excluded.mtime_ns,
-         sha256 = excluded.sha256",
-    )
-    .bind(root_id)
-    .bind(rel.as_str())
-    .bind(size)
-    .bind(mtime)
-    .bind(&hash)
-    .execute(pool)
-    .await?;
-    Ok(hash)
+    Ok(Some((revision(&after), hash)))
 }
 
 /// Visible entries of a directory: (folders, files), sorted by name.
@@ -287,49 +273,57 @@ pub async fn companion_extensions(pool: &SqlitePool) -> Vec<String> {
     }
 }
 
-/// Renames `from` to `to` without replacing an existing file. Falls back to copy + verify +
-/// remove across file systems.
+/// Atomically renames `from` to `to` without replacing an existing entry.
 pub fn move_no_replace(from: &Path, to: &Path) -> io::Result<()> {
-    if to.symlink_metadata().is_ok() {
-        return Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            "destination exists",
-        ));
-    }
     if let Some(parent) = to.parent() {
         fs::create_dir_all(parent)?;
     }
-    match fs::rename(from, to) {
-        Ok(()) => Ok(()),
-        Err(e) if e.raw_os_error() == Some(18) /* EXDEV */ => {
-            copy_verified(from, to)?;
-            if from.is_dir() {
-                fs::remove_dir_all(from)
-            } else {
-                fs::remove_file(from)
-            }
-        }
-        Err(e) => Err(e),
-    }
+    rename_no_replace(from, to)
 }
 
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
+    rustix::fs::renameat_with(
+        rustix::fs::CWD,
+        from,
+        rustix::fs::CWD,
+        to,
+        rustix::fs::RenameFlags::NOREPLACE,
+    )
+    .map_err(Into::into)
+}
+
+#[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+fn rename_no_replace(_from: &Path, _to: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "atomic no-replace rename is unavailable on this platform",
+    ))
+}
+
+/// Copies a file to a uniquely named temporary file, verifies it, and publishes it without
+/// replacing an existing destination.
 pub fn copy_verified(from: &Path, to: &Path) -> io::Result<()> {
-    if from.is_dir() {
-        fs::create_dir_all(to)?;
-        for entry in fs::read_dir(from)? {
-            let entry = entry?;
-            copy_verified(&entry.path(), &to.join(entry.file_name()))?;
-        }
-        return Ok(());
+    let parent = to
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "destination has no parent"))?;
+    fs::create_dir_all(parent)?;
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".ism-copy-")
+        .tempfile_in(parent)?;
+    let mut source = fs::File::open(from)?;
+    if !source.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "source is not a file",
+        ));
     }
-    let tmp = to.with_extension("ism-part");
-    fs::copy(from, &tmp)?;
-    fs::File::open(&tmp)?.sync_all()?;
-    if sha256_file(from)? != sha256_file(&tmp)? {
-        let _ = fs::remove_file(&tmp);
+    io::copy(&mut source, &mut tmp)?;
+    tmp.as_file().sync_all()?;
+    if sha256_file(from)? != sha256_file(tmp.path())? {
         return Err(io::Error::other("copy verification failed"));
     }
-    fs::rename(&tmp, to)
+    tmp.persist_noclobber(to).map(|_| ()).map_err(|e| e.error)
 }
 
 /// Total size of a file or directory tree.
@@ -367,18 +361,51 @@ mod tests {
         let root = root_at(dir.path());
         assert!(!root.available());
         fs::write(dir.path().join(SENTINEL), "").unwrap();
+        assert!(!root.available());
+        fs::write(dir.path().join(SENTINEL), "other\n").unwrap();
+        assert!(!root.available());
+        fs::write(dir.path().join(SENTINEL), "r\n").unwrap();
         assert!(root.available());
     }
 
     #[cfg(unix)]
     #[test]
-    fn symlinks_cannot_escape_the_root() {
+    fn availability_rejects_a_symlinked_sentinel() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("actual-marker");
+        fs::write(&marker, "r\n").unwrap();
+        std::os::unix::fs::symlink(&marker, dir.path().join(SENTINEL)).unwrap();
+        assert!(!root_at(dir.path()).available());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinks_are_refused_even_inside_the_root_or_when_dangling() {
         let dir = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
-        std::os::unix::fs::symlink(outside.path(), dir.path().join("link")).unwrap();
+        fs::create_dir(dir.path().join("real")).unwrap();
+        fs::write(dir.path().join("real/photo.jpg"), "photo").unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("outside")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("real"), dir.path().join("inside")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("missing"), dir.path().join("dangling"))
+            .unwrap();
+        std::os::unix::fs::symlink(
+            dir.path().join("real/photo.jpg"),
+            dir.path().join("photo.jpg"),
+        )
+        .unwrap();
         let root = root_at(dir.path());
-        assert!(root.abs(&RelPath::parse("link/x.jpg").unwrap()).is_err());
+        for rel in [
+            "outside/x.jpg",
+            "inside/photo.jpg",
+            "dangling/x.jpg",
+            "photo.jpg",
+        ] {
+            assert!(root.abs(&RelPath::parse(rel).unwrap()).is_err(), "{rel}");
+        }
+        assert!(root.abs(&RelPath::parse("real/photo.jpg").unwrap()).is_ok());
         assert!(root.abs(&RelPath::parse("new/x.jpg").unwrap()).is_ok());
+        assert_eq!(root.abs(&RelPath::root()).unwrap(), dir.path());
     }
 
     #[test]
@@ -391,6 +418,52 @@ mod tests {
         fs::write(&a, "2").unwrap();
         assert!(move_no_replace(&a, &b).is_err());
         assert_eq!(fs::read_to_string(&b).unwrap(), "1");
+    }
+
+    #[test]
+    fn concurrent_moves_do_not_replace_the_winner() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..50 {
+            let a = dir.path().join(format!("a{i}"));
+            let b = dir.path().join(format!("b{i}"));
+            let target = dir.path().join(format!("target{i}"));
+            fs::write(&a, "a").unwrap();
+            fs::write(&b, "b").unwrap();
+            let barrier = std::sync::Barrier::new(2);
+            let (left, right) = std::thread::scope(|s| {
+                let first = s.spawn(|| {
+                    barrier.wait();
+                    move_no_replace(&a, &target)
+                });
+                barrier.wait();
+                let second = move_no_replace(&b, &target);
+                (first.join().unwrap(), second)
+            });
+            assert_ne!(left.is_ok(), right.is_ok());
+            if left.is_ok() {
+                assert_eq!(fs::read_to_string(&target).unwrap(), "a");
+                assert_eq!(fs::read_to_string(&b).unwrap(), "b");
+            } else {
+                assert_eq!(fs::read_to_string(&target).unwrap(), "b");
+                assert_eq!(fs::read_to_string(&a).unwrap(), "a");
+            }
+        }
+    }
+
+    #[test]
+    fn verified_copy_does_not_replace_destination_or_existing_part_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        let destination = dir.path().join("photo.jpg");
+        let existing_part = dir.path().join("photo.ism-part");
+        fs::write(&source, "source").unwrap();
+        fs::write(&existing_part, "other").unwrap();
+        copy_verified(&source, &destination).unwrap();
+        assert_eq!(fs::read_to_string(&destination).unwrap(), "source");
+        assert_eq!(fs::read_to_string(&existing_part).unwrap(), "other");
+        fs::write(&source, "changed").unwrap();
+        assert!(copy_verified(&source, &destination).is_err());
+        assert_eq!(fs::read_to_string(&destination).unwrap(), "source");
     }
 
     #[test]

@@ -1,22 +1,33 @@
-//! The Immich maintenance barrier.
+//! The Immich write barrier.
 //!
-//! Before ISM touches files of an external library, Immich must not react to them: file watching
-//! and periodic scans are turned off, then the queues that read library files must drain. Work is
-//! then admitted. After 15 minutes without new work, ISM scans the affected libraries, waits for
-//! the scan to finish and restores exactly the settings it changed. Any failure to verify the
-//! barrier keeps writes refused (fail closed).
+//! ISM owns file detection, so Immich's library watcher and scheduled library scan stay off
+//! permanently: [`apply_immich_settings`] turns them off at enrollment, and a periodic check
+//! raises a drift alert (refusing writes) when either comes back on. Before a managed operation
+//! touches library files, the barrier pauses Immich's `library` queue, the only queue that
+//! imports files or marks them offline, and confirms on [`IDLE_CONFIRMATIONS`](ism_core::maintenance::IDLE_CONFIRMATIONS) consecutive polls
+//! that it is paused with no active job. Jobs queued while it is paused (a scan an administrator
+//! starts in Immich, say) wait in `waiting` and only run after the release, which was verified
+//! on stock Immich v3.4.1, so they do not hold up admission. Overlapping operations share the pause through a persisted reference
+//! count; the last release resumes the queue and wakes the scan scheduler. Anything that cannot
+//! be verified keeps writes refused (fail closed).
+//!
+//! Other queues keep running. `sidecar` and `metadataExtraction` jobs read files by the asset's
+//! database path; a managed move changes the file and the row in one checked transaction, so a
+//! job racing a move reads a missing file and fails without changing the asset, and a sidecar
+//! row that changed meanwhile makes the transaction's row check fail (recovery, not data loss).
 
+use std::collections::HashMap;
 use std::time::Duration;
 
-use chrono::Utc;
-use ism_core::maintenance::{Admission, MaintenanceState, Phase, SavedSettings, restore_value};
-use serde_json::Value;
+use ism_core::maintenance::{Admission, IdleConfirmation, MaintenanceState, Phase};
 
 use crate::error::{AppError, AppResult};
-use crate::immich::INTERFERING_QUEUES;
 use crate::immich::api::{self, Api, SCAN_ENABLED, WATCH_ENABLED};
 use crate::immich::registry::{self, Server};
-use crate::state::AppState;
+use crate::state::{AppState, ServerEvent};
+
+/// The queue the barrier pauses.
+pub const LIBRARY_QUEUE: &str = "library";
 
 async fn update<T>(
     state: &AppState,
@@ -31,43 +42,214 @@ async fn update<T>(
     Ok((out, m))
 }
 
-/// Waits until the server admits work on `library_ids`, starting an epoch if needed.
-pub async fn acquire(state: &AppState, server_id: &str, library_ids: &[String]) -> AppResult<()> {
+fn immich(e: api::ApiError) -> AppError {
+    AppError::conflict("immich_error", crate::error::redact(&e.to_string()))
+}
+
+fn blocked(message: impl Into<String>) -> AppError {
+    AppError::conflict("maintenance_blocked", message)
+}
+
+/// Waits until the server admits one managed operation, pausing the library queue if needed.
+/// The barrier was verified end to end against stock Immich v3.4.1
+/// (`docker/immich-proof/RESULTS.md`).
+pub async fn acquire(state: &AppState, server_id: &str) -> AppResult<()> {
     let deadline = tokio::time::Instant::now() + state.config.timing.admission_timeout;
     loop {
-        let now = Utc::now();
         let (admission, _) = update(state, server_id, |m| {
             let a = m.admission();
             match a {
-                Admission::Admit => m.admit(now, library_ids),
+                Admission::Admit => m.admit(),
                 Admission::Prepare => m.begin_prepare(),
-                _ => {}
+                Admission::Wait | Admission::Deny(_) => {}
             }
             a
         })
         .await?;
         match admission {
             Admission::Admit => return Ok(()),
-            Admission::Deny(message) => {
-                return Err(AppError::conflict("maintenance_blocked", message));
-            }
-            Admission::Prepare | Admission::Wait => {
-                state.maintenance_wake.notify_waiters();
+            Admission::Prepare => return prepare(state, server_id).await,
+            Admission::Deny(message) => return Err(blocked(message)),
+            Admission::Wait => {
                 if tokio::time::Instant::now() >= deadline {
-                    return Err(AppError::conflict(
-                        "maintenance_blocked",
-                        "Immich did not become ready for changes in time",
-                    ));
+                    return Err(blocked("Immich did not become ready for changes in time"));
                 }
+                state.maintenance_wake.notify_waiters();
                 tokio::time::sleep(state.config.timing.poll).await;
             }
         }
     }
 }
 
-/// One admitted unit of work finished; the quiet timer restarts.
+/// Checks the settings, pauses the library queue and confirms it idle. On failure the queue is
+/// resumed (when possible) and the server blocked; no file has been touched.
+async fn prepare(state: &AppState, server_id: &str) -> AppResult<()> {
+    let server = registry::server(state, server_id).await?;
+    let outcome = match registry::admin_api(state, &server).await {
+        Ok(api) => pause_confirmed(state, &api)
+            .await
+            .map_err(|e| (Some(api), e)),
+        Err(e) => Err((None, PauseError::Other(e))),
+    };
+    match outcome {
+        Ok(()) => {
+            update(state, server_id, MaintenanceState::prepared).await?;
+            tracing::info!(server = %server.name, "library queue paused; changes admitted");
+            Ok(())
+        }
+        Err((api, PauseError::Drift(message))) => {
+            let resumed = resume_queue(api.as_ref()).await;
+            update(state, server_id, |m| {
+                m.drift = Some(message.clone());
+                if resumed {
+                    m.resumed();
+                } else {
+                    m.block("could not resume Immich's library queue; retry");
+                }
+            })
+            .await?;
+            tracing::warn!(server = %server.name, "{message}");
+            Err(blocked(message))
+        }
+        Err((api, PauseError::Other(e))) => {
+            let message = format!("could not pause Immich safely: {}", e.message());
+            let resumed = resume_queue(api.as_ref()).await;
+            update(state, server_id, |m| {
+                if resumed {
+                    m.queue_paused_by_ism = false;
+                }
+                m.block(message.clone());
+            })
+            .await?;
+            Err(blocked(message))
+        }
+    }
+}
+
+/// Resumes the library queue; false when that failed or no API is available.
+async fn resume_queue(api: Option<&Api>) -> bool {
+    match api {
+        Some(api) => api.set_queue_paused(LIBRARY_QUEUE, false).await.is_ok(),
+        None => false,
+    }
+}
+
+enum PauseError {
+    Drift(String),
+    Other(AppError),
+}
+
+impl From<AppError> for PauseError {
+    fn from(e: AppError) -> Self {
+        Self::Other(e)
+    }
+}
+
+/// The drift message when Immich's watcher or scheduled scan is not off.
+async fn settings_drift(api: &Api) -> AppResult<Option<String>> {
+    let config = api.get_config().await.map_err(immich)?;
+    Ok(ism_core::maintenance::settings_drift(
+        api::config_bool(&config, WATCH_ENABLED),
+        api::config_bool(&config, SCAN_ENABLED),
+    ))
+}
+
+async fn library_queue(api: &Api) -> AppResult<api::Queue> {
+    let queues = api.queues().await.map_err(immich)?;
+    queues
+        .into_iter()
+        .find(|q| q.name == LIBRARY_QUEUE)
+        .ok_or_else(|| blocked("Immich queue 'library' not found"))
+}
+
+/// Pauses the library queue and requires several consecutive reads showing it paused with no
+/// active job. Jobs queued meanwhile (an administrator clicking Scan, for example) wait in the
+/// paused queue and only run after the release, so `waiting`/`delayed` jobs do not delay
+/// admission; waiting for them would deadlock behind a held scan.
+async fn pause_confirmed(state: &AppState, api: &Api) -> Result<(), PauseError> {
+    let timing = &state.config.timing;
+    if let Some(drift) = settings_drift(api).await? {
+        return Err(PauseError::Drift(drift));
+    }
+    let deadline = tokio::time::Instant::now() + timing.quiesce_timeout;
+    api.set_queue_paused(LIBRARY_QUEUE, true)
+        .await
+        .map_err(immich)?;
+    tokio::time::sleep(timing.settle).await;
+    let mut confirmation = IdleConfirmation::default();
+    loop {
+        let queue = library_queue(api).await?;
+        if confirmation.observe(queue.is_held()) {
+            break;
+        }
+        if !queue.is_paused {
+            // Someone resumed it in between: pause again and start counting over.
+            api.set_queue_paused(LIBRARY_QUEUE, true)
+                .await
+                .map_err(immich)?;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            let reason = if queue.is_paused {
+                "a library job was still running"
+            } else {
+                "the queue did not stay paused"
+            };
+            return Err(blocked(format!(
+                "could not hold Immich's library queue in time: {reason}"
+            ))
+            .into());
+        }
+        tokio::time::sleep(timing.poll).await;
+    }
+    // Settings may have changed while we waited.
+    if let Some(drift) = settings_drift(api).await? {
+        return Err(PauseError::Drift(drift));
+    }
+    Ok(())
+}
+
+/// One admitted operation finished. The last one resumes the queue and wakes due scans.
 pub async fn release(state: &AppState, server_id: &str) -> AppResult<()> {
-    update(state, server_id, |m| m.settle(Utc::now())).await?;
+    let (last, _) = update(state, server_id, MaintenanceState::settle).await?;
+    if last {
+        resume(state, server_id).await?;
+    }
+    Ok(())
+}
+
+/// Resumes a queue ISM paused. Failures block the server (shown with a retry action).
+async fn resume(state: &AppState, server_id: &str) -> AppResult<()> {
+    let server = registry::server(state, server_id).await?;
+    let result = match registry::admin_api(state, &server).await {
+        Ok(api) => api
+            .set_queue_paused(LIBRARY_QUEUE, false)
+            .await
+            .map_err(immich),
+        Err(e) => Err(e),
+    };
+    match result {
+        Ok(()) => {
+            update(state, server_id, |m| {
+                if m.phase == Phase::Resuming {
+                    m.resumed();
+                }
+            })
+            .await?;
+            state.scan_wake.notify_one();
+        }
+        Err(e) => {
+            tracing::warn!(server = %server.name, "cannot resume the library queue: {}", e.message());
+            update(state, server_id, |m| {
+                if m.phase == Phase::Resuming {
+                    m.block(format!(
+                        "could not resume Immich's library queue: {}; retry",
+                        e.message()
+                    ));
+                }
+            })
+            .await?;
+        }
+    }
     Ok(())
 }
 
@@ -81,87 +263,205 @@ pub async fn report_recovery(state: &AppState, server_id: &str, reason: &str) ->
     Ok(())
 }
 
-/// Admin action: all recoveries were handled; the normal quiet period, scan and restore follow.
+/// Admin action: all recoveries were handled.
 pub async fn resolve_recovery(state: &AppState, server_id: &str) -> AppResult<()> {
-    update(state, server_id, |m| {
-        m.unresolved_recoveries = m.unresolved_recoveries.saturating_sub(1);
-        if m.unresolved_recoveries == 0 && m.phase == Phase::RecoveryRequired {
-            m.phase = Phase::Active;
-            m.active_ops = 0;
-            m.message = None;
-            m.settle(Utc::now());
-        }
-    })
-    .await?;
+    update(state, server_id, MaintenanceState::resolve_one).await?;
     state.maintenance_wake.notify_waiters();
     Ok(())
 }
 
-/// Admin action after a blocked preparation: allow the next operation to try again.
-pub async fn retry(state: &AppState, server_id: &str) -> AppResult<()> {
-    let ((), m) = update(state, server_id, |m| {
-        if m.phase == Phase::Blocked && m.saved == SavedSettings::default() {
-            m.phase = Phase::Idle;
-            m.message = None;
-        } else if m.phase == Phase::Blocked {
-            // Settings we changed could not be put back: restore them first.
-            m.begin_restore();
-        }
-    })
+/// Resolves an operation and its server barriers in one SQLite transaction.
+pub async fn resolve_operation_recovery(state: &AppState, id: &str) -> AppResult<()> {
+    let _guard = state.maintenance_lock.lock().await;
+    let mut tx = state.db.begin().await?;
+    let row: Option<(String, String, i64)> = sqlx::query_as(
+        "SELECT status, admitted_server_ids_json, recovery_resolved FROM operations WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_optional(&mut *tx)
     .await?;
-    if m.phase == Phase::Blocked {
-        return Err(AppError::conflict("maintenance_blocked", "cannot retry"));
+    let Some((status, servers, resolved)) = row else {
+        return Err(AppError::not_found("operation not found"));
+    };
+    let servers: Vec<String> = serde_json::from_str(&servers)?;
+    if status != "recovery_required"
+        && !(status == "partial" && resolved == 0 && !servers.is_empty())
+    {
+        return Err(AppError::conflict(
+            "not_recoverable",
+            "this operation does not need recovery",
+        ));
+    }
+    if resolved != 0 {
+        return Ok(());
+    }
+    let servers: std::collections::BTreeSet<_> = servers.into_iter().collect();
+    for server_id in &servers {
+        let json: String =
+            sqlx::query_scalar("SELECT maintenance_json FROM immich_servers WHERE id = ?")
+                .bind(server_id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or_else(|| AppError::not_found("Immich server not found"))?;
+        let mut maintenance: MaintenanceState = serde_json::from_str(&json)?;
+        maintenance.resolve_one();
+        sqlx::query("UPDATE immich_servers SET maintenance_json = ? WHERE id = ?")
+            .bind(serde_json::to_string(&maintenance)?)
+            .bind(server_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    sqlx::query("UPDATE operations SET recovery_resolved = 1 WHERE id = ?")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    for server_id in servers {
+        state.emit(ServerEvent::MaintenanceChanged { server_id });
     }
     state.maintenance_wake.notify_waiters();
     Ok(())
 }
 
-/// Startup: operations interrupted mid-flight may have left files and Immich out of step.
+/// Admin action after a blocked barrier: resume a queue ISM still holds, then allow work.
+pub async fn retry(state: &AppState, server_id: &str) -> AppResult<()> {
+    let (retried, _) = update(state, server_id, MaintenanceState::retry).await?;
+    if !retried {
+        return Err(blocked("the barrier is not blocked"));
+    }
+    state.maintenance_wake.notify_waiters();
+    Ok(())
+}
+
+/// Turns Immich's file watcher and scheduled library scan off and verifies the result.
+pub async fn apply_immich_settings(api: &Api) -> AppResult<()> {
+    let mut config = api.get_config().await.map_err(immich)?;
+    let watch = api::config_bool(&config, WATCH_ENABLED);
+    let scan = api::config_bool(&config, SCAN_ENABLED);
+    if watch.is_none() || scan.is_none() {
+        return Err(blocked("unexpected Immich config shape"));
+    }
+    if watch != Some(false) || scan != Some(false) {
+        api::set_config_bool(&mut config, WATCH_ENABLED, false);
+        api::set_config_bool(&mut config, SCAN_ENABLED, false);
+        api.put_config(&config).await.map_err(immich)?;
+    }
+    if settings_drift(api).await?.is_some() {
+        return Err(blocked(
+            "Immich did not apply the watcher and scheduled scan settings",
+        ));
+    }
+    Ok(())
+}
+
+/// Enrollment: once an administrator account exists, Immich's watcher and scheduled scan go off.
+/// If that fails the server shows a drift alert (writes refused) until the settings are applied.
+pub async fn enroll(state: &AppState, server_id: &str) -> AppResult<()> {
+    let server = registry::server(state, server_id).await?;
+    let result = match registry::admin_api(state, &server).await {
+        Ok(api) => apply_immich_settings(&api).await,
+        Err(e) => Err(e),
+    };
+    match result {
+        Ok(()) => {
+            update(state, server_id, |m| m.drift = None).await?;
+            Ok(())
+        }
+        Err(e) => {
+            let message = format!(
+                "could not turn off Immich's file watcher and scheduled library scan: {}",
+                e.message()
+            );
+            update(state, server_id, |m| m.drift = Some(message.clone())).await?;
+            Err(blocked(message))
+        }
+    }
+}
+
+/// Admin action acknowledging a drift alert: re-applies ISM's Immich settings and clears it.
+pub async fn reapply_settings(state: &AppState, server_id: &str) -> AppResult<()> {
+    enroll(state, server_id).await?;
+    tracing::info!(server = %server_id, "Immich watcher and scheduled scan re-disabled");
+    state.maintenance_wake.notify_waiters();
+    Ok(())
+}
+
+/// Detects drift on one server. The alert stays until an admin re-applies the settings, even if
+/// the setting is turned off again in Immich: changes may have been imported meanwhile.
+async fn check_drift(state: &AppState, server: &Server) -> AppResult<()> {
+    if !server.compatible || server.maintenance.drift.is_some() {
+        return Ok(());
+    }
+    let api = registry::admin_api(state, server).await?;
+    if let Some(message) = settings_drift(&api).await? {
+        tracing::warn!(server = %server.name, "{message}");
+        update(state, &server.id, |m| m.drift = Some(message)).await?;
+    }
+    Ok(())
+}
+
+/// Startup: operations interrupted mid-flight may have left files and Immich out of step; a
+/// pause nobody holds any more is resumed by the run loop.
 pub async fn recover_after_restart(state: &AppState) -> AppResult<()> {
+    let _guard = state.maintenance_lock.lock().await;
+    let mut servers: std::collections::BTreeMap<_, _> = registry::servers(state)
+        .await?
+        .into_iter()
+        .map(|s| (s.id, s.maintenance))
+        .collect();
+    let mut tx = state.db.begin().await?;
     let interrupted: Vec<(String, String)> = sqlx::query_as(
         "SELECT id, admitted_server_ids_json FROM operations WHERE status = 'running'",
     )
-    .fetch_all(&state.db)
+    .fetch_all(&mut *tx)
     .await?;
-    for (op_id, servers) in &interrupted {
+    for (op_id, admitted_servers) in &interrupted {
+        for server_id in serde_json::from_str::<Vec<String>>(admitted_servers)? {
+            let m = servers.get_mut(&server_id).ok_or_else(|| {
+                AppError::internal(format!(
+                    "interrupted operation {op_id} references a missing server"
+                ))
+            })?;
+            m.unresolved_recoveries += 1;
+            m.require_recovery(format!("operation {op_id} was interrupted by a restart"));
+        }
         sqlx::query(
             "UPDATE operations SET status = 'recovery_required', finished_at = ? WHERE id = ?",
         )
         .bind(crate::db::now())
         .bind(op_id)
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await?;
         sqlx::query("UPDATE operation_items SET status = 'recovery_required' WHERE operation_id = ? AND status = 'running'")
             .bind(op_id)
-            .execute(&state.db)
+            .execute(&mut *tx)
             .await?;
-        for server_id in crate::db::json_vec(servers) {
-            update(state, &server_id, |m| {
-                m.active_ops = 0;
-                m.unresolved_recoveries += 1;
-                m.require_recovery(format!("operation {op_id} was interrupted by a restart"));
-            })
+        sqlx::query("UPDATE uploads SET status = 'failed' WHERE operation_id = ? AND status IN ('publishing', 'committed')")
+            .bind(op_id)
+            .execute(&mut *tx)
             .await?;
-        }
         tracing::warn!(operation = %op_id, "operation interrupted by restart; recovery required");
     }
-    // Admitted-but-idle epochs lose their counters on restart.
-    for server in registry::servers(state).await? {
-        if server.maintenance.phase == Phase::Active && server.maintenance.active_ops > 0 {
-            update(state, &server.id, |m| {
-                m.active_ops = 0;
-                m.settle(Utc::now());
-            })
+    sqlx::query("UPDATE operations SET status = 'queued' WHERE status = 'waiting_maintenance'")
+        .execute(&mut *tx)
+        .await?;
+    for (server_id, m) in &mut servers {
+        m.after_restart();
+        sqlx::query("UPDATE immich_servers SET maintenance_json = ? WHERE id = ?")
+            .bind(serde_json::to_string(m)?)
+            .bind(server_id)
+            .execute(&mut *tx)
             .await?;
-        }
     }
+    tx.commit().await?;
     Ok(())
 }
 
 pub async fn run(state: AppState) {
     let tick = Duration::from_secs(state.config.tick_secs.max(1));
+    let mut checked: HashMap<String, tokio::time::Instant> = HashMap::new();
     loop {
-        if let Err(e) = step(&state).await {
+        if let Err(e) = step(&state, &mut checked).await {
             tracing::warn!("maintenance: {}", e.message());
         }
         tokio::select! {
@@ -171,480 +471,30 @@ pub async fn run(state: AppState) {
     }
 }
 
-/// Advances every server's maintenance state by one phase.
-pub async fn step(state: &AppState) -> AppResult<()> {
+/// Resumes pauses nobody holds and checks settings drift (at most every `drift_check`).
+async fn step(
+    state: &AppState,
+    checked: &mut HashMap<String, tokio::time::Instant>,
+) -> AppResult<()> {
+    let now = tokio::time::Instant::now();
     for server in registry::servers(state).await? {
-        let result = match server.maintenance.phase {
-            Phase::Preparing => prepare(state, &server).await,
-            Phase::Active if server.maintenance.ready_to_reconcile(Utc::now()) => {
-                update(state, &server.id, MaintenanceState::begin_reconcile).await?;
-                reconcile(state, &server).await
-            }
-            Phase::Reconciling => reconcile(state, &server).await,
-            Phase::Restoring => restore(state, &server).await,
-            _ => Ok(()),
-        };
-        if let Err(e) = result {
-            tracing::warn!(server = %server.name, "maintenance step failed: {}", e.message());
-        }
-    }
-    Ok(())
-}
-
-fn immich(e: api::ApiError) -> AppError {
-    AppError::conflict("immich_error", crate::error::redact(&e.to_string()))
-}
-
-async fn queues_idle(api: &Api, names: &[&str]) -> Result<bool, AppError> {
-    let queues = api.queues().await.map_err(immich)?;
-    for name in names {
-        let Some(q) = queues.iter().find(|q| q.name == *name) else {
-            return Err(AppError::conflict(
-                "maintenance_blocked",
-                format!("Immich queue '{name}' not found"),
-            ));
-        };
-        if !q.is_idle() {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
-async fn wait_idle(
-    state: &AppState,
-    api: &Api,
-    names: &[&str],
-    timeout: Duration,
-) -> Result<bool, AppError> {
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        if queues_idle(api, names).await? {
-            return Ok(true);
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Ok(false);
-        }
-        tokio::time::sleep(state.config.timing.poll).await;
-    }
-}
-
-/// Turns watchers and scans off and waits for Immich to go quiet. On any failure everything we
-/// changed is put back and the server is blocked; no file has been touched yet.
-async fn prepare(state: &AppState, server: &Server) -> AppResult<()> {
-    let outcome = try_prepare(state, server).await;
-    match outcome {
-        Ok(saved) => {
-            update(state, &server.id, |m| m.prepared(saved, Utc::now())).await?;
-            tracing::info!(server = %server.name, "watchers paused; changes admitted");
-            Ok(())
-        }
-        Err((saved, err)) => {
-            let message = format!("could not pause Immich safely: {}", err.message());
-            let restored = match registry::admin_api(state, server).await {
-                Ok(api) => undo(&api, &saved).await.is_ok(),
-                Err(_) => saved == SavedSettings::default(),
-            };
-            update(state, &server.id, |m| {
-                m.saved = if restored {
-                    SavedSettings::default()
-                } else {
-                    saved
-                };
-                m.block(message.clone());
-            })
-            .await?;
-            Err(err)
-        }
-    }
-}
-
-async fn try_prepare(
-    state: &AppState,
-    server: &Server,
-) -> Result<SavedSettings, (SavedSettings, AppError)> {
-    let mut saved = SavedSettings::default();
-    let api = registry::admin_api(state, server)
-        .await
-        .map_err(|e| (saved.clone(), e))?;
-    let mut config = api
-        .get_config()
-        .await
-        .map_err(|e| (saved.clone(), immich(e)))?;
-    let watch = api::config_bool(&config, WATCH_ENABLED);
-    let scan = api::config_bool(&config, SCAN_ENABLED);
-    let (Some(watch), Some(scan)) = (watch, scan) else {
-        return Err((
-            saved,
-            AppError::conflict("maintenance_blocked", "unexpected Immich config shape"),
-        ));
-    };
-    if watch || scan {
-        api::set_config_bool(&mut config, WATCH_ENABLED, false);
-        api::set_config_bool(&mut config, SCAN_ENABLED, false);
-        if watch {
-            saved.watch_enabled = Some(true);
-        }
-        if scan {
-            saved.scan_enabled = Some(true);
-        }
-        api.put_config(&config).await.map_err(|e| {
-            // Nothing was written; nothing to undo.
-            (SavedSettings::default(), immich(e))
-        })?;
-        let verify = api
-            .get_config()
-            .await
-            .map_err(|e| (saved.clone(), immich(e)))?;
-        if api::config_bool(&verify, WATCH_ENABLED) != Some(false)
-            || api::config_bool(&verify, SCAN_ENABLED) != Some(false)
+        if server.maintenance.phase == Phase::Resuming
+            && let Err(e) = resume(state, &server.id).await
         {
-            return Err((
-                saved,
-                AppError::conflict(
-                    "maintenance_blocked",
-                    "Immich did not apply the watcher change",
-                ),
-            ));
+            tracing::warn!(server = %server.name, "resume failed: {}", e.message());
+        }
+        let due = checked
+            .get(&server.id)
+            .is_none_or(|last| now.duration_since(*last) >= state.config.timing.drift_check);
+        if due {
+            checked.insert(server.id.clone(), now);
+            if let Err(e) = check_drift(state, &server).await {
+                tracing::debug!(server = %server.name, "drift check skipped: {}", e.message());
+            }
         }
     }
-    match wait_idle(
-        state,
-        &api,
-        INTERFERING_QUEUES,
-        state.config.timing.quiesce_timeout,
-    )
-    .await
-    {
-        Ok(true) => {}
-        Ok(false) => {
-            return Err((
-                saved,
-                AppError::conflict("maintenance_blocked", "Immich queues did not drain in time"),
-            ));
-        }
-        Err(e) => return Err((saved, e)),
-    }
-    api.set_queue_paused("library", true)
-        .await
-        .map_err(|e| (saved.clone(), immich(e)))?;
-    saved.paused_queues.push("library".into());
-    tokio::time::sleep(state.config.timing.settle).await;
-    match queues_idle(&api, INTERFERING_QUEUES).await {
-        Ok(true) => Ok(saved),
-        Ok(false) => Err((
-            saved,
-            AppError::conflict(
-                "maintenance_blocked",
-                "Immich queued new work while pausing",
-            ),
-        )),
-        Err(e) => Err((saved, e)),
-    }
-}
-
-/// Puts back settings changed by `try_prepare` when it failed.
-async fn undo(api: &Api, saved: &SavedSettings) -> Result<(), AppError> {
-    for q in &saved.paused_queues {
-        api.set_queue_paused(q, false).await.map_err(immich)?;
-    }
-    restore_config(api, saved).await
-}
-
-async fn restore_config(api: &Api, saved: &SavedSettings) -> Result<(), AppError> {
-    if saved.watch_enabled.is_none() && saved.scan_enabled.is_none() {
-        return Ok(());
-    }
-    let mut config: Value = api.get_config().await.map_err(immich)?;
-    let mut changed = false;
-    for (path, before) in [
-        (WATCH_ENABLED, saved.watch_enabled),
-        (SCAN_ENABLED, saved.scan_enabled),
-    ] {
-        let current = api::config_bool(&config, path).unwrap_or(false);
-        if let Some(value) = restore_value(before, false, current) {
-            changed |= api::set_config_bool(&mut config, path, value);
-        }
-    }
-    if changed {
-        api.put_config(&config).await.map_err(immich)?;
-    }
-    Ok(())
-}
-
-/// Resumes the library queue, scans every affected library and waits for the scan to finish.
-async fn reconcile(state: &AppState, server: &Server) -> AppResult<()> {
-    let api = registry::admin_api(state, server).await?;
-    let m = registry::server(state, &server.id).await?.maintenance;
-    for q in &m.saved.paused_queues {
-        api.set_queue_paused(q, false).await.map_err(immich)?;
-    }
-    update(state, &server.id, |m| m.saved.paused_queues.clear()).await?;
-    for library in &m.affected_libraries {
-        api.scan_library(library).await.map_err(immich)?;
-    }
-    if !m.affected_libraries.is_empty() {
-        // Give the scan job time to be queued before watching the counters.
-        tokio::time::sleep(state.config.timing.settle).await;
-        let names = ["library", "sidecar", "metadataExtraction"];
-        if !wait_idle(state, &api, &names, state.config.timing.scan_timeout).await? {
-            tracing::warn!(server = %server.name, "reconciliation scan still running; restoring watchers anyway");
-        }
-    }
-    update(state, &server.id, MaintenanceState::begin_restore).await?;
-    restore(state, server).await
-}
-
-async fn restore(state: &AppState, server: &Server) -> AppResult<()> {
-    let api = registry::admin_api(state, server).await?;
-    let m = registry::server(state, &server.id).await?.maintenance;
-    for q in &m.saved.paused_queues {
-        api.set_queue_paused(q, false).await.map_err(immich)?;
-    }
-    if let Err(e) = restore_config(&api, &m.saved).await {
-        update(state, &server.id, |m| {
-            m.message = Some(format!("restoring watchers failed: {}", e.message()))
-        })
-        .await?;
-        return Err(e);
-    }
-    update(state, &server.id, MaintenanceState::restored).await?;
-    tracing::info!(server = %server.name, "watchers restored");
     Ok(())
 }
 
 #[cfg(test)]
-mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
-
-    use std::sync::{Arc, Mutex};
-
-    use serde_json::json;
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
-
-    use super::*;
-    use crate::config::Config;
-    use crate::crypto::SecretBox;
-
-    /// A tiny stateful Immich: `/admin/config` keeps what was PUT; queues report `busy` jobs.
-    #[derive(Clone)]
-    struct FakeImmich {
-        config: Arc<Mutex<Value>>,
-        busy_queue: Arc<Mutex<Option<&'static str>>>,
-        paused: Arc<Mutex<Vec<String>>>,
-    }
-
-    impl Respond for FakeImmich {
-        fn respond(&self, req: &Request) -> ResponseTemplate {
-            let p = req.url.path();
-            match (req.method.as_str(), p) {
-                ("GET", "/api/admin/config") => {
-                    ResponseTemplate::new(200).set_body_json(self.config.lock().unwrap().clone())
-                }
-                ("PUT", "/api/admin/config") => {
-                    let v: Value = serde_json::from_slice(&req.body).unwrap();
-                    *self.config.lock().unwrap() = v.clone();
-                    ResponseTemplate::new(200).set_body_json(v)
-                }
-                ("GET", "/api/queues") => {
-                    let busy = *self.busy_queue.lock().unwrap();
-                    let paused = self.paused.lock().unwrap().clone();
-                    let names = [
-                        "library",
-                        "sidecar",
-                        "metadataExtraction",
-                        "storageTemplateMigration",
-                        "thumbnailGeneration",
-                    ];
-                    let qs: Vec<Value> = names
-                        .iter()
-                        .map(|n| {
-                            json!({ "name": n, "isPaused": paused.iter().any(|x| x == n),
-                                    "statistics": { "active": i64::from(busy == Some(*n)), "waiting": 0, "delayed": 0, "paused": 0 } })
-                        })
-                        .collect();
-                    ResponseTemplate::new(200).set_body_json(qs)
-                }
-                ("PUT", q) if q.starts_with("/api/queues/") => {
-                    let name = q.trim_start_matches("/api/queues/").to_owned();
-                    let v: Value = serde_json::from_slice(&req.body).unwrap();
-                    let mut paused = self.paused.lock().unwrap();
-                    paused.retain(|x| *x != name);
-                    if v["isPaused"] == true {
-                        paused.push(name);
-                    }
-                    ResponseTemplate::new(200).set_body_json(json!({}))
-                }
-                ("POST", s) if s.starts_with("/api/libraries/") && s.ends_with("/scan") => {
-                    ResponseTemplate::new(204)
-                }
-                _ => ResponseTemplate::new(404),
-            }
-        }
-    }
-
-    async fn setup(
-        busy: Option<&'static str>,
-    ) -> (tempfile::TempDir, AppState, MockServer, FakeImmich) {
-        let dir = tempfile::tempdir().unwrap();
-        let pool = crate::db::connect(dir.path()).await.unwrap();
-        let secrets = SecretBox::open_or_create(dir.path()).unwrap();
-        let state = AppState::new(Config::for_tests(dir.path()), pool, secrets)
-            .await
-            .unwrap();
-        let fake = FakeImmich {
-            config: Arc::new(Mutex::new(json!({
-                "library": { "watch": { "enabled": true }, "scan": { "enabled": true, "cronExpression": "0 0 * * *" } },
-                "trash": { "enabled": true, "days": 30 }
-            }))),
-            busy_queue: Arc::new(Mutex::new(busy)),
-            paused: Arc::new(Mutex::new(Vec::new())),
-        };
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .respond_with(fake.clone())
-            .mount(&server)
-            .await;
-        Mock::given(method("PUT"))
-            .respond_with(fake.clone())
-            .mount(&server)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/api/libraries/lib1/scan"))
-            .respond_with(fake.clone())
-            .mount(&server)
-            .await;
-        let now = crate::db::now();
-        sqlx::query(
-            "INSERT INTO immich_servers (id, name, url, version, compatible, maintenance_json, created_at) VALUES ('s1', 'Home', ?, '3.4.1', 1, ?, ?)",
-        )
-        .bind(server.uri())
-        .bind(serde_json::to_string(&MaintenanceState::default()).unwrap())
-        .bind(&now)
-        .execute(&state.db)
-        .await
-        .unwrap();
-        let key = state
-            .secrets
-            .encrypt(registry::API_KEY_PURPOSE, "test-key")
-            .unwrap();
-        sqlx::query(
-            "INSERT INTO immich_accounts (id, server_id, label, email, immich_user_id, is_admin, api_key_enc, status, created_at)
-             VALUES ('a1', 's1', 'Admin', 'admin@ism.example', 'u1', 1, ?, 'ok', ?)",
-        )
-        .bind(key)
-        .bind(&now)
-        .execute(&state.db)
-        .await
-        .unwrap();
-        (dir, state, server, fake)
-    }
-
-    async fn scans(server: &MockServer) -> usize {
-        let reqs = server.received_requests().await.unwrap();
-        reqs.iter()
-            .filter(|r| r.url.path() == "/api/libraries/lib1/scan")
-            .count()
-    }
-
-    fn flag(fake: &FakeImmich, p: &[&str]) -> Option<bool> {
-        api::config_bool(&fake.config.lock().unwrap(), p)
-    }
-
-    #[tokio::test]
-    async fn pauses_admits_scans_and_restores() {
-        let (_dir, state, server, fake) = setup(None).await;
-        let worker = tokio::spawn(run(state.clone()));
-
-        acquire(&state, "s1", &["lib1".to_owned()]).await.unwrap();
-        assert_eq!(
-            flag(&fake, WATCH_ENABLED),
-            Some(false),
-            "watcher is off before any file is touched"
-        );
-        assert_eq!(flag(&fake, SCAN_ENABLED), Some(false));
-        assert_eq!(fake.paused.lock().unwrap().as_slice(), ["library"]);
-        assert_eq!(
-            registry::server(&state, "s1")
-                .await
-                .unwrap()
-                .maintenance
-                .phase,
-            Phase::Active
-        );
-
-        release(&state, "s1").await.unwrap();
-        // Nothing happens before the quiet period ends.
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        assert_eq!(
-            registry::server(&state, "s1")
-                .await
-                .unwrap()
-                .maintenance
-                .phase,
-            Phase::Active
-        );
-        // Skip the 15 minutes.
-        update(&state, "s1", |m| {
-            m.quiet_deadline = Some(Utc::now() - chrono::Duration::seconds(1))
-        })
-        .await
-        .unwrap();
-        state.maintenance_wake.notify_waiters();
-
-        for _ in 0..100 {
-            if registry::server(&state, "s1")
-                .await
-                .unwrap()
-                .maintenance
-                .phase
-                == Phase::Idle
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        worker.abort();
-        let m = registry::server(&state, "s1").await.unwrap().maintenance;
-        assert_eq!(m.phase, Phase::Idle, "{m:?}");
-        assert_eq!(flag(&fake, WATCH_ENABLED), Some(true));
-        assert_eq!(flag(&fake, SCAN_ENABLED), Some(true));
-        assert_eq!(
-            fake.config.lock().unwrap()["library"]["scan"]["cronExpression"],
-            "0 0 * * *"
-        );
-        assert!(fake.paused.lock().unwrap().is_empty());
-        assert_eq!(
-            scans(&server).await,
-            1,
-            "the affected library is scanned once"
-        );
-    }
-
-    #[tokio::test]
-    async fn busy_queue_blocks_and_restores() {
-        let (_dir, state, server, fake) = setup(Some("metadataExtraction")).await;
-        let worker = tokio::spawn(run(state.clone()));
-        let err = acquire(&state, "s1", &["lib1".to_owned()])
-            .await
-            .unwrap_err();
-        worker.abort();
-        assert_eq!(err.code(), "maintenance_blocked");
-        let m = registry::server(&state, "s1").await.unwrap().maintenance;
-        assert_eq!(m.phase, Phase::Blocked, "{m:?}");
-        assert_eq!(
-            flag(&fake, WATCH_ENABLED),
-            Some(true),
-            "settings are put back when pausing fails"
-        );
-        assert_eq!(flag(&fake, SCAN_ENABLED), Some(true));
-        assert!(fake.paused.lock().unwrap().is_empty());
-        // A blocked server keeps refusing work until an admin retries.
-        let err = acquire(&state, "s1", &["lib1".to_owned()])
-            .await
-            .unwrap_err();
-        assert_eq!(err.code(), "maintenance_blocked");
-        assert_eq!(scans(&server).await, 0);
-    }
-}
+pub(crate) mod tests;

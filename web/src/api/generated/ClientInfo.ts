@@ -2,4 +2,4 @@
 import type { ClientAction } from "./ClientAction";
 import type { ClientRoot } from "./ClientRoot";
 
-export type ClientInfo = { instance_id: string, instance_name: string, version: string, api_version: number, token_kind: string, actions: Array<ClientAction>, roots: Array<ClientRoot>, };
+export type ClientInfo = { instance_id: string, instance_name: string, version: string, api_version: number, token_kind: string, actions: Array<ClientAction>, roots: Array<ClientRoot>, capabilities: Array<string>, };

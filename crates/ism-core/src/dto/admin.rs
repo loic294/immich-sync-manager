@@ -39,9 +39,71 @@ pub struct MaintenanceView {
     pub phase: Phase,
     pub epoch: u64,
     pub active_ops: u32,
-    pub seconds_until_reconcile: Option<i64>,
-    pub affected_libraries: Vec<String>,
+    /// ISM holds Immich's `library` queue paused.
+    pub queue_paused: bool,
+    /// Immich's file watcher or scheduled scan was found on; writes are refused until an admin
+    /// re-applies ISM's settings.
+    pub drift: Option<String>,
     pub message: Option<String>,
+}
+
+/// How ISM detects changes in a mapped folder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum WatchMode {
+    /// Polling on network file systems, native change events otherwise.
+    Auto,
+    Native,
+    Poll,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct WatchSettingsInput {
+    pub mode: WatchMode,
+    /// Seconds between polling passes (60 to 86400).
+    pub poll_interval_secs: u32,
+}
+
+/// Change detection of one mapped folder.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct WatchStatusView {
+    pub root_id: String,
+    pub name: String,
+    /// The folder belongs to an Immich library or a peer share and is watched.
+    pub watched: bool,
+    pub mode: WatchMode,
+    pub poll_interval_secs: u32,
+    /// `native` or `poll` once the watcher started.
+    pub effective_mode: Option<String>,
+    pub fs_type: Option<String>,
+    pub last_pass_at: Option<String>,
+    pub last_change_at: Option<String>,
+    /// Detection is paused because the folder is unreachable or suddenly empty.
+    pub paused: bool,
+    pub warnings: Vec<String>,
+    pub files: i64,
+}
+
+/// A pending or running Immich library scan requested by ISM.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct ScanScheduleView {
+    pub library_id: String,
+    pub library_name: Option<String>,
+    pub server_id: String,
+    pub due_at: Option<String>,
+    /// Seconds until the scan is due; 0 when due (it may wait for the write barrier).
+    pub due_in_secs: Option<i64>,
+    pub reasons: Vec<String>,
+    pub running: bool,
+    /// Due, but a managed operation holds the server's write barrier.
+    pub waiting_for_barrier: bool,
+    pub last_started_at: Option<String>,
+    pub last_finished_at: Option<String>,
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -130,6 +192,7 @@ pub struct MappingView {
     pub opm_prefix: Option<String>,
     pub available: bool,
     pub availability_detail: Option<String>,
+    pub watch: WatchStatusView,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -202,7 +265,7 @@ pub struct PeerInvite {
 #[ts(export)]
 pub struct PeerAcceptInput {
     pub name: String,
-    /// Address of the other instance as reachable from here, e.g. `http://100.64.0.2:8080`.
+    /// Address of the other instance as reachable from here, e.g. `http://192.0.2.2:8080`.
     pub url: String,
     pub invite: String,
     /// Address of this instance as reachable from the other one, sent while pairing.
@@ -311,6 +374,8 @@ pub struct ConflictView {
     pub peer_id: String,
     pub status: String,
     pub created_at: String,
+    /// For a move that conflicted: where the peer moved the file or folder from.
+    pub moved_from: Option<Location>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -320,6 +385,8 @@ pub enum ConflictResolution {
     KeepLocal,
     KeepRemote,
     KeepBoth,
+    /// Dismisses the conflict without changing either side.
+    Skip,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -342,6 +409,8 @@ pub struct Overview {
     pub peers_online: i64,
     pub peers_total: i64,
     pub uncovered_libraries: i64,
+    pub watchers: Vec<WatchStatusView>,
+    pub scans: Vec<ScanScheduleView>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]

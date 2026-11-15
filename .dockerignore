@@ -1,0 +1,11 @@
+target/
+.data/
+data/
+keys/
+**/node_modules/
+web/dist/
+docker/immich-proof/
+.git/
+*.log
+.env
+.env.*

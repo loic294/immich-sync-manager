@@ -1,0 +1,52 @@
+# Disposable stock Immich v3.4.1 used only by run.sh. No machine learning container.
+name: ism-immich-proof
+services:
+  server:
+    image: ghcr.io/immich-app/immich-server:v3.4.1
+    environment:
+      DB_HOSTNAME: database
+      DB_USERNAME: ismtest
+      DB_PASSWORD: ismtestpassword
+      DB_DATABASE_NAME: ismtest
+      REDIS_HOSTNAME: redis
+      IMMICH_MACHINE_LEARNING_ENABLED: "false"
+      TZ: UTC
+    ports:
+      - "127.0.0.1::2283"
+    volumes:
+      - media:/data
+      # External library (import path /mnt/ext) and the ISM trash, outside every import path.
+      - ./.work/ext:/mnt/ext
+      - ./.work/ism-trash:/mnt/ism-trash
+    depends_on:
+      database:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+  database:
+    image: ghcr.io/immich-app/postgres@sha256:bcf63357191b76a916ae5eb93464d65c07511da41e3bf7a8416db519b40b1c23
+    ports:
+      - "127.0.0.1::5432"
+    environment:
+      POSTGRES_USER: ismtest
+      POSTGRES_PASSWORD: ismtestpassword
+      POSTGRES_DB: ismtest
+      POSTGRES_INITDB_ARGS: --data-checksums
+    volumes:
+      - database:/var/lib/postgresql/data
+    shm_size: 128mb
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ismtest -d ismtest"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+  redis:
+    image: valkey/valkey@sha256:418652cfb58ef879d4978c33553735d7147016032d5aefaa14c828e611eb9dfd
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+volumes:
+  media:
+  database:

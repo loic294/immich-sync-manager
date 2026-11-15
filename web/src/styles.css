@@ -69,3 +69,9 @@
 :where(.badge-warning:is(.badge-outline, .badge-dash)) {
   border-color: var(--color-warning);
 }
+
+/* daisyUI labels are single-line flex rows; field help text must wrap as prose. */
+.fieldset p.label {
+  display: block;
+  white-space: normal;
+}

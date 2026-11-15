@@ -3,12 +3,16 @@
 use std::time::{Duration, UNIX_EPOCH};
 
 use futures_util::StreamExt;
+use ism_core::dto::{
+    CreateUpload, FileRole, Location, OnConflict, OperationAction, OperationRequest, UploadFileSpec,
+};
 use ism_core::schedule::Schedule;
 use ism_core::version::{Causality, VersionVector};
 use reqwest::Method;
 use tokio::io::AsyncWriteExt;
 
 use super::{ConflictInput, Row, Share, net};
+use crate::auth::Principal;
 use crate::db;
 use crate::error::{AppError, AppResult};
 use crate::files::{self, STAGING_DIR};
@@ -16,6 +20,17 @@ use crate::state::{AppState, ServerEvent};
 
 const MAX_ATTEMPTS: i64 = 8;
 const PROGRESS_EVERY: u64 = 4 * 1024 * 1024;
+
+/// Interrupted downloads go back to the queue and resume from their staging file. A finished
+/// download is handed to a managed operation in the same transaction that removes its
+/// transfer, so the executor's own recovery covers publication.
+pub async fn recover_after_restart(state: &AppState) -> AppResult<()> {
+    sqlx::query("UPDATE transfers SET status = 'queued', error = NULL, updated_at = ? WHERE status = 'running'")
+        .bind(db::now())
+        .execute(&state.db)
+        .await?;
+    Ok(())
+}
 
 pub fn encode(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
@@ -102,7 +117,7 @@ async fn next(state: &AppState) -> AppResult<Option<(Transfer, Option<String>)>>
                     rel,
                     sha256,
                     size,
-                    vv: serde_json::from_str(&vv).unwrap_or_default(),
+                    vv: serde_json::from_str(&vv)?,
                 },
                 ov,
             )));
@@ -116,27 +131,50 @@ pub async fn run(state: AppState) {
     loop {
         match next(&state).await {
             Ok(Some((t, ov))) => {
-                let _ = sqlx::query("UPDATE transfers SET status = 'running', override_id = ?, updated_at = ? WHERE id = ?")
-                    .bind(&ov)
-                    .bind(db::now())
-                    .bind(&t.id)
-                    .execute(&state.db)
-                    .await;
+                match claim(&state, &t.id, ov.as_deref()).await {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(e) => {
+                        tracing::error!(transfer = %t.id, "claim transfer: {}", e.message());
+                        tokio::time::sleep(tick).await;
+                        continue;
+                    }
+                }
                 state.emit(ServerEvent::SyncChanged);
                 let result = run_one(&state, &t).await;
+                let deferred = matches!(result, Ok(Outcome::Deferred));
                 let now = db::now();
-                let _ = match result {
+                let updated = match result {
                     Ok(Outcome::Done) => {
-                        sqlx::query("DELETE FROM transfers WHERE id = ?")
+                        sqlx::query("DELETE FROM transfers WHERE id = ? AND status = 'running'")
                             .bind(&t.id)
                             .execute(&state.db)
                             .await
                     }
                     Ok(Outcome::Dropped) => {
-                        sqlx::query("DELETE FROM transfers WHERE id = ?")
+                        sqlx::query("DELETE FROM transfers WHERE id = ? AND status = 'running'")
                             .bind(&t.id)
                             .execute(&state.db)
                             .await
+                    }
+                    Ok(Outcome::Blocked(reason)) => {
+                        sqlx::query(
+                            "UPDATE transfers SET status = 'failed', error = ?, updated_at = ? WHERE id = ? AND status = 'running'",
+                        )
+                        .bind(reason)
+                        .bind(&now)
+                        .bind(&t.id)
+                        .execute(&state.db)
+                        .await
+                    }
+                    Ok(Outcome::Deferred) => {
+                        sqlx::query(
+                            "UPDATE transfers SET status = 'queued', updated_at = ? WHERE id = ? AND status = 'running'",
+                        )
+                        .bind(&now)
+                        .bind(&t.id)
+                        .execute(&state.db)
+                        .await
                     }
                     Err(e) => {
                         tracing::warn!(transfer = %t.id, "transfer failed: {e}");
@@ -154,7 +192,13 @@ pub async fn run(state: AppState) {
                         .await
                     }
                 };
+                if let Err(e) = updated {
+                    tracing::error!(transfer = %t.id, "record transfer outcome: {e}");
+                }
                 state.emit(ServerEvent::SyncChanged);
+                if deferred {
+                    tokio::time::sleep(tick).await;
+                }
             }
             Ok(None) => {
                 tokio::select! {
@@ -170,13 +214,40 @@ pub async fn run(state: AppState) {
     }
 }
 
+pub(super) async fn claim(
+    state: &AppState,
+    id: &str,
+    override_id: Option<&str>,
+) -> AppResult<bool> {
+    let updated = sqlx::query(
+        "UPDATE transfers SET status = 'running', override_id = ?, updated_at = ?
+         WHERE id = ? AND status = 'queued'",
+    )
+    .bind(override_id)
+    .bind(db::now())
+    .bind(id)
+    .execute(&state.db)
+    .await?;
+    Ok(updated.rows_affected() == 1)
+}
+
 enum Outcome {
     Done,
     /// The remote version is gone or superseded; a newer event will follow.
     Dropped,
+    Blocked(&'static str),
+    Deferred,
 }
 
 async fn run_one(state: &AppState, t: &Transfer) -> Result<Outcome, String> {
+    let _operation_guard = state.replication_operation_lock.lock().await;
+    if let Err(e) = super::require_stable_operations(state).await {
+        return if e.code() == "recovery_required" {
+            Ok(Outcome::Deferred)
+        } else {
+            Err(e.message().to_owned())
+        };
+    }
     let m = |e: AppError| e.message().to_owned();
     let peer = net::peer(state, &t.peer_id).await.map_err(m)?;
     let shares = super::shares(state).await.map_err(m)?;
@@ -192,14 +263,55 @@ async fn run_one(state: &AppState, t: &Transfer) -> Result<Outcome, String> {
     let target = root.abs(&target_rel).map_err(m)?;
 
     // Adopt an identical local copy without downloading.
-    if target.is_file()
-        && files::cached_sha256(&state.db, &root.mapping.root_id, &target_rel, &target)
+    let fingerprint_path = target.clone();
+    let fingerprint =
+        tokio::task::spawn_blocking(move || files::replacement_fingerprint(&fingerprint_path))
             .await
-            .map_err(m)?
-            == t.sha256
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
+    if fingerprint
+        .as_ref()
+        .is_some_and(|(_, hash)| hash == &t.sha256)
     {
         let meta = std::fs::metadata(&target).map_err(|e| e.to_string())?;
-        let mut r = super::row(state, &share.id, &t.rel)
+        if i64::try_from(meta.len()).ok() != Some(t.size) {
+            return Ok(Outcome::Blocked(
+                "matching peer file checksums have different sizes",
+            ));
+        }
+        if fingerprint.as_ref().map(|(revision, _)| revision.as_str())
+            != Some(files::revision(&meta).as_str())
+        {
+            return Err("target changed while verifying the local copy".into());
+        }
+        let mut tx = state
+            .db
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|e| e.to_string())?;
+        let status: Option<String> =
+            sqlx::query_scalar("SELECT status FROM transfers WHERE id = ?")
+                .bind(&t.id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| e.to_string())?;
+        if status.as_deref() != Some("running") {
+            tx.commit().await.map_err(|e| e.to_string())?;
+            return Ok(Outcome::Dropped);
+        }
+        let conflict: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM conflicts WHERE share_id = ? AND rel_path = ? AND status = 'open')",
+        )
+        .bind(&share.id)
+        .bind(&t.rel)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+        if conflict {
+            tx.commit().await.map_err(|e| e.to_string())?;
+            return Ok(Outcome::Blocked("the file has an unresolved conflict"));
+        }
+        let mut r = super::row_in(&mut tx, &share.id, &t.rel)
             .await
             .map_err(m)?
             .unwrap_or(Row {
@@ -214,9 +326,15 @@ async fn run_one(state: &AppState, t: &Transfer) -> Result<Outcome, String> {
         r.mtime_ns = files::mtime_ns(&meta);
         r.sha256 = Some(t.sha256.clone());
         r.deleted = false;
-        super::put_row(state, &share.id, &t.rel, &r)
+        super::put_row_in(&mut tx, &share.id, &t.rel, &r)
             .await
             .map_err(m)?;
+        sqlx::query("DELETE FROM transfers WHERE id = ? AND status = 'running'")
+            .bind(&t.id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| e.to_string())?;
+        tx.commit().await.map_err(|e| e.to_string())?;
         return Ok(Outcome::Done);
     }
 
@@ -327,41 +445,127 @@ async fn run_one(state: &AppState, t: &Transfer) -> Result<Outcome, String> {
         conflict_here(state, &peer, &share, t).await.map_err(m)?;
         return Ok(Outcome::Dropped);
     }
-    let (src, dst) = (staging.clone(), target.clone());
-    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-        if let Some(parent) = dst.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        if let Some(ns) = mtime_ns {
+    if let Some(ns) = mtime_ns {
+        let src = staging.clone();
+        tokio::task::spawn_blocking(move || -> std::io::Result<()> {
             let when = UNIX_EPOCH + Duration::from_nanos(ns.max(0) as u64);
             std::fs::File::options()
                 .write(true)
                 .open(&src)?
-                .set_modified(when)?;
-        }
-        std::fs::rename(&src, &dst)
-    })
-    .await
-    .map_err(|e| e.to_string())?
-    .map_err(|e| e.to_string())?;
-    let meta = std::fs::metadata(&target).map_err(|e| e.to_string())?;
-    let mut vv = local.map(|r| r.vv).unwrap_or_default();
-    vv.merge(&t.vv);
-    super::put_row(
-        state,
-        &share.id,
-        &t.rel,
-        &Row {
-            size: meta.len() as i64,
-            mtime_ns: files::mtime_ns(&meta),
-            sha256: Some(t.sha256.clone()),
-            deleted: false,
-            vv,
-        },
-    )
-    .await
-    .map_err(m)?;
+                .set_modified(when)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
+    }
+    publish(state, &peer, &share, &root, t, &staging, &target_rel)
+        .await
+        .map_err(m)?;
     Ok(Outcome::Done)
+}
+
+/// Publishes a verified download through a managed upload operation: it runs under the
+/// Immich write barrier, registers self-writes, keeps the replaced version in ISM trash and
+/// requests a library scan. The replica row is updated when the operation finishes.
+async fn publish(
+    state: &AppState,
+    peer: &net::Peer,
+    share: &Share,
+    root: &files::Root,
+    t: &Transfer,
+    staging: &std::path::Path,
+    target_rel: &ism_core::paths::RelPath,
+) -> AppResult<()> {
+    let name = target_rel
+        .name()
+        .ok_or_else(|| AppError::invalid_location("peer file has no name"))?
+        .to_owned();
+    let folder = target_rel
+        .parent()
+        .unwrap_or_else(ism_core::paths::RelPath::root);
+    let target = root.abs(target_rel)?;
+    let current = {
+        let path = target.clone();
+        tokio::task::spawn_blocking(move || files::replacement_fingerprint(&path))
+            .await
+            .map_err(AppError::internal)??
+    };
+    let upload_id = crate::crypto::new_id("upl");
+    let principal = Principal::Peer {
+        peer_id: peer.id.clone(),
+    };
+    let request = CreateUpload {
+        idempotency_key: Some(format!("peer-transfer:{}", t.id)),
+        target: Location {
+            root_id: root.mapping.root_id.clone(),
+            path: folder.as_str().to_owned(),
+        },
+        provenance: None,
+        files: vec![UploadFileSpec {
+            name,
+            role: FileRole::Original,
+            size: t.size as u64,
+            sha256: t.sha256.clone(),
+            expected_revision: current.as_ref().map(|(revision, _)| revision.clone()),
+            expected_sha256: current.as_ref().map(|(_, sha)| sha.clone()),
+        }],
+        on_conflict: if current.is_some() {
+            OnConflict::ReplaceIfExpected
+        } else {
+            OnConflict::Fail
+        },
+        existing_original: None,
+    };
+    let dir = crate::ops::plan::staging_dir(root, &upload_id)?;
+    std::fs::create_dir_all(&dir)?;
+    std::fs::rename(staging, dir.join("0"))?;
+    let op = OperationRequest {
+        idempotency_key: format!("upload:{upload_id}"),
+        label: Some(format!("{} from {}", t.rel, peer.name)),
+        actions: vec![OperationAction::PublishUpload {
+            upload_id: upload_id.clone(),
+        }],
+        allow_owner_transfer: false,
+        allow_partial: false,
+    };
+    let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
+    let running: Option<String> = sqlx::query_scalar("SELECT status FROM transfers WHERE id = ?")
+        .bind(&t.id)
+        .fetch_optional(&mut *tx)
+        .await?;
+    if running.as_deref() != Some("running") {
+        drop(tx);
+        let _ = std::fs::remove_dir_all(&dir);
+        return Ok(());
+    }
+    sqlx::query("INSERT INTO uploads (id, principal, request_json, status, created_at, idempotency_key) VALUES (?, ?, ?, 'receiving', ?, ?)")
+        .bind(&upload_id)
+        .bind(principal.key())
+        .bind(serde_json::to_string(&request)?)
+        .bind(db::now())
+        .bind(&request.idempotency_key)
+        .execute(&mut *tx)
+        .await?;
+    let accepted = crate::ops::insert_in(&mut tx, &principal, &op, Some(&upload_id)).await?;
+    sqlx::query(
+        "INSERT INTO pending_peer_ops (operation_id, idx, share_id, kind, from_path, to_path, vv_json, peer_id)
+         VALUES (?, 0, ?, 'publish', NULL, ?, ?, ?)",
+    )
+    .bind(&accepted.operation_id)
+    .bind(&share.id)
+    .bind(&t.rel)
+    .bind(serde_json::to_string(&t.vv)?)
+    .bind(&peer.id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("DELETE FROM transfers WHERE id = ?")
+        .bind(&t.id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    crate::ops::announce_queued(state, &accepted);
+    state.emit(ServerEvent::SyncChanged);
+    Ok(())
 }
 
 async fn conflict_here(
@@ -389,6 +593,7 @@ async fn conflict_here(
             },
             remote_vv: &t.vv,
             peer_id: &peer.id,
+            from: None,
         },
     )
     .await

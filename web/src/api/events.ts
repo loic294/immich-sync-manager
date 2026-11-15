@@ -12,6 +12,8 @@ export type ChangeType =
   | 'maintenance_changed'
   | 'sync_changed'
   | 'conflicts_changed'
+  | 'watch_changed'
+  | 'library_scanned'
   | 'resync';
 
 export interface ChangeEvent {

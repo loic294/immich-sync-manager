@@ -45,7 +45,9 @@ working, but moves and renames of existing assets are refused.
 
 ## First run
 
-1. Open `http://<host>:8080` and create the administrator (password: 10 characters or more).
+1. Open `http://<host>:8080` and create the administrator (password: 10 characters or more). Until
+   this is done, anyone who can reach the port can create it, so do it right after the first start
+   or publish the port on a private interface only.
 2. **Servers**: add Immich's URL, then accounts with username/password. ISM warns when a library is not
    owned by any added account.
 3. **Mappings**: for each `/mnt/<name>`, pick the Immich library and its import path. Give it a short
@@ -69,6 +71,7 @@ running operations or a maintenance window.
 | `ISM_SECURE_COOKIES` | unset | `true` when served over HTTPS. |
 | `ISM_LOG` | `info` | Log filter (`debug`, `ism_server=debug`, …). |
 | `ISM_WORKER_TICK_SECS` | `5` | Background worker interval. |
-| `ISM_SCAN_INTERVAL_SECS` | `300` | How often shared folders are checked for changes. |
-| `ISM_QUIESCE_TIMEOUT_SECS` | `600` | Longest wait for Immich queues to drain before changes. |
-| `ISM_SCAN_TIMEOUT_SECS` | `7200` | Longest wait for the reconciliation scan. |
+| `ISM_SCAN_INTERVAL_SECS` | `300` | Full safety rescan of peer shares; watcher changes trigger earlier rescans. |
+| `ISM_QUIESCE_TIMEOUT_SECS` | `600` | Longest wait for Immich's paused `library` queue to have no running job. |
+| `ISM_SCAN_TIMEOUT_SECS` | `7200` | Longest wait for a library scan to finish. |
+| `ISM_SCAN_DELAY_SECS` | `120` | Library scans run this long after the last detected change. |

@@ -88,14 +88,22 @@ pub struct QueueStatistics {
 #[serde(rename_all = "camelCase")]
 pub struct Queue {
     pub name: String,
+    #[serde(default)]
+    pub is_paused: bool,
     pub statistics: QueueStatistics,
 }
 
 impl Queue {
-    /// Jobs held in a paused queue would run later, so they count as pending work too.
+    /// Nothing running and nothing pending: work held by a pause counts as pending.
     pub fn is_idle(&self) -> bool {
         let s = &self.statistics;
         s.active == 0 && s.waiting == 0 && s.delayed == 0 && s.paused == 0
+    }
+
+    /// Paused with no job running. On Immich v3.4.1 jobs queued while the queue is paused stay
+    /// in `waiting` (or `delayed`) and do not start until it is resumed, so they are harmless.
+    pub fn is_held(&self) -> bool {
+        self.is_paused && self.statistics.active == 0
     }
 }
 
@@ -321,6 +329,24 @@ impl Api {
 
     pub async fn asset(&self, id: &str) -> Result<Value, ApiError> {
         self.json(Method::GET, &format!("/assets/{id}"), None).await
+    }
+
+    /// The id of this account's asset at exactly `original_path`, if Immich imported it.
+    pub async fn asset_id_by_path(&self, original_path: &str) -> Result<Option<String>, ApiError> {
+        let found: Value = self
+            .json(
+                Method::POST,
+                "/search/metadata",
+                Some(json!({ "originalPath": original_path, "size": 10 })),
+            )
+            .await?;
+        Ok(found["assets"]["items"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|a| a["originalPath"].as_str() == Some(original_path))
+            .and_then(|a| a["id"].as_str())
+            .map(ToOwned::to_owned))
     }
 }
 

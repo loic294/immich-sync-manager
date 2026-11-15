@@ -98,6 +98,10 @@ export class IsmPeersPage extends IsmPage {
     if (ok) await this.act(`peer:${peer.id}`, () => admin.deletePeer(peer.id), 'Peer removed.');
   }
 
+  private async retryPeer(peer: PeerView) {
+    await this.act(`retry:${peer.id}`, () => admin.retryPeer(peer.id), 'Peer retry requested.');
+  }
+
   private openShare(share: ShareView | null) {
     this.editing = share;
     this.shareDialog.value?.querySelector('form')?.reset();
@@ -171,7 +175,14 @@ export class IsmPeersPage extends IsmPage {
                           </td>
                           <td class="whitespace-nowrap">${formatDate(p.last_seen_at)}</td>
                           <td>${p.events_applied}</td>
-                          <td class="text-right">
+                          <td class="whitespace-nowrap text-right">
+                            ${
+                              p.last_error
+                                ? html`<button type="button" class="btn btn-ghost btn-sm" ?disabled=${this.busy !== undefined} @click=${() => this.retryPeer(p)}>
+                                    ${this.spin(`retry:${p.id}`)}Retry
+                                  </button>`
+                                : nothing
+                            }
                             <button type="button" class="btn btn-ghost btn-sm btn-square text-error" aria-label="Remove" @click=${() => this.removePeer(p)}>
                               <ism-icon name="unplug" size="sm"></ism-icon>
                             </button>
@@ -265,7 +276,7 @@ export class IsmPeersPage extends IsmPage {
             </fieldset>
             <fieldset class="fieldset">
               <legend class="fieldset-legend">Peer address</legend>
-              <input name="url" type="url" class="input w-full" required placeholder="http://100.64.0.2:8080" />
+              <input name="url" type="url" class="input w-full" required placeholder="http://192.0.2.2:8080" />
               <p class="label">How this instance reaches the other one, for example its Netbird address.</p>
             </fieldset>
             <fieldset class="fieldset">

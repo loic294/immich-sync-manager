@@ -35,3 +35,12 @@ export function percent(done: number, total: number): number {
   if (total <= 0) return 0;
   return Math.min(100, Math.round((done / total) * 100));
 }
+
+/** Seconds until `dueAt` as `1:05`, `0:00` once due, or `—`. */
+export function formatCountdown(dueAt: string | null | undefined, now = Date.now()): string {
+  if (!dueAt) return '—';
+  const due = new Date(dueAt).getTime();
+  if (Number.isNaN(due)) return '—';
+  const seconds = Math.max(0, Math.ceil((due - now) / 1000));
+  return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`;
+}
