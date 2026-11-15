@@ -77,6 +77,41 @@ docker compose pull
 docker compose up -d
 ```
 
+### Connecting to Immich on separate Docker networks
+
+ISM can join multiple Docker networks. If Immich and its PostgreSQL database are on different
+networks, attach the `ism` service to both. Add the following to your Compose file, replacing the
+network names with the existing names shown by `docker network ls`:
+
+```yaml
+services:
+  ism:
+    networks:
+      - default
+      - immich_net
+      - immich_db_net
+
+networks:
+  immich_net:
+    external: true
+    name: immich_default
+  immich_db_net:
+    external: true
+    name: immich_db_default
+```
+
+These are external networks created by the other Compose projects; they must exist on the same
+Docker host as ISM. If Immich and PostgreSQL are already on the same network, attach ISM to that
+network once instead. You can check which networks a container uses with
+`docker inspect <container> --format '{{json .NetworkSettings.Networks}}'`.
+
+In **Servers**, enter the Immich URL using its container name or network alias and its internal
+port, for example `http://immich-server:2283`. For database access, use the PostgreSQL container
+name or network alias and internal port, for example
+`postgres://<user>:<password>@immich-database:5432/immich`. Use the actual service names and
+credentials from your Immich Compose configuration; do not use `localhost` or a host-published
+port for container-to-container connections.
+
 Open `http://<host>:8080` and create the administrator immediately: anyone who can reach the
 port can create it until setup is complete. Then:
 
