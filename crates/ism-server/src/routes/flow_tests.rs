@@ -127,6 +127,154 @@ impl Harness {
 }
 
 #[tokio::test]
+async fn mounted_folders_browse_deep_paths_one_level_at_a_time() {
+    let h = harness().await;
+    let photos = h.state.config.mounts_dir.join("homes/example-user/Photos");
+    std::fs::create_dir_all(photos.join("2024/Trip")).unwrap();
+    std::fs::create_dir_all(photos.join("2025")).unwrap();
+    std::fs::create_dir_all(photos.join(".ism-trash")).unwrap();
+    std::fs::write(photos.join("photo.jpg"), b"image").unwrap();
+    let mapping = json!({
+        "root_id": "archive",
+        "name": "Archive",
+        "container_path": photos.to_str().unwrap(),
+    });
+    let response = send(
+        &h.app,
+        json_req("POST", "/api/admin/mappings", &h.admin(), &mapping),
+    )
+    .await;
+    assert_eq!(
+        response.status,
+        StatusCode::CREATED,
+        "{:?}",
+        response.json()
+    );
+
+    let response = send(&h.app, get("/api/admin/mounts", &h.admin())).await;
+    assert_eq!(response.status, StatusCode::OK, "{:?}", response.json());
+    let body = response.json();
+    let mounts = body.as_array().unwrap();
+    assert_eq!(mounts.len(), 2);
+    assert!(mounts[0]["path"].as_str().unwrap().ends_with("/homes"));
+    assert!(mounts[1]["path"].as_str().unwrap().ends_with("/photos"));
+
+    for (parent, children) in [
+        ("homes", vec!["example-user"]),
+        ("homes/example-user", vec!["Photos"]),
+        ("homes/example-user/Photos", vec!["2024", "2025"]),
+        ("homes/example-user/Photos/2024", vec!["Trip"]),
+        ("homes/example-user/Photos/2024/Trip", vec![]),
+    ] {
+        let parent = h.state.config.mounts_dir.join(parent);
+        let mut url = reqwest::Url::parse("http://ism.example/api/admin/mounts").unwrap();
+        url.query_pairs_mut()
+            .append_pair("path", parent.to_str().unwrap());
+        let response = send(
+            &h.app,
+            get(
+                &format!("{}?{}", url.path(), url.query().unwrap()),
+                &h.admin(),
+            ),
+        )
+        .await;
+        assert_eq!(response.status, StatusCode::OK, "{:?}", response.json());
+        let body = response.json();
+        let mounts = body.as_array().unwrap();
+        let expected: Vec<_> = children
+            .iter()
+            .map(|child| parent.join(child).to_str().unwrap().to_owned())
+            .collect();
+        let actual: Vec<_> = mounts
+            .iter()
+            .map(|mount| mount["path"].as_str().unwrap())
+            .collect();
+        assert_eq!(actual, expected, "listing {}", parent.display());
+        if parent.ends_with("example-user") {
+            assert_eq!(mounts[0]["mapped_root"], "archive");
+        }
+    }
+}
+
+#[tokio::test]
+async fn mounted_folders_do_not_truncate_large_directories() {
+    let h = harness().await;
+    for index in 0..205 {
+        std::fs::create_dir(h.root.join(format!("album-{index:03}"))).unwrap();
+    }
+    let mut url = reqwest::Url::parse("http://ism.example/api/admin/mounts").unwrap();
+    url.query_pairs_mut()
+        .append_pair("path", h.root.to_str().unwrap());
+    let response = send(
+        &h.app,
+        get(
+            &format!("{}?{}", url.path(), url.query().unwrap()),
+            &h.admin(),
+        ),
+    )
+    .await;
+    assert_eq!(response.status, StatusCode::OK, "{:?}", response.json());
+    let body = response.json();
+    // The existing 2024 folder is listed along with every new album.
+    assert_eq!(body.as_array().unwrap().len(), 206);
+    assert!(
+        body.as_array().unwrap().last().unwrap()["path"]
+            .as_str()
+            .unwrap()
+            .ends_with("/album-204")
+    );
+}
+
+#[tokio::test]
+async fn mounted_folders_reject_escape_paths_and_report_unavailable_folders() {
+    let h = harness().await;
+    let outside = tempfile::tempdir().unwrap();
+    let traversal = h.state.config.mounts_dir.join("../");
+    let missing = h.root.join("missing");
+    let mut cases = vec![
+        (outside.path(), StatusCode::FORBIDDEN),
+        (traversal.as_path(), StatusCode::BAD_REQUEST),
+        (std::path::Path::new("photos"), StatusCode::BAD_REQUEST),
+        (missing.as_path(), StatusCode::SERVICE_UNAVAILABLE),
+    ];
+    #[cfg(unix)]
+    let escape_link = h.root.join("escape");
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(outside.path(), &escape_link).unwrap();
+        std::os::unix::fs::symlink(&h.root, h.root.join("cycle")).unwrap();
+        cases.push((escape_link.as_path(), StatusCode::FORBIDDEN));
+    }
+    for (path, status) in cases {
+        let mut url = reqwest::Url::parse("http://ism.example/api/admin/mounts").unwrap();
+        url.query_pairs_mut()
+            .append_pair("path", path.to_str().unwrap());
+        let response = send(
+            &h.app,
+            get(
+                &format!("{}?{}", url.path(), url.query().unwrap()),
+                &h.admin(),
+            ),
+        )
+        .await;
+        assert_eq!(response.status, status, "{:?}", response.json());
+        assert!(response.json()["error"]["message"].is_string());
+    }
+    let mut url = reqwest::Url::parse("http://ism.example/api/admin/mounts").unwrap();
+    url.query_pairs_mut()
+        .append_pair("path", h.root.to_str().unwrap());
+    let uri = format!("{}?{}", url.path(), url.query().unwrap());
+    let response = send(&h.app, get(&uri, &h.admin())).await;
+    assert_eq!(response.status, StatusCode::OK);
+    let body = response.json();
+    let mounts = body.as_array().unwrap();
+    assert_eq!(mounts.len(), 1);
+    assert!(mounts[0]["path"].as_str().unwrap().ends_with("/2024"));
+    let response = send(&h.app, get(&uri, &[])).await;
+    assert_eq!(response.status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
 async fn cancellation_by_key_blocks_late_submission_and_is_principal_scoped() {
     let h = harness().await;
     h.map_root().await;

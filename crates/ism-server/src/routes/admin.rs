@@ -747,56 +747,63 @@ async fn list_libraries(
 // ---------------------------------------------------------------------------------------------
 // Mounts and mappings
 
+#[derive(Deserialize)]
+struct MountQuery {
+    path: Option<String>,
+}
+
 async fn list_mounts(
     State(state): State<AppState>,
     Admin(_): Admin,
+    Query(query): Query<MountQuery>,
 ) -> AppResult<Json<Vec<MountView>>> {
     let roots = files::load_roots(&state.db).await?;
     let base = state.config.mounts_dir.clone();
     let dirs = tokio::task::spawn_blocking(move || {
-        let mut out = Vec::new();
-        let Ok(entries) = std::fs::read_dir(&base) else {
-            return out;
+        let io_error = |error: std::io::Error| {
+            tracing::warn!(%error, "cannot browse mounted folder");
+            AppError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "mount_unavailable",
+                "Cannot read this folder. Check that the volume is mounted and the container has permission to read it.",
+            )
         };
-        for e in entries.flatten() {
-            let path = e.path();
-            if !path.is_dir() || e.file_name().to_string_lossy().starts_with('.') {
+        let base = std::path::absolute(base).map_err(io_error)?;
+        let path = query.path.map(std::path::PathBuf::from).unwrap_or_else(|| base.clone());
+        if !path.is_absolute()
+            || path.components().any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(AppError::invalid_location("the folder path must be absolute and cannot contain '..'"));
+        }
+        let allowed = base.canonicalize().map_err(io_error)?;
+        let resolved = path.canonicalize().map_err(io_error)?;
+        if !resolved.starts_with(allowed) {
+            return Err(AppError::forbidden("the folder must be inside the mounts directory"));
+        }
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(&path).map_err(io_error)? {
+            let entry = entry.map_err(io_error)?;
+            if !entry.file_type().map_err(io_error)?.is_dir()
+                || entry.file_name().to_string_lossy().starts_with('.')
+            {
                 continue;
             }
-            out.push(path.clone());
-            // One level deeper, so volumes mounted as /mnt/<volume>/<share> are offered too.
-            if let Ok(children) = std::fs::read_dir(&path) {
-                for c in children.flatten().take(200) {
-                    if c.path().is_dir() && !c.file_name().to_string_lossy().starts_with('.') {
-                        out.push(c.path());
-                    }
-                }
-            }
+            let path = entry.path().into_os_string().into_string().map_err(|_| {
+                AppError::invalid_location("a folder name is not valid UTF-8")
+            })?;
+            let writable = !entry.metadata().map_err(io_error)?.permissions().readonly();
+            let mapped_root = roots
+                .iter()
+                .find(|r| r.mapping.container_path == path)
+                .map(|r| r.mapping.root_id.clone());
+            out.push(MountView { path, writable, mapped_root });
         }
-        out.sort();
-        out
+        out.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(out)
     })
     .await
-    .map_err(AppError::internal)?;
-    Ok(Json(
-        dirs.into_iter()
-            .filter_map(|p| {
-                let path = p.to_str()?.to_owned();
-                let writable = std::fs::metadata(&p)
-                    .map(|m| !m.permissions().readonly())
-                    .unwrap_or(false);
-                let mapped_root = roots
-                    .iter()
-                    .find(|r| r.mapping.container_path == path)
-                    .map(|r| r.mapping.root_id.clone());
-                Some(MountView {
-                    path,
-                    writable,
-                    mapped_root,
-                })
-            })
-            .collect(),
-    ))
+    .map_err(AppError::internal)??;
+    Ok(Json(dirs))
 }
 
 fn mapping_view(r: &files::Root, watch: WatchStatusView) -> MappingView {

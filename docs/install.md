@@ -70,9 +70,13 @@ working, but moves and renames of existing assets are refused.
    or publish the port on a private interface only.
 2. **Servers**: add Immich's URL, then accounts with username/password. ISM warns when a library is not
    owned by any added account.
-3. **Mappings**: for each `/mnt/<name>`, pick the Immich library and its import path. Give it a short
-   root ID (e.g. `photos`): clients see paths as `photos:2024/Trip/a.jpg`. Add the Open Photo Manager
-   path prefix if OPM manages the same folder.
+3. **Mappings**: under **Mounted folders**, use **Browse** to navigate to a library folder at any
+   depth, for example `/mnt/homes/example-user/Photos`. Each level lists only its immediate
+   subfolders; **Up** and the path buttons return to earlier levels. Select **Map** beside a folder
+   or **Map this folder** for the current folder, then pick the Immich library and its import path.
+   Give it a short root ID (e.g. `photos`): clients see paths as `photos:2024/Trip/a.jpg`. Add the Open
+   Photo Manager path prefix if OPM manages the same folder. Hidden folders and symlinks are not
+   listed, and browsing stays inside `ISM_MOUNTS_DIR` (`/mnt` by default).
 4. **Tokens**: create one token per client and paste it into the client's settings.
 
 ## Updating

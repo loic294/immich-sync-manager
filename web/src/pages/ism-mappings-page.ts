@@ -23,6 +23,7 @@ export class IsmMappingsPage extends IsmPage {
     ...IsmPage.properties,
     mappings: { state: true },
     mounts: { state: true },
+    mountTrail: { state: true },
     servers: { state: true },
     libraries: { state: true },
     editing: { state: true },
@@ -36,6 +37,7 @@ export class IsmMappingsPage extends IsmPage {
 
   declare mappings: MappingView[];
   declare mounts: MountView[];
+  declare mountTrail: string[];
   declare servers: ImmichServerView[];
   declare libraries: LibraryView[];
   declare editing: MappingView | null;
@@ -51,6 +53,7 @@ export class IsmMappingsPage extends IsmPage {
     super();
     this.mappings = [];
     this.mounts = [];
+    this.mountTrail = [];
     this.servers = [];
     this.libraries = [];
     this.editing = null;
@@ -61,12 +64,25 @@ export class IsmMappingsPage extends IsmPage {
   }
 
   protected override async load() {
-    [this.mappings, this.mounts, this.servers, this.libraries] = await Promise.all([
+    const path = this.mountTrail.at(-1);
+    const [mappings, mounts, servers, libraries] = await Promise.all([
       admin.mappings(),
-      admin.mounts(),
+      admin.mounts(path),
       admin.servers(),
       admin.libraries(),
     ]);
+    this.mappings = mappings;
+    if (path === this.mountTrail.at(-1)) this.mounts = mounts;
+    this.servers = servers;
+    this.libraries = libraries;
+  }
+
+  private async browse(trail: string[]) {
+    await this.act('browse', async () => {
+      const mounts = await admin.mounts(trail.at(-1));
+      this.mounts = mounts;
+      this.mountTrail = trail;
+    });
   }
 
   private open(mapping: MappingView | null, mountPath = '') {
@@ -321,6 +337,8 @@ export class IsmMappingsPage extends IsmPage {
   protected override render() {
     const serverName = (id: string | null) => this.servers.find((s) => s.id === id)?.name ?? '—';
     const libraryName = (id: string | null) => this.libraries.find((l) => l.id === id)?.name ?? '—';
+    const mountPath = this.mountTrail.at(-1);
+    const currentMapping = this.mappings.find((m) => m.container_path === mountPath);
     return html`
       ${this.frame(
         () => html`
@@ -377,24 +395,80 @@ export class IsmMappingsPage extends IsmPage {
           <section class="card card-border bg-base-100">
             <div class="card-body p-4">
               <h2 class="card-title text-base">Mounted folders</h2>
-              <p class="text-sm text-base-content/70">Folders mounted into this container under the mounts directory (/mnt by default).</p>
-              <div class="overflow-x-auto">
+              <p class="text-sm text-base-content/70">Browse folders under the mounts directory (/mnt by default). Each level lists its immediate subfolders.</p>
+              <div class="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  class="btn btn-ghost btn-sm"
+                  aria-label="Go to parent folder"
+                  ?disabled=${this.mountTrail.length === 0 || this.busy !== undefined}
+                  @click=${() => this.browse(this.mountTrail.slice(0, -1))}
+                >Up</button>
+                <nav aria-label="Folder path" class="min-w-0 flex-1">
+                  <ol class="flex flex-wrap items-center gap-1 text-sm">
+                    <li><button
+                      type="button"
+                      class="btn btn-ghost btn-sm"
+                      ?disabled=${this.mountTrail.length === 0 || this.busy !== undefined}
+                      @click=${() => this.browse([])}
+                    >Mounts directory</button></li>
+                    ${this.mountTrail.map(
+                      (path, index) => html`
+                      <li class="flex min-w-0 items-center gap-1">
+                        <span aria-hidden="true">/</span>
+                        <button
+                          type="button"
+                          class="btn btn-ghost btn-sm h-auto break-all py-2"
+                          title=${path}
+                          aria-current=${index === this.mountTrail.length - 1 ? 'location' : nothing}
+                          ?disabled=${this.busy !== undefined}
+                          @click=${() => this.browse(this.mountTrail.slice(0, index + 1))}
+                        >${path.split('/').at(-1)}</button>
+                      </li>
+                    `,
+                    )}
+                  </ol>
+                </nav>
+                ${this.spin('browse')}
+                ${
+                  mountPath && !currentMapping
+                    ? html`
+                  <button
+                    type="button"
+                    class="btn btn-sm"
+                    aria-label="Map current folder"
+                    ?disabled=${this.busy !== undefined}
+                    @click=${() => this.open(null, mountPath)}
+                  >Map this folder</button>
+                `
+                    : nothing
+                }
+              </div>
+              ${mountPath ? html`<p class="break-all font-mono text-xs">${mountPath}</p>` : nothing}
+              <div class="overflow-x-auto" aria-busy=${this.busy === 'browse'}>
                 <table class="table table-sm">
                   <thead><tr><th>Folder</th><th>Access</th><th>Mapping</th><th></th></tr></thead>
                   <tbody>
                     ${
                       this.mounts.length === 0
-                        ? html`<tr><td colspan="4" class="text-base-content/60">No folder found. Mount your library folders as Docker volumes.</td></tr>`
+                        ? html`<tr><td colspan="4" class="text-base-content/60">${mountPath ? 'No subfolders in this folder.' : 'No folder found. Mount your library folders as Docker volumes.'}</td></tr>`
                         : this.mounts.map(
                             (mount) => html`<tr>
                               <td class="break-all font-mono text-xs">${mount.path}</td>
                               <td>${mount.writable ? 'Read and write' : html`<span class="badge badge-warning badge-soft">Read only</span>`}</td>
                               <td>${mount.mapped_root ? html`<code>${mount.mapped_root}</code>` : '—'}</td>
-                              <td class="text-right">
+                              <td class="whitespace-nowrap text-right">
+                                <button
+                                  type="button"
+                                  class="btn btn-ghost btn-sm"
+                                  aria-label=${`Browse ${mount.path}`}
+                                  ?disabled=${this.busy !== undefined}
+                                  @click=${() => this.browse([...this.mountTrail, mount.path])}
+                                >Browse</button>
                                 ${
                                   mount.mapped_root
                                     ? nothing
-                                    : html`<button type="button" class="btn btn-ghost btn-sm" @click=${() => this.open(null, mount.path)}>
+                                    : html`<button type="button" class="btn btn-ghost btn-sm" ?disabled=${this.busy !== undefined} @click=${() => this.open(null, mount.path)}>
                                         <ism-icon name="plus" size="sm"></ism-icon>Map
                                       </button>`
                                 }

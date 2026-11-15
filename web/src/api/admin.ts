@@ -66,7 +66,7 @@ export const admin = {
   deleteAccount: (id: string) => api.delete<void>(`${A}/accounts/${enc(id)}`),
   libraries: () => api.get<LibraryView[]>(`${A}/libraries`),
 
-  mounts: () => api.get<MountView[]>(`${A}/mounts`),
+  mounts: (path?: string) => api.get<MountView[]>(`${A}/mounts`, { query: { path } }),
   mappings: () => api.get<MappingView[]>(`${A}/mappings`),
   createMapping: (body: MappingInput) => api.post<MappingView>(`${A}/mappings`, { body }),
   updateMapping: (rootId: string, body: MappingInput) =>
