@@ -19,8 +19,28 @@ ISM is one container. It needs:
 3. Create the data folder and give it to that user: `sudo mkdir -p ism-data && sudo chown 1026:100 ism-data`
    (with your numbers).
 4. Container Manager → Project → Create, pick the folder, or `docker compose up -d --build` over SSH.
-   Building on the NAS is slow; building the image on a PC (`make image`) and loading it with
-   `docker save | docker load` is faster.
+   Building on the NAS is slow; use the prebuilt image below, or build on a PC (`make image`) and
+   transfer it with `docker save | docker load`.
+
+## Prebuilt Docker image
+
+Every push or merge to `main` builds native Linux AMD64 and ARM64 images and publishes a combined
+image to GitHub Container Registry:
+
+```text
+ghcr.io/loic294/immich-sync-manager:main
+```
+
+`latest` tracks the same build. Use `sha-<full Git commit SHA>` or a digest to pin an exact build.
+Publication only updates these tags after both platform builds succeed. The **Docker image**
+workflow in the repository's Actions tab contains the build logs and can also be started manually
+on `main`. It uses the repository's built-in `GITHUB_TOKEN`; no registry password secret is needed.
+The package owner must make the GHCR package public once after its first publication to allow
+anonymous pulls.
+
+To use it, replace the example service's `image:` with the address above and remove its `build:`
+block. Then run `docker compose pull && docker compose up -d` from the directory containing your
+Compose file. Windows Docker Desktop must use Linux containers.
 
 ## Linux
 
@@ -59,6 +79,9 @@ working, but moves and renames of existing assets are refused.
 
 `docker compose up -d --build`. The database migrates on start. Do not update while **Overview** shows
 running operations or a maintenance window.
+For a prebuilt image, use `docker compose pull && docker compose up -d` instead. Export recent
+[runtime logs](logging.md) first if investigating a problem: recreating a container discards its
+Docker log history.
 
 ## Configuration
 
@@ -75,3 +98,9 @@ running operations or a maintenance window.
 | `ISM_QUIESCE_TIMEOUT_SECS` | `600` | Longest wait for Immich's paused `library` queue to have no running job. |
 | `ISM_SCAN_TIMEOUT_SECS` | `7200` | Longest wait for a library scan to finish. |
 | `ISM_SCAN_DELAY_SECS` | `120` | Library scans run this long after the last detected change. |
+
+## Debugging
+
+Use **Audit**, **Operations** and **Sync** for persistent history, and Docker/Container Manager logs
+for runtime diagnostics. See [logs and debugging](logging.md) for log commands, retention,
+debug-level configuration and safe diagnostic exports.

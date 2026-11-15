@@ -53,7 +53,7 @@ Open `http://<host>:8080`, create the administrator, then:
 
 More: [install](docs/install.md) · [Immich compatibility](docs/immich-compatibility.md) ·
 [file watching](docs/watching.md) · [peer sync](docs/peers.md) · [recovery](docs/recovery.md) · [limitations](docs/limitations.md) ·
-[client API](docs/client-api.md).
+[client API](docs/client-api.md) · [logs and debugging](docs/logging.md).
 
 ## Development
 

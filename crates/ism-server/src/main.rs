@@ -26,6 +26,7 @@ use crate::state::AppState;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
+        .with_ansi(false)
         .with_env_filter(
             EnvFilter::try_from_env("ISM_LOG").unwrap_or_else(|_| EnvFilter::new("info")),
         )
