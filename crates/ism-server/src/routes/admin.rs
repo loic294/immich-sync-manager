@@ -886,11 +886,11 @@ async fn validate_mapping(
     }
     .normalized()
     .map_err(|e| bad(e.to_string()))?;
-    let mut all: Vec<RootMapping> = files::load_roots(&state.db)
-        .await?
-        .into_iter()
+    let roots = files::load_roots(&state.db).await?;
+    let mut all: Vec<RootMapping> = roots
+        .iter()
         .filter(|r| Some(r.mapping.root_id.as_str()) != replacing)
-        .map(|r| r.mapping)
+        .map(|r| r.mapping.clone())
         .collect();
     all.push(mapping.clone());
     validate_set(&all).map_err(|e| bad(e.to_string()))?;
@@ -934,7 +934,18 @@ async fn validate_mapping(
         (None, None) => {}
     }
     // Claim the folder; never overwrite or follow an existing marker.
-    let sentinel = dir.join(SENTINEL);
+    let mut sentinel = files::marker_path(&mapping);
+    if sentinel == dir.join(SENTINEL)
+        && roots.iter().any(|root| {
+            root.mapping.root_id != mapping.root_id
+                && root.mapping.container_path == mapping.container_path
+                && root.available()
+                && std::fs::read_to_string(&sentinel)
+                    .is_ok_and(|owner| owner.trim() == root.mapping.root_id)
+        })
+    {
+        sentinel = dir.join(format!("{SENTINEL}-{}", mapping.root_id));
+    }
     match std::fs::symlink_metadata(&sentinel) {
         Ok(meta) if !meta.is_file() || meta.len() > 128 => {
             return Err(AppError::conflict(
@@ -995,6 +1006,7 @@ async fn create_mapping(
     Admin(p): Admin,
     Json(input): Json<MappingInput>,
 ) -> AppResult<Response> {
+    let _guard = state.replication_operation_lock.lock().await;
     if files::root(&state.db, input.root_id.trim()).await.is_ok() {
         return Err(AppError::conflict(
             "root_exists",
@@ -1102,9 +1114,9 @@ async fn delete_mapping(
         .execute(&state.db)
         .await?;
     // Release the claim only when it is ours; the trash folder is left for the administrator.
-    let sentinel = root.base().join(SENTINEL);
-    if std::fs::read_to_string(&sentinel).is_ok_and(|o| o.trim() == root_id) {
-        let _ = std::fs::remove_file(&sentinel);
+    let sentinel = files::marker_path(&root.mapping);
+    if root.available() {
+        std::fs::remove_file(&sentinel)?;
     }
     db::audit(&state.db, &actor(&p), "mapping.delete", &root_id).await;
     Ok(no_content())

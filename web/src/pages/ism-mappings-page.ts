@@ -1,4 +1,5 @@
 import { html, nothing } from 'lit';
+import { live } from 'lit/directives/live.js';
 import { createRef, ref } from 'lit/directives/ref.js';
 import { admin } from '@/api/admin';
 import type { ImmichServerView } from '@/api/generated/ImmichServerView';
@@ -91,6 +92,7 @@ export class IsmMappingsPage extends IsmPage {
     this.libraryId = mapping?.library_id ?? '';
     this.containerPath = mapping?.container_path ?? mountPath;
     this.dialog.value?.querySelector('form')?.reset();
+    this.requestUpdate();
     this.dialog.value?.showModal();
   }
 
@@ -249,7 +251,7 @@ export class IsmMappingsPage extends IsmPage {
                   class="input w-full font-mono"
                   required
                   pattern=${ROOT_ID.source}
-                  .value=${m?.root_id ?? ''}
+                  .value=${live(m?.root_id ?? '')}
                   ?disabled=${m !== null}
                   placeholder="photos"
                 />
@@ -257,7 +259,7 @@ export class IsmMappingsPage extends IsmPage {
               </fieldset>
               <fieldset class="fieldset">
                 <legend class="fieldset-legend">Name</legend>
-                <input name="name" class="input w-full" required maxlength="64" .value=${m?.name ?? ''} placeholder="Photos" />
+                <input name="name" class="input w-full" required maxlength="64" .value=${live(m?.name ?? '')} placeholder="Photos" />
               </fieldset>
             </div>
             <fieldset class="fieldset">
@@ -267,14 +269,14 @@ export class IsmMappingsPage extends IsmPage {
                 class="input w-full font-mono"
                 required
                 list="ism-mounts"
-                .value=${this.containerPath}
+                .value=${live(this.containerPath)}
                 @input=${(e: Event) => (this.containerPath = (e.target as HTMLInputElement).value)}
                 placeholder="/data/photos"
               />
               <datalist id="ism-mounts">${this.mounts.map((mount) => html`<option value=${mount.path}></option>`)}</datalist>
               <p class="label">
-                The folder must contain a file named <code>.ism-root</code> whose content is the root ID, so a
-                missing mount is never mistaken for an empty folder.
+                ISM creates a root marker to verify the mount. Use separate root IDs for Immich and OPM
+                when they map the same folder or different levels of it. Overlaps within one source are not allowed.
               </p>
             </fieldset>
             <div class="grid grid-cols-1 gap-x-3 sm:grid-cols-2">
@@ -311,7 +313,7 @@ export class IsmMappingsPage extends IsmPage {
                 name="immich_import_path"
                 class="input w-full font-mono"
                 list="ism-import-paths"
-                .value=${m?.immich_import_path ?? ''}
+                .value=${live(m?.immich_import_path ?? '')}
                 ?disabled=${this.libraryId === ''}
                 placeholder="/mnt/photos"
               />
@@ -320,7 +322,7 @@ export class IsmMappingsPage extends IsmPage {
             </fieldset>
             <fieldset class="fieldset">
               <legend class="fieldset-legend">Open Photo Manager path (optional)</legend>
-              <input name="opm_prefix" class="input w-full font-mono" .value=${m?.opm_prefix ?? ''} placeholder="photos" />
+              <input name="opm_prefix" class="input w-full font-mono" .value=${live(m?.opm_prefix ?? '')} placeholder="/photos" />
               <p class="label">The volume or folder Open Photo Manager uses for these files.</p>
             </fieldset>
             <div class="modal-action">
@@ -338,7 +340,6 @@ export class IsmMappingsPage extends IsmPage {
     const serverName = (id: string | null) => this.servers.find((s) => s.id === id)?.name ?? '—';
     const libraryName = (id: string | null) => this.libraries.find((l) => l.id === id)?.name ?? '—';
     const mountPath = this.mountTrail.at(-1);
-    const currentMapping = this.mappings.find((m) => m.container_path === mountPath);
     return html`
       ${this.frame(
         () => html`
@@ -431,7 +432,7 @@ export class IsmMappingsPage extends IsmPage {
                 </nav>
                 ${this.spin('browse')}
                 ${
-                  mountPath && !currentMapping
+                  mountPath
                     ? html`
                   <button
                     type="button"
@@ -456,7 +457,13 @@ export class IsmMappingsPage extends IsmPage {
                             (mount) => html`<tr>
                               <td class="break-all font-mono text-xs">${mount.path}</td>
                               <td>${mount.writable ? 'Read and write' : html`<span class="badge badge-warning badge-soft">Read only</span>`}</td>
-                              <td>${mount.mapped_root ? html`<code>${mount.mapped_root}</code>` : '—'}</td>
+                              <td>${
+                                this.mappings.some((m) => m.container_path === mount.path)
+                                  ? this.mappings
+                                      .filter((m) => m.container_path === mount.path)
+                                      .map((m) => html`<div><code>${m.root_id}</code></div>`)
+                                  : '—'
+                              }</td>
                               <td class="whitespace-nowrap text-right">
                                 <button
                                   type="button"
@@ -465,13 +472,9 @@ export class IsmMappingsPage extends IsmPage {
                                   ?disabled=${this.busy !== undefined}
                                   @click=${() => this.browse([...this.mountTrail, mount.path])}
                                 >Browse</button>
-                                ${
-                                  mount.mapped_root
-                                    ? nothing
-                                    : html`<button type="button" class="btn btn-ghost btn-sm" ?disabled=${this.busy !== undefined} @click=${() => this.open(null, mount.path)}>
-                                        <ism-icon name="plus" size="sm"></ism-icon>Map
-                                      </button>`
-                                }
+                                <button type="button" class="btn btn-ghost btn-sm" aria-label=${`Map ${mount.path}`} ?disabled=${this.busy !== undefined} @click=${() => this.open(null, mount.path)}>
+                                  <ism-icon name="plus" size="sm"></ism-icon>Map
+                                </button>
                               </td>
                             </tr>`,
                           )

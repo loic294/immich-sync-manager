@@ -37,7 +37,7 @@ impl Root {
     }
 
     pub fn available(&self) -> bool {
-        let marker = self.base().join(SENTINEL);
+        let marker = marker_path(&self.mapping);
         fs::symlink_metadata(&marker).is_ok_and(|meta| meta.is_file() && meta.len() <= 128)
             && fs::read_to_string(marker).is_ok_and(|owner| owner.trim() == self.mapping.root_id)
     }
@@ -82,6 +82,16 @@ impl Root {
 
     pub fn immich_path(&self, rel: &RelPath) -> Option<String> {
         self.mapping.immich_abs(rel)
+    }
+}
+
+/// Shared folders use a separate marker for the additional root; legacy claims stay unchanged.
+pub fn marker_path(mapping: &RootMapping) -> PathBuf {
+    let dir = Path::new(&mapping.container_path);
+    let specific = dir.join(format!("{SENTINEL}-{}", mapping.root_id));
+    match fs::symlink_metadata(&specific) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => dir.join(SENTINEL),
+        _ => specific,
     }
 }
 
@@ -130,11 +140,9 @@ pub async fn root(pool: &SqlitePool, root_id: &str) -> AppResult<Root> {
 
 pub fn parse_rel(raw: &str) -> AppResult<RelPath> {
     let rel = RelPath::parse(raw).map_err(|e| AppError::invalid_location(e.to_string()))?;
-    if rel
-        .segments()
-        .next()
-        .is_some_and(|first| HIDDEN.contains(&first))
-    {
+    if rel.segments().enumerate().any(|(index, segment)| {
+        segment.starts_with(".ism-root") || (index == 0 && HIDDEN.contains(&segment))
+    }) {
         return Err(AppError::invalid_location("reserved path"));
     }
     Ok(rel)
@@ -368,6 +376,25 @@ mod tests {
         assert!(root.available());
     }
 
+    #[test]
+    fn shared_root_marker_is_independent_and_fail_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = root_at(dir.path());
+        let marker = dir.path().join(".ism-root-r");
+        fs::write(dir.path().join(SENTINEL), "other\n").unwrap();
+        fs::write(&marker, "r\n").unwrap();
+        assert!(root.available());
+        fs::write(&marker, "").unwrap();
+        assert!(!root.available());
+        fs::write(&marker, "other\n").unwrap();
+        assert!(!root.available());
+        fs::remove_file(&marker).unwrap();
+        assert!(!root.available());
+        for path in [".ism-root-r", "album/.ism-root", "album/.ism-root-r"] {
+            assert!(parse_rel(path).is_err());
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn availability_rejects_a_symlinked_sentinel() {
@@ -375,6 +402,10 @@ mod tests {
         let marker = dir.path().join("actual-marker");
         fs::write(&marker, "r\n").unwrap();
         std::os::unix::fs::symlink(&marker, dir.path().join(SENTINEL)).unwrap();
+        assert!(!root_at(dir.path()).available());
+        fs::remove_file(dir.path().join(SENTINEL)).unwrap();
+        fs::write(dir.path().join(SENTINEL), "r\n").unwrap();
+        std::os::unix::fs::symlink(&marker, dir.path().join(".ism-root-r")).unwrap();
         assert!(!root_at(dir.path()).available());
     }
 

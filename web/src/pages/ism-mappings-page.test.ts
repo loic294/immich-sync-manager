@@ -111,6 +111,7 @@ describe('ism-mappings-page', () => {
       }
       return [{ path: '/mnt/photos', writable: true, mapped_root: null }] as never;
     });
+
     const error = vi.spyOn(toast, 'error');
     const page = await mount('ism-mappings-page');
     await vi.waitFor(() => expect(page.loading).toBe(false));
@@ -129,6 +130,82 @@ describe('ism-mappings-page', () => {
     });
   });
 
+  it('offers another mapping for an already mapped folder and lists every root', async () => {
+    const opm: MappingView = {
+      ...MAPPING,
+      root_id: 'opm',
+      name: 'OPM',
+      server_id: null,
+      library_id: null,
+      immich_import_path: null,
+      opm_prefix: '/opm/photos',
+    };
+    vi.spyOn(api, 'get').mockImplementation(async (path, options) => {
+      if (path === '/api/admin/mappings') return [MAPPING, opm] as never;
+      if (path === '/api/admin/mounts') {
+        return (
+          options?.query?.path
+            ? []
+            : [{ path: '/mnt/photos', writable: true, mapped_root: 'photos' }]
+        ) as never;
+      }
+      return [] as never;
+    });
+    const post = vi.spyOn(api, 'post').mockResolvedValue(opm as never);
+    const page = await mount('ism-mappings-page');
+    await vi.waitFor(() => expect(page.loading).toBe(false));
+    const row = page.querySelector('button[aria-label="Browse /mnt/photos"]')?.closest('tr');
+    expect(row?.textContent).toContain('photos');
+    expect(row?.textContent).toContain('opm');
+    page.querySelector<HTMLButtonElement>('button[aria-label="Map /mnt/photos"]')?.click();
+    await page.updateComplete;
+    expect(page.querySelector<HTMLInputElement>('input[name="container_path"]')?.value).toBe(
+      '/mnt/photos',
+    );
+    page.querySelector<HTMLDialogElement>('dialog')?.close();
+    page.querySelector<HTMLButtonElement>('button[aria-label="Browse /mnt/photos"]')?.click();
+    await vi.waitFor(() => expect(page.mountTrail).toEqual(['/mnt/photos']));
+    page.querySelector<HTMLButtonElement>('button[aria-label="Map current folder"]')?.click();
+    await page.updateComplete;
+    const form = page.querySelector<HTMLFormElement>('dialog form');
+    if (!form) throw new Error('mapping form missing');
+    for (const [name, value] of [
+      ['root_id', 'opm-new'],
+      ['name', 'OPM new'],
+      ['opm_prefix', '/opm/new'],
+    ]) {
+      const input = form.querySelector<HTMLInputElement>(`input[name="${name}"]`);
+      if (!input) throw new Error(`missing ${name}`);
+      input.value = value;
+    }
+    form.dispatchEvent(new SubmitEvent('submit', { cancelable: true }));
+    await vi.waitFor(() =>
+      expect(post).toHaveBeenCalledWith('/api/admin/mappings', {
+        body: {
+          root_id: 'opm-new',
+          name: 'OPM new',
+          container_path: '/mnt/photos',
+          server_id: null,
+          library_id: null,
+          immich_import_path: null,
+          opm_prefix: '/opm/new',
+        },
+      }),
+    );
+    await vi.waitFor(() => expect(page.busy).toBeUndefined());
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const row = [...page.querySelectorAll('tbody tr')].find(
+        (row) => row.querySelector('td code')?.textContent === 'opm',
+      );
+      row?.querySelector<HTMLButtonElement>('button[aria-label="Edit"]')?.click();
+      await page.updateComplete;
+      expect(page.querySelector<HTMLInputElement>('input[name="name"]')?.value).toBe('OPM');
+      expect(page.querySelector<HTMLInputElement>('input[name="opm_prefix"]')?.value).toBe(
+        '/opm/photos',
+      );
+      page.querySelector<HTMLDialogElement>('dialog')?.close();
+    }
+  });
   it('saves the watch mode and polling interval of a mapping', async () => {
     vi.spyOn(api, 'get').mockImplementation(
       async (path: string) => (path === '/api/admin/mappings' ? [MAPPING] : []) as never,

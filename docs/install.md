@@ -77,6 +77,14 @@ working, but moves and renames of existing assets are refused.
    Give it a short root ID (e.g. `photos`): clients see paths as `photos:2024/Trip/a.jpg`. Add the Open
    Photo Manager path prefix if OPM manages the same folder. Hidden folders and symlinks are not
    listed, and browsing stays inside `ISM_MOUNTS_DIR` (`/mnt` by default).
+   When OPM manages a parent folder and Immich imports its subfolders, create an **OPM-only**
+   mapping for the parent and **Immich-only** mappings for the subfolders. Separate root IDs also
+   let these sources map the exact same folder independently: **Map** remains available on mapped
+   folders. Leave the other source's fields empty. Overlaps within the same source (or involving
+   files-only mappings) are rejected.
+   Use the Immich root ID for managed changes inside an imported folder. Writes through an
+   independent OPM mapping that would affect that folder are refused, rather than bypassing
+   Immich's maintenance and asset bookkeeping; browsing through either mapping remains available.
 4. **Tokens**: create one token per client and paste it into the client's settings.
 
 ## Updating

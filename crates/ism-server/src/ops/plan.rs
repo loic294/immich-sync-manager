@@ -188,6 +188,24 @@ impl<'a> Ctx<'a> {
         self.servers.iter().find(|s| s.id == id)
     }
 
+    fn require_mutation_source(&self, root: &Root, abs: &Path) -> AppResult<()> {
+        for other in &self.roots {
+            if other.mapping.root_id != root.mapping.root_id
+                && other.server_id.is_some()
+                && (abs.starts_with(other.base()) || other.base().starts_with(abs))
+            {
+                return Err(AppError::conflict(
+                    "immich_mapping_required",
+                    format!(
+                        "use Immich mapping '{}' to change files in its imported folder; '{}' is an independent source mapping",
+                        other.mapping.root_id, root.mapping.root_id
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Resolves a location, checking the grant, availability and path safety.
     fn locate(&self, loc: &Location, action: ClientAction) -> AppResult<(&Root, RelPath, PathBuf)> {
         let root = self.root(&loc.root_id)?;
@@ -200,6 +218,7 @@ impl<'a> Ctx<'a> {
             ));
         }
         let abs = root.abs(&rel)?;
+        self.require_mutation_source(root, &abs)?;
         Ok((root, rel, abs))
     }
 
@@ -1545,6 +1564,9 @@ async fn plan_publish(ctx: &Ctx<'_>, plan: &mut Plan, upload_id: &str) -> AppRes
     root.ensure_available()?;
     let folder = files::parse_rel(&req.target.path)?;
     let dir = root.abs(&folder)?;
+    for file in &req.files {
+        ctx.require_mutation_source(root, &dir.join(&file.name))?;
+    }
     let staging = staging_dir(root, upload_id)?;
     let names: Vec<String> = req.files.iter().map(|f| f.name.clone()).collect();
     let sidecar_only = req.existing_original.as_ref();

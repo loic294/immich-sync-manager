@@ -2352,6 +2352,78 @@ async fn bookkeeping_failure_is_reported_as_recovery_required() {
 }
 
 #[tokio::test]
+async fn independent_mappings_share_folders_and_keep_their_markers() {
+    for (nested, opm_first) in [(false, false), (false, true), (true, false)] {
+        let h = harness().await;
+        let immich_dir = if nested {
+            h.root.join("2024")
+        } else {
+            h.root.clone()
+        };
+        let immich = json!({
+            "root_id": "immich", "name": "Immich", "container_path": immich_dir,
+            "immich_import_path": "/external/photos"
+        });
+        let opm = json!({
+            "root_id": "opm", "name": "OPM", "container_path": h.root,
+            "opm_prefix": "/opm/photos"
+        });
+        let inputs = if opm_first {
+            [&opm, &immich]
+        } else {
+            [&immich, &opm]
+        };
+        for input in inputs {
+            let response = send(
+                &h.app,
+                json_req("POST", "/api/admin/mappings", &h.admin(), input),
+            )
+            .await;
+            assert_eq!(
+                response.status,
+                StatusCode::CREATED,
+                "{:?}",
+                response.json()
+            );
+            assert_eq!(response.json()["available"], true);
+        }
+        let response = send(
+            &h.app,
+            json_req("PUT", "/api/admin/mappings/opm", &h.admin(), &opm),
+        )
+        .await;
+        assert_eq!(response.status, StatusCode::OK, "{:?}", response.json());
+        assert_eq!(response.json()["available"], true);
+        let roots = crate::files::load_roots(&h.state.db).await.unwrap();
+        assert!(roots.iter().all(|root| root.available()));
+        let removed = if opm_first { "opm" } else { "immich" };
+        let remaining = if opm_first { "immich" } else { "opm" };
+        let response = send(
+            &h.app,
+            json_req(
+                "DELETE",
+                &format!("/api/admin/mappings/{removed}"),
+                &h.admin(),
+                &Value::Null,
+            ),
+        )
+        .await;
+        assert_eq!(
+            response.status,
+            StatusCode::NO_CONTENT,
+            "{:?}",
+            response.json()
+        );
+        assert!(
+            crate::files::root(&h.state.db, remaining)
+                .await
+                .unwrap()
+                .available()
+        );
+    }
+}
+
+#[tokio::test]
 async fn mapping_rejects_claimed_folder() {
     let h = harness().await;
     std::fs::write(h.root.join(".ism-root"), "other\n").unwrap();
@@ -2363,6 +2435,64 @@ async fn mapping_rejects_claimed_folder() {
     .await;
     assert_eq!(r.status, StatusCode::CONFLICT);
     assert_eq!(r.json()["error"]["code"], "folder_claimed");
+}
+
+#[tokio::test]
+async fn opm_alias_cannot_bypass_immich_for_nested_file_changes() {
+    let h = harness().await;
+    for input in [
+        json!({
+            "root_id": "immich", "name": "Immich", "container_path": h.root.join("2024"),
+            "immich_import_path": "/external/photos"
+        }),
+        json!({
+            "root_id": "opm", "name": "OPM", "container_path": h.root,
+            "opm_prefix": "/opm/photos"
+        }),
+    ] {
+        let response = send(
+            &h.app,
+            json_req("POST", "/api/admin/mappings", &h.admin(), &input),
+        )
+        .await;
+        assert_eq!(
+            response.status,
+            StatusCode::CREATED,
+            "{:?}",
+            response.json()
+        );
+    }
+    sqlx::query("INSERT INTO immich_servers (id, name, url, maintenance_json, created_at) VALUES ('server', 'Example', 'https://immich.example', ?, ?)")
+        .bind(serde_json::to_string(&ism_core::maintenance::MaintenanceState::default()).unwrap())
+        .bind(crate::db::now())
+        .execute(&h.state.db).await.unwrap();
+    sqlx::query("UPDATE mappings SET server_id = 'server' WHERE root_id = 'immich'")
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    let request = serde_json::from_value(json!({
+        "idempotency_key": "opm-alias",
+        "actions": [{ "kind": "create_folder", "target": { "root_id": "opm", "path": "2024/new" } }]
+    }))
+    .unwrap();
+    let principal = crate::auth::Principal::Admin {
+        username: "admin".into(),
+    };
+    let response = crate::ops::preview(&h.state, &principal, &request)
+        .await
+        .unwrap();
+    assert!(!response.ok);
+    assert_eq!(response.blockers[0].code, "immich_mapping_required");
+    assert!(!h.root.join("2024/new").exists());
+    let outside = serde_json::from_value(json!({
+        "idempotency_key": "outside-import",
+        "actions": [{ "kind": "create_folder", "target": { "root_id": "opm", "path": "2025" } }]
+    }))
+    .unwrap();
+    let response = crate::ops::preview(&h.state, &principal, &outside)
+        .await
+        .unwrap();
+    assert!(response.ok, "{:?}", response.blockers);
 }
 
 #[tokio::test]

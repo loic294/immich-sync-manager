@@ -27,6 +27,9 @@ If a mapped root is unavailable, verify that the intended volume is mounted befo
 `.ism-root` marker. The marker must be a regular file containing that mapping's root ID; an empty,
 different, missing, or symlinked marker is refused. Older empty markers need manual verification and
 repair. Matching root IDs alone do not prove that the correct physical volume is mounted.
+When two independent source mappings share the exact same folder, the additional mapping uses
+`.ism-root-<root-id>` instead. Each marker contains its own root ID; removing one mapping leaves
+the other's marker intact. These markers are hidden from listings and cannot be accessed by clients.
 
 Trash created before the corresponding file-group or recursive folder inventories were introduced
 cannot be restored automatically: ISM cannot determine which entries were originally quarantined.

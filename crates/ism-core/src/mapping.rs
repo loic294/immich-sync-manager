@@ -5,7 +5,8 @@
 //! - the import path Immich uses for the same directory (inside the Immich container),
 //! - optionally the prefix Open Photo Manager uses for it.
 //!
-//! Mappings must not overlap on any side, otherwise one file would have two identities.
+//! Immich-only and OPM-only mappings may share container folders. Within a source, mappings
+//! must not overlap, otherwise one file would have two identities.
 
 use thiserror::Error;
 
@@ -92,6 +93,13 @@ pub fn validate_set(mappings: &[RootMapping]) -> Result<(), MappingError> {
             if a.root_id == b.root_id {
                 return Err(MappingError::DuplicateId(a.root_id.clone()));
             }
+            let independent = |immich: &RootMapping, opm: &RootMapping| {
+                immich.immich_import_path.is_some()
+                    && immich.opm_prefix.is_none()
+                    && opm.immich_import_path.is_none()
+                    && opm.opm_prefix.is_some()
+            };
+            let independent = independent(a, b) || independent(b, a);
             let pairs: [(&'static str, Option<&str>, Option<&str>); 3] = [
                 (
                     "container_path",
@@ -110,6 +118,9 @@ pub fn validate_set(mappings: &[RootMapping]) -> Result<(), MappingError> {
                 ),
             ];
             for (field, x, y) in pairs {
+                if field == "container_path" && independent {
+                    continue;
+                }
                 if let (Some(x), Some(y)) = (x, y)
                     && overlaps(x, y)
                 {
@@ -134,12 +145,13 @@ pub enum PathSide {
 }
 
 /// Resolves an absolute path of one side to `(root_id, relative path)`.
+/// Ambiguous container paths require an explicit source or root ID.
 pub fn resolve<'a>(
     mappings: &'a [RootMapping],
     side: PathSide,
     abs: &str,
 ) -> Option<(&'a RootMapping, RelPath)> {
-    mappings.iter().find_map(|m| {
+    let mut matches = mappings.iter().filter_map(|m| {
         let prefix = match side {
             PathSide::Container => Some(m.container_path.as_str()),
             PathSide::Immich => m.immich_import_path.as_deref(),
@@ -147,7 +159,9 @@ pub fn resolve<'a>(
         }?;
         let rest = strip_abs_prefix(abs, prefix)?;
         RelPath::parse(&rest).ok().map(|rel| (m, rel))
-    })
+    });
+    let first = matches.next()?;
+    matches.next().is_none().then_some(first)
 }
 
 #[cfg(test)]
@@ -188,6 +202,38 @@ mod tests {
         assert_eq!(root.container_abs(&rel), "/mnt/photos/2024/a.jpg");
         assert!(resolve(&set, PathSide::Immich, "/external/photosX/a.jpg").is_none());
         assert!(resolve(&set, PathSide::Immich, "/external/photos/../etc").is_none());
+    }
+
+    #[test]
+    fn different_sources_can_share_container_folders() {
+        for folder in ["/mnt/photos", "/mnt/photos/2024"] {
+            let mut opm = m("opm", "/mnt/photos", None);
+            opm.opm_prefix = Some("/opm/photos".into());
+            let set = [opm, m("immich", folder, Some("/external/photos"))];
+            assert_eq!(validate_set(&set), Ok(()));
+            let (root, rel) = resolve(&set, PathSide::Opm, "/opm/photos/2024/a.jpg").unwrap();
+            assert_eq!(root.root_id, "opm");
+            assert_eq!(rel.as_str(), "2024/a.jpg");
+            let (root, _) = resolve(&set, PathSide::Immich, "/external/photos/a.jpg").unwrap();
+            assert_eq!(root.root_id, "immich");
+            assert!(resolve(&set, PathSide::Container, "/mnt/photos/2024/a.jpg").is_none());
+        }
+    }
+
+    #[test]
+    fn same_source_container_overlap_is_rejected() {
+        let mut opm = m("opm", "/mnt/photos", None);
+        opm.opm_prefix = Some("/opm/photos".into());
+        let mut other = m("other", "/mnt/photos/2024", None);
+        other.opm_prefix = Some("/opm/archive".into());
+        assert!(validate_set(&[opm, other]).is_err());
+        assert!(
+            validate_set(&[
+                m("a", "/mnt/photos", Some("/external/a")),
+                m("b", "/mnt/photos/2024", Some("/external/b")),
+            ])
+            .is_err()
+        );
     }
 
     #[test]
