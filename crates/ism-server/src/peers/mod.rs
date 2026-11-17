@@ -29,6 +29,12 @@ use crate::state::{AppState, ServerEvent};
 /// Files must be unchanged this long before a share scan publishes them.
 pub(crate) const SETTLE_SECS: i64 = 30;
 const EVENT_BATCH: i64 = 500;
+const SYNOLOGY_METADATA_DIR: &str = "@eaDir";
+
+/// NAS-generated metadata is not replicated content, regardless of its depth or extension.
+fn excluded_path(path: &str) -> bool {
+    path.split('/').any(|name| name == SYNOLOGY_METADATA_DIR)
+}
 
 #[derive(Debug, Clone)]
 pub struct Share {
@@ -47,7 +53,7 @@ impl Share {
             return None;
         }
         let p = RelPath::parse(&loc.path).ok()?;
-        if !p.starts_with(&self.path) || p == self.path {
+        if !p.starts_with(&self.path) || p == self.path || excluded_path(p.as_str()) {
             return None;
         }
         Some(if self.path.is_root() {
@@ -64,6 +70,11 @@ impl Share {
             (false, true) => self.path.as_str().to_owned(),
             (false, false) => format!("{}/{rel}", self.path.as_str()),
         };
+        if excluded_path(&joined) {
+            return Err(AppError::invalid_location(
+                "Synology metadata is excluded from peer replication",
+            ));
+        }
         files::parse_rel(&joined)
     }
 
@@ -75,7 +86,9 @@ impl Share {
     }
 
     pub fn includes(&self, peer_id: &str) -> bool {
-        self.enabled && self.peer_ids.iter().any(|p| p == peer_id)
+        self.enabled
+            && !excluded_path(self.path.as_str())
+            && self.peer_ids.iter().any(|p| p == peer_id)
     }
 }
 
@@ -113,6 +126,12 @@ pub struct EventData {
     pub mtime_ns: Option<i64>,
     #[serde(default)]
     pub vv: VersionVector,
+}
+
+impl EventData {
+    fn excluded(&self) -> bool {
+        excluded_path(&self.path) || self.from.as_deref().is_some_and(excluded_path)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -228,7 +247,7 @@ pub async fn events_for(
         .map(|s| s.name.as_str())
         .collect();
     let next = rows.last().map_or(after, |r| r.0);
-    let events = rows
+    let mut events = rows
         .into_iter()
         .filter(|r| r.1 != peer_instance && allowed.contains(r.3.as_str()))
         .map(|(seq, origin, origin_seq, share, kind, data)| {
@@ -242,6 +261,8 @@ pub async fn events_for(
             })
         })
         .collect::<AppResult<Vec<_>>>()?;
+    // Keep the unfiltered cursor so historical metadata events do not stall pagination.
+    events.retain(|e| e.kind == SHARE_ENABLED || !e.data.excluded());
     Ok(EventPage { events, next })
 }
 
@@ -393,8 +414,12 @@ fn now_ns() -> i64 {
     chrono::Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX)
 }
 
-fn hidden(name: &str) -> bool {
+fn reserved(name: &str) -> bool {
     HIDDEN.contains(&name) || name.starts_with(".ism")
+}
+
+fn hidden(name: &str) -> bool {
+    reserved(name) || excluded_path(name)
 }
 
 /// Hashes one file on disk and records it as a local change when it differs from its row.
@@ -501,6 +526,7 @@ async fn require_stable_operations(state: &AppState) -> AppResult<()> {
 pub async fn scan_share(state: &AppState, share: &Share) -> AppResult<()> {
     let _operation_guard = state.replication_operation_lock.lock().await;
     require_stable_operations(state).await?;
+    share.root_rel("")?;
     let root = files::root(&state.db, &share.root_id).await?;
     // An unmounted root must never look like "everything was deleted".
     root.ensure_available()?;
@@ -560,7 +586,8 @@ pub async fn scan_share(state: &AppState, share: &Share) -> AppResult<()> {
         register_local(state, share, &root, &rel).await?;
     }
     for (rel, (_, _, deleted)) in known {
-        if deleted || seen.contains(&rel) {
+        // A newly ignored row is not evidence that the file was deleted.
+        if deleted || seen.contains(&rel) || rel.split('/').any(hidden) {
             continue;
         }
         if let Some(mut r) = row(state, &share.id, &rel).await? {
@@ -1057,8 +1084,9 @@ fn file_event_metadata(data: &EventData) -> AppResult<(&str, u64)> {
 
 /// Checks the shape of a remote delete, move or trash before it can become a managed operation.
 fn management_event_valid(kind: &str, data: &EventData) -> Result<(), String> {
-    let valid =
-        |p: &str| RelPath::parse(p).is_ok_and(|rel| !rel.is_root() && !rel.segments().any(hidden));
+    let valid = |p: &str| {
+        RelPath::parse(p).is_ok_and(|rel| !rel.is_root() && !rel.segments().any(reserved))
+    };
     let needs_from = matches!(kind, "file_moved" | "folder_moved");
     if !valid(&data.path)
         || data.from.as_deref().is_some_and(|f| !valid(f))
@@ -1080,6 +1108,7 @@ pub async fn queue_transfer(
     size: u64,
     vv: &VersionVector,
 ) -> AppResult<()> {
+    share.root_rel(rel)?;
     let size = checked_transfer_size(sha256, size)?;
     let sha256 = sha256.to_ascii_lowercase();
     let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
@@ -1653,11 +1682,15 @@ pub async fn pull(state: &AppState, peer: &net::Peer) -> Result<usize, String> {
             let path =
                 RelPath::parse(&e.data.path).map_err(|_| "invalid peer folder path".to_owned())?;
             if path.is_root()
-                || path.segments().any(hidden)
+                || path.segments().any(reserved)
                 || e.data.from.is_some()
                 || e.seq <= cursor
             {
                 return Err("invalid peer folder event".into());
+            }
+            if e.data.excluded() {
+                cursor = e.seq;
+                continue;
             }
             let abs = root
                 .abs(
@@ -1692,6 +1725,13 @@ pub async fn pull(state: &AppState, peer: &net::Peer) -> Result<usize, String> {
                 management_event_valid(&e.kind, &e.data)?;
             }
             other => return Err(format!("unsupported peer event kind '{other}'")),
+        }
+        // Validate legacy metadata events, then acknowledge without applying or forwarding
+        // them, including moves whose source is now excluded.
+        if e.data.excluded() {
+            tracing::debug!(path = %e.data.path, "skipping excluded peer metadata event");
+            cursor = e.seq;
+            continue;
         }
         if has_open_conflict(state, &share.id, &e.data.path)
             .await
@@ -1943,10 +1983,12 @@ pub async fn inventory_for(
     let rows: Vec<R> = sqlx::query_as(
         "SELECT rel_path, size, mtime_ns, sha256, deleted, vv_json FROM replica_files
          WHERE share_id = ? AND rel_path > ? AND (deleted = 1 OR sha256 IS NOT NULL)
+         AND instr('/' || rel_path || '/', ?) = 0
          ORDER BY rel_path LIMIT ?",
     )
     .bind(&share.id)
     .bind(after)
+    .bind(format!("/{SYNOLOGY_METADATA_DIR}/"))
     .bind(INVENTORY_BATCH)
     .fetch_all(&state.db)
     .await?;

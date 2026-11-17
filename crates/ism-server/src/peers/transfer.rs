@@ -240,6 +240,12 @@ enum Outcome {
 }
 
 async fn run_one(state: &AppState, t: &Transfer) -> Result<Outcome, String> {
+    // Retain legacy queue entries for inspection, but never adopt or publish their content.
+    if super::excluded_path(&t.rel) {
+        return Ok(Outcome::Blocked(
+            "Synology metadata is excluded from peer replication",
+        ));
+    }
     let _operation_guard = state.replication_operation_lock.lock().await;
     if let Err(e) = super::require_stable_operations(state).await {
         return if e.code() == "recovery_required" {

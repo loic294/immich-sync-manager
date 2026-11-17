@@ -166,6 +166,465 @@ async fn settle_share_announcements(a: &Instance, b: &Instance) {
     panic!("share announcements did not settle");
 }
 
+async fn stop_workers(instance: &mut Instance) {
+    while instance.tasks.len() > 1 {
+        let task = instance.tasks.pop().unwrap();
+        task.abort();
+        let _ = task.await;
+    }
+}
+
+#[tokio::test]
+async fn share_scan_excludes_synology_metadata_but_replicates_originals_and_companions() {
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    let ordinary = [
+        "Edited/pilot/source.png",
+        "Edited/pilot/source.png.xmp",
+        "Edited/pilot/source.png.json",
+        "Edited/pilot/source.png.xml",
+        "@ordinary/photo.jpg",
+        ".ordinary/photo.jpg",
+        "Edited/@eaDirectory/photo.jpg",
+    ];
+    for path in ordinary {
+        write_old(&a.shared.join(path), b"original or companion");
+    }
+    for directory in ["@eaDir", "Edited/pilot/@eaDir"] {
+        for name in [
+            "SYNOPHOTO_THUMB_XL.jpg",
+            "SYNOPHOTO_THUMB_M.jpg",
+            "SYNOPHOTO_THUMB_SM.jpg",
+            "SYNOPHOTO_THUMB_B.jpg",
+            "SYNOPHOTO_THUMB_S.jpg",
+            "SYNOINDEX_MEDIA_INFO",
+        ] {
+            write_old(
+                &a.shared.join(directory).join("source.png").join(name),
+                b"generated metadata",
+            );
+        }
+    }
+    for path in [".ism-staging/tmp.jpg", "Edited/.ism-trash/old.jpg"] {
+        write_old(&a.shared.join(path), b"reserved");
+    }
+    scan(&a).await;
+    let peer = super::net::peers(&b.state).await.unwrap().remove(0);
+    super::pull(&b.state, &peer).await.unwrap();
+    let queued: Vec<String> = sqlx::query_scalar(
+        "SELECT rel_path FROM transfers WHERE status = 'queued' ORDER BY rel_path",
+    )
+    .fetch_all(&b.state.db)
+    .await
+    .unwrap();
+    assert!(
+        queued
+            .iter()
+            .all(|path| !path.split('/').any(|p| p == "@eaDir")),
+        "Synology metadata entered the transfer queue: {queued:?}"
+    );
+    let mut expected = ordinary.map(str::to_owned).to_vec();
+    expected.sort();
+    assert_eq!(queued, expected);
+    let tracked: Vec<String> =
+        sqlx::query_scalar("SELECT rel_path FROM replica_files ORDER BY rel_path")
+            .fetch_all(&a.state.db)
+            .await
+            .unwrap();
+    assert_eq!(tracked, expected);
+}
+
+#[tokio::test]
+async fn tracked_synology_metadata_is_not_deleted_advertised_or_served() {
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    let share = super::shares(&a.state).await.unwrap().remove(0);
+    let peer = super::net::peers(&a.state).await.unwrap().remove(0);
+    let mut vv = ism_core::version::VersionVector::default();
+    vv.increment(&a.state.instance_id);
+    let old = super::Row {
+        size: 5,
+        mtime_ns: 1,
+        sha256: Some(crate::crypto::sha256_hex(b"thumb")),
+        deleted: false,
+        vv,
+    };
+    let metadata = "Edited/@eaDir/photo.jpg/thumb.jpg";
+    write_old(&a.shared.join(metadata), b"thumb");
+    super::put_row(&a.state, &share.id, metadata, &old)
+        .await
+        .unwrap();
+    // Include a missing tracked file and a historical tombstone as well as a file on disk.
+    for (path, deleted) in [
+        ("Edited/@eaDir/missing.jpg", false),
+        ("Edited/@eaDir/deleted.jpg", true),
+    ] {
+        super::put_row(
+            &a.state,
+            &share.id,
+            path,
+            &super::Row {
+                deleted,
+                ..old.clone()
+            },
+        )
+        .await
+        .unwrap();
+    }
+    let before: i64 = sqlx::query_scalar("SELECT MAX(seq) FROM event_log")
+        .fetch_one(&a.state.db)
+        .await
+        .unwrap();
+    for (kind, path, from) in [
+        ("file_changed", metadata, None),
+        ("file_deleted", "Edited/@eaDir/deleted.jpg", None),
+        ("file_moved", "rescued.jpg", Some(metadata)),
+        ("file_moved", metadata, Some("ordinary.jpg")),
+    ] {
+        super::append_local(
+            &a.state,
+            &share.name,
+            kind,
+            &super::EventData {
+                path: path.into(),
+                from: from.map(str::to_owned),
+                sha256: old.sha256.clone(),
+                size: Some(5),
+                vv: old.vv.clone(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    }
+    let last: i64 = sqlx::query_scalar("SELECT MAX(seq) FROM event_log")
+        .fetch_one(&a.state.db)
+        .await
+        .unwrap();
+    scan(&a).await;
+    super::record_local(
+        &a.state,
+        &[
+            super::LocalChange::FileTrashed {
+                at: loc(&format!("shared/{metadata}")),
+            },
+            super::LocalChange::FolderCreated {
+                at: loc("shared/Edited/@eaDir/new"),
+            },
+            super::LocalChange::FileMoved {
+                from: loc(&format!("shared/{metadata}")),
+                to: loc("shared/rescued.jpg"),
+            },
+        ],
+    )
+    .await
+    .unwrap();
+    let after: i64 = sqlx::query_scalar("SELECT MAX(seq) FROM event_log")
+        .fetch_one(&a.state.db)
+        .await
+        .unwrap();
+    assert_eq!(
+        after, last,
+        "ignoring metadata must not emit deletions or moves"
+    );
+    for path in [metadata, "Edited/@eaDir/missing.jpg"] {
+        let row = super::row(&a.state, &share.id, path)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!row.deleted);
+        assert_eq!(row.vv, old.vv);
+    }
+    let page = super::events_for(&a.state, &peer.id, &b.state.instance_id, before)
+        .await
+        .unwrap();
+    assert!(page.events.is_empty());
+    assert_eq!(page.next, last);
+    // More than a page of legacy metadata must not produce an empty, invalid inventory page.
+    sqlx::query(
+        "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 501)
+         INSERT INTO replica_files (share_id, rel_path, size, mtime_ns, deleted, vv_json)
+         SELECT ?, '@eaDir/old-' || i, 0, 0, 1, '{}' FROM n",
+    )
+    .bind(&share.id)
+    .execute(&a.state.db)
+    .await
+    .unwrap();
+    write_old(&a.shared.join("z-original.png"), b"original");
+    scan(&a).await;
+    let inventory = super::inventory_for(&a.state, &peer.id, &share.name, "")
+        .await
+        .unwrap();
+    inventory.validate("").unwrap();
+    assert_eq!(inventory.entries.len(), 1);
+    assert_eq!(inventory.entries[0].path, "z-original.png");
+    assert!(inventory.next.is_none());
+    let receiver_peer = super::net::peers(&b.state).await.unwrap().remove(0);
+    let uri = format!(
+        "/api/peer/v1/content?share=Family&path={}&sha256={}",
+        super::transfer::encode(metadata),
+        old.sha256.as_deref().unwrap()
+    );
+    let response = super::net::request(
+        &b.state,
+        &receiver_peer.url,
+        &receiver_peer.secret,
+        reqwest::Method::GET,
+        &uri,
+        None,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(std::fs::read(a.shared.join(metadata)).unwrap(), b"thumb");
+}
+
+#[tokio::test]
+async fn legacy_synology_events_and_backfill_do_not_apply_metadata_or_stall_the_cursor() {
+    use wiremock::{Mock, MockServer, ResponseTemplate, matchers};
+
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    let share = super::shares(&b.state).await.unwrap().remove(0);
+    let mut peer = super::net::peers(&b.state).await.unwrap().remove(0);
+    let server = MockServer::start().await;
+    peer.url = server.uri();
+    let metadata = "Edited/@eaDir/photo.jpg/thumb.jpg";
+    write_old(&b.shared.join(metadata), b"local metadata");
+    write_old(&b.shared.join("@eaDir/deleted.jpg"), b"keep metadata");
+    let mut vv = ism_core::version::VersionVector::default();
+    vv.increment(&a.state.instance_id);
+    let data = super::EventData {
+        path: metadata.into(),
+        sha256: Some(crate::crypto::sha256_hex(b"remote")),
+        size: Some(6),
+        vv: vv.clone(),
+        ..Default::default()
+    };
+    let mut events = Vec::new();
+    for (kind, path, from) in [
+        ("file_changed", metadata, None),
+        ("file_deleted", metadata, None),
+        ("folder_created", "Edited/@eaDir/new", None),
+        ("folder_trashed", "Edited/@eaDir/photo.jpg", None),
+        ("file_moved", "rescued.jpg", Some(metadata)),
+        ("folder_moved", "rescued", Some("Edited/@eaDir")),
+        ("file_moved", metadata, Some("original.jpg")),
+        ("file_changed", "original.jpg", None),
+    ] {
+        events.push(super::PeerEvent {
+            seq: peer.cursor + events.len() as i64 + 1,
+            origin: a.state.instance_id.clone(),
+            origin_seq: 100 + events.len() as i64,
+            share: share.name.clone(),
+            kind: kind.into(),
+            data: super::EventData {
+                path: path.into(),
+                from: from.map(str::to_owned),
+                ..data.clone()
+            },
+        });
+    }
+    let last = events.last().unwrap().seq;
+    Mock::given(matchers::path("/api/peer/v1/events"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(super::EventPage { events, next: last }),
+        )
+        .mount(&server)
+        .await;
+    super::pull(&b.state, &peer).await.unwrap();
+    assert_eq!(
+        super::net::peer(&b.state, &peer.id).await.unwrap().cursor,
+        last
+    );
+    let mut tx = b.state.db.begin().await.unwrap();
+    super::mark_backfill_in(&mut tx, &share.id, &peer.id)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    Mock::given(matchers::path("/api/peer/v1/inventory"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(super::InventoryPage {
+                entries: vec![
+                    super::InventoryEntry {
+                        path: "@eaDir/deleted.jpg".into(),
+                        sha256: None,
+                        size: 0,
+                        mtime_ns: 0,
+                        deleted: true,
+                        vv: vv.clone(),
+                    },
+                    super::InventoryEntry {
+                        path: metadata.into(),
+                        sha256: data.sha256.clone(),
+                        size: 6,
+                        mtime_ns: 0,
+                        deleted: false,
+                        vv: vv.clone(),
+                    },
+                    super::InventoryEntry {
+                        path: "original.jpg".into(),
+                        sha256: data.sha256.clone(),
+                        size: 6,
+                        mtime_ns: 0,
+                        deleted: false,
+                        vv,
+                    },
+                ],
+                next: None,
+            }),
+        )
+        .mount(&server)
+        .await;
+    super::backfill(&b.state, &peer).await.unwrap();
+    let queued: Vec<String> = sqlx::query_scalar("SELECT rel_path FROM transfers")
+        .fetch_all(&b.state.db)
+        .await
+        .unwrap();
+    assert_eq!(queued, ["original.jpg"]);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM operations")
+            .fetch_one(&b.state.db)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        std::fs::read(b.shared.join(metadata)).unwrap(),
+        b"local metadata"
+    );
+    assert_eq!(
+        std::fs::read(b.shared.join("@eaDir/deleted.jpg")).unwrap(),
+        b"keep metadata"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM share_backfills")
+            .fetch_one(&b.state.db)
+            .await
+            .unwrap(),
+        0
+    );
+    server.reset().await;
+    peer.cursor = last;
+    Mock::given(matchers::path("/api/peer/v1/events"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(super::EventPage {
+            events: vec![super::PeerEvent {
+                seq: last + 1,
+                origin: a.state.instance_id.clone(),
+                origin_seq: 200,
+                share: share.name,
+                kind: "file_changed".into(),
+                data: super::EventData {
+                    sha256: None,
+                    ..data
+                },
+            }],
+            next: last + 1,
+        }))
+        .mount(&server)
+        .await;
+    assert!(super::pull(&b.state, &peer).await.is_err());
+    assert_eq!(
+        super::net::peer(&b.state, &peer.id).await.unwrap().cursor,
+        last,
+        "exclusion must not bypass event validation"
+    );
+}
+
+#[tokio::test]
+async fn legacy_queued_synology_metadata_fails_without_adoption_or_publication() {
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    let share = super::shares(&b.state).await.unwrap().remove(0);
+    let peer = super::net::peers(&b.state).await.unwrap().remove(0);
+    let metadata = "Edited/@eaDir/photo.jpg/thumb.jpg";
+    write_old(&b.shared.join(metadata), b"thumb");
+    assert!(
+        super::queue_transfer(
+            &b.state,
+            &peer.id,
+            &share,
+            metadata,
+            &crate::crypto::sha256_hex(b"thumb"),
+            5,
+            &Default::default(),
+        )
+        .await
+        .is_err()
+    );
+    // Seed pre-upgrade state directly: one adoptable copy and one interrupted download.
+    for (id, path, status) in [
+        ("legacy-copy", metadata, "queued"),
+        ("legacy-download", "@eaDir/missing.jpg", "running"),
+    ] {
+        sqlx::query(
+            "INSERT INTO transfers (id, peer_id, share_id, rel_path, sha256, size, vv_json,
+                                    status, queued_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, 5, '{}', ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(&peer.id)
+        .bind(&share.id)
+        .bind(path)
+        .bind(crate::crypto::sha256_hex(b"thumb"))
+        .bind(status)
+        .bind(crate::db::now())
+        .bind(crate::db::now())
+        .execute(&b.state.db)
+        .await
+        .unwrap();
+    }
+    let staging = b
+        .shared
+        .parent()
+        .unwrap()
+        .join(".ism-staging/peer/legacy-download");
+    std::fs::create_dir_all(staging.parent().unwrap()).unwrap();
+    std::fs::write(&staging, b"partial").unwrap();
+    super::transfer::recover_after_restart(&b.state)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE peers SET status = 'online'")
+        .execute(&b.state.db)
+        .await
+        .unwrap();
+    let worker = tokio::spawn(super::transfer::run(b.state.clone()));
+    let result = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let failed: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM transfers WHERE status = 'failed'
+                 AND error = 'Synology metadata is excluded from peer replication'",
+            )
+            .fetch_one(&b.state.db)
+            .await
+            .unwrap();
+            if failed == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    worker.abort();
+    let _ = worker.await;
+    result.unwrap();
+    assert_eq!(std::fs::read(b.shared.join(metadata)).unwrap(), b"thumb");
+    assert!(!b.shared.join("@eaDir/missing.jpg").exists());
+    assert_eq!(std::fs::read(staging).unwrap(), b"partial");
+    let changes: i64 = sqlx::query_scalar(
+        "SELECT (SELECT COUNT(*) FROM operations) + (SELECT COUNT(*) FROM replica_files)",
+    )
+    .fetch_one(&b.state.db)
+    .await
+    .unwrap();
+    assert_eq!(changes, 0);
+}
+
 #[tokio::test]
 async fn stalled_peer_does_not_block_polling_other_peers() {
     let (_a, mut b) = pair().await;

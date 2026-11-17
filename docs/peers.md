@@ -42,6 +42,17 @@ while one of its changes is still being applied.
 
 ### What is synchronized
 
+- Synology `@eaDir` metadata is excluded at every path depth, independently of Immich library
+  exclusions. Originals and XMP/JSON/XML companions remain eligible, as do ordinary dot-prefixed
+  and `@`-prefixed folders; ISM's reserved paths remain excluded.
+  Previously tracked metadata is ignored, not announced as deleted, and historical metadata events
+  and inventory entries are not advertised or applied. Moves with an excluded source or destination
+  are not replayed; ordinary files moved out of metadata are discovered by the next share scan.
+  A legacy queued metadata transfer fails with an explicit exclusion reason when the worker
+  examines it during allowed hours (or an override), without adopting or publishing its content.
+  Existing metadata files, replica history and staging data are left untouched; this is not a
+  remote cleanup or migration of already accepted managed operations. Upgrade both peers to
+  enforce the policy on both sides.
 - **Management events:** moves, renames, folder creation, folder moves, file trash and folder trash
   done through ISM become peer events. A peer applies each one as a managed operation, so on an
   Immich-linked root the asset keeps its ID and only its path changes. An event is acknowledged
