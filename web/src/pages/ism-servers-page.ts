@@ -69,6 +69,9 @@ export class IsmServersPage extends IsmPage {
       url: String(form.get('url') ?? '').trim(),
       database_url: clearDatabase ? '' : databaseUrl || null,
       direct_writes_enabled: form.get('direct_writes_enabled') === 'on',
+      external_library_move_mode: String(
+        form.get('external_library_move_mode'),
+      ) as ImmichServerInput['external_library_move_mode'],
     };
     const editing = this.editing;
     const ok = await this.act(
@@ -211,6 +214,10 @@ export class IsmServersPage extends IsmPage {
                 <span class="badge badge-sm badge-ghost">
                   ${server.database_configured ? 'Database connected' : 'No database access'}
                 </span>
+                <span class="badge badge-sm badge-info badge-soft">${humanize(server.external_library_move_mode)}</span>
+                <span class="badge badge-sm ${server.external_library_api_capable === true ? 'badge-success' : server.external_library_api_capable === false ? 'badge-warning' : 'badge-ghost'} badge-soft">
+                  ${server.external_library_api_capable === true ? 'External API available' : server.external_library_api_capable === false ? 'External API unavailable' : 'External API unverified'}
+                </span>
                 ${server.direct_writes_enabled ? html`<span class="badge badge-sm badge-warning badge-soft">Direct writes on</span>` : nothing}
               </div>
               ${server.compatibility_detail ? html`<p class="mt-1 text-sm text-error">${server.compatibility_detail}</p>` : nothing}
@@ -333,6 +340,15 @@ export class IsmServersPage extends IsmPage {
               <input type="checkbox" class="toggle toggle-sm" name="direct_writes_enabled" .checked=${s?.direct_writes_enabled ?? false} />
               Allow direct database writes for moves and renames
             </label>
+            <fieldset class="fieldset">
+              <legend class="fieldset-legend">External-library move mode</legend>
+              <select name="external_library_move_mode" class="select w-full" .value=${s?.external_library_move_mode ?? 'api_with_db_fallback'}>
+                <option value="api_only">API only — never use direct database fallback</option>
+                <option value="api_with_db_fallback">API with DB fallback — compatibility for stock Immich</option>
+                <option value="db_only">DB only — skip the external-library move API</option>
+              </select>
+              <p class="label">API mode is preferred. DB modes require database access and direct writes.</p>
+            </fieldset>
             <div class="modal-action">
               <button type="button" class="btn btn-ghost" @click=${() => this.serverDialog.value?.close()}>Cancel</button>
               <button class="btn btn-primary" ?disabled=${this.busy !== undefined}>${this.spin('server')}Save</button>

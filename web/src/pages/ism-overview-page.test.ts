@@ -14,6 +14,8 @@ const SERVER: ImmichServerView = {
   compatibility_detail: null,
   database_configured: true,
   direct_writes_enabled: false,
+  external_library_move_mode: 'api_with_db_fallback',
+  external_library_api_capable: true,
   admin_account_id: 'a1',
   maintenance: {
     phase: 'idle',

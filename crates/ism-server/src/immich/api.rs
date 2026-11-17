@@ -16,6 +16,22 @@ pub enum ApiError {
     Decode(String),
 }
 
+impl ApiError {
+    /// Route-level absence, distinct from a real `404` returned by a known library.
+    pub fn is_external_library_api_unavailable(&self) -> bool {
+        match self {
+            Self::Status {
+                status: 405 | 501, ..
+            } => true,
+            Self::Status {
+                status: 404,
+                message,
+            } => message.contains("Cannot POST"),
+            _ => false,
+        }
+    }
+}
+
 impl From<reqwest::Error> for ApiError {
     fn from(e: reqwest::Error) -> Self {
         Self::Network(e.without_url().to_string())
@@ -395,6 +411,26 @@ impl Api {
         .map(|_| ())
     }
 
+    /// Mutation-free route probe: a matching route rejects the invalid UUID with 400.
+    pub async fn external_library_api_capable(&self) -> Result<bool, ApiError> {
+        match self
+            .call(
+                Method::POST,
+                "/libraries/invalid/files/move",
+                Some(json!({
+                    "sourcePath": "/__ism_capability_probe__",
+                    "destinationPath": "/__ism_capability_probe__"
+                })),
+            )
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(ApiError::Status { status: 400, .. }) => Ok(true),
+            Err(error) if error.is_external_library_api_unavailable() => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Moves assets to Immich's trash (`force = false`) or deletes them (`force = true`).
     pub async fn delete_assets(&self, ids: &[String], force: bool) -> Result<(), ApiError> {
         if ids.is_empty() {
@@ -534,6 +570,31 @@ mod tests {
         .unwrap();
         assert!(legacy.is_idle());
         assert!(!legacy.is_held());
+    }
+
+    #[test]
+    fn distinguishes_missing_route_from_known_library_not_found() {
+        assert!(
+            ApiError::Status {
+                status: 404,
+                message: "Cannot POST /api/libraries/invalid/files/move".to_owned(),
+            }
+            .is_external_library_api_unavailable()
+        );
+        assert!(
+            !ApiError::Status {
+                status: 404,
+                message: "Library not found".to_owned(),
+            }
+            .is_external_library_api_unavailable()
+        );
+        assert!(
+            !ApiError::Status {
+                status: 409,
+                message: "Destination already has an asset".to_owned(),
+            }
+            .is_external_library_api_unavailable()
+        );
     }
 
     #[tokio::test]
