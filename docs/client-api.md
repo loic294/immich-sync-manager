@@ -67,7 +67,7 @@ blocked). `direct_writes` is one of:
 
 | Reason | Cause | Writes fail with |
 |---|---|---|
-| `not_configured` | Compatibility check not passed, no database access configured, or direct writes turned off | `direct_writes_unavailable` |
+| `not_configured` | Compatibility check/database access missing, or `db_only` selected without direct writes | `direct_writes_unavailable` |
 | `unknown_server` | The root points to an Immich server that is no longer registered | `direct_writes_unavailable` |
 | `drift` | Immich's watcher or scheduled scan was turned back on | `maintenance_blocked` |
 | `maintenance` | The library queue could not be paused or resumed | `maintenance_blocked` |

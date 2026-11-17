@@ -435,14 +435,15 @@ async fn create_server(
         None => None,
     };
     sqlx::query(
-        "INSERT INTO immich_servers (id, name, url, database_url_enc, direct_writes_enabled, maintenance_json, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO immich_servers (id, name, url, database_url_enc, direct_writes_enabled, \
+         external_library_move_mode, maintenance_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(&name)
     .bind(&url)
     .bind(&db_enc)
     .bind(input.direct_writes_enabled as i64)
+    .bind(input.external_library_move_mode.as_str())
     .bind(serde_json::to_string(&MaintenanceState::default())?)
     .bind(db::now())
     .execute(&state.db)
@@ -488,11 +489,15 @@ async fn update_server(
                 .map_err(AppError::internal)?,
         ),
     };
-    sqlx::query("UPDATE immich_servers SET name = ?, url = ?, database_url_enc = ?, direct_writes_enabled = ? WHERE id = ?")
+    sqlx::query(
+        "UPDATE immich_servers SET name = ?, url = ?, database_url_enc = ?, direct_writes_enabled = ?, \
+         external_library_move_mode = ? WHERE id = ?",
+    )
         .bind(&name)
         .bind(&url)
         .bind(&db_enc)
         .bind(input.direct_writes_enabled as i64)
+        .bind(input.external_library_move_mode.as_str())
         .bind(&id)
         .execute(&state.db)
         .await?;

@@ -1,7 +1,7 @@
 //! Immich servers and accounts known to this instance, and routing of each change to the
 //! account that owns the affected library.
 
-use ism_core::dto::{DirectWritesReason, ImmichServerView, MaintenanceView};
+use ism_core::dto::{DirectWritesReason, ImmichMoveMode, ImmichServerView, MaintenanceView};
 use ism_core::maintenance::{MaintenanceState, Phase};
 use sqlx::Row;
 use sqlx::postgres::PgPool;
@@ -27,6 +27,8 @@ pub struct Server {
     pub url: String,
     pub database_url_enc: Option<String>,
     pub direct_writes_enabled: bool,
+    pub external_library_move_mode: ImmichMoveMode,
+    pub external_library_api_capable: Option<bool>,
     pub version: Option<String>,
     pub compatible: bool,
     pub compatibility_detail: Option<String>,
@@ -35,12 +37,22 @@ pub struct Server {
 
 fn server_from_row(row: &sqlx::sqlite::SqliteRow) -> AppResult<Server> {
     let maintenance: String = row.try_get("maintenance_json")?;
+    let move_mode: String = row.try_get("external_library_move_mode")?;
+    let move_mode = ImmichMoveMode::parse(&move_mode).ok_or_else(|| {
+        AppError::internal(format!(
+            "unknown Immich move mode in stored settings: {move_mode}"
+        ))
+    })?;
     Ok(Server {
         id: row.try_get("id")?,
         name: row.try_get("name")?,
         url: row.try_get("url")?,
         database_url_enc: row.try_get("database_url_enc")?,
         direct_writes_enabled: row.try_get::<i64, _>("direct_writes_enabled")? != 0,
+        external_library_move_mode: move_mode,
+        external_library_api_capable: row
+            .try_get::<Option<i64>, _>("external_library_api_capable")?
+            .map(|value| value != 0),
         version: row.try_get("version")?,
         compatible: row.try_get::<i64, _>("compatible")? != 0,
         compatibility_detail: row.try_get("compatibility_detail")?,
@@ -48,8 +60,9 @@ fn server_from_row(row: &sqlx::sqlite::SqliteRow) -> AppResult<Server> {
     })
 }
 
-const SERVER_COLUMNS: &str = "id, name, url, database_url_enc, direct_writes_enabled, version, compatible, \
-     compatibility_detail, maintenance_json";
+const SERVER_COLUMNS: &str = "id, name, url, database_url_enc, direct_writes_enabled, \
+     external_library_move_mode, external_library_api_capable, version, compatible, compatibility_detail, \
+     maintenance_json";
 
 pub async fn servers(state: &AppState) -> AppResult<Vec<Server>> {
     let sql = format!("SELECT {SERVER_COLUMNS} FROM immich_servers ORDER BY name");
@@ -112,6 +125,8 @@ pub async fn server_view(state: &AppState, s: &Server) -> AppResult<ImmichServer
         compatibility_detail: s.compatibility_detail.clone(),
         database_configured: s.database_url_enc.is_some(),
         direct_writes_enabled: s.direct_writes_enabled,
+        external_library_move_mode: s.external_library_move_mode,
+        external_library_api_capable: s.external_library_api_capable,
         admin_account_id: admin,
         maintenance: maintenance_view(&s.maintenance),
     })
@@ -119,10 +134,17 @@ pub async fn server_view(state: &AppState, s: &Server) -> AppResult<ImmichServer
 
 /// Why managed (direct) writes are refused on a server right now; `None` when they can run.
 pub fn write_block(server: &Server) -> Option<(DirectWritesReason, String)> {
-    if !(server.compatible && server.direct_writes_enabled && server.database_url_enc.is_some()) {
+    if !(server.compatible && server.database_url_enc.is_some()) {
         return Some((
             DirectWritesReason::NotConfigured,
-            "the Immich compatibility check, database access and direct writes are required".into(),
+            "the Immich compatibility check and database access are required".into(),
+        ));
+    }
+    if server.external_library_move_mode == ImmichMoveMode::DbOnly && !server.direct_writes_enabled
+    {
+        return Some((
+            DirectWritesReason::NotConfigured,
+            "db_only mode requires direct writes to be enabled".into(),
         ));
     }
     let m = &server.maintenance;
@@ -295,13 +317,21 @@ pub async fn check_compatibility(state: &AppState, server_id: &str) -> AppResult
     } else {
         problems.join("; ")
     };
-    sqlx::query("UPDATE immich_servers SET version = ?, compatible = ?, compatibility_detail = ? WHERE id = ?")
-        .bind(&version)
-        .bind(compatible as i64)
-        .bind(&detail)
-        .bind(&server.id)
-        .execute(&state.db)
-        .await?;
+    let external_library_api_capable = match admin_api(state, &server).await {
+        Ok(api) => api.external_library_api_capable().await.ok(),
+        Err(_) => None,
+    };
+    sqlx::query(
+        "UPDATE immich_servers SET version = ?, compatible = ?, compatibility_detail = ?, \
+         external_library_api_capable = ? WHERE id = ?",
+    )
+    .bind(&version)
+    .bind(compatible as i64)
+    .bind(&detail)
+    .bind(external_library_api_capable.map(i64::from))
+    .bind(&server.id)
+    .execute(&state.db)
+    .await?;
     self::server(state, server_id).await
 }
 

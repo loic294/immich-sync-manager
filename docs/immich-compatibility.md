@@ -1,10 +1,19 @@
 # Immich compatibility
 
 ISM targets **Immich v3.4.1** only. On every check it reads the server version and the newest database
-migration. Immich-linked writes (moves, renames, folder moves, trash, uploads) are **enabled** for a
-compatible server with direct writes turned on: every one runs under the write barrier described below,
-which was verified end to end against stock Immich v3.4.1 (`docker/immich-proof/RESULTS.md`).
-ISM supports stock Immich deployments; it does not require or provide a custom Immich image.
+migration. External-library moves use a per-server `external_library_move_mode`, persisted by ISM and
+available under **Servers → Edit**:
+
+| Mode | Behavior |
+| --- | --- |
+| `api_only` | Prefer the external-library move API and fail on unsupported routes. Database fallback is never attempted. |
+| `api_with_db_fallback` | Default for existing and new servers. Prefer the API; only allow compatibility DB writes for route-unavailable `404` (`Cannot POST`), `405`, or `501`. Known-library `404`, `400`, `409`, and all other errors never fall back. |
+| `db_only` | Skip the move API and use guarded database writes; requires stored database access and **direct writes** enabled. |
+
+Every managed write runs under the barrier below. The server check also probes the mutation-free
+external-library route and exposes `external_library_api_capable` (`true`, `false`, or unverified) to
+administrative and client-discovery consumers. The custom Immich v3.4.1 fork exposes this API; stock
+v3.4.1 remains supported through `api_with_db_fallback` or `db_only`.
 
 ## What uses the API
 
@@ -14,7 +23,8 @@ scans. Every request is sent as the account that owns the asset or library.
 
 ## What writes to the database directly
 
-Immich has no API to change these for external-library assets, so `immich/pg.rs` does:
+The API-capable fork handles the asset path and owner/library change. ISM still uses guarded
+`immich/pg.rs` writes only for sidecar rows, for `db_only`, or for the explicit compatibility fallback:
 
 | Change | Statement | Guard |
 | --- | --- | --- |

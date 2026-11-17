@@ -10,7 +10,8 @@ use std::fs;
 
 use crate::peers::LocalChange;
 use ism_core::dto::{
-    Change, ClientAction, ItemStatus, OperationAction, OperationCommitted, OperationStatus,
+    Change, ClientAction, ImmichMoveMode, ItemStatus, OperationAction, OperationCommitted,
+    OperationStatus,
 };
 use serde_json::json;
 
@@ -542,6 +543,30 @@ async fn blocking<T: Send + 'static>(
 
 async fn call_api(state: &AppState, step: &ApiStep) -> AppResult<()> {
     let server = registry::server(state, &step.server_id).await?;
+    if let ApiKind::SyncMove {
+        destination_library_id,
+        source_path,
+        destination_path,
+        asset_id,
+        from_owner,
+        to_owner,
+        ..
+    } = &step.kind
+        && server.external_library_move_mode == ImmichMoveMode::DbOnly
+    {
+        return fallback_sync_move(
+            state,
+            &server,
+            destination_library_id,
+            source_path,
+            destination_path,
+            asset_id,
+            from_owner,
+            to_owner,
+        )
+        .await
+        .map_err(|e| AppError::conflict("immich_error", crate::error::redact(&e.to_string())));
+    }
     let api = registry::api_as_user(state, &server, &step.owner).await?;
     let result = match &step.kind {
         ApiKind::Trash => api.delete_assets(&step.ids, false).await,
@@ -555,25 +580,11 @@ async fn call_api(state: &AppState, step: &ApiStep) -> AppResult<()> {
             asset_id,
             from_owner,
             to_owner,
-        } => match api
-            .sync_library_file_move(
-                source_library_id,
-                source_path,
-                destination_path,
-                destination_library_id.as_deref(),
-                asset_id.as_deref(),
-            )
-            .await
-        {
-            Ok(()) => Ok(()),
-            Err(crate::immich::api::ApiError::Status {
-                status: 404 | 405 | 501,
-                ..
-            }) => {
+        } => {
+            let fallback = || {
                 fallback_sync_move(
                     state,
                     &server,
-                    source_library_id,
                     destination_library_id,
                     source_path,
                     destination_path,
@@ -581,10 +592,34 @@ async fn call_api(state: &AppState, step: &ApiStep) -> AppResult<()> {
                     from_owner,
                     to_owner,
                 )
-                .await
+            };
+            match server.external_library_move_mode {
+                ImmichMoveMode::DbOnly => unreachable!("handled before API key lookup"),
+                ImmichMoveMode::ApiOnly | ImmichMoveMode::ApiWithDbFallback => {
+                    match api
+                        .sync_library_file_move(
+                            source_library_id,
+                            source_path,
+                            destination_path,
+                            destination_library_id.as_deref(),
+                            asset_id.as_deref(),
+                        )
+                        .await
+                    {
+                        Ok(()) => Ok(()),
+                        Err(error)
+                            if should_use_db_fallback(
+                                server.external_library_move_mode,
+                                &error,
+                            ) =>
+                        {
+                            fallback().await
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
             }
-            Err(error) => Err(error),
-        },
+        }
     };
     result.map_err(|e| AppError::conflict("immich_error", crate::error::redact(&e.to_string())))
 }
@@ -592,7 +627,6 @@ async fn call_api(state: &AppState, step: &ApiStep) -> AppResult<()> {
 async fn fallback_sync_move(
     state: &AppState,
     server: &registry::Server,
-    source_library_id: &str,
     destination_library_id: &Option<String>,
     source_path: &str,
     destination_path: &str,
@@ -600,6 +634,11 @@ async fn fallback_sync_move(
     from_owner: &Option<String>,
     to_owner: &Option<String>,
 ) -> Result<(), crate::immich::api::ApiError> {
+    if !server.direct_writes_enabled {
+        return Err(crate::immich::api::ApiError::Decode(
+            "direct database fallback is disabled for this Immich server".to_owned(),
+        ));
+    }
     let pool = registry::pg_pool(state, server)
         .await
         .map_err(|error| crate::immich::api::ApiError::Decode(error.to_string()))?;
@@ -649,7 +688,6 @@ async fn fallback_sync_move(
     tx.commit().await.map_err(|error| {
         crate::immich::api::ApiError::Decode(format!("compatibility transaction failed: {error}"))
     })?;
-    let _ = source_library_id;
     Ok(())
 }
 
@@ -680,6 +718,10 @@ fn reverse_api_kind(kind: &ApiKind) -> Option<ApiKind> {
             to_owner: from_owner.clone(),
         }),
     }
+}
+
+fn should_use_db_fallback(mode: ImmichMoveMode, error: &crate::immich::api::ApiError) -> bool {
+    mode == ImmichMoveMode::ApiWithDbFallback && error.is_external_library_api_unavailable()
 }
 
 async fn apply(state: &AppState, step: &Step) -> Result<Option<Undo>, Failure> {
@@ -1018,6 +1060,30 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    #[test]
+    fn move_mode_controls_database_fallback() {
+        let unavailable = crate::immich::api::ApiError::Status {
+            status: 404,
+            message: "Cannot POST /api/libraries/id/files/move".to_owned(),
+        };
+        let conflict = crate::immich::api::ApiError::Status {
+            status: 409,
+            message: "Destination already has an asset".to_owned(),
+        };
+        assert!(!should_use_db_fallback(
+            ImmichMoveMode::ApiOnly,
+            &unavailable
+        ));
+        assert!(should_use_db_fallback(
+            ImmichMoveMode::ApiWithDbFallback,
+            &unavailable
+        ));
+        assert!(!should_use_db_fallback(
+            ImmichMoveMode::ApiWithDbFallback,
+            &conflict
+        ));
+    }
 
     #[test]
     fn sync_move_undo_reverses_paths_libraries_and_owners() {

@@ -106,6 +106,58 @@ pub struct ScanScheduleView {
     pub last_error: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "snake_case")]
+pub enum ImmichMoveMode {
+    ApiOnly,
+    ApiWithDbFallback,
+    DbOnly,
+}
+
+impl Default for ImmichMoveMode {
+    fn default() -> Self {
+        Self::ApiWithDbFallback
+    }
+}
+
+impl ImmichMoveMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ApiOnly => "api_only",
+            Self::ApiWithDbFallback => "api_with_db_fallback",
+            Self::DbOnly => "db_only",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "api_only" => Some(Self::ApiOnly),
+            "api_with_db_fallback" => Some(Self::ApiWithDbFallback),
+            "db_only" => Some(Self::DbOnly),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod move_mode_tests {
+    use super::ImmichMoveMode;
+
+    #[test]
+    fn supports_the_persisted_move_modes() {
+        assert_eq!(ImmichMoveMode::default().as_str(), "api_with_db_fallback");
+        for mode in [
+            ImmichMoveMode::ApiOnly,
+            ImmichMoveMode::ApiWithDbFallback,
+            ImmichMoveMode::DbOnly,
+        ] {
+            assert_eq!(ImmichMoveMode::parse(mode.as_str()), Some(mode));
+        }
+        assert_eq!(ImmichMoveMode::parse("unknown"), None);
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct ImmichServerView {
@@ -118,6 +170,9 @@ pub struct ImmichServerView {
     pub compatibility_detail: Option<String>,
     pub database_configured: bool,
     pub direct_writes_enabled: bool,
+    #[serde(default)]
+    pub external_library_move_mode: ImmichMoveMode,
+    pub external_library_api_capable: Option<bool>,
     pub admin_account_id: Option<String>,
     pub maintenance: MaintenanceView,
 }
@@ -132,6 +187,8 @@ pub struct ImmichServerInput {
     pub database_url: Option<String>,
     #[serde(default)]
     pub direct_writes_enabled: bool,
+    #[serde(default)]
+    pub external_library_move_mode: ImmichMoveMode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]

@@ -635,12 +635,62 @@ async fn immich_writes_are_enabled_for_a_ready_server() {
         url: "https://immich.example".into(),
         database_url_enc: Some("encrypted".into()),
         direct_writes_enabled: true,
+        external_library_move_mode: ism_core::dto::ImmichMoveMode::ApiWithDbFallback,
+        external_library_api_capable: Some(true),
         version: Some("3.4.1".into()),
         compatible: true,
         compatibility_detail: None,
         maintenance,
     };
     assert_eq!(crate::immich::registry::write_block(&server), None);
+}
+
+#[tokio::test]
+async fn immich_move_mode_controls_direct_write_requirement() {
+    let server = crate::immich::registry::Server {
+        id: "server".into(),
+        name: "Example".into(),
+        url: "https://immich.example".into(),
+        database_url_enc: Some("encrypted".into()),
+        direct_writes_enabled: false,
+        external_library_move_mode: ism_core::dto::ImmichMoveMode::ApiOnly,
+        external_library_api_capable: Some(true),
+        version: Some("3.4.1".into()),
+        compatible: true,
+        compatibility_detail: None,
+        maintenance: ism_core::maintenance::MaintenanceState::default(),
+    };
+    assert_eq!(crate::immich::registry::write_block(&server), None);
+
+    let mut db_only = server;
+    db_only.external_library_move_mode = ism_core::dto::ImmichMoveMode::DbOnly;
+    assert!(crate::immich::registry::write_block(&db_only).is_some());
+
+    db_only.external_library_move_mode = ism_core::dto::ImmichMoveMode::ApiWithDbFallback;
+    assert_eq!(crate::immich::registry::write_block(&db_only), None);
+}
+
+#[tokio::test]
+async fn migrated_server_defaults_to_api_with_db_fallback() {
+    let h = harness().await;
+    sqlx::query(
+        "INSERT INTO immich_servers (id, name, url, maintenance_json, created_at) \
+         VALUES ('mode-default', 'Mode default', 'https://immich.example', ?, ?)",
+    )
+    .bind(serde_json::to_string(&ism_core::maintenance::MaintenanceState::default()).unwrap())
+    .bind(crate::db::now())
+    .execute(&h.state.db)
+    .await
+    .unwrap();
+
+    let server = crate::immich::registry::server(&h.state, "mode-default")
+        .await
+        .unwrap();
+    assert_eq!(
+        server.external_library_move_mode,
+        ism_core::dto::ImmichMoveMode::ApiWithDbFallback
+    );
+    assert_eq!(server.external_library_api_capable, None);
 }
 
 #[tokio::test]
