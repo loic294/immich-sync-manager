@@ -34,29 +34,27 @@ pub struct FsMove {
 
 #[derive(Debug, Clone)]
 pub enum DbStep {
-    MoveAsset {
-        asset_id: String,
-        from: String,
-        to: String,
-    },
     MoveSidecar {
         file_id: String,
         from: String,
         to: String,
     },
-    ChangeLibrary {
-        asset_id: String,
-        from_owner: String,
-        to_owner: String,
-        to_library: String,
-    },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApiKind {
     Trash,
     Restore,
     ForceDelete,
+    SyncMove {
+        source_library_id: String,
+        destination_library_id: Option<String>,
+        source_path: String,
+        destination_path: String,
+        asset_id: Option<String>,
+        from_owner: Option<String>,
+        to_owner: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -580,11 +578,7 @@ async fn plan_move_file(
         );
     }
     plan.asset_id = Some(asset.id.clone());
-    let mut steps = vec![DbStep::MoveAsset {
-        asset_id: asset.id.clone(),
-        from: from_path.clone(),
-        to: to_path.clone(),
-    }];
+    let mut steps = Vec::new();
     for (i, (from_name, to_name, _, shared)) in group.iter().enumerate().skip(1) {
         let (Some(cf), Some(ct)) = (
             src_root.immich_path(
@@ -614,8 +608,25 @@ async fn plan_move_file(
             }
         }
     }
-    owner_change(ctx, plan, &mut conn, server, &asset, dst_root, &mut steps).await?;
-    plan.db.insert(server.id.clone(), steps);
+    let owner_change =
+        owner_change(ctx, plan, &mut conn, server, &asset, dst_root, &mut steps).await?;
+    plan.steps.push(Step::Api(ApiStep {
+        kind: ApiKind::SyncMove {
+            source_library_id: asset.library_id.clone().unwrap_or_default(),
+            destination_library_id: dst_root.library_id.clone(),
+            source_path: from_path,
+            destination_path: to_path,
+            asset_id: Some(asset.id.clone()),
+            from_owner: owner_change.as_ref().map(|(from, _)| from.clone()),
+            to_owner: owner_change.map(|(_, to)| to),
+        },
+        server_id: server.id.clone(),
+        owner: asset.owner_id.clone(),
+        ids: Vec::new(),
+    }));
+    if !steps.is_empty() {
+        plan.db.insert(server.id.clone(), steps);
+    }
     Ok(())
 }
 
@@ -629,7 +640,7 @@ async fn owner_change(
     asset: &AssetRow,
     dst_root: &Root,
     steps: &mut Vec<DbStep>,
-) -> AppResult<()> {
+) -> AppResult<Option<(String, String)>> {
     let target_library = dst_root.library_id.clone();
     let owner_label = registry::account_label(ctx.state, &server.id, &asset.owner_id).await;
     let same_library = target_library.is_none() || target_library == asset.library_id;
@@ -640,7 +651,7 @@ async fn owner_change(
             owner: owner_label,
             owner_change: false,
         });
-        return Ok(());
+        return Ok(None);
     }
     let to_library = target_library.unwrap_or_default();
     let Some(to_owner) = registry::library_owner(ctx.state, &to_library).await? else {
@@ -648,7 +659,7 @@ async fn owner_change(
             "library_unknown",
             "refresh the Immich libraries of the target root",
         );
-        return Ok(());
+        return Ok(None);
     };
     let owner_differs = to_owner != asset.owner_id;
     plan.assets.push(PlannedAsset {
@@ -677,13 +688,8 @@ async fn owner_change(
             plan.block("owner_transfer_blocked", reason);
         }
     }
-    steps.push(DbStep::ChangeLibrary {
-        asset_id: asset.id.clone(),
-        from_owner: asset.owner_id.clone(),
-        to_owner,
-        to_library,
-    });
-    Ok(())
+    let _ = steps;
+    Ok(Some((asset.owner_id.clone(), to_owner)))
 }
 
 fn plan_create_folder(ctx: &Ctx<'_>, plan: &mut Plan, target: &Location) -> AppResult<()> {
@@ -794,13 +800,6 @@ async fn plan_move_folder(
             "Immich already has assets under the target folder",
         );
     }
-    for asset in &assets {
-        steps.push(DbStep::MoveAsset {
-            asset_id: asset.id.clone(),
-            from: asset.original_path.clone(),
-            to: rebase(&asset.original_path),
-        });
-    }
     for sidecar in pg::sidecars_under(&mut conn, &from_prefix).await? {
         steps.push(DbStep::MoveSidecar {
             to: rebase(&sidecar.path),
@@ -809,7 +808,22 @@ async fn plan_move_folder(
         });
     }
     for asset in &assets {
-        owner_change(ctx, plan, &mut conn, server, asset, dst_root, &mut steps).await?;
+        let owner_change =
+            owner_change(ctx, plan, &mut conn, server, asset, dst_root, &mut steps).await?;
+        plan.steps.push(Step::Api(ApiStep {
+            kind: ApiKind::SyncMove {
+                source_library_id: asset.library_id.clone().unwrap_or_default(),
+                destination_library_id: dst_root.library_id.clone(),
+                source_path: asset.original_path.clone(),
+                destination_path: rebase(&asset.original_path),
+                asset_id: Some(asset.id.clone()),
+                from_owner: owner_change.as_ref().map(|(from, _)| from.clone()),
+                to_owner: owner_change.map(|(_, to)| to),
+            },
+            server_id: server.id.clone(),
+            owner: asset.owner_id.clone(),
+            ids: Vec::new(),
+        }));
     }
     if plan.assets.len() > 50 {
         let changed = plan.assets.iter().filter(|a| a.owner_change).count();
