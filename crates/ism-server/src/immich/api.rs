@@ -90,20 +90,46 @@ pub struct Queue {
     pub name: String,
     #[serde(default)]
     pub is_paused: bool,
+    #[serde(default)]
+    pub is_running: Option<bool>,
+    #[serde(default)]
+    pub status: Option<String>,
     pub statistics: QueueStatistics,
 }
 
 impl Queue {
+    /// Explicit Immich status when available, otherwise derives running from active jobs.
+    pub fn is_running(&self) -> bool {
+        match self.status.as_deref() {
+            Some("running") => true,
+            Some("paused" | "idle") => false,
+            _ => self.is_running.unwrap_or(self.statistics.active > 0),
+        }
+    }
+
     /// Nothing running and nothing pending: work held by a pause counts as pending.
     pub fn is_idle(&self) -> bool {
+        match self.status.as_deref() {
+            Some("idle") => return true,
+            Some("running" | "paused") => return false,
+            _ => {}
+        }
         let s = &self.statistics;
-        s.active == 0 && s.waiting == 0 && s.delayed == 0 && s.paused == 0
+        !self.is_running()
+            && s.active == 0
+            && s.waiting == 0
+            && s.delayed == 0
+            && s.paused == 0
+            && !self.is_paused
     }
 
     /// Paused with no job running. On Immich v3.4.1 jobs queued while the queue is paused stay
     /// in `waiting` (or `delayed`) and do not start until it is resumed, so they are harmless.
     pub fn is_held(&self) -> bool {
-        self.is_paused && self.statistics.active == 0
+        match self.status.as_deref() {
+            Some("paused") => self.is_paused,
+            _ => self.is_paused && !self.is_running(),
+        }
     }
 }
 
@@ -300,6 +326,75 @@ impl Api {
         .map(|_| ())
     }
 
+    /// Queues a scan only for a folder inside the external library.
+    pub async fn scan_library_folder(&self, library_id: &str, path: &str) -> Result<(), ApiError> {
+        self.call(
+            Method::POST,
+            &format!("/libraries/{library_id}/scan"),
+            Some(json!({ "path": path })),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Synchronizes an external library after ISM or OPM has created a file.
+    pub async fn sync_library_file_add(
+        &self,
+        library_id: &str,
+        path: &str,
+    ) -> Result<(), ApiError> {
+        self.call(
+            Method::POST,
+            &format!("/libraries/{library_id}/files/add"),
+            Some(json!({ "path": path })),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Synchronizes an external library after ISM or OPM has removed a file.
+    pub async fn sync_library_file_remove(
+        &self,
+        library_id: &str,
+        path: &str,
+    ) -> Result<(), ApiError> {
+        self.call(
+            Method::POST,
+            &format!("/libraries/{library_id}/files/remove"),
+            Some(json!({ "path": path })),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Synchronizes an external library after ISM or OPM has moved a file.
+    pub async fn sync_library_file_move(
+        &self,
+        library_id: &str,
+        source_path: &str,
+        destination_path: &str,
+        destination_library_id: Option<&str>,
+        asset_id: Option<&str>,
+    ) -> Result<(), ApiError> {
+        let mut body = json!({
+            "sourcePath": source_path,
+            "destinationPath": destination_path,
+        });
+        if let Some(destination_library_id) = destination_library_id {
+            body["destinationLibraryId"] = json!(destination_library_id);
+        }
+        if let Some(asset_id) = asset_id {
+            body["assetId"] = json!(asset_id);
+        }
+        self.call(
+            Method::POST,
+            &format!("/libraries/{library_id}/files/move"),
+            Some(body),
+        )
+        .await
+        .map(|_| ())
+    }
+
     /// Moves assets to Immich's trash (`force = false`) or deletes them (`force = true`).
     pub async fn delete_assets(&self, ids: &[String], force: bool) -> Result<(), ApiError> {
         if ids.is_empty() {
@@ -383,6 +478,10 @@ pub const SCAN_ENABLED: &[&str] = &["library", "scan", "enabled"];
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{body_json, header, method, path},
+    };
 
     #[test]
     fn edits_nested_config_flags() {
@@ -400,5 +499,105 @@ mod tests {
             base_url("http://immich.example:2283/api/"),
             "http://immich.example:2283"
         );
+    }
+
+    #[test]
+    fn decodes_explicit_and_fallback_queue_status() {
+        let running: Queue = serde_json::from_value(json!({
+            "name": "library",
+            "isPaused": false,
+            "isRunning": true,
+            "status": "running",
+            "statistics": { "active": 1, "waiting": 0, "delayed": 0, "paused": 0 }
+        }))
+        .unwrap();
+        assert!(running.is_running());
+        assert!(!running.is_idle());
+
+        let paused: Queue = serde_json::from_value(json!({
+            "name": "library",
+            "isPaused": true,
+            "isRunning": false,
+            "status": "paused",
+            "statistics": { "active": 0, "waiting": 2, "delayed": 0, "paused": 0 }
+        }))
+        .unwrap();
+        assert!(!paused.is_running());
+        assert!(!paused.is_idle());
+        assert!(paused.is_held());
+
+        let legacy: Queue = serde_json::from_value(json!({
+            "name": "library",
+            "isPaused": false,
+            "statistics": { "active": 0, "waiting": 0, "delayed": 0, "paused": 0 }
+        }))
+        .unwrap();
+        assert!(legacy.is_idle());
+        assert!(!legacy.is_held());
+    }
+
+    #[tokio::test]
+    async fn sends_folder_scan_contract() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/libraries/lib-1/scan"))
+            .and(header("x-api-key", "test-key"))
+            .and(body_json(json!({ "path": "/mnt/library/photos" })))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+
+        let api = Api::new(reqwest::Client::new(), &server.uri(), "test-key".to_owned());
+        api.scan_library_folder("lib-1", "/mnt/library/photos")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn sends_external_library_file_sync_contracts() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/libraries/lib-1/files/add"))
+            .and(header("x-api-key", "test-key"))
+            .and(body_json(json!({ "path": "/mnt/library/photo.jpg" })))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/libraries/lib-1/files/remove"))
+            .and(header("x-api-key", "test-key"))
+            .and(body_json(json!({ "path": "/mnt/library/photo.jpg" })))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/libraries/lib-1/files/move"))
+            .and(header("x-api-key", "test-key"))
+            .and(body_json(json!({
+                "sourcePath": "/mnt/library/a.jpg",
+                "destinationPath": "/mnt/library/b.jpg",
+                "destinationLibraryId": "lib-2",
+                "assetId": "asset-1"
+            })))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+
+        let api = Api::new(reqwest::Client::new(), &server.uri(), "test-key".to_owned());
+        api.sync_library_file_add("lib-1", "/mnt/library/photo.jpg")
+            .await
+            .unwrap();
+        api.sync_library_file_remove("lib-1", "/mnt/library/photo.jpg")
+            .await
+            .unwrap();
+        api.sync_library_file_move(
+            "lib-1",
+            "/mnt/library/a.jpg",
+            "/mnt/library/b.jpg",
+            Some("lib-2"),
+            Some("asset-1"),
+        )
+        .await
+        .unwrap();
     }
 }
