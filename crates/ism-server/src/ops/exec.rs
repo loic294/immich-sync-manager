@@ -543,12 +543,143 @@ async fn blocking<T: Send + 'static>(
 async fn call_api(state: &AppState, step: &ApiStep) -> AppResult<()> {
     let server = registry::server(state, &step.server_id).await?;
     let api = registry::api_as_user(state, &server, &step.owner).await?;
-    let result = match step.kind {
+    let result = match &step.kind {
         ApiKind::Trash => api.delete_assets(&step.ids, false).await,
         ApiKind::Restore => api.restore_assets(&step.ids).await,
         ApiKind::ForceDelete => api.delete_assets(&step.ids, true).await,
+        ApiKind::SyncMove {
+            source_library_id,
+            destination_library_id,
+            source_path,
+            destination_path,
+            asset_id,
+            from_owner,
+            to_owner,
+        } => match api
+            .sync_library_file_move(
+                source_library_id,
+                source_path,
+                destination_path,
+                destination_library_id.as_deref(),
+                asset_id.as_deref(),
+            )
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(crate::immich::api::ApiError::Status {
+                status: 404 | 405 | 501,
+                ..
+            }) => {
+                fallback_sync_move(
+                    state,
+                    &server,
+                    source_library_id,
+                    destination_library_id,
+                    source_path,
+                    destination_path,
+                    asset_id,
+                    from_owner,
+                    to_owner,
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        },
     };
     result.map_err(|e| AppError::conflict("immich_error", crate::error::redact(&e.to_string())))
+}
+
+async fn fallback_sync_move(
+    state: &AppState,
+    server: &registry::Server,
+    source_library_id: &str,
+    destination_library_id: &Option<String>,
+    source_path: &str,
+    destination_path: &str,
+    asset_id: &Option<String>,
+    from_owner: &Option<String>,
+    to_owner: &Option<String>,
+) -> Result<(), crate::immich::api::ApiError> {
+    let pool = registry::pg_pool(state, server)
+        .await
+        .map_err(|error| crate::immich::api::ApiError::Decode(error.to_string()))?;
+    let mut tx = pool.begin().await.map_err(|error| {
+        crate::immich::api::ApiError::Decode(format!(
+            "could not start compatibility transaction: {error}"
+        ))
+    })?;
+
+    if let (Some(destination_library_id), Some(asset_id), Some(from_owner), Some(to_owner)) =
+        (destination_library_id, asset_id, from_owner, to_owner)
+    {
+        pg::move_asset(&mut tx, asset_id, source_path, destination_path)
+            .await
+            .map_err(|error| {
+                crate::immich::api::ApiError::Decode(format!(
+                    "compatibility path move failed: {error}"
+                ))
+            })?;
+        pg::transfer_owner(
+            &mut tx,
+            asset_id,
+            from_owner,
+            to_owner,
+            destination_library_id,
+        )
+        .await
+        .map_err(|error| {
+            crate::immich::api::ApiError::Decode(format!(
+                "compatibility owner transfer failed: {error}"
+            ))
+        })?;
+    } else if let Some(asset_id) = asset_id {
+        pg::move_asset(&mut tx, asset_id, source_path, destination_path)
+            .await
+            .map_err(|error| {
+                crate::immich::api::ApiError::Decode(format!(
+                    "compatibility path move failed: {error}"
+                ))
+            })?;
+    } else {
+        return Err(crate::immich::api::ApiError::Decode(
+            "compatibility move is missing its asset ID".to_owned(),
+        ));
+    }
+
+    tx.commit().await.map_err(|error| {
+        crate::immich::api::ApiError::Decode(format!("compatibility transaction failed: {error}"))
+    })?;
+    let _ = source_library_id;
+    Ok(())
+}
+
+fn reverse_api_kind(kind: &ApiKind) -> Option<ApiKind> {
+    match kind {
+        ApiKind::Trash => Some(ApiKind::Restore),
+        ApiKind::Restore => Some(ApiKind::Trash),
+        ApiKind::ForceDelete => None,
+        ApiKind::SyncMove {
+            source_library_id,
+            destination_library_id,
+            source_path,
+            destination_path,
+            asset_id,
+            from_owner,
+            to_owner,
+        } => Some(ApiKind::SyncMove {
+            source_library_id: destination_library_id
+                .clone()
+                .unwrap_or_else(|| source_library_id.clone()),
+            destination_library_id: destination_library_id
+                .as_ref()
+                .map(|_| source_library_id.clone()),
+            source_path: destination_path.clone(),
+            destination_path: source_path.clone(),
+            asset_id: asset_id.clone(),
+            from_owner: to_owner.clone(),
+            to_owner: from_owner.clone(),
+        }),
+    }
 }
 
 async fn apply(state: &AppState, step: &Step) -> Result<Option<Undo>, Failure> {
@@ -649,11 +780,7 @@ async fn apply(state: &AppState, step: &Step) -> Result<Option<Undo>, Failure> {
             call_api(state, a)
                 .await
                 .map_err(|e| Failure::new(e.code(), e.message().to_owned()))?;
-            let undo = match a.kind {
-                ApiKind::Trash => Some(ApiKind::Restore),
-                ApiKind::Restore => Some(ApiKind::Trash),
-                ApiKind::ForceDelete => None,
-            };
+            let undo = reverse_api_kind(&a.kind);
             Ok(undo.map(|kind| Undo::Api(ApiStep { kind, ..a.clone() })))
         }
         Step::Remove(p) => {
@@ -742,18 +869,9 @@ async fn apply_db(state: &AppState, server_id: &str, steps: &[DbStep]) -> Result
     let mut tx = pool.begin().await.map_err(|e| db_err(e.into()))?;
     for step in steps {
         match step {
-            DbStep::MoveAsset { asset_id, from, to } => {
-                pg::move_asset(&mut tx, asset_id, from, to).await
-            }
             DbStep::MoveSidecar { file_id, from, to } => {
                 pg::move_sidecar(&mut tx, file_id, from, to).await
             }
-            DbStep::ChangeLibrary {
-                asset_id,
-                from_owner,
-                to_owner,
-                to_library,
-            } => pg::transfer_owner(&mut tx, asset_id, from_owner, to_owner, to_library).await,
         }
         .map_err(db_err)?;
     }
@@ -900,6 +1018,38 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    #[test]
+    fn sync_move_undo_reverses_paths_libraries_and_owners() {
+        let forward = ApiKind::SyncMove {
+            source_library_id: "library-a".to_owned(),
+            destination_library_id: Some("library-b".to_owned()),
+            source_path: "/mnt/a/photo.jpg".to_owned(),
+            destination_path: "/mnt/b/photo.jpg".to_owned(),
+            asset_id: Some("asset-1".to_owned()),
+            from_owner: Some("owner-a".to_owned()),
+            to_owner: Some("owner-b".to_owned()),
+        };
+        let Some(ApiKind::SyncMove {
+            source_library_id,
+            destination_library_id,
+            source_path,
+            destination_path,
+            asset_id,
+            from_owner,
+            to_owner,
+        }) = reverse_api_kind(&forward)
+        else {
+            panic!("sync move should create undo");
+        };
+        assert_eq!(source_library_id, "library-b");
+        assert_eq!(destination_library_id.as_deref(), Some("library-a"));
+        assert_eq!(source_path, "/mnt/b/photo.jpg");
+        assert_eq!(destination_path, "/mnt/a/photo.jpg");
+        assert_eq!(asset_id.as_deref(), Some("asset-1"));
+        assert_eq!(from_owner.as_deref(), Some("owner-b"));
+        assert_eq!(to_owner.as_deref(), Some("owner-a"));
+    }
 
     #[tokio::test]
     async fn folder_inventory_failure_rolls_back_the_move() {
