@@ -340,7 +340,7 @@ fn role_of(role: &CompanionRole) -> FileRole {
     }
 }
 
-fn is_asset_original(role: FileRole) -> bool {
+pub(crate) fn upload_file_needs_sync_add(role: FileRole) -> bool {
     role == FileRole::Original
 }
 
@@ -724,14 +724,22 @@ fn plan_create_folder(ctx: &Ctx<'_>, plan: &mut Plan, target: &Location) -> AppR
 
 #[cfg(test)]
 mod tests {
-    use super::is_asset_original;
+    use super::upload_file_needs_sync_add;
     use ism_core::dto::FileRole;
 
     #[test]
     fn external_file_sync_only_targets_original_assets() {
-        assert!(is_asset_original(FileRole::Original));
-        assert!(!is_asset_original(FileRole::Sidecar));
-        assert!(!is_asset_original(FileRole::Companion));
+        assert!(upload_file_needs_sync_add(FileRole::Original));
+        assert!(!upload_file_needs_sync_add(FileRole::Sidecar));
+        assert!(!upload_file_needs_sync_add(FileRole::Companion));
+        let adjacent_roles = [FileRole::Original, FileRole::Sidecar];
+        assert_eq!(
+            adjacent_roles
+                .into_iter()
+                .filter(|role| upload_file_needs_sync_add(*role))
+                .count(),
+            1
+        );
     }
 }
 
@@ -1785,7 +1793,7 @@ async fn plan_publish(ctx: &Ctx<'_>, plan: &mut Plan, upload_id: &str) -> AppRes
             to: dir.join(&name),
             copy: false,
         }));
-        if is_asset_original(f.role) {
+        if upload_file_needs_sync_add(f.role) {
             published_original_path = Some(r.clone());
         }
         if f.name == original {

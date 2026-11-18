@@ -3694,7 +3694,11 @@ async fn replicates_files_moves_and_conflicts() {
     let copy = std::fs::read_dir(a.shared.join("2024/Trip"))
         .unwrap()
         .filter_map(|e| e.ok())
-        .find(|e| e.file_name().to_string_lossy().contains("conflict"))
+        .find(|e| {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            name.contains("conflict") && name.ends_with(".jpg")
+        })
         .unwrap()
         .file_name();
     let ca = std::fs::read(a.shared.join("2024/Trip").join(&copy)).unwrap();

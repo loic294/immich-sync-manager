@@ -4,9 +4,11 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use futures_util::StreamExt;
 use ism_core::dto::{
-    CreateUpload, FileRole, Location, OnConflict, OperationAction, OperationRequest, UploadFileSpec,
+    CreateUpload, ExistingOriginal, FileRole, Location, OnConflict, OperationAction,
+    OperationRequest, UploadFileSpec,
 };
 use ism_core::schedule::Schedule;
+use ism_core::sidecar::{CompanionRole, companion_role, companions_of, is_companion_name};
 use ism_core::version::{Causality, VersionVector};
 use reqwest::Method;
 use tokio::io::AsyncWriteExt;
@@ -20,6 +22,81 @@ use crate::state::{AppState, ServerEvent};
 
 const MAX_ATTEMPTS: i64 = 8;
 const PROGRESS_EVERY: u64 = 4 * 1024 * 1024;
+
+fn existing_original_for_companion(
+    folder: &std::path::Path,
+    name: &str,
+    companion_extensions: &[String],
+) -> AppResult<ExistingOriginal> {
+    let mut names = std::fs::read_dir(folder)
+        .map_err(AppError::internal)?
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|file_type| file_type.is_file()))
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .collect::<Vec<_>>();
+    if !names.iter().any(|candidate| candidate == name) {
+        names.push(name.to_owned());
+    }
+    let owners = names
+        .iter()
+        .filter(|candidate| !is_companion_name(candidate, companion_extensions))
+        .filter(|candidate| {
+            companions_of(candidate, &names, companion_extensions)
+                .iter()
+                .any(|companion| companion.name == name)
+        })
+        .collect::<Vec<_>>();
+    let [original] = owners.as_slice() else {
+        return Err(if owners.is_empty() {
+            AppError::conflict(
+                "companion_original_missing",
+                format!("no original matches companion '{name}'"),
+            )
+        } else {
+            AppError::conflict(
+                "companion_original_ambiguous",
+                format!("companion '{name}' belongs to multiple originals"),
+            )
+        });
+    };
+    let Some((expected_revision, _)) = files::replacement_fingerprint(&folder.join(original))?
+    else {
+        return Err(AppError::conflict(
+            "companion_original_missing",
+            format!("original '{original}' disappeared"),
+        ));
+    };
+    Ok(ExistingOriginal {
+        name: (*original).clone(),
+        expected_revision,
+    })
+}
+
+fn peer_upload_file(
+    folder: &std::path::Path,
+    name: &str,
+    companion_extensions: &[String],
+) -> AppResult<(FileRole, Option<ExistingOriginal>)> {
+    match companion_role(name, companion_extensions) {
+        Some(CompanionRole::Sidecar) => Ok((
+            FileRole::Sidecar,
+            Some(existing_original_for_companion(
+                folder,
+                name,
+                companion_extensions,
+            )?),
+        )),
+        Some(CompanionRole::Companion) => Ok((
+            FileRole::Companion,
+            Some(existing_original_for_companion(
+                folder,
+                name,
+                companion_extensions,
+            )?),
+        )),
+        None => Ok((FileRole::Original, None)),
+    }
+}
 
 /// Interrupted downloads go back to the queue and resume from their staging file. A finished
 /// download is handed to a managed operation in the same transaction that removes its
@@ -489,6 +566,7 @@ async fn publish(
     let folder = target_rel
         .parent()
         .unwrap_or_else(ism_core::paths::RelPath::root);
+    let folder_path = root.abs(&folder)?;
     let target = root.abs(target_rel)?;
     let current = {
         let path = target.clone();
@@ -496,6 +574,8 @@ async fn publish(
             .await
             .map_err(AppError::internal)??
     };
+    let companion_extensions = files::companion_extensions(&state.db).await;
+    let (role, existing_original) = peer_upload_file(&folder_path, &name, &companion_extensions)?;
     let upload_id = crate::crypto::new_id("upl");
     let principal = Principal::Peer {
         peer_id: peer.id.clone(),
@@ -509,18 +589,18 @@ async fn publish(
         provenance: None,
         files: vec![UploadFileSpec {
             name,
-            role: FileRole::Original,
+            role,
             size: t.size as u64,
             sha256: t.sha256.clone(),
             expected_revision: current.as_ref().map(|(revision, _)| revision.clone()),
             expected_sha256: current.as_ref().map(|(_, sha)| sha.clone()),
         }],
-        on_conflict: if current.is_some() {
+        on_conflict: if existing_original.is_some() || current.is_some() {
             OnConflict::ReplaceIfExpected
         } else {
             OnConflict::Fail
         },
-        existing_original: None,
+        existing_original,
     };
     let dir = crate::ops::plan::staging_dir(root, &upload_id)?;
     std::fs::create_dir_all(&dir)?;
@@ -572,6 +652,58 @@ async fn publish(
     crate::ops::announce_queued(state, &accepted);
     state.emit(ServerEvent::SyncChanged);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{existing_original_for_companion, peer_upload_file};
+    use crate::ops::plan::upload_file_needs_sync_add;
+    use ism_core::dto::FileRole;
+    use ism_core::sidecar::DEFAULT_COMPANION_EXTENSIONS;
+
+    #[test]
+    fn classifies_peer_xmp_as_attached_to_existing_original() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("retry-move.png"), b"original").unwrap();
+        std::fs::write(dir.path().join("retry-move.xmp"), b"metadata").unwrap();
+        let extensions = DEFAULT_COMPANION_EXTENSIONS
+            .iter()
+            .map(|extension| extension.to_string())
+            .collect::<Vec<_>>();
+
+        let existing =
+            existing_original_for_companion(dir.path(), "retry-move.xmp", &extensions).unwrap();
+        assert_eq!(existing.name, "retry-move.png");
+        assert!(!existing.expected_revision.is_empty());
+
+        let (role, existing_original) =
+            peer_upload_file(dir.path(), "retry-move.xmp", &extensions).unwrap();
+        assert_eq!(role, FileRole::Sidecar);
+        assert!(existing_original.is_some());
+        assert!(!upload_file_needs_sync_add(role));
+
+        let (role, existing_original) =
+            peer_upload_file(dir.path(), "new-photo.png", &extensions).unwrap();
+        assert_eq!(role, FileRole::Original);
+        assert!(existing_original.is_none());
+        assert!(upload_file_needs_sync_add(role));
+    }
+
+    #[test]
+    fn refuses_ambiguous_shared_peer_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("retry.jpg"), b"jpg").unwrap();
+        std::fs::write(dir.path().join("retry.png"), b"png").unwrap();
+        std::fs::write(dir.path().join("retry.xmp"), b"metadata").unwrap();
+        let extensions = DEFAULT_COMPANION_EXTENSIONS
+            .iter()
+            .map(|extension| extension.to_string())
+            .collect::<Vec<_>>();
+
+        let error =
+            existing_original_for_companion(dir.path(), "retry.xmp", &extensions).unwrap_err();
+        assert_eq!(error.code(), "companion_original_ambiguous");
+    }
 }
 
 async fn conflict_here(
