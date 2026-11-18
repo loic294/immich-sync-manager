@@ -587,13 +587,45 @@ async fn plan_requires_queue_barrier(
     server_id: &str,
     plan: &Plan,
 ) -> AppResult<bool> {
-    let server = registry::server(state, server_id).await?;
+    let mut server = registry::server(state, server_id).await?;
+    if server.external_library_move_mode == ImmichMoveMode::ApiWithDbFallback
+        && server.external_library_api_capable != Some(true)
+        && let Some(capable) = probe_external_library_capability(state, &server).await?
+    {
+        sqlx::query("UPDATE immich_servers SET external_library_api_capable = ? WHERE id = ?")
+            .bind(capable as i64)
+            .bind(server_id)
+            .execute(&state.db)
+            .await?;
+        server.external_library_api_capable = Some(capable);
+    }
     Ok(sync_plan_requires_queue_barrier(
         server.external_library_move_mode,
         server.external_library_api_capable,
         server_id,
         plan,
     ))
+}
+
+async fn probe_external_library_capability(
+    state: &AppState,
+    server: &registry::Server,
+) -> AppResult<Option<bool>> {
+    let candidates = match registry::admin_api_candidates(state, server).await {
+        Ok(candidates) => candidates,
+        Err(_) => return Ok(None),
+    };
+    for candidate in candidates {
+        if admin_candidate_issue(&candidate).await.is_some() {
+            continue;
+        }
+        match candidate.api.external_library_api_capable().await {
+            Ok(capable) => return Ok(Some(capable)),
+            Err(crate::immich::api::ApiError::Status { status: 403, .. }) => continue,
+            Err(_) => return Ok(None),
+        }
+    }
+    Ok(None)
 }
 
 fn sync_plan_requires_queue_barrier(
@@ -1522,6 +1554,88 @@ mod tests {
             })],
             ..Plan::default()
         }
+    }
+
+    #[tokio::test]
+    async fn publish_upload_reprobes_unknown_capability_before_waiting_for_queue() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/api-keys/me"))
+            .and(header("x-api-key", "valid"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "key-1",
+                "permissions": ["library.update"]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/users/me"))
+            .and(header("x-api-key", "valid"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "user-1",
+                "isAdmin": true
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/libraries/invalid/files/move"))
+            .and(header("x-api-key", "valid"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "message": ["Invalid UUID"]
+            })))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let pool = crate::db::connect(dir.path()).await.unwrap();
+        let secrets = crate::crypto::SecretBox::open_or_create(dir.path()).unwrap();
+        let state = AppState::new(crate::config::Config::for_tests(dir.path()), pool, secrets)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO immich_servers (id, name, url, external_library_move_mode, \
+             maintenance_json, created_at) VALUES ('server-1', 'Immich', ?, 'api_with_db_fallback', ?, ?)",
+        )
+        .bind(server.uri())
+        .bind(
+            serde_json::to_string(&ism_core::maintenance::MaintenanceState::default()).unwrap(),
+        )
+        .bind(crate::db::now())
+        .execute(&state.db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO immich_accounts (id, server_id, label, email, immich_user_id, \
+             is_admin, api_key_enc, status, created_at) \
+             VALUES ('account-1', 'server-1', 'Admin', 'admin@example.test', 'user-1', 1, ?, 'ok', ?)",
+        )
+        .bind(
+            state
+                .secrets
+                .encrypt(crate::immich::registry::API_KEY_PURPOSE, "valid")
+                .unwrap(),
+        )
+        .bind(crate::db::now())
+        .execute(&state.db)
+        .await
+        .unwrap();
+
+        let plan = api_sync_plan(ApiKind::SyncAdd {
+            library_id: "library-1".to_owned(),
+            path: "/library/retry-move.png".to_owned(),
+        });
+        assert!(
+            !plan_requires_queue_barrier(&state, "server-1", &plan)
+                .await
+                .unwrap()
+        );
+        let capable: Option<i64> = sqlx::query_scalar(
+            "SELECT external_library_api_capable FROM immich_servers WHERE id = 'server-1'",
+        )
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+        assert_eq!(capable, Some(1));
     }
 
     #[test]
