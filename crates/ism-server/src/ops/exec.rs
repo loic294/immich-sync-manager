@@ -215,14 +215,24 @@ pub async fn run_operation(state: &AppState, id: &str) -> AppResult<()> {
     };
     let ctx = plan::Ctx::new(state, &principal, allow_owner_transfer).await?;
 
-    // Maintenance admission for every Immich server the operation touches.
+    // Maintenance admission is limited to servers whose current plan can need legacy DB or
+    // queue-scan behavior. API-native external-library plans stay independent of unrelated scans.
     let mut servers: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for (index, action) in actions.iter().enumerate() {
         if rejected.contains(&(index as i64)) {
             continue;
         }
-        for (server, library) in ctx.touched_servers(action).await? {
-            let libs = servers.entry(server).or_default();
+        let touched = ctx.touched_servers(action).await?;
+        let preliminary_plan = plan::plan(&ctx, action).await;
+        for (server_id, library) in touched {
+            let requires_barrier = match &preliminary_plan {
+                Ok(plan) => plan_requires_queue_barrier(state, &server_id, plan).await?,
+                Err(_) => true,
+            };
+            if !requires_barrier {
+                continue;
+            }
+            let libs = servers.entry(server_id).or_default();
             if let Some(l) = library
                 && !libs.contains(&l)
             {
@@ -293,6 +303,37 @@ pub async fn run_operation(state: &AppState, id: &str) -> AppResult<()> {
                 continue;
             }
         };
+        let mut barrier_failed = false;
+        for (server_id, _) in ctx.touched_servers(action).await? {
+            if admitted.contains(&server_id)
+                || !plan_requires_queue_barrier(state, &server_id, &plan).await?
+            {
+                continue;
+            }
+            if let Err(e) = crate::maintenance::acquire(state, &server_id).await {
+                failed += 1;
+                set_item(
+                    state,
+                    id,
+                    index,
+                    ItemStatus::Failed,
+                    Some((e.code(), e.message())),
+                    None,
+                )
+                .await?;
+                barrier_failed = true;
+                break;
+            }
+            admitted.push(server_id);
+            sqlx::query("UPDATE operations SET admitted_server_ids_json = ? WHERE id = ?")
+                .bind(serde_json::to_string(&admitted)?)
+                .bind(id)
+                .execute(&state.db)
+                .await?;
+        }
+        if barrier_failed {
+            continue;
+        }
         if let Some(b) = plan.blockers.first() {
             failed += 1;
             set_item(
@@ -542,6 +583,53 @@ async fn blocking<T: Send + 'static>(
         .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())))
 }
 
+async fn plan_requires_queue_barrier(
+    state: &AppState,
+    server_id: &str,
+    plan: &Plan,
+) -> AppResult<bool> {
+    let server = registry::server(state, server_id).await?;
+    Ok(sync_plan_requires_queue_barrier(
+        server.external_library_move_mode,
+        server.external_library_api_capable,
+        server_id,
+        plan,
+    ))
+}
+
+fn sync_plan_requires_queue_barrier(
+    mode: ImmichMoveMode,
+    api_capable: Option<bool>,
+    server_id: &str,
+    plan: &Plan,
+) -> bool {
+    if plan
+        .db
+        .get(server_id)
+        .is_some_and(|steps| !steps.is_empty())
+    {
+        return true;
+    }
+
+    plan.steps.iter().any(|step| {
+        let Step::Api(api) = step else {
+            return false;
+        };
+        if api.server_id != server_id {
+            return false;
+        }
+        match &api.kind {
+            ApiKind::SyncAdd { .. } | ApiKind::SyncRemove { .. } | ApiKind::SyncMove { .. } => {
+                !matches!(
+                    (mode, api_capable),
+                    (ImmichMoveMode::ApiOnly, _) | (ImmichMoveMode::ApiWithDbFallback, Some(true))
+                )
+            }
+            ApiKind::Trash | ApiKind::Restore | ApiKind::ForceDelete => true,
+        }
+    })
+}
+
 async fn call_api(state: &AppState, step: &ApiStep) -> AppResult<()> {
     let server = registry::server(state, &step.server_id).await?;
     let result = match &step.kind {
@@ -570,6 +658,7 @@ async fn call_api(state: &AppState, step: &ApiStep) -> AppResult<()> {
                     Err(error)
                         if server.external_library_move_mode
                             == ImmichMoveMode::ApiWithDbFallback
+                            && server.external_library_api_capable != Some(true)
                             && error.is_external_library_api_unavailable() =>
                     {
                         schedule_add_fallback(state, &server, library_id).await
@@ -630,6 +719,7 @@ async fn call_api(state: &AppState, step: &ApiStep) -> AppResult<()> {
                         Err(error)
                             if should_use_db_fallback(
                                 server.external_library_move_mode,
+                                server.external_library_api_capable,
                                 &error,
                             ) =>
                         {
@@ -659,6 +749,7 @@ where
         Ok(()) => Ok(()),
         Err(error)
             if server.external_library_move_mode == ImmichMoveMode::ApiWithDbFallback
+                && server.external_library_api_capable != Some(true)
                 && error.is_external_library_api_unavailable() =>
         {
             Ok(())
@@ -779,8 +870,14 @@ fn reverse_api_kind(kind: &ApiKind) -> Option<ApiKind> {
     }
 }
 
-fn should_use_db_fallback(mode: ImmichMoveMode, error: &crate::immich::api::ApiError) -> bool {
-    mode == ImmichMoveMode::ApiWithDbFallback && error.is_external_library_api_unavailable()
+fn should_use_db_fallback(
+    mode: ImmichMoveMode,
+    api_capable: Option<bool>,
+    error: &crate::immich::api::ApiError,
+) -> bool {
+    mode == ImmichMoveMode::ApiWithDbFallback
+        && api_capable != Some(true)
+        && error.is_external_library_api_unavailable()
 }
 
 async fn apply(state: &AppState, step: &Step) -> Result<Option<Undo>, Failure> {
@@ -1131,6 +1228,106 @@ mod tests {
 
     use super::*;
 
+    fn api_sync_plan(kind: ApiKind) -> Plan {
+        Plan {
+            steps: vec![Step::Api(ApiStep {
+                kind,
+                server_id: "server-1".to_owned(),
+                owner: "owner-1".to_owned(),
+                ids: Vec::new(),
+            })],
+            ..Plan::default()
+        }
+    }
+
+    #[test]
+    fn queue_barrier_classification_keeps_legacy_and_database_work_conservative() {
+        let add = api_sync_plan(ApiKind::SyncAdd {
+            library_id: "library-1".to_owned(),
+            path: "/library/photo.jpg".to_owned(),
+        });
+        assert!(!sync_plan_requires_queue_barrier(
+            ImmichMoveMode::ApiOnly,
+            None,
+            "server-1",
+            &add
+        ));
+        assert!(!sync_plan_requires_queue_barrier(
+            ImmichMoveMode::ApiWithDbFallback,
+            Some(true),
+            "server-1",
+            &add
+        ));
+        assert!(sync_plan_requires_queue_barrier(
+            ImmichMoveMode::ApiWithDbFallback,
+            Some(false),
+            "server-1",
+            &add
+        ));
+        assert!(sync_plan_requires_queue_barrier(
+            ImmichMoveMode::ApiWithDbFallback,
+            None,
+            "server-1",
+            &add
+        ));
+        assert!(sync_plan_requires_queue_barrier(
+            ImmichMoveMode::DbOnly,
+            Some(true),
+            "server-1",
+            &add
+        ));
+
+        let legacy = api_sync_plan(ApiKind::Trash);
+        assert!(sync_plan_requires_queue_barrier(
+            ImmichMoveMode::ApiOnly,
+            Some(true),
+            "server-1",
+            &legacy
+        ));
+
+        let mut with_sidecar_db = add;
+        with_sidecar_db.db.insert(
+            "server-1".to_owned(),
+            vec![DbStep::MoveSidecar {
+                file_id: "sidecar-1".to_owned(),
+                from: "/library/photo.xmp".to_owned(),
+                to: "/library/moved/photo.xmp".to_owned(),
+            }],
+        );
+        assert!(sync_plan_requires_queue_barrier(
+            ImmichMoveMode::ApiOnly,
+            Some(true),
+            "server-1",
+            &with_sidecar_db
+        ));
+    }
+
+    #[test]
+    fn remove_sync_only_skips_barrier_when_api_native_is_authoritative() {
+        let remove = api_sync_plan(ApiKind::SyncRemove {
+            library_id: "library-1".to_owned(),
+            path: "/library/photo.jpg".to_owned(),
+        });
+        assert!(!sync_plan_requires_queue_barrier(
+            ImmichMoveMode::ApiOnly,
+            Some(false),
+            "server-1",
+            &remove
+        ));
+        assert!(!sync_plan_requires_queue_barrier(
+            ImmichMoveMode::ApiWithDbFallback,
+            Some(true),
+            "server-1",
+            &remove
+        ));
+        assert!(sync_plan_requires_queue_barrier(
+            ImmichMoveMode::ApiWithDbFallback,
+            Some(false),
+            "server-1",
+            &remove
+        ));
+    }
+
     #[test]
     fn move_mode_controls_database_fallback() {
         let unavailable = crate::immich::api::ApiError::Status {
@@ -1143,14 +1340,22 @@ mod tests {
         };
         assert!(!should_use_db_fallback(
             ImmichMoveMode::ApiOnly,
+            Some(false),
             &unavailable
         ));
         assert!(should_use_db_fallback(
             ImmichMoveMode::ApiWithDbFallback,
+            Some(false),
             &unavailable
         ));
         assert!(!should_use_db_fallback(
             ImmichMoveMode::ApiWithDbFallback,
+            Some(true),
+            &unavailable
+        ));
+        assert!(!should_use_db_fallback(
+            ImmichMoveMode::ApiWithDbFallback,
+            None,
             &conflict
         ));
     }
