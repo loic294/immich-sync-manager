@@ -46,6 +46,14 @@ pub enum ApiKind {
     Trash,
     Restore,
     ForceDelete,
+    SyncAdd {
+        library_id: String,
+        path: String,
+    },
+    SyncRemove {
+        library_id: String,
+        path: String,
+    },
     SyncMove {
         source_library_id: String,
         destination_library_id: Option<String>,
@@ -330,6 +338,10 @@ fn role_of(role: &CompanionRole) -> FileRole {
         CompanionRole::Sidecar => FileRole::Sidecar,
         CompanionRole::Companion => FileRole::Companion,
     }
+}
+
+fn is_asset_original(role: FileRole) -> bool {
+    role == FileRole::Original
 }
 
 /// Whether `name` would collide with an existing entry of `dir` on a case-insensitive or
@@ -697,6 +709,7 @@ fn plan_create_folder(ctx: &Ctx<'_>, plan: &mut Plan, target: &Location) -> AppR
     if root.server_id.is_some() {
         immich_side(ctx, root, plan);
     }
+
     let parent = abs.parent().map(ToOwned::to_owned).unwrap_or_default();
     let name = rel.name().unwrap_or_default();
     if abs.exists() || (parent.is_dir() && collides(&parent, name, &HashSet::new())) {
@@ -707,6 +720,19 @@ fn plan_create_folder(ctx: &Ctx<'_>, plan: &mut Plan, target: &Location) -> AppR
         location: target.clone(),
     });
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_asset_original;
+    use ism_core::dto::FileRole;
+
+    #[test]
+    fn external_file_sync_only_targets_original_assets() {
+        assert!(is_asset_original(FileRole::Original));
+        assert!(!is_asset_original(FileRole::Sidecar));
+        assert!(!is_asset_original(FileRole::Companion));
+    }
 }
 
 async fn plan_move_folder(
@@ -1170,6 +1196,19 @@ async fn plan_trash(
         }
         api_steps.append(&mut plan.steps);
         plan.steps = api_steps;
+        for asset in &assets {
+            if let Some(library_id) = &asset.library_id {
+                plan.steps.push(Step::Api(ApiStep {
+                    kind: ApiKind::SyncRemove {
+                        library_id: library_id.clone(),
+                        path: asset.original_path.clone(),
+                    },
+                    server_id: server.id.clone(),
+                    owner: asset.owner_id.clone(),
+                    ids: vec![asset.id.clone()],
+                }));
+            }
+        }
     }
     if expected_asset_id.is_some() && !identity_checked {
         plan.block(
@@ -1729,6 +1768,7 @@ async fn plan_publish(ctx: &Ctx<'_>, plan: &mut Plan, upload_id: &str) -> AppRes
     if !dir.exists() {
         plan.steps.insert(0, Step::Mkdir(dir.clone()));
     }
+    let mut published_original_path = None;
     for (index, f) in req.files.iter().enumerate() {
         let name = renamed_companion(&f.name, &original, &final_original);
         let r = folder
@@ -1745,6 +1785,9 @@ async fn plan_publish(ctx: &Ctx<'_>, plan: &mut Plan, upload_id: &str) -> AppRes
             to: dir.join(&name),
             copy: false,
         }));
+        if is_asset_original(f.role) {
+            published_original_path = Some(r.clone());
+        }
         if f.name == original {
             plan.changes.push(Change::Created {
                 location: root.location(&r),
@@ -1753,6 +1796,23 @@ async fn plan_publish(ctx: &Ctx<'_>, plan: &mut Plan, upload_id: &str) -> AppRes
     }
     if root.server_id.is_some() {
         immich_side(ctx, root, plan);
+    }
+    if let (Some(server_id), Some(library_id), Some(original_rel)) =
+        (&root.server_id, &root.library_id, published_original_path)
+        && let Some(path) = root.immich_path(&original_rel)
+    {
+        let owner = registry::library_owner(ctx.state, library_id)
+            .await?
+            .unwrap_or_default();
+        plan.steps.push(Step::Api(ApiStep {
+            kind: ApiKind::SyncAdd {
+                library_id: library_id.clone(),
+                path,
+            },
+            server_id: server_id.clone(),
+            owner,
+            ids: Vec::new(),
+        }));
     }
     plan.upload_done = Some(upload_id.to_owned());
     Ok(())

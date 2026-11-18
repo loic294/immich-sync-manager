@@ -15,6 +15,14 @@ external-library route and exposes `external_library_api_capable` (`true`, `fals
 administrative and client-discovery consumers. The custom Immich v3.4.1 fork exposes this API; stock
 v3.4.1 remains supported through `api_with_db_fallback` or `db_only`.
 
+Managed upload publication synchronizes only the `Original` file with `POST /libraries/:id/files/add`
+after the filesystem move. Sidecars and companions remain grouped files but are never sent to this
+endpoint. Managed trash synchronizes each exact original asset path with
+`POST /libraries/:id/files/remove` after the original leaves the library. `db_only` skips both calls.
+With `api_with_db_fallback`, route-unavailable errors schedule the existing library scan only for add
+operations; `remove` is already represented by the existing Immich trash API. A `400`, `409`, known
+library `404`, or any other error fails the operation and is never hidden by fallback.
+
 ## What uses the API
 
 Login and account discovery, libraries and their import paths, asset lookup, downloads of originals,
