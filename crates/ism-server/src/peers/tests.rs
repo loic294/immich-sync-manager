@@ -3609,6 +3609,23 @@ async fn replicates_files_moves_and_conflicts() {
         ],
     )
     .await;
+    let move_events: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM event_log WHERE kind = 'file_moved'
+         AND json_extract(data_json, '$.from') = '2024/x.jpg'
+         AND json_extract(data_json, '$.path') = '2024/Trip/x.jpg'",
+    )
+    .fetch_one(&a.state.db)
+    .await
+    .unwrap();
+    let sidecar_move_events: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM event_log WHERE kind = 'file_moved'
+         AND json_extract(data_json, '$.from') LIKE '2024/x.jpg.%'",
+    )
+    .fetch_one(&a.state.db)
+    .await
+    .unwrap();
+    assert_eq!(move_events, 1);
+    assert_eq!(sidecar_move_events, 0);
     eventually("move reaches B", &[&a, &b], || {
         b.shared.join("2024/Trip/x.jpg").is_file()
             && b.shared.join("2024/Trip/x.jpg.xmp").is_file()

@@ -182,25 +182,50 @@ async fn api_for(
     Ok(Api::new(state.http.clone(), &server.url, key))
 }
 
-/// The first healthy administrator account; needed for config, queues and scans.
-pub async fn admin_api(state: &AppState, server: &Server) -> AppResult<Api> {
-    let row: Option<(String, String)> = sqlx::query_as(
-        "SELECT id, api_key_enc FROM immich_accounts WHERE server_id = ? AND is_admin = 1 AND status = 'ok'
-         ORDER BY created_at LIMIT 1",
+pub struct AdminApiCandidate {
+    pub account_id: String,
+    pub label: String,
+    pub immich_user_id: String,
+    pub api: Api,
+}
+
+/// All healthy administrator keys, oldest first. API-native file operations retry a 403 with
+/// another healthy admin key so one stale credential cannot mask a valid server administrator.
+pub async fn admin_api_candidates(
+    state: &AppState,
+    server: &Server,
+) -> AppResult<Vec<AdminApiCandidate>> {
+    let rows: Vec<(String, String, String, String)> = sqlx::query_as(
+        "SELECT id, label, immich_user_id, api_key_enc FROM immich_accounts
+         WHERE server_id = ? AND is_admin = 1 AND status = 'ok' ORDER BY created_at",
     )
     .bind(&server.id)
-    .fetch_optional(&state.db)
+    .fetch_all(&state.db)
     .await?;
-    let (id, key) = row.ok_or_else(|| {
-        AppError::conflict(
+    if rows.is_empty() {
+        return Err(AppError::conflict(
             "admin_account_required",
             format!(
                 "connect an Immich administrator account for '{}'",
                 server.name
             ),
-        )
-    })?;
-    api_for(state, server, &id, &key).await
+        ));
+    }
+    let mut candidates = Vec::with_capacity(rows.len());
+    for (account_id, label, immich_user_id, key) in rows {
+        candidates.push(AdminApiCandidate {
+            api: api_for(state, server, &account_id, &key).await?,
+            account_id,
+            label,
+            immich_user_id,
+        });
+    }
+    Ok(candidates)
+}
+
+/// The first healthy administrator account; needed for config, queues and scans.
+pub async fn admin_api(state: &AppState, server: &Server) -> AppResult<Api> {
+    Ok(admin_api_candidates(state, server).await?.remove(0).api)
 }
 
 /// The account of the Immich user `user_id`. Changes to an asset are always made as its owner.

@@ -7,12 +7,11 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::future::Future;
 
 use crate::peers::LocalChange;
 use ism_core::dto::{
-    Change, ClientAction, ImmichMoveMode, ItemStatus, OperationAction, OperationCommitted,
-    OperationStatus,
+    Change, ClientAction, FileRole, ImmichMoveMode, ItemStatus, OperationAction,
+    OperationCommitted, OperationStatus,
 };
 use serde_json::json;
 
@@ -458,7 +457,7 @@ fn local_changes_of(action: &OperationAction, plan: &Plan) -> Vec<LocalChange> {
         OperationAction::Move { .. } | OperationAction::Rename { .. } => plan
             .files
             .iter()
-            .filter(|f| !f.copy)
+            .filter(|f| !f.copy && f.role == FileRole::Original)
             .filter_map(|f| {
                 Some(LocalChange::FileMoved {
                     from: f.from.clone()?,
@@ -630,6 +629,198 @@ fn sync_plan_requires_queue_barrier(
     })
 }
 
+fn forbidden(error: &crate::immich::api::ApiError) -> bool {
+    matches!(
+        error,
+        crate::immich::api::ApiError::Status { status: 403, .. }
+    )
+}
+
+fn all_admins_forbidden(attempted: &[(String, String, String)]) -> crate::immich::api::ApiError {
+    crate::immich::api::ApiError::Status {
+        status: 403,
+        message: format!(
+            "Forbidden for all healthy ISM admin accounts ({})",
+            attempted
+                .iter()
+                .map(|(account, user, issue)| format!("{account}:{user} ({issue})"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+async fn admin_candidate_issue(candidate: &registry::AdminApiCandidate) -> Option<String> {
+    let identity = match candidate.api.external_library_api_identity().await {
+        Ok(identity) => identity,
+        Err(error) => return Some(format!("identity check failed: {error}")),
+    };
+    let mut issues = Vec::new();
+    if identity.user_id != candidate.immich_user_id {
+        issues.push(format!(
+            "key belongs to {}, stored account expects {}",
+            identity.user_id, candidate.immich_user_id
+        ));
+    }
+    if !identity.is_admin {
+        issues.push("effective Immich user is no longer an administrator".to_owned());
+    }
+    if !identity
+        .permissions
+        .iter()
+        .any(|permission| permission == "all" || permission == "library.update")
+    {
+        issues.push(format!("key {} lacks library.update", identity.key_id));
+    }
+    (!issues.is_empty()).then(|| issues.join("; "))
+}
+
+async fn sync_file_add_with_admins(
+    state: &AppState,
+    server: &registry::Server,
+    library_id: &str,
+    path: &str,
+) -> AppResult<Result<(), crate::immich::api::ApiError>> {
+    let candidates = registry::admin_api_candidates(state, server).await?;
+    let mut attempted = Vec::new();
+    for candidate in candidates {
+        tracing::debug!(
+            server_id = %server.id,
+            account_id = %candidate.account_id,
+            account_label = %candidate.label,
+            immich_user_id = %candidate.immich_user_id,
+            library_id,
+            path,
+            "trying external-library files/add with Immich admin"
+        );
+        if let Some(issue) = admin_candidate_issue(&candidate).await {
+            attempted.push((
+                candidate.account_id.clone(),
+                candidate.immich_user_id.clone(),
+                issue,
+            ));
+            continue;
+        }
+        match candidate.api.sync_library_file_add(library_id, path).await {
+            Ok(()) => return Ok(Ok(())),
+            Err(error) if forbidden(&error) => {
+                attempted.push((
+                    candidate.account_id.clone(),
+                    candidate.immich_user_id.clone(),
+                    "verified identity/permission, endpoint still returned 403".to_owned(),
+                ));
+                continue;
+            }
+            Err(error) => return Ok(Err(error)),
+        }
+    }
+    Ok(Err(all_admins_forbidden(&attempted)))
+}
+
+async fn sync_file_remove_with_admins(
+    state: &AppState,
+    server: &registry::Server,
+    library_id: &str,
+    path: &str,
+) -> AppResult<Result<(), crate::immich::api::ApiError>> {
+    let candidates = registry::admin_api_candidates(state, server).await?;
+    let mut attempted = Vec::new();
+    for candidate in candidates {
+        tracing::debug!(
+            server_id = %server.id,
+            account_id = %candidate.account_id,
+            account_label = %candidate.label,
+            immich_user_id = %candidate.immich_user_id,
+            library_id,
+            path,
+            "trying external-library files/remove with Immich admin"
+        );
+        if let Some(issue) = admin_candidate_issue(&candidate).await {
+            attempted.push((
+                candidate.account_id.clone(),
+                candidate.immich_user_id.clone(),
+                issue,
+            ));
+            continue;
+        }
+        match candidate
+            .api
+            .sync_library_file_remove(library_id, path)
+            .await
+        {
+            Ok(()) => return Ok(Ok(())),
+            Err(error) if forbidden(&error) => {
+                attempted.push((
+                    candidate.account_id.clone(),
+                    candidate.immich_user_id.clone(),
+                    "verified identity/permission, endpoint still returned 403".to_owned(),
+                ));
+                continue;
+            }
+            Err(error) => return Ok(Err(error)),
+        }
+    }
+    Ok(Err(all_admins_forbidden(&attempted)))
+}
+
+async fn sync_file_move_with_admins(
+    state: &AppState,
+    server: &registry::Server,
+    source_library_id: &str,
+    source_path: &str,
+    destination_path: &str,
+    destination_library_id: Option<&str>,
+    asset_id: Option<&str>,
+) -> AppResult<Result<(), crate::immich::api::ApiError>> {
+    let candidates = registry::admin_api_candidates(state, server).await?;
+    let mut attempted = Vec::new();
+    for candidate in candidates {
+        tracing::debug!(
+            server_id = %server.id,
+            account_id = %candidate.account_id,
+            account_label = %candidate.label,
+            immich_user_id = %candidate.immich_user_id,
+            source_library_id,
+            destination_library_id,
+            source_path,
+            destination_path,
+            asset_id,
+            "trying external-library files/move with Immich admin"
+        );
+        if let Some(issue) = admin_candidate_issue(&candidate).await {
+            attempted.push((
+                candidate.account_id.clone(),
+                candidate.immich_user_id.clone(),
+                issue,
+            ));
+            continue;
+        }
+        match candidate
+            .api
+            .sync_library_file_move(
+                source_library_id,
+                source_path,
+                destination_path,
+                destination_library_id,
+                asset_id,
+            )
+            .await
+        {
+            Ok(()) => return Ok(Ok(())),
+            Err(error) if forbidden(&error) => {
+                attempted.push((
+                    candidate.account_id.clone(),
+                    candidate.immich_user_id.clone(),
+                    "verified identity/permission, endpoint still returned 403".to_owned(),
+                ));
+                continue;
+            }
+            Err(error) => return Ok(Err(error)),
+        }
+    }
+    Ok(Err(all_admins_forbidden(&attempted)))
+}
+
 async fn call_api(state: &AppState, step: &ApiStep) -> AppResult<()> {
     let server = registry::server(state, &step.server_id).await?;
     let result = match &step.kind {
@@ -649,11 +840,7 @@ async fn call_api(state: &AppState, step: &ApiStep) -> AppResult<()> {
             if server.external_library_move_mode == ImmichMoveMode::DbOnly {
                 schedule_add_fallback(state, &server, library_id).await
             } else {
-                let api = match registry::admin_api(state, &server).await {
-                    Ok(api) => api,
-                    Err(error) => return Err(error),
-                };
-                match api.sync_library_file_add(library_id, path).await {
+                match sync_file_add_with_admins(state, &server, library_id, path).await? {
                     Ok(()) => Ok(()),
                     Err(error)
                         if server.external_library_move_mode
@@ -668,14 +855,22 @@ async fn call_api(state: &AppState, step: &ApiStep) -> AppResult<()> {
             }
         }
         ApiKind::SyncRemove { library_id, path } => {
-            call_external_file_sync(&server, || async {
-                registry::admin_api(state, &server)
-                    .await
-                    .map_err(|error| crate::immich::api::ApiError::Decode(error.to_string()))?
-                    .sync_library_file_remove(library_id, path)
-                    .await
-            })
-            .await
+            if server.external_library_move_mode == ImmichMoveMode::DbOnly {
+                Ok(())
+            } else {
+                match sync_file_remove_with_admins(state, &server, library_id, path).await? {
+                    Ok(()) => Ok(()),
+                    Err(error)
+                        if server.external_library_move_mode
+                            == ImmichMoveMode::ApiWithDbFallback
+                            && server.external_library_api_capable != Some(true)
+                            && error.is_external_library_api_unavailable() =>
+                    {
+                        Ok(())
+                    }
+                    Err(error) => Err(error),
+                }
+            }
         }
         ApiKind::SyncMove {
             source_library_id,
@@ -701,19 +896,16 @@ async fn call_api(state: &AppState, step: &ApiStep) -> AppResult<()> {
             match server.external_library_move_mode {
                 ImmichMoveMode::DbOnly => fallback().await,
                 ImmichMoveMode::ApiOnly | ImmichMoveMode::ApiWithDbFallback => {
-                    let api = match registry::admin_api(state, &server).await {
-                        Ok(api) => api,
-                        Err(error) => return Err(error),
-                    };
-                    match api
-                        .sync_library_file_move(
-                            source_library_id,
-                            source_path,
-                            destination_path,
-                            destination_library_id.as_deref(),
-                            asset_id.as_deref(),
-                        )
-                        .await
+                    match sync_file_move_with_admins(
+                        state,
+                        &server,
+                        source_library_id,
+                        source_path,
+                        destination_path,
+                        destination_library_id.as_deref(),
+                        asset_id.as_deref(),
+                    )
+                    .await?
                     {
                         Ok(()) => Ok(()),
                         Err(error)
@@ -732,30 +924,6 @@ async fn call_api(state: &AppState, step: &ApiStep) -> AppResult<()> {
         }
     };
     result.map_err(|e| AppError::conflict("immich_error", crate::error::redact(&e.to_string())))
-}
-
-async fn call_external_file_sync<F, Fut>(
-    server: &registry::Server,
-    operation: F,
-) -> Result<(), crate::immich::api::ApiError>
-where
-    F: FnOnce() -> Fut,
-    Fut: Future<Output = Result<(), crate::immich::api::ApiError>>,
-{
-    if server.external_library_move_mode == ImmichMoveMode::DbOnly {
-        return Ok(());
-    }
-    match operation().await {
-        Ok(()) => Ok(()),
-        Err(error)
-            if server.external_library_move_mode == ImmichMoveMode::ApiWithDbFallback
-                && server.external_library_api_capable != Some(true)
-                && error.is_external_library_api_unavailable() =>
-        {
-            Ok(())
-        }
-        Err(error) => Err(error),
-    }
 }
 
 async fn schedule_add_fallback(
@@ -1227,6 +1395,122 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+    use ism_core::dto::{Location, PlannedFile};
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{body_json, header, method, path},
+    };
+
+    #[tokio::test]
+    async fn sync_move_retries_a_forbidden_admin_key_without_changing_asset_identity() {
+        let server = MockServer::start().await;
+        for (key, user_id, status) in [("stale", "user-1", 403), ("valid", "user-2", 204)] {
+            Mock::given(method("GET"))
+                .and(path("/api/api-keys/me"))
+                .and(header("x-api-key", key))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "id": format!("key-{key}"),
+                    "permissions": ["library.update"]
+                })))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/api/users/me"))
+                .and(header("x-api-key", key))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "id": user_id,
+                    "isAdmin": true
+                })))
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/api/libraries/source-library/files/move"))
+                .and(header("x-api-key", key))
+                .and(body_json(json!({
+                    "sourcePath": "/library/source/photo.jpg",
+                    "destinationPath": "/library/destination/photo.jpg",
+                    "destinationLibraryId": "destination-library",
+                    "assetId": "asset-1"
+                })))
+                .respond_with(ResponseTemplate::new(status))
+                .mount(&server)
+                .await;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let pool = crate::db::connect(dir.path()).await.unwrap();
+        let secrets = crate::crypto::SecretBox::open_or_create(dir.path()).unwrap();
+        let state = AppState::new(crate::config::Config::for_tests(dir.path()), pool, secrets)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO immich_servers (id, name, url, maintenance_json, created_at) VALUES \
+             ('server-1', 'Immich', ?, ?, ?)",
+        )
+        .bind(server.uri())
+        .bind(serde_json::to_string(&ism_core::maintenance::MaintenanceState::default()).unwrap())
+        .bind(crate::db::now())
+        .execute(&state.db)
+        .await
+        .unwrap();
+        for (account_id, user_id, key) in [
+            ("account-1", "user-1", "stale"),
+            ("account-2", "user-2", "valid"),
+        ] {
+            sqlx::query(
+                "INSERT INTO immich_accounts (id, server_id, label, email, immich_user_id, \
+                 is_admin, api_key_enc, status, created_at) VALUES (?, 'server-1', ?, ?, ?, 1, ?, 'ok', ?)",
+            )
+            .bind(account_id)
+            .bind(account_id)
+            .bind(format!("{account_id}@example.test"))
+            .bind(user_id)
+            .bind(
+                state
+                    .secrets
+                    .encrypt(crate::immich::registry::API_KEY_PURPOSE, key)
+                    .unwrap(),
+            )
+            .bind(crate::db::now())
+            .execute(&state.db)
+            .await
+            .unwrap();
+        }
+        let immich_server = registry::server(&state, "server-1").await.unwrap();
+
+        let result = sync_file_move_with_admins(
+            &state,
+            &immich_server,
+            "source-library",
+            "/library/source/photo.jpg",
+            "/library/destination/photo.jpg",
+            Some("destination-library"),
+            Some("asset-1"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.unwrap(), ());
+
+        let move_requests = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| request.url.path() == "/api/libraries/source-library/files/move")
+            .map(|request| serde_json::from_slice::<serde_json::Value>(&request.body).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(move_requests.len(), 2);
+        assert!(
+            move_requests
+                .iter()
+                .all(|body| body["assetId"] == "asset-1")
+        );
+        assert!(
+            move_requests
+                .iter()
+                .all(|body| body["destinationLibraryId"] == "destination-library")
+        );
+    }
 
     fn api_sync_plan(kind: ApiKind) -> Plan {
         Plan {
@@ -1401,6 +1685,52 @@ mod tests {
         ] {
             assert_eq!(reverse_api_kind(&kind), None);
         }
+    }
+
+    #[test]
+    fn managed_move_emits_only_the_original_peer_event() {
+        let original_from = Location {
+            root_id: "root-1".to_owned(),
+            path: "photo.jpg".to_owned(),
+        };
+        let original_to = Location {
+            root_id: "root-1".to_owned(),
+            path: "edited/photo.jpg".to_owned(),
+        };
+        let plan = Plan {
+            files: vec![
+                PlannedFile {
+                    from: Some(original_from.clone()),
+                    to: Some(original_to.clone()),
+                    role: FileRole::Original,
+                    copy: false,
+                },
+                PlannedFile {
+                    from: Some(Location {
+                        root_id: "root-1".to_owned(),
+                        path: "photo.jpg.xmp".to_owned(),
+                    }),
+                    to: Some(Location {
+                        root_id: "root-1".to_owned(),
+                        path: "edited/photo.jpg.xmp".to_owned(),
+                    }),
+                    role: FileRole::Sidecar,
+                    copy: false,
+                },
+            ],
+            ..Plan::default()
+        };
+        let action = OperationAction::Move {
+            source: original_from.clone(),
+            target: original_to.clone(),
+            expected_revision: None,
+        };
+
+        let changes = local_changes_of(&action, &plan);
+        assert_eq!(changes.len(), 1);
+        assert!(
+            matches!(&changes[0], LocalChange::FileMoved { from, to } if from == &original_from && to == &original_to)
+        );
     }
 
     #[test]
