@@ -7,6 +7,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::future::Future;
 
 use crate::peers::LocalChange;
 use ism_core::dto::{
@@ -543,35 +544,50 @@ async fn blocking<T: Send + 'static>(
 
 async fn call_api(state: &AppState, step: &ApiStep) -> AppResult<()> {
     let server = registry::server(state, &step.server_id).await?;
-    if let ApiKind::SyncMove {
-        destination_library_id,
-        source_path,
-        destination_path,
-        asset_id,
-        from_owner,
-        to_owner,
-        ..
-    } = &step.kind
-        && server.external_library_move_mode == ImmichMoveMode::DbOnly
-    {
-        return fallback_sync_move(
-            state,
-            &server,
-            destination_library_id,
-            source_path,
-            destination_path,
-            asset_id,
-            from_owner,
-            to_owner,
-        )
-        .await
-        .map_err(|e| AppError::conflict("immich_error", crate::error::redact(&e.to_string())));
-    }
-    let api = registry::api_as_user(state, &server, &step.owner).await?;
     let result = match &step.kind {
-        ApiKind::Trash => api.delete_assets(&step.ids, false).await,
-        ApiKind::Restore => api.restore_assets(&step.ids).await,
-        ApiKind::ForceDelete => api.delete_assets(&step.ids, true).await,
+        ApiKind::Trash => {
+            let api = registry::api_as_user(state, &server, &step.owner).await?;
+            api.delete_assets(&step.ids, false).await
+        }
+        ApiKind::Restore => {
+            let api = registry::api_as_user(state, &server, &step.owner).await?;
+            api.restore_assets(&step.ids).await
+        }
+        ApiKind::ForceDelete => {
+            let api = registry::api_as_user(state, &server, &step.owner).await?;
+            api.delete_assets(&step.ids, true).await
+        }
+        ApiKind::SyncAdd { library_id, path } => {
+            if server.external_library_move_mode == ImmichMoveMode::DbOnly {
+                schedule_add_fallback(state, &server, library_id).await
+            } else {
+                let api = match registry::admin_api(state, &server).await {
+                    Ok(api) => api,
+                    Err(error) => return Err(error),
+                };
+                match api.sync_library_file_add(library_id, path).await {
+                    Ok(()) => Ok(()),
+                    Err(error)
+                        if server.external_library_move_mode
+                            == ImmichMoveMode::ApiWithDbFallback
+                            && error.is_external_library_api_unavailable() =>
+                    {
+                        schedule_add_fallback(state, &server, library_id).await
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+        }
+        ApiKind::SyncRemove { library_id, path } => {
+            call_external_file_sync(&server, || async {
+                registry::admin_api(state, &server)
+                    .await
+                    .map_err(|error| crate::immich::api::ApiError::Decode(error.to_string()))?
+                    .sync_library_file_remove(library_id, path)
+                    .await
+            })
+            .await
+        }
         ApiKind::SyncMove {
             source_library_id,
             destination_library_id,
@@ -594,8 +610,12 @@ async fn call_api(state: &AppState, step: &ApiStep) -> AppResult<()> {
                 )
             };
             match server.external_library_move_mode {
-                ImmichMoveMode::DbOnly => unreachable!("handled before API key lookup"),
+                ImmichMoveMode::DbOnly => fallback().await,
                 ImmichMoveMode::ApiOnly | ImmichMoveMode::ApiWithDbFallback => {
+                    let api = match registry::admin_api(state, &server).await {
+                        Ok(api) => api,
+                        Err(error) => return Err(error),
+                    };
                     match api
                         .sync_library_file_move(
                             source_library_id,
@@ -622,6 +642,44 @@ async fn call_api(state: &AppState, step: &ApiStep) -> AppResult<()> {
         }
     };
     result.map_err(|e| AppError::conflict("immich_error", crate::error::redact(&e.to_string())))
+}
+
+async fn call_external_file_sync<F, Fut>(
+    server: &registry::Server,
+    operation: F,
+) -> Result<(), crate::immich::api::ApiError>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<(), crate::immich::api::ApiError>>,
+{
+    if server.external_library_move_mode == ImmichMoveMode::DbOnly {
+        return Ok(());
+    }
+    match operation().await {
+        Ok(()) => Ok(()),
+        Err(error)
+            if server.external_library_move_mode == ImmichMoveMode::ApiWithDbFallback
+                && error.is_external_library_api_unavailable() =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn schedule_add_fallback(
+    state: &AppState,
+    server: &registry::Server,
+    library_id: &str,
+) -> Result<(), crate::immich::api::ApiError> {
+    crate::watch::scheduler::request_scan(
+        state,
+        &server.id,
+        library_id,
+        "external-library file add API unavailable",
+    )
+    .await
+    .map_err(|error| crate::immich::api::ApiError::Decode(error.to_string()))
 }
 
 async fn fallback_sync_move(
@@ -696,6 +754,7 @@ fn reverse_api_kind(kind: &ApiKind) -> Option<ApiKind> {
         ApiKind::Trash => Some(ApiKind::Restore),
         ApiKind::Restore => Some(ApiKind::Trash),
         ApiKind::ForceDelete => None,
+        ApiKind::SyncAdd { .. } | ApiKind::SyncRemove { .. } => None,
         ApiKind::SyncMove {
             source_library_id,
             destination_library_id,
@@ -938,6 +997,17 @@ fn expected_writes(plan: &Plan) -> Vec<crate::watch::Expected> {
 /// Whether Immich must scan to see the result: new or restored files, or files moved without
 /// a direct database update (no asset yet). Moves of known assets update Immich directly.
 fn needs_scan(action: &OperationAction, plan: &Plan) -> bool {
+    if plan.steps.iter().any(|step| {
+        matches!(
+            step,
+            Step::Api(ApiStep {
+                kind: ApiKind::SyncAdd { .. },
+                ..
+            })
+        )
+    }) {
+        return false;
+    }
     let touches_files = plan
         .steps
         .iter()
@@ -1083,6 +1153,49 @@ mod tests {
             ImmichMoveMode::ApiWithDbFallback,
             &conflict
         ));
+    }
+
+    #[test]
+    fn explicit_add_sync_replaces_the_publish_full_scan() {
+        let action = OperationAction::PublishUpload {
+            upload_id: "upload-1".to_owned(),
+        };
+        let mut plan = Plan {
+            steps: vec![Step::Fs(plan::FsMove {
+                from: "staging".into(),
+                to: "photo.jpg".into(),
+                copy: false,
+            })],
+            ..Plan::default()
+        };
+        assert!(needs_scan(&action, &plan));
+
+        plan.steps.push(Step::Api(ApiStep {
+            kind: ApiKind::SyncAdd {
+                library_id: "library-1".to_owned(),
+                path: "/library/photo.jpg".to_owned(),
+            },
+            server_id: "server-1".to_owned(),
+            owner: "owner-1".to_owned(),
+            ids: Vec::new(),
+        }));
+        assert!(!needs_scan(&action, &plan));
+    }
+
+    #[test]
+    fn file_sync_steps_are_terminal_and_not_reversed() {
+        for kind in [
+            ApiKind::SyncAdd {
+                library_id: "library-1".to_owned(),
+                path: "/library/photo.jpg".to_owned(),
+            },
+            ApiKind::SyncRemove {
+                library_id: "library-1".to_owned(),
+                path: "/library/photo.jpg".to_owned(),
+            },
+        ] {
+            assert_eq!(reverse_api_kind(&kind), None);
+        }
     }
 
     #[test]
