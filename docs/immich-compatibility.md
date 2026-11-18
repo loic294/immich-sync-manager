@@ -23,6 +23,13 @@ With `api_with_db_fallback`, route-unavailable errors schedule the existing libr
 operations; `remove` is already represented by the existing Immich trash API. A `400`, `409`, known
 library `404`, or any other error fails the operation and is never hidden by fallback.
 
+For external-library API calls ISM iterates healthy administrator accounts rather than using
+`step.owner` (the asset owner). Before sending a move, it verifies that the selected key still belongs
+to the stored Immich user, that the user is currently an administrator, and that the effective API-key
+permissions contain `library.update` or `all`. A `403` retries the next healthy admin key; if all fail,
+the operation reports account/user IDs and the verification or endpoint failure without exposing any
+secret. This also removes stale-first-admin ambiguity after keys are rotated or permissions change.
+
 ## What uses the API
 
 Login and account discovery, libraries and their import paths, asset lookup, downloads of originals,

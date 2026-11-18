@@ -156,6 +156,14 @@ pub struct Api {
     api_key: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct ExternalLibraryApiIdentity {
+    pub key_id: String,
+    pub user_id: String,
+    pub is_admin: bool,
+    pub permissions: Vec<String>,
+}
+
 pub fn base_url(url: &str) -> String {
     url.trim()
         .trim_end_matches('/')
@@ -431,6 +439,26 @@ impl Api {
         }
     }
 
+    pub async fn external_library_api_identity(
+        &self,
+    ) -> Result<ExternalLibraryApiIdentity, ApiError> {
+        let key: Value = self.json(Method::GET, "/api-keys/me", None).await?;
+        let user: Value = self.json(Method::GET, "/users/me", None).await?;
+        let permissions = key["permissions"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(ToOwned::to_owned)
+            .collect();
+        Ok(ExternalLibraryApiIdentity {
+            key_id: key["id"].as_str().unwrap_or_default().to_owned(),
+            user_id: user["id"].as_str().unwrap_or_default().to_owned(),
+            is_admin: user["isAdmin"].as_bool().unwrap_or(false),
+            permissions,
+        })
+    }
+
     /// Moves assets to Immich's trash (`force = false`) or deletes them (`force = true`).
     pub async fn delete_assets(&self, ids: &[String], force: bool) -> Result<(), ApiError> {
         if ids.is_empty() {
@@ -660,5 +688,38 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn reads_effective_admin_identity_and_permissions() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/api-keys/me"))
+            .and(header("x-api-key", "test-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "key-1",
+                "name": "ISM",
+                "permissions": ["library.update", "asset.update"],
+                "createdAt": "2026-01-01T00:00:00Z",
+                "updatedAt": "2026-01-01T00:00:00Z"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/users/me"))
+            .and(header("x-api-key", "test-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "user-1",
+                "isAdmin": true
+            })))
+            .mount(&server)
+            .await;
+
+        let api = Api::new(reqwest::Client::new(), &server.uri(), "test-key".to_owned());
+        let identity = api.external_library_api_identity().await.unwrap();
+        assert_eq!(identity.key_id, "key-1");
+        assert_eq!(identity.user_id, "user-1");
+        assert!(identity.is_admin);
+        assert_eq!(identity.permissions, ["library.update", "asset.update"]);
     }
 }
