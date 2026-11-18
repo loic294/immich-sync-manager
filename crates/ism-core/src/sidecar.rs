@@ -49,9 +49,13 @@ fn ext_role(ext: &str, companions: &[String]) -> Option<CompanionRole> {
     }
 }
 
+pub fn companion_role(name: &str, companions: &[String]) -> Option<CompanionRole> {
+    split_ext(name).1.and_then(|ext| ext_role(ext, companions))
+}
+
 /// True when `name` is a sidecar or companion rather than an original.
 pub fn is_companion_name(name: &str, companions: &[String]) -> bool {
-    matches!(split_ext(name), (_, Some(ext)) if ext_role(ext, companions).is_some())
+    companion_role(name, companions).is_some()
 }
 
 /// The companions of `original` among `siblings` (names in the same folder, may include the
@@ -154,5 +158,13 @@ mod tests {
         assert!(is_companion_name("x.XMP", &defaults()));
         assert!(is_companion_name("x.jpg.pp3", &defaults()));
         assert!(!is_companion_name("x.jpg", &defaults()));
+        assert_eq!(
+            companion_role("x.XMP", &defaults()),
+            Some(CompanionRole::Sidecar)
+        );
+        assert_eq!(
+            companion_role("x.jpg.pp3", &defaults()),
+            Some(CompanionRole::Companion)
+        );
     }
 }
