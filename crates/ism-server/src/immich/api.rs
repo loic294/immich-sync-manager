@@ -332,16 +332,6 @@ impl Api {
         .map(|_| ())
     }
 
-    pub async fn scan_library(&self, library_id: &str) -> Result<(), ApiError> {
-        self.call(
-            Method::POST,
-            &format!("/libraries/{library_id}/scan"),
-            Some(json!({})),
-        )
-        .await
-        .map(|_| ())
-    }
-
     /// Queues a scan only for a folder inside the external library.
     pub async fn scan_library_folder(&self, library_id: &str, path: &str) -> Result<(), ApiError> {
         self.call(

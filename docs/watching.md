@@ -1,7 +1,7 @@
 # File watching
 
 Immich's own file watcher and scheduled library scans stay **off**; ISM detects file changes in the
-mapped folders and tells Immich when to scan. Every mapping linked to an Immich library or a peer
+mapped folders and synchronizes them with Immich. Every mapping linked to an Immich library or a peer
 share is watched.
 
 ## Modes
@@ -27,16 +27,44 @@ for that mapping with a warning; nothing is treated as deleted. After checking t
 Before ISM moves, renames, trashes, restores, uploads or copies a file from a peer, it records the
 expected result (path, and size and modification time when known) for a limited time. Matching
 changes are ignored by the watcher; anything else is treated as an outside change. Uploads, peer
-copies and restores still need Immich to import them, so ISM requests a library scan for them.
-Moves update Immich's database directly and need no scan.
+copies and restores use the existing file APIs first. Work not already handled by an operation's
+API/database updates enters the scoped synchronization queue. Successful direct synchronization
+does not schedule another scan.
 
-## Library scans
+## Scoped synchronization and scan fallback
 
-Each detected outside change (or ISM request) in a library's import path sets that library's scan
+Each detected outside change (or ISM request) in a library's import path sets its synchronization
 to run **2 minutes** later (`ISM_SCAN_DELAY_SECS`); every further change restarts the timer. A due
-scan waits while a managed operation holds the server's write barrier and starts once it is
-released. The Overview page shows the queue with countdowns. When a scan finishes, ISM emits a
-`library_scanned` event that clients waiting for new asset IDs can use to refresh.
+batch waits while a managed operation holds or prepares the server's write barrier. Exact paths,
+change kinds and requests arriving during a running batch are saved in SQLite and survive restarts.
+
+Outside additions and removals first use the fork's `/libraries/:id/files/add` and `files/remove`
+APIs. Successfully handled files cause **no scan**. Modified files have no direct update endpoint,
+and the add endpoint does not update existing assets, so they request the affected parent folder.
+Unsupported companion additions and compatible route-unavailable add requests also fall back to
+that folder. Directory imports use the directory itself. Overlapping folder scopes are coalesced;
+other folders and other library import paths are not included.
+
+Every fallback uses `POST /libraries/:id/scan` with a nonempty `path` in **Immich's path namespace**,
+not the ISM container path. ISM requires the fork's external-library capability (probing when
+unverified); stock Immich must not receive a scope it might ignore. There is **no automatic
+full-library fallback**, including when the scoped endpoint rejects an inaccessible/deleted folder.
+Explicit full scans requested manually in Immich are unchanged.
+
+Authentication errors, known-library errors and failures of an API previously confirmed available
+remain errors, following the existing capability rules. Failed work is retained and its error
+appears in the Overview queue; a later request retries it. The fork's folder scan discovers new
+files but does not reconcile existing-asset metadata or removals. In particular, a failed outside
+removal is reported rather than pretending a folder scan repaired it. Refreshing existing metadata
+remains an Immich API limitation; ISM does not work around it with a full scan.
+
+After a successful batch, including one handled entirely by file APIs, ISM emits the existing
+`library_scanned` event and looks up imported upload asset IDs. For queued folder scans it first
+waits for the library queue to become idle. The Overview page shows the queue with countdowns.
+
+On upgrade, legacy pending scans have no recoverable folder scope. They are stopped with an
+explicit queue error instead of being replayed as full-library scans; request scoped synchronization
+again for any work that was pending.
 
 ## Peers
 

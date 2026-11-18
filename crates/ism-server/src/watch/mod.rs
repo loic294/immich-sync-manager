@@ -4,8 +4,8 @@
 //! mapped folder that belongs to an Immich library or a peer share is watched here: local disks
 //! with native change events, network shares by polling (per-mapping mode and interval). A full
 //! pass runs after every start; changes are diffed against a snapshot kept in SQLite. Changes ISM
-//! announced itself ([`selfwrite`]) are ignored. Outside changes schedule a debounced Immich
-//! library scan ([`scheduler`]) and mark peer shares for a rescan. An unreachable or suddenly
+//! announced itself ([`selfwrite`]) are ignored. Outside changes schedule debounced API-first
+//! synchronization ([`scheduler`]) and mark peer shares for a rescan. An unreachable or suddenly
 //! empty folder pauses detection; it is never read as "everything was deleted".
 
 pub mod fstype;
@@ -299,7 +299,7 @@ pub(crate) async fn pass(
     Ok(PassOutcome::Changes(changes))
 }
 
-/// Drops ISM's own changes and routes the rest: library scans and peer share rescans.
+/// Drops ISM's own changes and routes the rest: Immich synchronization and peer share rescans.
 /// Returns the outside changes.
 pub(crate) async fn handle(
     state: &AppState,
@@ -327,18 +327,25 @@ pub(crate) async fn handle(
         let patterns: Vec<String> = patterns
             .and_then(|p| serde_json::from_str(&p).ok())
             .unwrap_or_default();
-        let relevant = outside
+        let relevant: Vec<scheduler::Work> = outside
             .iter()
-            .filter(|c| {
-                files::parse_rel(&c.rel)
+            .filter_map(|c| {
+                let path = files::parse_rel(&c.rel)
                     .ok()
-                    .and_then(|rel| root.immich_path(&rel))
-                    .is_some_and(|p| !ignore::excluded(&patterns, &p))
+                    .and_then(|rel| root.immich_path(&rel))?;
+                (!ignore::excluded(&patterns, &path)).then_some(scheduler::Work {
+                    path,
+                    kind: match c.kind {
+                        ChangeKind::Added => scheduler::WorkKind::Added,
+                        ChangeKind::Changed => scheduler::WorkKind::Changed,
+                        ChangeKind::Removed => scheduler::WorkKind::Removed,
+                    },
+                })
             })
-            .count();
-        if relevant > 0 {
-            let reason = format!("{relevant} outside change(s) in {}", root.name);
-            scheduler::request_scan(state, server_id, library_id, &reason).await?;
+            .collect();
+        if !relevant.is_empty() {
+            let reason = format!("{} outside change(s) in {}", relevant.len(), root.name);
+            scheduler::request_work(state, server_id, library_id, &reason, &relevant).await?;
         }
     }
     let settle = Duration::from_secs(crate::peers::SETTLE_SECS.unsigned_abs() + 1);

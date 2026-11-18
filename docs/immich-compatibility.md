@@ -19,9 +19,13 @@ Managed upload publication synchronizes only the `Original` file with `POST /lib
 after the filesystem move. Sidecars and companions remain grouped files but are never sent to this
 endpoint. Managed trash synchronizes each exact original asset path with
 `POST /libraries/:id/files/remove` after the original leaves the library. `db_only` skips both calls.
-With `api_with_db_fallback`, route-unavailable errors schedule the existing library scan only for add
+With `api_with_db_fallback`, route-unavailable errors schedule a debounced targeted parent-folder scan only for add
 operations; `remove` is already represented by the existing Immich trash API. A `400`, `409`, known
 library `404`, or any other error fails the operation and is never hidden by fallback.
+Folder fallbacks require the fork's external-library capability; an unverified server is probed
+before dispatch. Unsupported stock servers report an error rather than risking an unscoped scan.
+The fork's folder scan discovers files, not existing-asset metadata changes or removals. See
+[file watching](watching.md) for API-first outside-change handling and fallback limitations.
 
 ## What uses the API
 
@@ -52,7 +56,7 @@ emits a local update, which the [notification service](https://github.com/immich
 forwards to other workers without awaiting an acknowledgement. ISM therefore never toggles the
 watcher around changes. Instead, when a server or account is enrolled, ISM turns **off**
 `library.watch.enabled` (file watching) and `library.scan.enabled` (scheduled library scans), and
-they stay off. ISM detects file changes itself and schedules library scans (see
+they stay off. ISM detects file changes itself and uses file APIs with scoped scan fallbacks (see
 [file watching](watching.md)).
 
 ISM re-reads these settings before every batch of changes and periodically. If either was turned
