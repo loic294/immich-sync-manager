@@ -175,10 +175,6 @@ export class IsmSyncPage extends IsmPage {
         <span>${formatBytes(p.bytes_per_second)}/s <span class="text-base-content/70">(last minute)</span></span>
         <span>${eta}</span>
       </div>
-      <p class="mt-3 text-xs text-base-content/70">
-        ${p.running} transferring, ${p.publishing} publishing, ${p.queued} queued, ${p.failed} need attention.
-        Includes incoming and outgoing files.
-      </p>
     </section>
     ${this.warnings.map((warning) => html`<p role="alert" class="alert alert-warning alert-soft">${warning} Speed and remaining time may be unavailable.</p>`)}`;
   }
