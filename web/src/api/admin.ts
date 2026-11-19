@@ -23,17 +23,13 @@ import type { PeerAcceptInput } from '@/api/generated/PeerAcceptInput';
 import type { PeerInvite } from '@/api/generated/PeerInvite';
 import type { PeerView } from '@/api/generated/PeerView';
 import type { ScheduleView } from '@/api/generated/ScheduleView';
+import type { SettingsInput } from '@/api/generated/SettingsInput';
+import type { SettingsView } from '@/api/generated/SettingsView';
 import type { ShareInput } from '@/api/generated/ShareInput';
 import type { ShareView } from '@/api/generated/ShareView';
 import type { SyncStatus } from '@/api/generated/SyncStatus';
 import type { TrashEntry } from '@/api/generated/TrashEntry';
 import type { WatchSettingsInput } from '@/api/generated/WatchSettingsInput';
-
-/** Instance-wide settings (`GET/PUT /api/admin/settings`). */
-export interface Settings {
-  instance_name: string;
-  companion_extensions: string[];
-}
 
 const A = '/api/admin';
 const enc = encodeURIComponent;
@@ -44,8 +40,8 @@ export const admin = {
     api.post<void>(`${A}/setup`, { body }),
   login: (body: { username: string; password: string }) => api.post<void>(`${A}/login`, { body }),
   overview: () => api.get<Overview>(`${A}/overview`),
-  settings: () => api.get<Settings>(`${A}/settings`),
-  saveSettings: (body: Settings) => api.put<Settings>(`${A}/settings`, { body }),
+  settings: () => api.get<SettingsView>(`${A}/settings`),
+  saveSettings: (body: SettingsInput) => api.put<SettingsView>(`${A}/settings`, { body }),
 
   servers: () => api.get<ImmichServerView[]>(`${A}/servers`),
   createServer: (body: ImmichServerInput) => api.post<ImmichServerView>(`${A}/servers`, { body }),

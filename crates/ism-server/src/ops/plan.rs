@@ -178,7 +178,7 @@ impl<'a> Ctx<'a> {
             principal,
             allow_owner_transfer,
             roots: files::load_roots(&state.db).await?,
-            companions: files::companion_extensions(&state.db).await,
+            companions: state.sidecar_extensions(),
             servers: registry::servers(state).await?,
         })
     }
@@ -720,27 +720,6 @@ fn plan_create_folder(ctx: &Ctx<'_>, plan: &mut Plan, target: &Location) -> AppR
         location: target.clone(),
     });
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::upload_file_needs_sync_add;
-    use ism_core::dto::FileRole;
-
-    #[test]
-    fn external_file_sync_only_targets_original_assets() {
-        assert!(upload_file_needs_sync_add(FileRole::Original));
-        assert!(!upload_file_needs_sync_add(FileRole::Sidecar));
-        assert!(!upload_file_needs_sync_add(FileRole::Companion));
-        let adjacent_roles = [FileRole::Original, FileRole::Sidecar];
-        assert_eq!(
-            adjacent_roles
-                .into_iter()
-                .filter(|role| upload_file_needs_sync_add(*role))
-                .count(),
-            1
-        );
-    }
 }
 
 async fn plan_move_folder(
@@ -1824,4 +1803,25 @@ async fn plan_publish(ctx: &Ctx<'_>, plan: &mut Plan, upload_id: &str) -> AppRes
     }
     plan.upload_done = Some(upload_id.to_owned());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::upload_file_needs_sync_add;
+    use ism_core::dto::FileRole;
+
+    #[test]
+    fn external_file_sync_only_targets_original_assets() {
+        assert!(upload_file_needs_sync_add(FileRole::Original));
+        assert!(!upload_file_needs_sync_add(FileRole::Sidecar));
+        assert!(!upload_file_needs_sync_add(FileRole::Companion));
+        let adjacent_roles = [FileRole::Original, FileRole::Sidecar];
+        assert_eq!(
+            adjacent_roles
+                .into_iter()
+                .filter(|role| upload_file_needs_sync_add(*role))
+                .count(),
+            1
+        );
+    }
 }

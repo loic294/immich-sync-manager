@@ -153,10 +153,15 @@ async fn own_writes_are_ignored_and_outside_changes_schedule_a_scan() {
     let PassOutcome::Changes(found) = full_pass(&state, &root).await else {
         panic!("changes expected");
     };
-    assert_eq!(found.len(), 2);
+    // `@eaDir` is an ignored name, so the walk never reports the thumbnail.
+    assert_eq!(found.len(), 1);
     let outside = handle(&state, &root, found).await.unwrap();
-    assert_eq!(outside.len(), 1, "only the excluded thumbnail is outside");
-    assert_eq!(due_at(&state).await, None, "excluded paths do not scan");
+    assert!(outside.is_empty(), "own writes are not outside changes");
+    assert_eq!(
+        due_at(&state).await,
+        None,
+        "own writes and ignored names do not scan"
+    );
 
     std::fs::write(base.join("trip/theirs.jpg"), "theirs").unwrap();
     let PassOutcome::Changes(found) = full_pass(&state, &root).await else {

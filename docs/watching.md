@@ -15,8 +15,9 @@ Set per mapping on the Mappings page (eye button):
 | **Poll** | ISM compares the folder with a saved snapshot (path, size, modification time, inode) every poll interval (default 5 minutes, 1 minute to 24 hours). |
 
 A full polling pass runs after every restart, so changes made while ISM was stopped are found.
-Passes are throttled. ISM's staging and trash folders, partial or temporary files and the Immich
-library's exclusion patterns are ignored.
+Passes are throttled. ISM's staging and trash folders, partial or temporary files, the Immich
+library's exclusion patterns and the **Ignored names** and **Ignored prefixes** from
+**Settings → Files and sidecars** are ignored.
 
 If the folder is unreachable, or a snapshot that held files is suddenly empty, detection **pauses**
 for that mapping with a warning; nothing is treated as deleted. After checking the mount, click

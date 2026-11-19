@@ -268,7 +268,8 @@ pub(crate) async fn pass(
     let walked = {
         let base = root.base();
         let scope = scope.map(str::to_owned);
-        tokio::task::spawn_blocking(move || poll::walk(&base, scope.as_deref())).await
+        let junk = state.junk_rules();
+        tokio::task::spawn_blocking(move || poll::walk(&base, scope.as_deref(), &junk)).await
     };
     let new = match walked {
         Ok(Ok(tree)) => tree,
@@ -610,7 +611,10 @@ impl Task {
                 for p in paths {
                     match rel_from_event(bases, &p) {
                         Some(rel) if rel.is_empty() => return true,
-                        Some(rel) if !ignore::ignored(&rel) => {
+                        Some(rel)
+                            if !ignore::ignored(&rel)
+                                && !self.state.junk_rules().path_is_junk(&rel) =>
+                        {
                             pending.insert(rel);
                         }
                         _ => {}

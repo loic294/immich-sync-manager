@@ -318,9 +318,9 @@ enum Outcome {
 
 async fn run_one(state: &AppState, t: &Transfer) -> Result<Outcome, String> {
     // Retain legacy queue entries for inspection, but never adopt or publish their content.
-    if super::excluded_path(&t.rel) {
+    if super::excluded_path(&t.rel, &state.junk_rules()) {
         return Ok(Outcome::Blocked(
-            "Synology metadata is excluded from peer replication",
+            "NAS metadata and ignored names are excluded from peer replication",
         ));
     }
     let _operation_guard = state.replication_operation_lock.lock().await;
@@ -574,7 +574,7 @@ async fn publish(
             .await
             .map_err(AppError::internal)??
     };
-    let companion_extensions = files::companion_extensions(&state.db).await;
+    let companion_extensions = state.sidecar_extensions();
     let (role, existing_original) = peer_upload_file(&folder_path, &name, &companion_extensions)?;
     let upload_id = crate::crypto::new_id("upl");
     let principal = Principal::Peer {
@@ -654,58 +654,6 @@ async fn publish(
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{existing_original_for_companion, peer_upload_file};
-    use crate::ops::plan::upload_file_needs_sync_add;
-    use ism_core::dto::FileRole;
-    use ism_core::sidecar::DEFAULT_COMPANION_EXTENSIONS;
-
-    #[test]
-    fn classifies_peer_xmp_as_attached_to_existing_original() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("retry-move.png"), b"original").unwrap();
-        std::fs::write(dir.path().join("retry-move.xmp"), b"metadata").unwrap();
-        let extensions = DEFAULT_COMPANION_EXTENSIONS
-            .iter()
-            .map(|extension| extension.to_string())
-            .collect::<Vec<_>>();
-
-        let existing =
-            existing_original_for_companion(dir.path(), "retry-move.xmp", &extensions).unwrap();
-        assert_eq!(existing.name, "retry-move.png");
-        assert!(!existing.expected_revision.is_empty());
-
-        let (role, existing_original) =
-            peer_upload_file(dir.path(), "retry-move.xmp", &extensions).unwrap();
-        assert_eq!(role, FileRole::Sidecar);
-        assert!(existing_original.is_some());
-        assert!(!upload_file_needs_sync_add(role));
-
-        let (role, existing_original) =
-            peer_upload_file(dir.path(), "new-photo.png", &extensions).unwrap();
-        assert_eq!(role, FileRole::Original);
-        assert!(existing_original.is_none());
-        assert!(upload_file_needs_sync_add(role));
-    }
-
-    #[test]
-    fn refuses_ambiguous_shared_peer_sidecar() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("retry.jpg"), b"jpg").unwrap();
-        std::fs::write(dir.path().join("retry.png"), b"png").unwrap();
-        std::fs::write(dir.path().join("retry.xmp"), b"metadata").unwrap();
-        let extensions = DEFAULT_COMPANION_EXTENSIONS
-            .iter()
-            .map(|extension| extension.to_string())
-            .collect::<Vec<_>>();
-
-        let error =
-            existing_original_for_companion(dir.path(), "retry.xmp", &extensions).unwrap_err();
-        assert_eq!(error.code(), "companion_original_ambiguous");
-    }
-}
-
 async fn conflict_here(
     state: &AppState,
     peer: &net::Peer,
@@ -735,4 +683,56 @@ async fn conflict_here(
         },
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{existing_original_for_companion, peer_upload_file};
+    use crate::ops::plan::upload_file_needs_sync_add;
+    use ism_core::dto::FileRole;
+    use ism_core::file_settings::DEFAULT_SIDECAR_EXTENSIONS;
+
+    #[test]
+    fn classifies_peer_xmp_as_attached_to_existing_original() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("retry-move.png"), b"original").unwrap();
+        std::fs::write(dir.path().join("retry-move.xmp"), b"metadata").unwrap();
+        let extensions = DEFAULT_SIDECAR_EXTENSIONS
+            .iter()
+            .map(|extension| extension.to_string())
+            .collect::<Vec<_>>();
+
+        let existing =
+            existing_original_for_companion(dir.path(), "retry-move.xmp", &extensions).unwrap();
+        assert_eq!(existing.name, "retry-move.png");
+        assert!(!existing.expected_revision.is_empty());
+
+        let (role, existing_original) =
+            peer_upload_file(dir.path(), "retry-move.xmp", &extensions).unwrap();
+        assert_eq!(role, FileRole::Sidecar);
+        assert!(existing_original.is_some());
+        assert!(!upload_file_needs_sync_add(role));
+
+        let (role, existing_original) =
+            peer_upload_file(dir.path(), "new-photo.png", &extensions).unwrap();
+        assert_eq!(role, FileRole::Original);
+        assert!(existing_original.is_none());
+        assert!(upload_file_needs_sync_add(role));
+    }
+
+    #[test]
+    fn refuses_ambiguous_shared_peer_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("retry.jpg"), b"jpg").unwrap();
+        std::fs::write(dir.path().join("retry.png"), b"png").unwrap();
+        std::fs::write(dir.path().join("retry.xmp"), b"metadata").unwrap();
+        let extensions = DEFAULT_SIDECAR_EXTENSIONS
+            .iter()
+            .map(|extension| extension.to_string())
+            .collect::<Vec<_>>();
+
+        let error =
+            existing_original_for_companion(dir.path(), "retry.xmp", &extensions).unwrap_err();
+        assert_eq!(error.code(), "companion_original_ambiguous");
+    }
 }

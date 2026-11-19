@@ -351,6 +351,7 @@ impl Api {
     }
 
     /// Queues a scan only for a folder inside the external library.
+    #[cfg(test)]
     pub async fn scan_library_folder(&self, library_id: &str, path: &str) -> Result<(), ApiError> {
         self.call(
             Method::POST,

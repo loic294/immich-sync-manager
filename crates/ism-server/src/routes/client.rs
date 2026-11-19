@@ -13,11 +13,11 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use futures_util::{StreamExt, stream};
 use ism_core::dto::{
-    CancelOperationByKey, Change, ClientAction, ClientInfo, ClientRoot, CreateUpload, DirectWrites,
-    DirectWritesReason, FileRole, FolderEntry, FolderListing, Location, Manifest, ManifestFile,
-    OperationRequest,
+    CancelOperationByKey, Change, ClientAction, ClientAsset, ClientAssetPage, ClientInfo,
+    ClientRoot, ClientSettings, CreateUpload, DirectWrites, DirectWritesReason, FileRole,
+    FolderEntry, FolderListing, Location, Manifest, ManifestFile, OperationRequest,
 };
-use ism_core::paths::{RelPath, split_ext};
+use ism_core::paths::{RelPath, split_ext, strip_abs_prefix};
 use ism_core::sidecar::{CompanionRole, companions_of};
 use serde::Deserialize;
 use tokio::sync::broadcast;
@@ -35,6 +35,8 @@ pub const API_VERSION: u32 = 1;
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/client/info", get(info))
+        .route("/client/settings", get(client_settings))
+        .route("/assets", get(assets))
         .route("/locations/resolve", get(resolve_location))
         .route("/folders", get(folders))
         .route("/assets/{id}/manifest", get(asset_manifest))
@@ -125,7 +127,105 @@ async fn info(State(state): State<AppState>, Client(p): Client) -> AppResult<Jso
             "find_operation_by_key".into(),
             "trash_expectations".into(),
             "partial_submit".into(),
+            "shared_file_settings".into(),
+            "immich_assets".into(),
         ],
+    }))
+}
+
+async fn client_settings(State(state): State<AppState>, Client(_): Client) -> Json<ClientSettings> {
+    Json(crate::settings::client_view(&state).await)
+}
+
+const ASSET_PAGE_DEFAULT: u32 = 1000;
+const ASSET_PAGE_MAX: u32 = 5000;
+
+#[derive(Deserialize)]
+struct AssetsQuery {
+    root_id: String,
+    #[serde(default)]
+    path: String,
+    after: Option<String>,
+    limit: Option<u32>,
+}
+
+fn immich_unavailable(detail: impl std::fmt::Display) -> AppError {
+    AppError::new(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "immich_unavailable",
+        format!("the Immich database cannot be read: {detail}"),
+    )
+}
+
+/// Live Immich assets below a root folder, one page at a time.
+async fn assets(
+    State(state): State<AppState>,
+    Client(p): Client,
+    Query(q): Query<AssetsQuery>,
+) -> AppResult<Json<ClientAssetPage>> {
+    p.require(ClientAction::Read, &q.root_id)?;
+    let limit = q.limit.unwrap_or(ASSET_PAGE_DEFAULT);
+    if !(1..=ASSET_PAGE_MAX).contains(&limit) {
+        return Err(AppError::bad_request(
+            "invalid_request",
+            format!("limit must be between 1 and {ASSET_PAGE_MAX}"),
+        ));
+    }
+    let folder = files::parse_rel(&q.path)?;
+    let after = q.after.as_deref().map(files::parse_rel).transpose()?;
+    let root = files::root(&state.db, &q.root_id).await?;
+    let linked = root
+        .server_id
+        .as_deref()
+        .zip(root.immich_path(&RelPath::root()));
+    let Some((server_id, base)) = linked else {
+        return Ok(Json(ClientAssetPage {
+            root_id: q.root_id,
+            linked: false,
+            assets: Vec::new(),
+            next: None,
+        }));
+    };
+    let folder_abs = root
+        .immich_path(&folder)
+        .ok_or_else(|| AppError::internal("linked root without an Immich path"))?;
+    let after_abs = after.as_ref().and_then(|a| root.immich_path(a));
+    let server = registry::server(&state, server_id).await?;
+    if !server.compatible || server.database_url_enc.is_none() {
+        return Err(immich_unavailable(
+            "the server is incompatible or has no database connection",
+        ));
+    }
+    let pool = registry::pg_pool(&state, &server)
+        .await
+        .map_err(|e| immich_unavailable(e.message()))?;
+    let mut conn = pool.acquire().await.map_err(immich_unavailable)?;
+    let mut rows = pg::live_assets_page(
+        &mut conn,
+        &folder_abs,
+        after_abs.as_deref(),
+        i64::from(limit) + 1,
+    )
+    .await
+    .map_err(immich_unavailable)?;
+    let more = rows.len() > limit as usize;
+    rows.truncate(limit as usize);
+    let assets: Vec<ClientAsset> = rows
+        .into_iter()
+        .filter_map(|(asset_id, original)| {
+            strip_abs_prefix(&original, &base).map(|path| ClientAsset { asset_id, path })
+        })
+        .collect();
+    let next = if more {
+        assets.last().map(|a| a.path.clone())
+    } else {
+        None
+    };
+    Ok(Json(ClientAssetPage {
+        root_id: q.root_id,
+        linked: true,
+        assets,
+        next,
     }))
 }
 
@@ -240,7 +340,7 @@ pub async fn build_manifest(
         .await
         .map_err(AppError::internal)??;
     let names: Vec<String> = siblings.iter().map(|(n, _)| n.clone()).collect();
-    let companions = companions_of(&name, &names, &files::companion_extensions(&state.db).await);
+    let companions = companions_of(&name, &names, &state.sidecar_extensions());
 
     // Immich links (best effort; only when the database is readable).
     let mut conn = None;
@@ -734,24 +834,51 @@ fn visible_change(p: &Principal, c: &Change) -> bool {
 
 async fn events(State(state): State<AppState>, Client(p): Client) -> AppResult<Response> {
     let rx = state.events.subscribe();
-    let s = stream::unfold((rx, p), |(mut rx, p)| async move {
+    let s = stream::unfold((rx, p, state), |(mut rx, p, state)| async move {
         loop {
-            match rx.recv().await {
+            let ev = match rx.recv().await {
                 Ok(ServerEvent::OperationCommitted(mut c)) => {
                     c.changes.retain(|ch| visible_change(&p, ch));
                     if c.changes.is_empty() {
                         continue;
                     }
                     let data = serde_json::to_string(&c).unwrap_or_default();
-                    let ev = Event::default().event("operation_committed").data(data);
-                    return Some((Ok::<_, Infallible>(ev), (rx, p)));
+                    Event::default().event("operation_committed").data(data)
+                }
+                Ok(ServerEvent::SettingsChanged) => {
+                    let settings = crate::settings::client_view(&state).await;
+                    let data = serde_json::to_string(&settings).unwrap_or_default();
+                    Event::default().event("settings_changed").data(data)
+                }
+                Ok(ServerEvent::LibraryScanned {
+                    server_id,
+                    library_id,
+                }) => {
+                    let Ok(roots) = files::load_roots(&state.db).await else {
+                        continue;
+                    };
+                    let root_ids: Vec<String> = roots
+                        .into_iter()
+                        .filter(|r| {
+                            r.server_id.as_deref() == Some(server_id.as_str())
+                                && r.library_id.as_deref() == Some(library_id.as_str())
+                                && p.sees_root(&r.mapping.root_id)
+                        })
+                        .map(|r| r.mapping.root_id)
+                        .collect();
+                    if root_ids.is_empty() {
+                        continue;
+                    }
+                    let data = serde_json::json!({ "root_ids": root_ids }).to_string();
+                    Event::default().event("assets_changed").data(data)
                 }
                 Ok(_) => continue,
                 Err(broadcast::error::RecvError::Lagged(_)) => {
-                    return Some((Ok(Event::default().event("resync").data("{}")), (rx, p)));
+                    Event::default().event("resync").data("{}")
                 }
                 Err(broadcast::error::RecvError::Closed) => return None,
-            }
+            };
+            return Some((Ok::<_, Infallible>(ev), (rx, p, state)));
         }
     });
     Ok(sse(s))

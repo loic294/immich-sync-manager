@@ -14,6 +14,7 @@ export type ChangeType =
   | 'conflicts_changed'
   | 'watch_changed'
   | 'library_scanned'
+  | 'settings_changed'
   | 'resync';
 
 export interface ChangeEvent {

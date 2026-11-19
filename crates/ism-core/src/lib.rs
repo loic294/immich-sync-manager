@@ -3,6 +3,7 @@
 
 pub mod checksum;
 pub mod dto;
+pub mod file_settings;
 pub mod maintenance;
 pub mod mapping;
 pub mod paths;

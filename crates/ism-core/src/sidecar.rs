@@ -10,10 +10,10 @@
 
 use crate::paths::split_ext;
 
-/// Extensions that are never originals. `xmp` is the metadata sidecar Immich links.
+/// Extensions that are always sidecars, whatever the settings say: `xmp` is the metadata sidecar
+/// Immich links. The other configured sidecar extensions
+/// ([`FileSettings::sidecar_extensions`](crate::dto::FileSettings)) are companions.
 pub const SIDECAR_EXTENSIONS: &[&str] = &["xmp"];
-/// Default editor companions. Configurable per installation.
-pub const DEFAULT_COMPANION_EXTENSIONS: &[&str] = &["pp3", "dop", "on1", "aae", "arp", "cos"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompanionRole {
@@ -119,7 +119,7 @@ mod tests {
     }
 
     fn defaults() -> Vec<String> {
-        names(DEFAULT_COMPANION_EXTENSIONS)
+        names(crate::file_settings::DEFAULT_SIDECAR_EXTENSIONS)
     }
 
     #[test]

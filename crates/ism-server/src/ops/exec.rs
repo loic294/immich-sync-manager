@@ -973,6 +973,7 @@ async fn schedule_add_fallback(
     .map_err(|error| crate::immich::api::ApiError::Decode(error.to_string()))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn fallback_sync_move(
     state: &AppState,
     server: &registry::Server,

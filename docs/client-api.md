@@ -38,7 +38,8 @@ client.
   "token_kind": "ila",
   "actions": ["read", "download", "upload", "manage", "trash"],
   "capabilities": ["trash_if_asset_matches", "cancel_receiving_upload", "cancel_operation_by_key", "instance_scoped_operations",
-                   "find_operation_by_key", "trash_expectations", "partial_submit"],
+                   "find_operation_by_key", "trash_expectations", "partial_submit",
+                   "shared_file_settings", "immich_assets"],
   "roots": [
     {
       "root_id": "photos",
@@ -113,8 +114,49 @@ binding for ILA, `immich_import_path` when starting from an Immich `originalPath
 ```
 
 `role` is `original`, `sidecar` (XMP, `photo.ext.xmp` or `photo.xmp`), or `companion` (other
-editor files sharing the stem, e.g. `.pp3`, `.dop`, `.on1`). `sha256` is the transfer hash; it is
+files sharing the stem whose extension is one of the shared sidecar extensions, e.g. `.pp3`,
+`.dop`, `.on1`; see [File settings](#file-settings)). `sha256` is the transfer hash; it is
 unrelated to Immich's checksum. Clients must download **every** file of the manifest.
+
+## File settings
+
+`GET /api/v1/client/settings` (capability `shared_file_settings`) returns the "Files and sidecars"
+settings the client must use while it is connected:
+
+```json
+{
+  "files": {
+    "sidecar_extensions": ["xmp", "json", "aae", "dop", "pp3", "xml", "on1", "arp", "cos"],
+    "junk_names": ["@eaDir", "#recycle", ".DS_Store", "Thumbs.db"],
+    "junk_prefixes": ["._"],
+    "name_max_len": 255
+  },
+  "revision": 1700000000000,
+  "origin_instance_id": "ism_3f2a…",
+  "primary": { "instance_id": "ism_3f2a…", "name": "Example NAS" }
+}
+```
+
+Extensions are lowercase without the dot; names and prefixes match whole names or name starts,
+ignoring case. `name_max_len` is in UTF-8 bytes (16-255). `primary` is `null` when every instance
+keeps its own values. Changes are pushed as `settings_changed` on `GET /api/v1/events`.
+Administrators edit these in **Settings → Files and sidecars**, on the primary instance when one
+is chosen (see [peers.md](peers.md#shared-file-settings)).
+
+## Immich assets
+
+`GET /api/v1/assets?root_id=photos&path=2024&after=…&limit=1000` (capability `immich_assets`,
+`read` grant) lists the live (not trashed) Immich assets below a folder of a root, ordered by
+path:
+
+```json
+{ "root_id": "photos", "linked": true,
+  "assets": [ { "asset_id": "uuid", "path": "2024/a.CR3" } ], "next": "2024/a.CR3" }
+```
+
+`path` defaults to the root. `limit` is 1-5000 (default 1000). While `next` is not `null`, pass it
+as `after` to get the next page. `linked: false` (with no assets) means the root is not inside an
+Immich library. `503 immich_unavailable` means the Immich database cannot be read right now.
 
 ## Downloading content
 
@@ -317,6 +359,13 @@ token so OPM can refresh its index:
   { "kind": "trashed", "location": {…}, "trash_id": "…" }, { "kind": "created", "location": {…} } ] }
 ```
 
+The same stream also sends:
+- `settings_changed`: the new [file settings](#file-settings) (same JSON as
+  `GET /api/v1/client/settings`);
+- `assets_changed`: `{ "root_ids": ["photos"] }` after an Immich library scan finished for those
+  roots, so the client can refetch [`/assets`](#immich-assets);
+- `resync` (`{}`) when events were dropped: refetch everything.
+
 ## Trash
 
 `GET /api/v1/trash?root_id=photos` → `[ { "trash_id", "location": {…}, "is_folder", "size",
@@ -336,4 +385,5 @@ automatically.
 | `destination_exists` | Target already exists |
 | `direct_writes_unavailable` | Immich compatibility gate not passed or disabled for that root |
 | `owner_transfer_required` / `owner_transfer_blocked` | Cross-owner move needs approval / is unsafe |
+| `immich_unavailable` | The Immich database cannot be read (`/assets`); retry later |
 | `maintenance_blocked` | Immich's library queue could not be paused and confirmed idle, or its watcher/scheduled scan was turned back on; nothing was changed |
