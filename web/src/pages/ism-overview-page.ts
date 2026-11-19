@@ -1,29 +1,39 @@
 import { html, nothing } from 'lit';
+import { createRef, ref } from 'lit/directives/ref.js';
 import { admin } from '@/api/admin';
 import type { ImmichServerView } from '@/api/generated/ImmichServerView';
+import type { OperationActivity } from '@/api/generated/OperationActivity';
 import type { Overview } from '@/api/generated/Overview';
 import type { ScanScheduleView } from '@/api/generated/ScanScheduleView';
 import type { WatchStatusView } from '@/api/generated/WatchStatusView';
 import { IsmPage } from '@/base/ism-page';
 import type { IconName } from '@/components/ism-icon';
+import type { IsmOperationDetail } from '@/components/ism-operation-detail';
 import { overview, refreshOverview } from '@/stores/overview';
 import { formatCountdown, formatDate, humanize } from '@/util/format';
 import { statusBadge } from '@/util/status';
+import '@/components/ism-operation-table';
+import '@/components/ism-operation-detail';
 
 /** Dashboard: what needs attention, with links to the page that fixes it. */
 export class IsmOverviewPage extends IsmPage {
   static override properties = {
     ...IsmPage.properties,
     now: { state: true },
+    operations: { state: true },
   };
 
   /** Drives the scan countdowns. */
   declare now: number;
+  declare operations: OperationActivity[];
+  protected override reloadOn = ['operation_updated', 'operation_committed'] as const;
+  private detail = createRef<IsmOperationDetail>();
   private clock: number | undefined;
 
   constructor() {
     super();
     this.now = Date.now();
+    this.operations = [];
   }
 
   override connectedCallback() {
@@ -39,7 +49,8 @@ export class IsmOverviewPage extends IsmPage {
   }
 
   protected override async load() {
-    await refreshOverview();
+    const [, page] = await Promise.all([refreshOverview(), admin.operationPage('recent', 10)]);
+    this.operations = page.rows;
     if (!overview.value) throw new Error('Cannot load the overview.');
   }
 
@@ -165,7 +176,7 @@ export class IsmOverviewPage extends IsmPage {
   }
 
   protected override render() {
-    return this.frame(() => {
+    return html`${this.frame(() => {
       const o = overview.value;
       if (!o) return html``;
       return html`
@@ -180,6 +191,14 @@ export class IsmOverviewPage extends IsmPage {
           ${this.stat('Unavailable folders', `${o.roots_unavailable} / ${o.roots_total}`, '/mappings', 'folder-sync', o.roots_unavailable > 0)}
           ${this.stat('Libraries without an account', o.uncovered_libraries, '/servers', 'users', o.uncovered_libraries > 0)}
         </div>
+        <section class="min-w-0 overflow-hidden rounded-box border border-base-300 bg-base-100">
+          <div class="flex items-center justify-between gap-3 p-4">
+            <h2 class="text-base font-semibold">Running & recent operations</h2>
+            <a href="/operations" class="link link-hover text-sm">View all operations</a>
+          </div>
+          <ism-operation-table .rows=${this.operations}
+            @operation-open=${(e: CustomEvent<string>) => this.detail.value?.show(e.detail)}></ism-operation-table>
+        </section>
         <section class="card card-border bg-base-100">
           <div class="card-body p-4">
             <h2 class="card-title text-base">Immich servers</h2>
@@ -199,7 +218,7 @@ export class IsmOverviewPage extends IsmPage {
         </section>
         ${this.detection(o)}
       `;
-    });
+    })}<ism-operation-detail ${ref(this.detail)}></ism-operation-detail>`;
   }
 }
 

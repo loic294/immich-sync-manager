@@ -24,6 +24,28 @@ pub fn router() -> Router<AppState> {
         .route("/events", get(events))
         .route("/inventory", get(inventory))
         .route("/content", get(content))
+        .route("/file-info", get(file_info))
+        .route("/thumbnail", get(thumbnail))
+}
+
+async fn file_info(
+    State(state): State<AppState>,
+    PeerAuth(peer): PeerAuth,
+    Query(q): Query<super::activity::SyncFileQuery>,
+) -> AppResult<Json<ism_core::dto::SyncFileDetails>> {
+    let location = super::activity::shared_location(&state, Some(&peer.id), &q).await?;
+    Ok(Json(
+        super::activity::file_details(&state, &location).await?,
+    ))
+}
+
+async fn thumbnail(
+    State(state): State<AppState>,
+    PeerAuth(peer): PeerAuth,
+    Query(q): Query<super::activity::SyncFileQuery>,
+) -> AppResult<Response> {
+    let location = super::activity::shared_location(&state, Some(&peer.id), &q).await?;
+    super::activity::thumbnail(&state, &location).await
 }
 
 /// A paired peer whose GET request carries a valid signature.

@@ -6,12 +6,18 @@ import type { OverrideView } from '@/api/generated/OverrideView';
 import type { PeerView } from '@/api/generated/PeerView';
 import type { ScheduleView } from '@/api/generated/ScheduleView';
 import type { ShareView } from '@/api/generated/ShareView';
+import type { SyncActivity } from '@/api/generated/SyncActivity';
 import type { SyncStatus } from '@/api/generated/SyncStatus';
-import type { TransferView } from '@/api/generated/TransferView';
 import type { Window } from '@/api/generated/Window';
 import { IsmPage } from '@/base/ism-page';
-import { formatBytes, formatDate, formatLocation, humanize, percent } from '@/util/format';
+import type { PageChange } from '@/components/ism-pagination';
+import type { IsmSyncDetail } from '@/components/ism-sync-detail';
+import { formatBytes, formatDate, humanize, percent } from '@/util/format';
 import { statusBadge } from '@/util/status';
+import { tabKeydown } from '@/util/tabs';
+import '@/components/ism-pagination';
+import '@/components/ism-sync-thumbnail';
+import '@/components/ism-sync-detail';
 
 const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'] as const;
 
@@ -33,6 +39,11 @@ export class IsmSyncPage extends IsmPage {
     overrides: { state: true },
     shares: { state: true },
     peers: { state: true },
+    rows: { state: true },
+    total: { state: true },
+    view: { state: true },
+    limit: { state: true },
+    offset: { state: true },
   };
 
   declare status: SyncStatus | undefined;
@@ -41,8 +52,19 @@ export class IsmSyncPage extends IsmPage {
   declare overrides: OverrideView[];
   declare shares: ShareView[];
   declare peers: PeerView[];
-  protected override reloadOn = ['sync_changed'] as const;
+  declare rows: SyncActivity[];
+  declare total: number;
+  declare view: string;
+  declare limit: number;
+  declare offset: number;
+  protected override reloadOn = [
+    'sync_changed',
+    'operation_updated',
+    'operation_committed',
+  ] as const;
   private overrideDialog = createRef<HTMLDialogElement>();
+  private settingsDialog = createRef<HTMLDialogElement>();
+  private detail = createRef<IsmSyncDetail>();
   private scheduleDirty = false;
 
   constructor() {
@@ -53,10 +75,16 @@ export class IsmSyncPage extends IsmPage {
     this.overrides = [];
     this.shares = [];
     this.peers = [];
+    this.rows = [];
+    this.total = 0;
+    this.view = 'active';
+    this.limit = 250;
+    this.offset = 0;
   }
 
   protected override async load() {
-    const [status, schedule, overrides, shares, peers] = await Promise.all([
+    const { view, limit, offset } = this;
+    const [status, schedule, overrides, shares, peers, page] = await Promise.all([
       admin.sync().catch((error: unknown) => {
         if (isApiError(error) && error.code === 'invalid_schedule') return undefined;
         throw error;
@@ -68,6 +96,7 @@ export class IsmSyncPage extends IsmPage {
       admin.overrides(),
       admin.shares(),
       admin.peers(),
+      admin.syncPage(view, limit, offset),
     ]);
     this.status = status;
     this.scheduleInvalid = !schedule;
@@ -80,6 +109,14 @@ export class IsmSyncPage extends IsmPage {
     this.overrides = overrides;
     this.shares = shares;
     this.peers = peers;
+    if (view === this.view && limit === this.limit && offset === this.offset) {
+      this.rows = page.rows;
+      this.total = page.total;
+      if (offset > 0 && offset >= page.total) {
+        this.offset = Math.max(0, Math.ceil(page.total / limit) - 1) * limit;
+        void this.reload();
+      }
+    }
   }
 
   private editSchedule(change: (schedule: ScheduleView) => ScheduleView) {
@@ -138,71 +175,65 @@ export class IsmSyncPage extends IsmPage {
     }
   }
 
-  private renderTransfer(t: TransferView, running: boolean) {
-    return html`<tr>
-      <td class="break-all">
-        <div>${formatLocation(t.location)}</div>
-        <div class="text-xs text-base-content/60">${t.share_name} · ${t.peer_name}</div>
-        ${t.error ? html`<div class="text-xs text-error">${t.error}</div>` : nothing}
-      </td>
-      <td class="whitespace-nowrap">${formatBytes(t.size)}</td>
-      <td class="min-w-32">
-        ${
-          running
-            ? html`<progress class="progress progress-primary w-24" value=${percent(t.bytes_done, t.size)} max="100"></progress>
-                <span class="text-xs">${percent(t.bytes_done, t.size)}%</span>`
-            : html`<span class=${statusBadge(t.status)}>${humanize(t.status)}</span>
-                ${t.attempts > 0 ? html`<span class="text-xs">${t.attempts} attempt(s)</span>` : nothing}`
-        }
-      </td>
-      <td class="whitespace-nowrap">${formatDate(t.queued_at)}</td>
-      <td class="whitespace-nowrap text-right">
-        ${
-          t.status === 'failed' || t.status === 'cancelled'
-            ? html`<button type="button" class="btn btn-ghost btn-sm" @click=${() => this.act(`retry:${t.id}`, () => admin.retryTransfer(t.id))}>
-                ${this.spin(`retry:${t.id}`)}<ism-icon name="rotate-ccw" size="sm"></ism-icon>Retry
-              </button>`
-            : nothing
-        }
-        ${
-          t.status !== 'cancelled'
-            ? html`<button type="button" class="btn btn-ghost btn-sm" @click=${() => this.act(`cancel:${t.id}`, () => admin.cancelTransfer(t.id))}>
-                ${this.spin(`cancel:${t.id}`)}Cancel
-              </button>`
-            : nothing
-        }
-      </td>
-    </tr>`;
-  }
-
-  private renderTransfers(title: string, rows: TransferView[], running: boolean, empty: string) {
-    return html`
-      <section class="card card-border bg-base-100">
-        <div class="card-body p-4">
-          <h2 class="card-title text-base">${title}</h2>
-          <div class="max-h-96 overflow-auto">
-            <table class="table table-sm table-pin-rows">
-              <thead><tr><th>File</th><th>Size</th><th>${running ? 'Progress' : 'Status'}</th><th>Queued</th><th></th></tr></thead>
-              <tbody>
-                ${
-                  rows.length === 0
-                    ? html`<tr><td colspan="5" class="text-base-content/60">${empty}</td></tr>`
-                    : rows.map((t) => this.renderTransfer(t, running))
-                }
-              </tbody>
-            </table>
-          </div>
+  private renderTransfers() {
+    return html`<section class="min-w-0 rounded-box border border-base-300 bg-base-100">
+      <div role="tablist" aria-label="Sync view" class="tabs tabs-border" @keydown=${tabKeydown}>
+        ${['active', 'completed'].map(
+          (view) => html`<button type="button" role="tab"
+          id=${`sync-tab-${view}`} aria-controls="sync-panel" aria-selected=${this.view === view}
+          tabindex=${this.view === view ? 0 : -1}
+          class=${this.view === view ? 'tab tab-active' : 'tab'}
+          @click=${() => {
+            this.view = view;
+            this.offset = 0;
+            void this.reload();
+          }}>
+          ${view === 'active' ? 'Active & queued' : 'Completed syncs'}</button>`,
+        )}
+      </div>
+      <div id="sync-panel" role="tabpanel" aria-labelledby=${`sync-tab-${this.view}`}>
+        ${this.view === 'active' ? html`<p class="px-4 pt-3 text-xs text-base-content/70">Current runs first, then files in queue order. Files waiting for a peer, retry delay or allowed hours may be skipped until eligible.</p>` : nothing}
+        <div class="overflow-x-auto">
+          <table class="table table-sm">
+            <thead><tr><th><span class="sr-only">Preview</span></th><th>File</th><th>Sync direction</th><th>Size</th><th>Status & progress</th>${this.view === 'completed' ? html`<th>Finished</th>` : nothing}</tr></thead>
+            <tbody>${
+              this.rows.length
+                ? this.rows.map(
+                    (t) => html`<tr class="hover:bg-base-200">
+              <td class="w-16"><ism-sync-thumbnail .transfer=${t}></ism-sync-thumbnail></td>
+              <td class="max-w-72 break-all">
+                <button type="button" class="link link-hover text-left font-medium" @click=${() => this.detail.value?.show(t)}>${t.relative_path.split('/').at(-1)}</button>
+                <div class="text-xs text-base-content/70">${t.share_name} / ${t.relative_path}</div>
+                ${t.error ? html`<p class="text-xs text-error">${t.error}</p>` : nothing}
+              </td>
+              <td class="text-xs"><div>${t.source}</div><div>→ ${t.destination}</div></td>
+              <td class="whitespace-nowrap">${formatBytes(t.size)}</td>
+              <td class="min-w-32"><span class=${statusBadge(t.status)}>${humanize(t.status)}</span>
+                ${t.status === 'running' ? html`<div><progress class="progress progress-primary w-24" aria-label="Transfer progress" value=${percent(t.bytes_done, t.size)} max="100"></progress> <span class="text-xs">${percent(t.bytes_done, t.size)}%</span></div>` : nothing}
+              </td>
+              ${this.view === 'completed' ? html`<td class="whitespace-nowrap">${formatDate(t.finished_at)}</td>` : nothing}
+            </tr>`,
+                  )
+                : html`<tr><td colspan=${this.view === 'completed' ? 6 : 5} class="p-6 text-center text-base-content/70">${this.view === 'completed' ? 'No completed syncs recorded yet.' : 'No active or queued files. New peer changes will appear here.'}</td></tr>`
+            }</tbody>
+          </table>
         </div>
-      </section>
-    `;
+        <ism-pagination .total=${this.total} .limit=${this.limit} .offset=${this.offset}
+          @page-change=${(e: CustomEvent<PageChange>) => {
+            this.limit = e.detail.limit;
+            this.offset = e.detail.offset;
+            void this.reload();
+          }}></ism-pagination>
+      </div>
+    </section>`;
   }
 
   private renderSchedule() {
     const s = this.schedule;
     if (!s) return nothing;
     return html`
-      <section class="card card-border bg-base-100">
-        <div class="card-body gap-3 p-4">
+      <section>
+        <div class="flex flex-col gap-3">
           <h2 class="card-title text-base">Allowed hours for file transfers</h2>
           <p class="text-sm text-base-content/70">
             New and changed file content is copied to peers only inside these windows. With no window,
@@ -264,8 +295,8 @@ export class IsmSyncPage extends IsmPage {
     const peerName = (id: string | null) =>
       id ? (this.peers.find((p) => p.id === id)?.name ?? id) : 'all peers';
     return html`
-      <section class="card card-border bg-base-100">
-        <div class="card-body p-4">
+      <section>
+        <div class="flex flex-col gap-3">
           <h2 class="card-title text-base">Overrides</h2>
           ${
             this.overrides.length === 0
@@ -346,7 +377,7 @@ export class IsmSyncPage extends IsmPage {
                 The saved schedule is invalid. File transfers are paused unless an override is active.
                 Choose replacement hours and save them to resume scheduling.
               </div>
-              ${this.renderSchedule()}
+              ${this.renderTransfers()}
             `;
           }
           if (!s) return html``;
@@ -364,23 +395,30 @@ export class IsmSyncPage extends IsmPage {
                 ${s.queued_total} queued, ${s.failed_total} failed.
               </span>
             </div>
-            ${this.renderTransfers('Transferring now', s.running, true, 'Nothing is transferring.')}
-            ${this.renderTransfers(
-              s.queued_total + s.failed_total > s.queued.length
-                ? `Queue (first ${s.queued.length})`
-                : 'Queue',
-              s.queued,
-              false,
-              'The queue is empty.',
-            )}
-            ${this.renderSchedule()} ${this.renderOverrides()}
+            ${this.renderTransfers()}
           `;
         },
-        html`<button type="button" class="btn btn-primary btn-sm" @click=${() => this.overrideDialog.value?.showModal()}>
-          <ism-icon name="play" size="sm"></ism-icon>Allow transfers now
+        html`<button type="button" class="btn btn-sm" @click=${() => this.settingsDialog.value?.showModal()}>
+          <ism-icon name="settings" size="sm"></ism-icon>Hours & overrides
         </button>`,
       )}
+      <dialog class="modal" aria-labelledby="sync-settings-title" ${ref(this.settingsDialog)}>
+        <div class="modal-box flex max-w-3xl flex-col gap-5">
+          <div class="flex items-center justify-between gap-3">
+            <h2 id="sync-settings-title" class="text-lg font-semibold">Sync settings</h2>
+            <form method="dialog"><button class="btn btn-ghost btn-sm btn-square" aria-label="Close sync settings"><ism-icon name="x"></ism-icon></button></form>
+          </div>
+          ${this.renderSchedule()}
+          <div class="divider my-0"></div>
+          ${this.renderOverrides()}
+          <button type="button" class="btn btn-primary btn-sm self-start" @click=${() => this.overrideDialog.value?.showModal()}>
+            <ism-icon name="play" size="sm"></ism-icon>Allow transfers now
+          </button>
+        </div>
+        <form method="dialog" class="modal-backdrop"><button>Close</button></form>
+      </dialog>
       ${this.renderOverrideDialog()}
+      <ism-sync-detail ${ref(this.detail)}></ism-sync-detail>
     `;
   }
 }

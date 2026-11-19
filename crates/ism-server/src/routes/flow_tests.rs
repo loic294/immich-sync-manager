@@ -127,6 +127,271 @@ impl Harness {
 }
 
 #[tokio::test]
+async fn activity_websocket_requires_a_session_and_same_origin_and_streams_changes() {
+    use futures_util::StreamExt;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    let h = harness().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let app = h.app.clone();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let url = format!("ws://{address}/api/admin/live");
+    let unauthenticated = tokio_tungstenite::connect_async(&url).await;
+    assert!(
+        matches!(unauthenticated, Err(tokio_tungstenite::tungstenite::Error::Http(response)) if response.status() == StatusCode::UNAUTHORIZED)
+    );
+    let mut request = url.clone().into_client_request().unwrap();
+    request
+        .headers_mut()
+        .insert(header::COOKIE, h.cookie.parse().unwrap());
+    request
+        .headers_mut()
+        .insert(header::ORIGIN, "https://unrelated.example".parse().unwrap());
+    let cross_origin = tokio_tungstenite::connect_async(request).await;
+    assert!(
+        matches!(cross_origin, Err(tokio_tungstenite::tungstenite::Error::Http(response)) if response.status() == StatusCode::FORBIDDEN)
+    );
+    let mut request = url.into_client_request().unwrap();
+    request
+        .headers_mut()
+        .insert(header::COOKIE, h.cookie.parse().unwrap());
+    request
+        .headers_mut()
+        .insert(header::ORIGIN, format!("http://{address}").parse().unwrap());
+    let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+    h.state.emit(crate::state::ServerEvent::SyncChanged);
+    let event = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let message = socket.next().await.unwrap().unwrap();
+            if let tokio_tungstenite::tungstenite::Message::Text(text) = message {
+                break serde_json::from_str::<Value>(&text).unwrap();
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(event["type"], "sync_changed");
+    socket.close(None).await.unwrap();
+    server.abort();
+}
+
+#[tokio::test]
+async fn activity_pages_are_bounded_stable_and_handling_does_not_resolve_recovery() {
+    let h = harness().await;
+    h.map_root().await;
+    sqlx::query(
+        "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 525)
+         INSERT INTO operations (id, idempotency_key, principal, source, request_json, status, created_at)
+         SELECT printf('op-%05d', i), printf('key-%d',i), 'admin:admin', 'admin', '{}',
+                CASE WHEN i = 525 THEN 'recovery_required' ELSE 'completed' END, '2026-01-01T00:00:00Z' FROM n",
+    ).execute(&h.state.db).await.unwrap();
+    sqlx::query(
+        r#"INSERT INTO operation_items (operation_id, idx, kind, action_json, status)
+           SELECT id, 0, 'move', '{"kind":"move","source":{"root_id":"photos","path":"a.jpg"},"target":{"root_id":"photos","path":"2024/a.jpg"}}', 'done' FROM operations"#,
+    ).execute(&h.state.db).await.unwrap();
+    let page = send(&h.app, get("/api/admin/operations/page", &h.admin())).await;
+    assert_eq!(page.status, StatusCode::OK, "{:?}", page.json());
+    assert_eq!(page.json()["total"], 525);
+    assert_eq!(page.json()["rows"].as_array().unwrap().len(), 250);
+    assert_eq!(page.json()["rows"][0]["operation_id"], "op-00525");
+    assert_eq!(page.json()["rows"][0]["title"], "Move");
+    assert_eq!(page.json()["rows"][0]["source"], "ISM: Test");
+    assert_eq!(page.json()["rows"][0]["destination"], "ISM: Test");
+    let page = send(
+        &h.app,
+        get(
+            "/api/admin/operations/page?limit=5000&offset=250",
+            &h.admin(),
+        ),
+    )
+    .await;
+    assert_eq!(page.json()["rows"].as_array().unwrap().len(), 275);
+    assert_eq!(page.json()["rows"][0]["operation_id"], "op-00275");
+    let invalid = send(
+        &h.app,
+        get("/api/admin/operations/page?limit=5001", &h.admin()),
+    )
+    .await;
+    assert_eq!(invalid.status, StatusCode::BAD_REQUEST);
+    let recent = send(
+        &h.app,
+        get(
+            "/api/admin/operations/page?status=recent&limit=10",
+            &h.admin(),
+        ),
+    )
+    .await;
+    assert_eq!(recent.json()["rows"].as_array().unwrap().len(), 10);
+    let before = send(&h.app, get("/api/admin/overview", &h.admin())).await;
+    assert_eq!(before.json()["operations_attention"], 1);
+    let response = send(
+        &h.app,
+        json_req(
+            "POST",
+            "/api/admin/operations/op-00525/handled",
+            &h.admin(),
+            &json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        response.status,
+        StatusCode::NO_CONTENT,
+        "{:?}",
+        response.json()
+    );
+    let (status, resolved, handled): (String, i64, Option<String>) = sqlx::query_as(
+        "SELECT status, recovery_resolved, handled_at FROM operations WHERE id = 'op-00525'",
+    )
+    .fetch_one(&h.state.db)
+    .await
+    .unwrap();
+    assert_eq!(status, "recovery_required");
+    assert_eq!(resolved, 0);
+    assert!(handled.is_some());
+    let attention = send(
+        &h.app,
+        get("/api/admin/operations/page?status=attention", &h.admin()),
+    )
+    .await;
+    assert_eq!(attention.json()["total"], 0);
+    let overview = send(&h.app, get("/api/admin/overview", &h.admin())).await;
+    assert_eq!(overview.json()["operations_attention"], 0);
+    let response = send(
+        &h.app,
+        json_req(
+            "POST",
+            "/api/admin/operations/op-00524/handled",
+            &h.admin(),
+            &json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(response.status, StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn activity_details_include_original_sidecars_and_live_step_states() {
+    let h = harness().await;
+    h.map_root().await;
+    std::fs::write(h.root.join("2024/a.jpg"), b"original").unwrap();
+    std::fs::write(h.root.join("2024/a.jpg.xmp"), b"metadata").unwrap();
+    let accepted = send(&h.app, json_req("POST", "/api/v1/operations", &h.admin(), &json!({
+        "idempotency_key": "live-step-details",
+        "actions": [{"kind":"move","source":{"root_id":"photos","path":"2024/a.jpg"},"target":{"root_id":"photos","path":"2024/b.jpg"}}]
+    }))).await;
+    assert_eq!(
+        accepted.status,
+        StatusCode::ACCEPTED,
+        "{:?}",
+        accepted.json()
+    );
+    let id = accepted.json()["operation_id"].as_str().unwrap().to_owned();
+    crate::ops::exec::run_operation(&h.state, &id)
+        .await
+        .unwrap();
+    let detail = send(
+        &h.app,
+        get(&format!("/api/admin/operations/{id}/detail"), &h.admin()),
+    )
+    .await;
+    assert_eq!(detail.status, StatusCode::OK, "{:?}", detail.json());
+    assert_eq!(detail.json()["operation"]["status"], "completed");
+    let body = detail.json();
+    let files = body["tasks"][0]["files"].as_array().unwrap();
+    assert_eq!(files.len(), 2);
+    assert!(
+        files
+            .iter()
+            .any(|file| file["from"]["path"] == "2024/a.jpg.xmp"
+                && file["to"]["path"] == "2024/b.jpg.xmp")
+    );
+    let steps = body["tasks"][0]["steps"].as_array().unwrap();
+    assert!(steps.len() >= 3);
+    assert!(steps.iter().all(|step| step["status"] == "done"));
+    sqlx::query("UPDATE operation_items SET status='running', progress_json = ? WHERE operation_id = ?")
+        .bind(json!({"files": [], "steps": [{"label":"Move original", "status":"done"},{"label":"Update Immich","status":"running"},{"label":"Record changes","status":"pending"}]}).to_string())
+        .bind(&id).execute(&h.state.db).await.unwrap();
+    let detail = send(
+        &h.app,
+        get(&format!("/api/admin/operations/{id}/detail"), &h.admin()),
+    )
+    .await;
+    assert_eq!(detail.json()["tasks"][0]["steps"][1]["status"], "running");
+    assert_eq!(detail.json()["tasks"][0]["steps"][2]["status"], "pending");
+}
+
+#[tokio::test]
+async fn sync_activity_keeps_running_first_and_pages_completed_publications_separately() {
+    let h = harness().await;
+    h.map_root().await;
+    sqlx::query("INSERT INTO peers (id,name,url,secret_enc,status,created_at) VALUES ('peer1','Remote','https://peer.example','unused','online',?)")
+        .bind(crate::db::now()).execute(&h.state.db).await.unwrap();
+    sqlx::query("INSERT INTO shares (id,name,root_id,path,peer_ids_json,enabled) VALUES ('share1','Photos','photos','2024','[\"peer1\"]',1)")
+        .execute(&h.state.db).await.unwrap();
+    for (id, status) in [
+        ("a-queued", "queued"),
+        ("b-running", "running"),
+        ("c-queued", "queued"),
+        ("d-failed", "failed"),
+    ] {
+        sqlx::query(
+            "INSERT INTO transfers (id,peer_id,share_id,rel_path,sha256,size,vv_json,status,bytes_done,queued_at,updated_at)
+             VALUES (?, 'peer1','share1',?,'hash',100,'{}',?,50,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+        ).bind(id).bind(format!("{id}.jpg")).bind(status).execute(&h.state.db).await.unwrap();
+    }
+    sqlx::query("INSERT INTO operations (id,idempotency_key,principal,source,request_json,status,created_at) VALUES ('publish1','publish-key','peer:peer1','peer','{}','running',?)")
+        .bind(crate::db::now()).execute(&h.state.db).await.unwrap();
+    for (id, operation) in [("history1", None), ("history2", Some("publish1"))] {
+        sqlx::query(
+            "INSERT INTO transfer_history (id,peer_id,share_id,rel_path,sha256,size,queued_at,finished_at,operation_id)
+             VALUES (?,'peer1','share1',?,'hash',100,'2026-01-01T00:00:00Z','2026-01-02T00:00:00Z',?)",
+        ).bind(id).bind(format!("{id}.jpg")).bind(operation).execute(&h.state.db).await.unwrap();
+    }
+    let response = send(&h.app, get("/api/admin/sync/page?limit=2", &h.admin())).await;
+    assert_eq!(response.status, StatusCode::OK, "{:?}", response.json());
+    assert_eq!(response.json()["total"], 5);
+    assert_eq!(response.json()["rows"][0]["id"], "b-running");
+    assert_eq!(response.json()["rows"][1]["id"], "history2");
+    assert!(response.json()["rows"][1]["finished_at"].is_null());
+    assert_eq!(response.json()["rows"][0]["source"], "ISM: Remote");
+    assert_eq!(response.json()["rows"][0]["destination"], "ISM: Test");
+    let response = send(
+        &h.app,
+        get("/api/admin/sync/page?limit=2&offset=2", &h.admin()),
+    )
+    .await;
+    assert_eq!(response.json()["rows"][0]["id"], "a-queued");
+    assert_eq!(response.json()["rows"][1]["id"], "c-queued");
+    let response = send(
+        &h.app,
+        get("/api/admin/sync/page?status=completed", &h.admin()),
+    )
+    .await;
+    assert_eq!(response.json()["total"], 1);
+    sqlx::query("UPDATE operations SET status='completed',finished_at='2026-01-03T00:00:00Z' WHERE id='publish1'")
+        .execute(&h.state.db).await.unwrap();
+    let response = send(
+        &h.app,
+        get("/api/admin/sync/page?status=completed", &h.admin()),
+    )
+    .await;
+    assert_eq!(response.json()["total"], 2);
+    assert_eq!(response.json()["rows"][0]["id"], "history2");
+    let response = send(&h.app, get("/api/admin/sync/page?id=history2", &h.admin())).await;
+    assert_eq!(response.json()["rows"][0]["status"], "completed");
+    let response = send(
+        &h.app,
+        get("/api/admin/sync/files?share=Photos&path=", &h.admin()),
+    )
+    .await;
+    assert_eq!(response.status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn mounted_folders_browse_deep_paths_one_level_at_a_time() {
     let h = harness().await;
     let photos = h.state.config.mounts_dir.join("homes/example-user/Photos");
@@ -694,10 +959,10 @@ async fn migrated_server_defaults_to_api_with_db_fallback() {
 }
 
 #[tokio::test]
-async fn immich_linked_changes_fail_closed_when_the_barrier_cannot_be_taken() {
+async fn an_empty_library_folder_does_not_require_immich_queue_access() {
     let h = harness().await;
     h.map_root().await;
-    // No administrator account: ISM cannot pause Immich's library queue.
+    // Empty folders do not change Immich assets or require a queue pause.
     sqlx::query("INSERT INTO immich_servers (id, name, url, database_url_enc, direct_writes_enabled, version, compatible, maintenance_json, created_at) VALUES ('server', 'Example', 'https://immich.example', 'encrypted', 1, '3.4.1', 1, ?, ?)")
         .bind(serde_json::to_string(&ism_core::maintenance::MaintenanceState::default()).unwrap())
         .bind(crate::db::now())
@@ -725,16 +990,13 @@ async fn immich_linked_changes_fail_closed_when_the_barrier_cannot_be_taken() {
     let (operation, _) = crate::ops::load(&h.state, &accepted.operation_id)
         .await
         .unwrap();
-    assert_eq!(operation.status, ism_core::dto::OperationStatus::Failed);
-    assert_eq!(
-        operation.items[0].error.as_ref().unwrap().code,
-        "maintenance_blocked"
-    );
-    assert!(!h.root.join("2024/new").exists());
+    assert_eq!(operation.status, ism_core::dto::OperationStatus::Completed);
+    assert!(operation.items[0].error.is_none());
+    assert!(h.root.join("2024/new").is_dir());
 }
 
 #[tokio::test]
-async fn a_move_into_an_immich_library_runs_under_the_write_barrier() {
+async fn a_move_into_an_immich_library_schedules_an_import_scan() {
     let h = harness().await;
     h.map_root().await;
     let inbox = h._dir.path().join("inbox");
@@ -811,11 +1073,8 @@ async fn a_move_into_an_immich_library_runs_under_the_write_barrier() {
     );
     assert!(target.exists() && h.root.join("2024/IMG_0001.jpg.xmp").exists());
     assert!(!inbox.join("IMG_0001.jpg").exists());
-    // Paused before the file moved, resumed after it was in place.
-    assert_eq!(
-        *fake.queue_log.lock().unwrap(),
-        [(true, false), (false, true)]
-    );
+    // No existing asset is mutated, so the import does not pause Immich's queues.
+    assert!(fake.queue_log.lock().unwrap().is_empty());
     assert!(fake.paused.lock().unwrap().is_empty());
     let server = crate::immich::registry::server(&h.state, "s1")
         .await
@@ -2762,7 +3021,7 @@ async fn an_upload_gets_its_asset_id_after_the_library_scan() {
         .execute(&h.state.db)
         .await
         .unwrap();
-    sqlx::query("UPDATE immich_servers SET direct_writes_enabled = 1, database_url_enc = 'unused' WHERE id = 's1'")
+    sqlx::query("UPDATE immich_servers SET direct_writes_enabled = 1, database_url_enc = 'unused', external_library_move_mode = 'db_only' WHERE id = 's1'")
         .execute(&h.state.db)
         .await
         .unwrap();

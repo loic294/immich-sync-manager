@@ -27,6 +27,8 @@ export abstract class IsmPage extends IsmElement {
   protected reloadOn: readonly ChangeType[] = [];
   private stopEvents: (() => void) | undefined;
   private reloadTimer: number | undefined;
+  private reloading: Promise<void> | undefined;
+  private reloadAgain = false;
 
   constructor() {
     super();
@@ -47,16 +49,38 @@ export abstract class IsmPage extends IsmElement {
     super.disconnectedCallback();
     this.stopEvents?.();
     window.clearTimeout(this.reloadTimer);
+    this.reloadTimer = undefined;
   }
 
   protected onChange(event: ChangeEvent) {
     if (event.type !== 'resync' && !this.reloadOn.includes(event.type)) return;
     // Coalesce bursts (one event per committed item) into one request.
-    window.clearTimeout(this.reloadTimer);
-    this.reloadTimer = window.setTimeout(() => void this.reload(), 250);
+    if (this.reloadTimer !== undefined) return;
+    this.reloadTimer = window.setTimeout(() => {
+      this.reloadTimer = undefined;
+      void this.reload();
+    }, 250);
   }
 
-  async reload(): Promise<void> {
+  reload(): Promise<void> {
+    if (this.reloading) {
+      this.reloadAgain = true;
+      return this.reloading;
+    }
+    this.reloading = this.reloadLoop().finally(() => {
+      this.reloading = undefined;
+    });
+    return this.reloading;
+  }
+
+  private async reloadLoop(): Promise<void> {
+    do {
+      this.reloadAgain = false;
+      await this.loadOnce();
+    } while (this.reloadAgain && this.isConnected);
+  }
+
+  private async loadOnce(): Promise<void> {
     try {
       await this.load();
       this.loadError = undefined;

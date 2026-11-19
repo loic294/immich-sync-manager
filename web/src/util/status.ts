@@ -14,6 +14,7 @@ export function statusBadge(status: string): string {
     case 'reconciling':
     case 'restoring':
     case 'transferring':
+    case 'publishing':
     case 'resolving':
       return 'badge badge-info badge-soft';
     case 'queued':

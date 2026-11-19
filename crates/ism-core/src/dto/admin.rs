@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
-use super::client::{ClientAction, Location};
+use super::client::{ClientAction, Location, Operation, OperationStatus, PlannedFile, Progress};
 use crate::maintenance::Phase;
 use crate::schedule::Window;
 
@@ -106,19 +106,14 @@ pub struct ScanScheduleView {
     pub last_error: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[ts(export)]
 #[serde(rename_all = "snake_case")]
 pub enum ImmichMoveMode {
     ApiOnly,
+    #[default]
     ApiWithDbFallback,
     DbOnly,
-}
-
-impl Default for ImmichMoveMode {
-    fn default() -> Self {
-        Self::ApiWithDbFallback
-    }
 }
 
 impl ImmichMoveMode {
@@ -365,6 +360,92 @@ pub struct TransferView {
     pub error: Option<String>,
     pub queued_at: String,
     pub override_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct OperationActivity {
+    pub operation_id: String,
+    pub title: String,
+    pub label: Option<String>,
+    pub source: String,
+    pub destination: String,
+    pub status: OperationStatus,
+    pub progress: Progress,
+    pub created_at: String,
+    pub finished_at: Option<String>,
+    pub handled_at: Option<String>,
+    pub recovery_resolved: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct OperationPage {
+    pub rows: Vec<OperationActivity>,
+    pub total: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct OperationStep {
+    pub label: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct OperationTaskProgress {
+    pub files: Vec<PlannedFile>,
+    pub steps: Vec<OperationStep>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct OperationDetail {
+    pub operation: Operation,
+    pub activity: OperationActivity,
+    pub tasks: Vec<OperationTaskProgress>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct SyncActivity {
+    pub id: String,
+    pub peer_id: String,
+    pub share_name: String,
+    pub relative_path: String,
+    pub location: Location,
+    pub source: String,
+    pub destination: String,
+    pub destination_path: String,
+    pub status: String,
+    pub size: u64,
+    pub bytes_done: u64,
+    pub error: Option<String>,
+    pub queued_at: String,
+    pub finished_at: Option<String>,
+    pub operation_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct SyncPage {
+    pub rows: Vec<SyncActivity>,
+    pub total: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct SyncFileInfo {
+    pub path: String,
+    pub role: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct SyncFileDetails {
+    pub folder: String,
+    pub files: Vec<SyncFileInfo>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]

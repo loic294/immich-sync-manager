@@ -1,5 +1,6 @@
 //! HTTP routing: client API, admin API, peer API and the single-page app.
 
+pub mod activity;
 pub mod admin;
 pub mod client;
 pub mod peer;

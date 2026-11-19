@@ -936,6 +936,17 @@ async fn content_and_management_events_replicate_through_managed_operations() {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     assert_eq!(published, 2);
+    let history: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM transfer_history h JOIN operations o ON o.id = h.operation_id
+         WHERE o.status = 'completed' AND h.rel_path IN ('x.jpg','y.jpg')",
+    )
+    .fetch_one(&b.state.db)
+    .await
+    .unwrap();
+    assert_eq!(
+        history, 2,
+        "completed transfers remain inspectable after leaving the queue"
+    );
 
     // A newer version replaces the copy and keeps the old one in ISM trash.
     let before = trash_count(&b);
@@ -2738,7 +2749,7 @@ async fn cancelled_peer_folder_creation_can_be_explicitly_retried() {
 }
 
 #[tokio::test]
-async fn incoming_folder_creation_goes_through_the_immich_barrier() {
+async fn incoming_empty_folder_uses_a_managed_operation_without_queue_access() {
     let (_a, b, peer, _) = pending_folder_fixture().await;
     sqlx::query(
         "INSERT INTO immich_servers (id, name, url, database_url_enc, direct_writes_enabled, version, compatible, maintenance_json, created_at)
@@ -2758,20 +2769,15 @@ async fn incoming_folder_creation_goes_through_the_immich_barrier() {
         .fetch_one(&b.state.db)
         .await
         .unwrap();
-    // No administrator account: the library queue cannot be paused, so nothing is written.
+    // Creating an empty folder does not change any existing Immich assets.
     crate::ops::exec::run_operation(&b.state, &operation_id)
         .await
         .unwrap();
     let (operation, _) = crate::ops::load(&b.state, &operation_id).await.unwrap();
-    assert_eq!(
-        operation.items[0].error.as_ref().unwrap().code,
-        "maintenance_blocked"
-    );
-    assert!(!b.shared.join("new-folder").exists());
-    assert_eq!(
-        super::net::peer(&b.state, &peer.id).await.unwrap().cursor,
-        peer.cursor
-    );
+    assert_eq!(operation.status, ism_core::dto::OperationStatus::Completed);
+    assert!(operation.items[0].error.is_none());
+    assert!(b.shared.join("new-folder").is_dir());
+    assert!(super::net::peer(&b.state, &peer.id).await.unwrap().cursor > peer.cursor);
 }
 
 #[tokio::test]

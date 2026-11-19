@@ -36,6 +36,7 @@ use crate::state::AppState;
 
 pub fn router() -> Router<AppState> {
     Router::new()
+        .merge(super::activity::router())
         .route("/session", get(session))
         .route("/setup", post(setup))
         .route("/login", post(login))
@@ -290,8 +291,8 @@ async fn overview(State(state): State<AppState>, Admin(_): Admin) -> AppResult<J
         )
         .await?,
         operations_attention: count(
-            "SELECT COUNT(*) FROM operations WHERE (status = 'recovery_required' AND recovery_resolved = 0)
-             OR (status IN ('failed','partial') AND finished_at > datetime('now','-1 day'))",
+            "SELECT COUNT(*) FROM operations WHERE handled_at IS NULL AND
+             ((status = 'recovery_required' AND recovery_resolved = 0) OR status IN ('failed','partial'))",
         )
         .await?,
         transfers_queued: count("SELECT COUNT(*) FROM transfers WHERE status IN ('queued','running')").await?,
@@ -1388,8 +1389,23 @@ async fn delete_share(
     Ok(no_content())
 }
 
-async fn sync_status(State(state): State<AppState>, Admin(_): Admin) -> AppResult<Response> {
-    Ok(Json(peers::sync_status(&state).await?).into_response())
+#[derive(Default, Deserialize)]
+struct SyncStatusQuery {
+    #[serde(default)]
+    summary: bool,
+}
+
+async fn sync_status(
+    State(state): State<AppState>,
+    Admin(_): Admin,
+    Query(q): Query<SyncStatusQuery>,
+) -> AppResult<Response> {
+    let status = if q.summary {
+        peers::sync_status_with_rows(&state, false).await?
+    } else {
+        peers::sync_status(&state).await?
+    };
+    Ok(Json(status).into_response())
 }
 
 async fn get_schedule(State(state): State<AppState>, Admin(_): Admin) -> AppResult<Response> {

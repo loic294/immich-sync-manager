@@ -755,6 +755,10 @@ async fn transfers(state: &AppState, statuses: &str, limit: i64) -> AppResult<Ve
 }
 
 pub async fn sync_status(state: &AppState) -> AppResult<SyncStatus> {
+    sync_status_with_rows(state, true).await
+}
+
+pub async fn sync_status_with_rows(state: &AppState, include_rows: bool) -> AppResult<SyncStatus> {
     let view = schedule(state).await?;
     let schedule = Schedule::new(&view.timezone, &view.windows)
         .map_err(|e| AppError::internal(e.to_string()))?;
@@ -772,8 +776,16 @@ pub async fn sync_status(state: &AppState) -> AppResult<SyncStatus> {
             schedule.next_allowed(now).map(db::ts)
         },
         override_active: active_overrides(state).await?.into_iter().next(),
-        running: transfers(state, "'running'", 50).await?,
-        queued: transfers(state, "'queued', 'failed', 'cancelled'", 500).await?,
+        running: if include_rows {
+            transfers(state, "'running'", 50).await?
+        } else {
+            Vec::new()
+        },
+        queued: if include_rows {
+            transfers(state, "'queued', 'failed', 'cancelled'", 500).await?
+        } else {
+            Vec::new()
+        },
         queued_total: count("SELECT COUNT(*) FROM transfers WHERE status = 'queued'").await?,
         failed_total: count("SELECT COUNT(*) FROM transfers WHERE status = 'failed'").await?,
     })

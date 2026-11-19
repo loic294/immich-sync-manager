@@ -19,6 +19,7 @@ export default defineConfig({
     proxy: {
       '/api': {
         target: apiTarget,
+        ws: true,
         // The backend's CSRF check compares Origin to Host, so Host must stay as the browser sent it.
         changeOrigin: false,
         configure: (proxy) => {

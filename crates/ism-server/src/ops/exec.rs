@@ -347,7 +347,7 @@ pub async fn run_operation(state: &AppState, id: &str) -> AppResult<()> {
             continue;
         }
         journal(state, id, index, &plan).await?;
-        match execute(state, id, &plan).await {
+        match execute(state, id, index, &plan).await {
             Ok(()) => {
                 done += 1;
                 if needs_scan(action, &plan) {
@@ -545,7 +545,71 @@ async fn journal(state: &AppState, id: &str, index: i64, plan: &Plan) -> AppResu
         .bind(index)
         .execute(&state.db)
         .await?;
+    let progress = ism_core::dto::OperationTaskProgress {
+        files: plan.files.clone(),
+        steps: steps
+            .into_iter()
+            .chain(
+                plan.db
+                    .keys()
+                    .map(|server| format!("Update Immich database: {server}")),
+            )
+            .chain(std::iter::once("Record changes".into()))
+            .map(|label| ism_core::dto::OperationStep {
+                label,
+                status: "pending".into(),
+            })
+            .collect(),
+    };
+    sqlx::query("UPDATE operation_items SET progress_json = ? WHERE operation_id = ? AND idx = ?")
+        .bind(serde_json::to_string(&progress)?)
+        .bind(id)
+        .bind(index)
+        .execute(&state.db)
+        .await?;
     Ok(())
+}
+
+async fn step_progress(state: &AppState, id: &str, item: i64, step: usize, status: &str) {
+    let result: AppResult<()> = async {
+        let json: Option<String> = sqlx::query_scalar(
+            "SELECT progress_json FROM operation_items WHERE operation_id = ? AND idx = ?",
+        )
+        .bind(id)
+        .bind(item)
+        .fetch_optional(&state.db)
+        .await?
+        .flatten();
+        let Some(json) = json else {
+            return Ok(());
+        };
+        let mut progress: ism_core::dto::OperationTaskProgress = serde_json::from_str(&json)?;
+        if let Some(current) = progress.steps.get_mut(step) {
+            current.status = status.to_owned();
+        }
+        sqlx::query(
+            "UPDATE operation_items SET progress_json = ? WHERE operation_id = ? AND idx = ?",
+        )
+        .bind(serde_json::to_string(&progress)?)
+        .bind(id)
+        .bind(item)
+        .execute(&state.db)
+        .await?;
+        state.emit(crate::state::ServerEvent::OperationUpdated {
+            operation_id: id.to_owned(),
+        });
+        Ok(())
+    }
+    .await;
+    if let Err(error) = result {
+        tracing::error!(
+            operation = id,
+            item,
+            step,
+            "cannot persist live step progress: {}",
+            error.message()
+        );
+    }
 }
 
 pub struct Failure {
@@ -918,8 +982,7 @@ async fn call_api(state: &AppState, step: &ApiStep) -> AppResult<()> {
                     state,
                     &server,
                     destination_library_id,
-                    source_path,
-                    destination_path,
+                    (source_path, destination_path),
                     asset_id,
                     from_owner,
                     to_owner,
@@ -977,8 +1040,7 @@ async fn fallback_sync_move(
     state: &AppState,
     server: &registry::Server,
     destination_library_id: &Option<String>,
-    source_path: &str,
-    destination_path: &str,
+    (source_path, destination_path): (&str, &str),
     asset_id: &Option<String>,
     from_owner: &Option<String>,
     to_owner: &Option<String>,
@@ -1318,7 +1380,7 @@ fn needs_scan(action: &OperationAction, plan: &Plan) -> bool {
     }
 }
 
-async fn execute(state: &AppState, op_id: &str, plan: &Plan) -> Result<(), Failure> {
+async fn execute(state: &AppState, op_id: &str, item: i64, plan: &Plan) -> Result<(), Failure> {
     if let Err(e) = crate::watch::expect_writes(state, &expected_writes(plan)).await {
         return Err(Failure::new(
             "internal",
@@ -1326,26 +1388,42 @@ async fn execute(state: &AppState, op_id: &str, plan: &Plan) -> Result<(), Failu
         ));
     }
     let mut done = Vec::new();
-    for step in &plan.steps {
+    for (index, step) in plan.steps.iter().enumerate() {
+        step_progress(state, op_id, item, index, "running").await;
         match apply(state, step).await {
             Ok(Some(u)) => done.push(u),
             Ok(None) => {}
-            Err(f) if matches!(step, Step::Remove(_)) => return Err(f),
-            Err(f) => return Err(rollback(state, done, f).await),
+            Err(f) if matches!(step, Step::Remove(_)) => {
+                step_progress(state, op_id, item, index, "failed").await;
+                return Err(f);
+            }
+            Err(f) => {
+                step_progress(state, op_id, item, index, "failed").await;
+                return Err(rollback(state, done, f).await);
+            }
         }
+        step_progress(state, op_id, item, index, "done").await;
     }
-    for (server_id, steps) in &plan.db {
+    for (index, (server_id, steps)) in plan.db.iter().enumerate() {
+        let index = plan.steps.len() + index;
+        step_progress(state, op_id, item, index, "running").await;
         if let Err(f) = apply_db(state, server_id, steps).await {
+            step_progress(state, op_id, item, index, "failed").await;
             return Err(rollback(state, done, f).await);
         }
+        step_progress(state, op_id, item, index, "done").await;
     }
+    let index = plan.steps.len() + plan.db.len();
+    step_progress(state, op_id, item, index, "running").await;
     if let Err(e) = bookkeeping(state, op_id, plan).await {
+        step_progress(state, op_id, item, index, "failed").await;
         return Err(Failure {
             code: "recovery_required".into(),
             message: format!("operation bookkeeping failed: {}", e.message()),
             recovery: true,
         });
     }
+    step_progress(state, op_id, item, index, "done").await;
     Ok(())
 }
 
@@ -1909,7 +1987,7 @@ mod tests {
             ],
             ..Plan::default()
         };
-        let Err(failure) = execute(&state, "unused", &plan).await else {
+        let Err(failure) = execute(&state, "unused", 0, &plan).await else {
             panic!("changed folder should fail verification");
         };
         assert_eq!(failure.code, "revision_changed");

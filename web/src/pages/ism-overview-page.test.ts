@@ -76,7 +76,10 @@ describe('ism-overview-page', () => {
   afterEach(() => vi.restoreAllMocks());
 
   it('shows watchers, scan countdowns and re-applies drifted Immich settings', async () => {
-    vi.spyOn(api, 'get').mockResolvedValue(OVERVIEW as never);
+    vi.spyOn(api, 'get').mockImplementation(
+      async (path) =>
+        (path === '/api/admin/operations/page' ? { rows: [], total: 0 } : OVERVIEW) as never,
+    );
     const post = vi.spyOn(api, 'post').mockResolvedValue(undefined as never);
     const page = await mount('ism-overview-page');
     await vi.waitFor(() => expect(page.textContent).toContain('Family library'));

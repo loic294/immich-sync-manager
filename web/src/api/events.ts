@@ -1,11 +1,5 @@
 import { type ReadonlySignal, signal } from '@preact/signals-core';
 
-/**
- * Live change notifications from `GET /api/admin/events` (server-sent events named `change`, each
- * a JSON `{ "type": ... }`). There is no replay: after a reconnect every listener is called with a
- * `resync` event so pages refetch what they show.
- */
-
 export type ChangeType =
   | 'operation_updated'
   | 'operation_committed'
@@ -23,35 +17,44 @@ export interface ChangeEvent {
 
 export type ConnectionState = 'connecting' | 'open' | 'reconnecting' | 'closed';
 
-export interface EventSourceLike {
+export interface SocketLike {
   onopen: ((event: Event) => void) | null;
+  onclose: ((event: CloseEvent) => void) | null;
   onerror: ((event: Event) => void) | null;
-  addEventListener(type: string, listener: (event: MessageEvent<string>) => void): void;
+  onmessage: ((event: MessageEvent<string>) => void) | null;
   close(): void;
 }
 
 export interface EventsClient {
   readonly connection: ReadonlySignal<ConnectionState>;
-  /** Called for every change and for `resync`; returns the unsubscribe function. */
   on(handler: (event: ChangeEvent) => void): () => void;
   start(): void;
   stop(): void;
   emit(event: ChangeEvent): void;
 }
 
-const MIN_RETRY_MS = 3000;
-const MAX_RETRY_MS = 30_000;
+const TYPES = new Set<ChangeType>([
+  'operation_updated',
+  'operation_committed',
+  'maintenance_changed',
+  'sync_changed',
+  'conflicts_changed',
+  'watch_changed',
+  'library_scanned',
+  'resync',
+]);
 
+/** Reconnecting WebSocket notifications; refetch on every connection to close snapshot races. */
 export function createEventsClient(
-  url = '/api/admin/events',
-  factory: (url: string) => EventSourceLike = (u) => new EventSource(u),
+  url = '/api/admin/live',
+  factory: (url: string) => SocketLike = (u) => new WebSocket(u),
 ): EventsClient {
   const connection = signal<ConnectionState>('closed');
   const handlers = new Set<(event: ChangeEvent) => void>();
-  let source: EventSourceLike | undefined;
+  let source: SocketLike | undefined;
   let timer: number | undefined;
   let failures = 0;
-  let missed = false;
+  let active = false;
 
   function emit(event: ChangeEvent) {
     for (const handler of [...handlers]) {
@@ -64,33 +67,47 @@ export function createEventsClient(
   }
 
   function open() {
-    source = factory(url);
-    source.onopen = () => {
+    timer = undefined;
+    if (!active) return;
+    const target = new URL(url, window.location.href);
+    target.protocol = target.protocol === 'https:' || target.protocol === 'wss:' ? 'wss:' : 'ws:';
+    const socket = factory(target.href);
+    source = socket;
+    socket.onopen = () => {
+      if (source !== socket || !active) return;
       connection.value = 'open';
       failures = 0;
-      if (missed) emit({ type: 'resync' });
-      missed = false;
+      emit({ type: 'resync' });
     };
-    source.onerror = () => {
-      source?.close();
+    const reconnect = () => {
+      if (source !== socket || !active) return;
       source = undefined;
-      missed = true;
+      socket.onclose = null;
+      socket.onerror = null;
+      socket.close();
       connection.value = 'reconnecting';
-      failures += 1;
-      const delay = Math.min(MAX_RETRY_MS, MIN_RETRY_MS * 2 ** Math.min(failures - 1, 4));
+      const delay = Math.min(30_000, 3000 * 2 ** Math.min(failures++, 4));
       timer = window.setTimeout(open, delay);
     };
-    source.addEventListener('change', (event) => {
+    socket.onerror = reconnect;
+    socket.onclose = reconnect;
+    socket.onmessage = (event) => {
+      if (source !== socket || !active) return;
       try {
         const parsed: unknown = JSON.parse(event.data);
-        if (typeof parsed === 'object' && parsed !== null && 'type' in parsed) {
+        if (
+          typeof parsed === 'object' &&
+          parsed !== null &&
+          'type' in parsed &&
+          typeof parsed.type === 'string' &&
+          TYPES.has(parsed.type as ChangeType)
+        ) {
           emit(parsed as ChangeEvent);
         }
-      } catch {
-        // Ignore malformed events.
+      } catch (error) {
+        console.error('[events] invalid notification', error);
       }
-    });
-    source.addEventListener('resync', () => emit({ type: 'resync' }));
+    };
   }
 
   return {
@@ -100,20 +117,22 @@ export function createEventsClient(
       return () => handlers.delete(handler);
     },
     start() {
-      if (source || timer !== undefined) return;
+      if (active) return;
+      active = true;
       connection.value = 'connecting';
       open();
     },
     stop() {
+      active = false;
       window.clearTimeout(timer);
       timer = undefined;
-      source?.close();
+      const socket = source;
       source = undefined;
-      missed = true;
+      socket?.close();
       connection.value = 'closed';
     },
     emit,
   };
 }
 
-export const events: EventsClient = createEventsClient();
+export const events = createEventsClient();

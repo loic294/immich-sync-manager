@@ -172,7 +172,7 @@ async fn next(state: &AppState) -> AppResult<Option<(Transfer, Option<String>)>>
     let rows: Vec<R> = sqlx::query_as(
         "SELECT t.id, t.peer_id, t.share_id, t.rel_path, t.sha256, t.size, t.vv_json, t.attempts, t.updated_at
          FROM transfers t JOIN peers p ON p.id = t.peer_id
-         WHERE t.status = 'queued' AND p.status = 'online' ORDER BY t.queued_at LIMIT 200",
+         WHERE t.status = 'queued' AND p.status = 'online' ORDER BY t.queued_at, t.id LIMIT 200",
     )
     .fetch_all(&state.db)
     .await?;
@@ -412,6 +412,7 @@ async fn run_one(state: &AppState, t: &Transfer) -> Result<Outcome, String> {
         super::put_row_in(&mut tx, &share.id, &t.rel, &r)
             .await
             .map_err(m)?;
+        archive_transfer(&mut tx, &t.id, None).await.map_err(m)?;
         sqlx::query("DELETE FROM transfers WHERE id = ? AND status = 'running'")
             .bind(&t.id)
             .execute(&mut *tx)
@@ -644,6 +645,7 @@ async fn publish(
     .bind(&peer.id)
     .execute(&mut *tx)
     .await?;
+    archive_transfer(&mut tx, &t.id, Some(&accepted.operation_id)).await?;
     sqlx::query("DELETE FROM transfers WHERE id = ?")
         .bind(&t.id)
         .execute(&mut *tx)
@@ -652,6 +654,50 @@ async fn publish(
     crate::ops::announce_queued(state, &accepted);
     state.emit(ServerEvent::SyncChanged);
     Ok(())
+}
+
+async fn archive_transfer(
+    conn: &mut sqlx::SqliteConnection,
+    id: &str,
+    operation_id: Option<&str>,
+) -> AppResult<()> {
+    sqlx::query(
+        "INSERT INTO transfer_history (id, peer_id, share_id, rel_path, sha256, size, queued_at, finished_at, operation_id)
+         SELECT id, peer_id, share_id, rel_path, sha256, size, queued_at, ?, ? FROM transfers WHERE id = ?",
+    )
+    .bind(db::now()).bind(operation_id).bind(id).execute(conn).await?;
+    Ok(())
+}
+
+async fn conflict_here(
+    state: &AppState,
+    peer: &net::Peer,
+    share: &Share,
+    t: &Transfer,
+) -> AppResult<()> {
+    super::conflict(
+        state,
+        ConflictInput {
+            share,
+            rel: &t.rel,
+            kind: "changed_on_both",
+            detail: format!(
+                "{} changed here while a newer version from {} was downloading",
+                t.rel, peer.name
+            ),
+            remote: ism_core::dto::ConflictSide {
+                instance: peer.name.clone(),
+                sha256: Some(t.sha256.clone()),
+                size: Some(t.size as u64),
+                modified_at: None,
+                deleted: false,
+            },
+            remote_vv: &t.vv,
+            peer_id: &peer.id,
+            from: None,
+        },
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -704,35 +750,4 @@ mod tests {
             existing_original_for_companion(dir.path(), "retry.xmp", &extensions).unwrap_err();
         assert_eq!(error.code(), "companion_original_ambiguous");
     }
-}
-
-async fn conflict_here(
-    state: &AppState,
-    peer: &net::Peer,
-    share: &Share,
-    t: &Transfer,
-) -> AppResult<()> {
-    super::conflict(
-        state,
-        ConflictInput {
-            share,
-            rel: &t.rel,
-            kind: "changed_on_both",
-            detail: format!(
-                "{} changed here while a newer version from {} was downloading",
-                t.rel, peer.name
-            ),
-            remote: ism_core::dto::ConflictSide {
-                instance: peer.name.clone(),
-                sha256: Some(t.sha256.clone()),
-                size: Some(t.size as u64),
-                modified_at: None,
-                deleted: false,
-            },
-            remote_vv: &t.vv,
-            peer_id: &peer.id,
-            from: None,
-        },
-    )
-    .await
 }

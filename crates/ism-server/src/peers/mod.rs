@@ -32,7 +32,7 @@ const EVENT_BATCH: i64 = 500;
 const SYNOLOGY_METADATA_DIR: &str = "@eaDir";
 
 /// NAS-generated metadata is not replicated content, regardless of its depth or extension.
-fn excluded_path(path: &str) -> bool {
+pub(crate) fn excluded_path(path: &str) -> bool {
     path.split('/').any(|name| name == SYNOLOGY_METADATA_DIR)
 }
 
@@ -1170,6 +1170,7 @@ pub async fn queue_transfer(
     .await?;
     tx.commit().await?;
     state.sync_wake.notify_one();
+    state.emit(ServerEvent::SyncChanged);
     Ok(())
 }
 

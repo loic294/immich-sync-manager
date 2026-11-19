@@ -12,7 +12,7 @@ version = "0.1.0"
 # One dependency per line, alphabetical. Crates use `name.workspace = true`.
 [workspace.dependencies]
 anyhow = "1.0.104"
-axum = { version = "0.8.9", features = ["macros"] }
+axum = { version = "0.8.9", features = ["macros", "ws"] }
 base64 = "0.23.1"
 bytes = "1.12.1"
 chacha20poly1305 = "0.11.0"
@@ -35,6 +35,7 @@ tempfile = "3.27.0"
 thiserror = "2.0.21"
 tokio = { version = "1.54.1", features = ["full"] }
 tokio-stream = { version = "0.1.19", features = ["sync"] }
+tokio-tungstenite = "0.29.0"
 tokio-util = { version = "0.7.20", features = ["io", "rt"] }
 tower = { version = "0.5.3", features = ["util"] }
 tower-http = { version = "0.7.1", features = ["fs", "limit", "set-header", "trace"] }

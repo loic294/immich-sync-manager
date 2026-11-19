@@ -559,6 +559,10 @@ pub async fn cancel_by_key(
 /// Admin: the files were checked by hand; release the server barrier.
 pub async fn resolve_recovery(state: &AppState, id: &str) -> AppResult<()> {
     crate::maintenance::resolve_operation_recovery(state, id).await?;
+    state.emit(ServerEvent::OperationUpdated {
+        operation_id: id.to_owned(),
+    });
+    state.emit(ServerEvent::SyncChanged);
     db::audit(&state.db, "admin", "operation.resolve", id).await;
     Ok(())
 }

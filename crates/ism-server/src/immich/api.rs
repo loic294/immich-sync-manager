@@ -351,6 +351,7 @@ impl Api {
     }
 
     /// Queues a scan only for a folder inside the external library.
+    #[cfg(test)]
     pub async fn scan_library_folder(&self, library_id: &str, path: &str) -> Result<(), ApiError> {
         self.call(
             Method::POST,
@@ -488,6 +489,15 @@ impl Api {
 
     pub async fn asset(&self, id: &str) -> Result<Value, ApiError> {
         self.json(Method::GET, &format!("/assets/{id}"), None).await
+    }
+
+    pub async fn thumbnail(&self, id: &str) -> Result<reqwest::Response, ApiError> {
+        self.call(
+            Method::GET,
+            &format!("/assets/{id}/thumbnail?size=thumbnail"),
+            None,
+        )
+        .await
     }
 
     /// The id of this account's asset at exactly `original_path`, if Immich imported it.
