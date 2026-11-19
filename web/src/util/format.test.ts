@@ -1,5 +1,12 @@
 import { describe, expect, it } from 'vitest';
-import { formatBytes, formatCountdown, formatLocation, humanize, percent } from '@/util/format';
+import {
+  formatBytes,
+  formatCountdown,
+  formatDuration,
+  formatLocation,
+  humanize,
+  percent,
+} from '@/util/format';
 
 describe('format', () => {
   it('formats sizes', () => {
@@ -26,5 +33,12 @@ describe('format', () => {
     expect(formatCountdown('2024-01-01T00:01:05Z', now)).toBe('1:05');
     expect(formatCountdown('2023-12-31T23:59:00Z', now)).toBe('0:00');
     expect(formatCountdown(null, now)).toBe('—');
+  });
+
+  it('formats remaining transfer time without overflowing minute fields', () => {
+    expect(formatDuration(6)).toBe('6 sec');
+    expect(formatDuration(61)).toBe('2 min');
+    expect(formatDuration(7199)).toBe('2 hr 0 min');
+    expect(formatDuration(90000)).toBe('1 day 1 hr');
   });
 });

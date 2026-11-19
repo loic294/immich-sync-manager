@@ -40,7 +40,7 @@ export class IsmSyncDetail extends IsmPage {
       const files = await admin.syncFiles(
         transfer.share_name,
         transfer.relative_path,
-        transfer.peer_id,
+        transfer.outgoing ? undefined : transfer.peer_id,
       );
       if (this.selectedId === transfer.id) this.files = files;
     } catch (error) {
@@ -101,15 +101,16 @@ export class IsmSyncDetail extends IsmPage {
                 : nothing
           }
           <div class="modal-action flex-wrap">
-            ${t.operation_id ? html`<button class="btn btn-sm" @click=${() => this.operation.value?.show(t.operation_id ?? '')}>View publishing operation</button>` : nothing}
+            ${t.outgoing ? html`<p class="text-sm text-base-content/70">The receiving instance manages this transfer and its publishing operation.</p>` : nothing}
+            ${!t.outgoing && t.operation_id ? html`<button class="btn btn-sm" @click=${() => this.operation.value?.show(t.operation_id ?? '')}>View publishing operation</button>` : nothing}
             ${
-              !t.operation_id && ['failed', 'cancelled'].includes(t.status)
+              !t.outgoing && !t.operation_id && ['failed', 'cancelled'].includes(t.status)
                 ? html`<button class="btn btn-primary btn-sm" ?disabled=${!!this.busy}
               @click=${() => this.act('retry', () => admin.retryTransfer(t.id), 'Transfer queued again.')}>${this.spin('retry')}Retry</button>`
                 : nothing
             }
             ${
-              !t.operation_id && ['queued', 'running', 'failed'].includes(t.status)
+              !t.outgoing && !t.operation_id && ['queued', 'running', 'failed'].includes(t.status)
                 ? html`<button class="btn btn-sm" ?disabled=${!!this.busy}
               @click=${() => this.act('cancel', () => admin.cancelTransfer(t.id), 'Transfer cancelled.')}>${this.spin('cancel')}Cancel transfer</button>`
                 : nothing

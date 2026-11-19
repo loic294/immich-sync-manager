@@ -65,6 +65,12 @@ while one of its changes is still being applied.
   during **allowed hours** (Sync → Schedule). An override permits a share or peer outside those
   hours for a set time. Uploads and other writes by ISM schedule a rescan of the affected shares,
   so their content is announced without waiting for the full scan.
+  Each receiving instance downloads up to three files concurrently, starting the next eligible
+  file as soon as a slot becomes free rather than waiting for a batch. Publication still runs
+  through the serialized managed-operation barrier. On the receiver, **Sync → Active & queued**
+  shows incoming files and their progress, including files awaiting publication; successful
+  publications move to **Completed syncs**. Sidecars wait for their matching original to finish
+  publishing, so concurrent downloads cannot publish a companion before its original exists.
 - If the saved schedule is invalid, transfers stop rather than defaulting to unrestricted hours.
   An active, explicitly scoped override still applies. The Sync page provides a replacement
   schedule with no allowed days; choose the desired hours and save to resume scheduling.
@@ -140,3 +146,28 @@ peer's version is unknown.
 If different pending peer versions have concurrent or inconsistent histories, ISM keeps the
 existing transfer and leaves the incoming event unacknowledged. The peer's processing error
 identifies this condition.
+
+## Sync activity and progress
+
+Both the source and receiver show the full incoming and outgoing queue in **Sync**, including
+completed transfers. The receiver owns the transfer state and shares incremental, signed activity
+updates with the source during peer polling. Only activity involving the authenticated peer is
+shared; mirrored outgoing activity is never mirrored back. Both peers must be upgraded for
+outgoing visibility. An unreachable or older peer leaves the last-known queue visible with a
+warning rather than making it look empty or current. Outgoing transfer controls and publishing
+operations are managed on the receiving instance.
+
+The summary above the queue shows completed files versus total files, transferred bytes versus
+total bytes, average throughput over the last minute, and estimated remaining transfer time.
+The progress bar and estimate use bytes, not file counts. Throughput measures newly received
+network bytes (including retries), not adopted identical files or resumed bytes already on disk;
+before a minute has elapsed it uses the elapsed run time. The estimate is remaining bytes divided
+by that throughput; it excludes allowed-hours waits and managed publication, and is unavailable
+when no recent throughput is known or a peer's status is stale.
+
+Run totals are tracked per peer and direction, combined for the local instance. A new run starts
+when new work arrives after that queue has finished; completed history remains available in the
+Completed tab. Pending publication or failed work keeps its current run. Totals and mirrored
+queues survive a restart, while the rolling rate naturally decays to zero after a minute without
+traffic. The page refreshes while open even without new events so rates and estimates do not
+remain stuck on an old value.

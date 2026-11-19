@@ -27,6 +27,23 @@ pub fn router() -> Router<AppState> {
         .route("/file-info", get(file_info))
         .route("/thumbnail", get(thumbnail))
         .route("/settings", get(settings))
+        .route("/sync-activity", get(sync_activity))
+}
+
+#[derive(Deserialize)]
+struct ActivityQuery {
+    #[serde(default)]
+    after: i64,
+}
+
+async fn sync_activity(
+    State(state): State<AppState>,
+    PeerAuth(peer): PeerAuth,
+    Query(q): Query<ActivityQuery>,
+) -> AppResult<Json<peers::activity::Changes>> {
+    Ok(Json(
+        peers::activity::changes(&state, &peer.id, q.after).await?,
+    ))
 }
 
 async fn file_info(

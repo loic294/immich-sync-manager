@@ -6,6 +6,7 @@
 //! managed operations so Immich keeps its asset IDs; file contents are copied by the transfer
 //! worker during allowed hours. Concurrent changes become conflicts that an admin resolves.
 
+pub mod activity;
 pub mod admin;
 pub mod net;
 pub mod transfer;
@@ -1160,6 +1161,7 @@ pub async fn queue_transfer(
         tx.commit().await?;
         return Ok(());
     }
+    let run_id = activity::ensure_run(&mut tx, peer_id).await?;
     sqlx::query("DELETE FROM transfers WHERE share_id = ? AND rel_path = ? AND status IN ('queued', 'failed')")
         .bind(&share.id)
         .bind(rel)
@@ -1167,8 +1169,8 @@ pub async fn queue_transfer(
         .await?;
     let now = db::now();
     sqlx::query(
-        "INSERT INTO transfers (id, peer_id, share_id, rel_path, sha256, size, vv_json, status, queued_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)",
+        "INSERT INTO transfers (id, peer_id, share_id, rel_path, sha256, size, vv_json, status, queued_at, updated_at, run_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)",
     )
     .bind(crate::crypto::new_id("tr"))
     .bind(peer_id)
@@ -1179,6 +1181,7 @@ pub async fn queue_transfer(
     .bind(serde_json::to_string(&merged)?)
     .bind(&now)
     .bind(&now)
+    .bind(run_id)
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -2442,8 +2445,17 @@ async fn poll_peer(state: &AppState, peer: &net::Peer) {
                 outcome.as_ref().err().map(String::as_str),
             )
             .await;
+            if let Err(error) = activity::refresh(state, peer).await {
+                activity::unavailable(state, &peer.id, &error).await;
+            }
         }
         Ok(_) => {
+            activity::unavailable(
+                state,
+                &peer.id,
+                "the peer answered with another instance id",
+            )
+            .await;
             net::mark(
                 state,
                 &peer.id,
@@ -2451,7 +2463,10 @@ async fn poll_peer(state: &AppState, peer: &net::Peer) {
             )
             .await
         }
-        Err(e) => net::mark(state, &peer.id, Err(e)).await,
+        Err(e) => {
+            activity::unavailable(state, &peer.id, &e).await;
+            net::mark(state, &peer.id, Err(e)).await;
+        }
     }
 }
 

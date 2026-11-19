@@ -3,6 +3,7 @@ import { api } from '@/api/client';
 import { ApiError } from '@/api/errors';
 import { events } from '@/api/events';
 import type { SyncActivity } from '@/api/generated/SyncActivity';
+import type { SyncProgress } from '@/api/generated/SyncProgress';
 import { mount } from '@/test/helpers';
 import '@/pages/ism-sync-page';
 
@@ -12,6 +13,7 @@ describe('ism-sync-page', () => {
   it('uses one live paginated table with direction, previews and completed tabs', async () => {
     const transfer: SyncActivity = {
       id: 'tr1',
+      outgoing: false,
       peer_id: 'p1',
       share_name: 'Photos',
       relative_path: 'Trip/photo.jpg',
@@ -81,6 +83,80 @@ describe('ism-sync-page', () => {
     expect([...page.querySelectorAll('dialog[open] dt')].map((term) => term.textContent)).toContain(
       'Queued',
     );
+    page.querySelector<HTMLDialogElement>('ism-sync-detail dialog')?.close();
+    transfer.outgoing = true;
+    transfer.operation_id = 'remote-publication';
+    await page.reload();
+    await page.updateComplete;
+    page.querySelector<HTMLButtonElement>('tbody button')?.click();
+    await vi.waitFor(() =>
+      expect(get).toHaveBeenCalledWith('/api/admin/sync/files', {
+        query: { share: 'Photos', path: 'Trip/photo.jpg', peer_id: undefined },
+      }),
+    );
+    expect(page.querySelector('ism-sync-thumbnail img')?.getAttribute('src')).not.toContain(
+      'peer_id',
+    );
+    const buttons = [...page.querySelectorAll('ism-sync-detail button')].map(
+      (button) => button.textContent,
+    );
+    expect(buttons).not.toContain('View publishing operation');
+    expect(buttons).not.toContain('Cancel transfer');
+    expect(page.textContent).toContain('The receiving instance manages this transfer');
+  });
+
+  it('shows current-run file and byte totals, a byte-based progress bar, speed and ETA', async () => {
+    const progress: SyncProgress = {
+      files_total: 8,
+      files_completed: 2,
+      bytes_total: 10 * 1024 * 1024,
+      bytes_done: 4 * 1024 * 1024,
+      bytes_per_second: 1024 * 1024,
+      eta_seconds: 6,
+      queued: 3,
+      running: 3,
+      publishing: 0,
+      failed: 0,
+    };
+    let warnings: string[] = [];
+    vi.spyOn(api, 'get').mockImplementation(async (path) => {
+      if (path === '/api/admin/sync') return { allowed_now: true, override_active: null } as never;
+      if (path === '/api/admin/sync/page')
+        return { rows: [], total: 0, progress: { ...progress }, warnings } as never;
+      if (path === '/api/admin/sync/schedule') return { timezone: 'UTC', windows: [] } as never;
+      return [] as never;
+    });
+    const page = await mount('ism-sync-page');
+    await vi.waitFor(() => expect(page.textContent).toContain('2 of 8 files transferred'));
+    expect(page.textContent).toContain('4.0 MB of 10 MB');
+    expect(page.textContent).toContain('1.0 MB/s');
+    expect(page.textContent).toContain('last minute');
+    expect(page.textContent).toContain('6 sec remaining');
+    expect(
+      page.querySelector<HTMLProgressElement>('[aria-label="Total sync progress"]')?.value,
+    ).toBe(40);
+
+    progress.bytes_per_second = 0;
+    progress.eta_seconds = null;
+    warnings = ['Outgoing sync with Remote is not up to date.'];
+    await page.reload();
+    await page.updateComplete;
+    expect(page.textContent).toContain('Waiting for transfer speed');
+    expect(page.textContent).toContain('Outgoing sync with Remote is not up to date.');
+    expect(page.textContent).not.toContain('6 sec remaining');
+
+    progress.bytes_done = progress.bytes_total;
+    progress.files_completed = 7;
+    progress.publishing = 1;
+    await page.reload();
+    await page.updateComplete;
+    expect(page.textContent).toContain('Finishing publication');
+    expect(page.textContent).toContain('7 of 8 files transferred');
+    progress.publishing = 0;
+    progress.files_completed = 8;
+    await page.reload();
+    await page.updateComplete;
+    expect(page.textContent).toContain('Complete');
   });
 
   it('offers an explicit, initially closed replacement for a corrupt schedule', async () => {

@@ -451,6 +451,7 @@ pub struct OperationDetail {
 #[ts(export)]
 pub struct SyncActivity {
     pub id: String,
+    pub outgoing: bool,
     pub peer_id: String,
     pub share_name: String,
     pub relative_path: String,
@@ -472,6 +473,23 @@ pub struct SyncActivity {
 pub struct SyncPage {
     pub rows: Vec<SyncActivity>,
     pub total: i64,
+    pub progress: SyncProgress,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct SyncProgress {
+    pub files_total: u64,
+    pub files_completed: u64,
+    pub bytes_total: u64,
+    pub bytes_done: u64,
+    pub bytes_per_second: f64,
+    pub eta_seconds: Option<u64>,
+    pub queued: u64,
+    pub running: u64,
+    pub publishing: u64,
+    pub failed: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]

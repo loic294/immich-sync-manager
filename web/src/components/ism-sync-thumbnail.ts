@@ -29,7 +29,7 @@ export class IsmSyncThumbnail extends IsmElement {
     if (!t) return nothing;
     const media = MEDIA.test(t.relative_path);
     const extension = t.relative_path.split('.').at(-1)?.toUpperCase() ?? 'FILE';
-    const local = t.status === 'completed';
+    const local = t.outgoing || t.status === 'completed';
     return html`<div class="flex size-12 shrink-0 flex-col items-center justify-center overflow-hidden rounded bg-base-200"
       title=${this.failed && media ? 'Preview unavailable. The file may not be indexed in Immich yet.' : t.relative_path}>
       ${

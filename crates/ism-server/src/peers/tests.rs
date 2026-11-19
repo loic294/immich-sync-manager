@@ -174,6 +174,535 @@ async fn stop_workers(instance: &mut Instance) {
     }
 }
 
+async fn gate_peer_content(
+    a: &mut Instance,
+    b: &Instance,
+) -> tokio::sync::mpsc::UnboundedReceiver<(String, tokio::sync::oneshot::Sender<()>)> {
+    let (started, requests) = tokio::sync::mpsc::unbounded_channel();
+    let source = crate::routes::router(a.state.clone()).layer(axum::middleware::from_fn(
+        move |request: axum::extract::Request, next: axum::middleware::Next| {
+            let started = started.clone();
+            async move {
+                if request.uri().path() == "/api/peer/v1/content" {
+                    let query = axum::extract::Query::<std::collections::HashMap<String, String>>::try_from_uri(request.uri()).unwrap();
+                    let (release, wait) = tokio::sync::oneshot::channel();
+                    started.send((query["path"].clone(), release)).unwrap();
+                    wait.await.unwrap();
+                }
+                next.run(request).await
+            }
+        },
+    ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let source_url = format!("http://{}", listener.local_addr().unwrap());
+    a.tasks.push(tokio::spawn(async move {
+        axum::serve(listener, source).await.unwrap();
+    }));
+    sqlx::query("UPDATE peers SET url = ?, status = 'online'")
+        .bind(source_url)
+        .execute(&b.state.db)
+        .await
+        .unwrap();
+    requests
+}
+
+#[tokio::test]
+async fn three_independent_transfers_refill_slots_and_update_receiver_activity() {
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    for name in ["one.jpg", "two.jpg", "three.jpg", "four.jpg", "five.jpg"] {
+        write_old(&a.shared.join(name), name.as_bytes());
+    }
+    scan(&a).await;
+    let peer = super::net::peers(&b.state).await.unwrap().remove(0);
+    super::pull(&b.state, &peer).await.unwrap();
+    let mut requests = gate_peer_content(&mut a, &b).await;
+
+    let client = reqwest::Client::new();
+    let setup = client
+        .post(format!("{}/api/admin/setup", b.url))
+        .header("x-ism-request", "1")
+        .json(&serde_json::json!({
+            "username": "admin", "password": "synthetic test password", "instance_name": "Beta"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let cookie = setup.headers()["set-cookie"]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+    async fn page(b: &Instance, cookie: &str, status: &str) -> ism_core::dto::SyncPage {
+        reqwest::Client::new()
+            .get(format!("{}/api/admin/sync/page?status={status}", b.url))
+            .header("cookie", cookie)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap()
+    }
+
+    b.tasks
+        .push(tokio::spawn(super::transfer::run(b.state.clone())));
+    let mut pending = Vec::new();
+    for _ in 0..3 {
+        pending.push(
+            tokio::time::timeout(Duration::from_secs(3), requests.recv())
+                .await
+                .expect("three downloads must reach the source concurrently")
+                .unwrap(),
+        );
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), requests.recv())
+            .await
+            .is_err(),
+        "a fourth download must wait for a free slot"
+    );
+    let active = page(&b, &cookie, "active").await;
+    assert_eq!(active.total, 5);
+    assert_eq!(
+        active.rows.iter().filter(|r| r.status == "running").count(),
+        3
+    );
+    assert_eq!(
+        active.rows.iter().filter(|r| r.status == "queued").count(),
+        2
+    );
+    assert!(
+        active
+            .rows
+            .iter()
+            .all(|r| r.source == "ISM: Alpha" && r.destination == "ISM: Beta")
+    );
+    assert_eq!(page(&b, &cookie, "completed").await.total, 0);
+    let destination = super::net::peers(&a.state).await.unwrap().remove(0);
+    super::activity::refresh(&a.state, &destination)
+        .await
+        .unwrap();
+    let outgoing = super::activity::page(&a.state, "active", 2, 0, None)
+        .await
+        .unwrap();
+    assert_eq!(outgoing.total, 5);
+    assert_eq!(
+        outgoing.rows.len(),
+        2,
+        "the source queue must stay paginated"
+    );
+    assert!(outgoing.rows.iter().all(|row| row.outgoing
+        && row.source == "ISM: Alpha"
+        && row.destination == "ISM: Beta"
+        && row.location.path.starts_with("shared/")));
+    assert_eq!(outgoing.progress.files_total, 5);
+    assert_eq!(outgoing.progress.files_completed, 0);
+    assert_eq!(outgoing.progress.bytes_total, active.progress.bytes_total);
+
+    let (first, release) = pending.pop().unwrap();
+    release.send(()).unwrap();
+    pending.push(
+        tokio::time::timeout(Duration::from_secs(3), requests.recv())
+            .await
+            .expect("the next image must start while the other two remain blocked")
+            .unwrap(),
+    );
+    let publishing = page(&b, &cookie, "active").await;
+    let received = publishing
+        .rows
+        .iter()
+        .find(|r| r.relative_path == first)
+        .unwrap();
+    assert_eq!(received.status, "publishing");
+    assert!(received.finished_at.is_none());
+    assert_eq!(page(&b, &cookie, "completed").await.total, 0);
+    crate::ops::exec::run_operation(&b.state, received.operation_id.as_deref().unwrap())
+        .await
+        .unwrap();
+    let completed = page(&b, &cookie, "completed").await;
+    assert_eq!(completed.total, 1);
+    assert_eq!(completed.rows[0].relative_path, first);
+    assert!(completed.rows[0].finished_at.is_some());
+    assert_eq!(
+        std::fs::read(b.shared.join(&first)).unwrap(),
+        first.as_bytes()
+    );
+    assert_eq!(page(&b, &cookie, "active").await.total, 4);
+    super::activity::refresh(&a.state, &destination)
+        .await
+        .unwrap();
+    let outgoing = super::activity::page(&a.state, "completed", 250, 0, None)
+        .await
+        .unwrap();
+    assert_eq!(outgoing.total, 1);
+    assert_eq!(outgoing.rows[0].relative_path, first);
+    assert_eq!(outgoing.progress.files_completed, 1);
+    assert_eq!(outgoing.progress.bytes_done, first.len() as u64);
+
+    super::activity::unavailable(&a.state, &destination.id, "unreachable").await;
+    let stale = super::activity::page(&a.state, "active", 250, 0, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        stale.total, 4,
+        "keep the last-known queue while disconnected"
+    );
+    assert_eq!(stale.warnings.len(), 1);
+    assert_eq!(stale.progress.bytes_per_second, 0.0);
+    assert!(stale.progress.eta_seconds.is_none());
+
+    b.tasks
+        .push(tokio::spawn(crate::ops::exec::run(b.state.clone())));
+    pending.pop().unwrap().1.send(()).unwrap();
+    pending.push(
+        tokio::time::timeout(Duration::from_secs(3), requests.recv())
+            .await
+            .expect("each completed task must independently refill its slot")
+            .unwrap(),
+    );
+    for (_, release) in pending {
+        release.send(()).unwrap();
+    }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if page(&b, &cookie, "completed").await.total == 5 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(page(&b, &cookie, "active").await.total, 0);
+    for name in ["one.jpg", "two.jpg", "three.jpg", "four.jpg", "five.jpg"] {
+        assert_eq!(std::fs::read(b.shared.join(name)).unwrap(), name.as_bytes());
+    }
+    super::activity::refresh(&a.state, &destination)
+        .await
+        .unwrap();
+    let outgoing = super::activity::page(&a.state, "completed", 250, 0, None)
+        .await
+        .unwrap();
+    assert_eq!(outgoing.total, 5);
+    assert_eq!(outgoing.progress.files_completed, 5);
+    assert_eq!(outgoing.progress.bytes_done, outgoing.progress.bytes_total);
+    assert!(outgoing.warnings.is_empty());
+    // Mirrored outgoing records must not bounce back as new incoming transfers.
+    super::activity::refresh(&b.state, &peer).await.unwrap();
+    assert_eq!(page(&b, &cookie, "completed").await.total, 5);
+    sqlx::query("DELETE FROM transfer_history WHERE rel_path = ?")
+        .bind(&first)
+        .execute(&b.state.db)
+        .await
+        .unwrap();
+    super::activity::refresh(&a.state, &destination)
+        .await
+        .unwrap();
+    assert_eq!(
+        super::activity::page(&a.state, "completed", 250, 0, None)
+            .await
+            .unwrap()
+            .total,
+        4
+    );
+}
+
+#[tokio::test]
+async fn mirrored_sync_drains_multiple_pages_and_never_exposes_another_peers_queue() {
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    let source = super::net::peers(&b.state).await.unwrap().remove(0);
+    let destination = super::net::peers(&a.state).await.unwrap().remove(0);
+    let share = super::shares(&b.state).await.unwrap().remove(0);
+    let secret = b
+        .state
+        .secrets
+        .encrypt(super::net::SECRET_PURPOSE, "synthetic peer secret")
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO peers (id,name,url,secret_enc,status,created_at)
+         VALUES ('unrelated','Unrelated','https://unrelated.example',?,'offline',?)",
+    )
+    .bind(secret)
+    .bind(crate::db::now())
+    .execute(&b.state.db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 501)
+         INSERT INTO transfers (id,peer_id,share_id,rel_path,sha256,size,vv_json,status,queued_at,updated_at)
+         SELECT printf('transfer-%04d',i),?1,?2,printf('photo-%04d.jpg',i),?3,100,'{}','queued',?4,?4 FROM n",
+    )
+    .bind(&source.id).bind(&share.id).bind(crate::crypto::sha256_hex(b"synthetic"))
+    .bind(crate::db::now()).execute(&b.state.db).await.unwrap();
+    sqlx::query(
+        "INSERT INTO transfers (id,peer_id,share_id,rel_path,sha256,size,vv_json,status,queued_at,updated_at)
+         VALUES ('private-transfer','unrelated',?,'private.jpg',?,100,'{}','queued',?,?)",
+    ).bind(&share.id).bind(crate::crypto::sha256_hex(b"private synthetic"))
+    .bind(crate::db::now()).bind(crate::db::now()).execute(&b.state.db).await.unwrap();
+    super::activity::refresh(&a.state, &destination)
+        .await
+        .unwrap();
+    let first = super::activity::page(&a.state, "active", 250, 0, None)
+        .await
+        .unwrap();
+    let last = super::activity::page(&a.state, "active", 250, 500, None)
+        .await
+        .unwrap();
+    assert_eq!(first.total, 501);
+    assert_eq!(first.rows.len(), 250);
+    assert_eq!(last.rows.len(), 1);
+    assert_eq!(last.rows[0].id, "transfer-0501");
+    assert!(first.rows.iter().all(|r| r.relative_path != "private.jpg"));
+
+    sqlx::query(
+        "UPDATE transfers SET bytes_done = 75,status = 'running' WHERE id = 'transfer-0001'",
+    )
+    .execute(&b.state.db)
+    .await
+    .unwrap();
+    super::activity::refresh(&a.state, &destination)
+        .await
+        .unwrap();
+    let updated = super::activity::page(&a.state, "active", 1, 0, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        updated.total, 501,
+        "incremental updates must not duplicate queue entries"
+    );
+    assert_eq!(updated.rows[0].bytes_done, 75);
+    assert_eq!(updated.rows[0].status, "running");
+    let cursor: i64 = sqlx::query_scalar("SELECT cursor FROM peer_sync_state WHERE peer_id = ?")
+        .bind(&destination.id)
+        .fetch_one(&a.state.db)
+        .await
+        .unwrap();
+    super::activity::refresh(&a.state, &destination)
+        .await
+        .unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT cursor FROM peer_sync_state WHERE peer_id = ?")
+            .bind(&destination.id)
+            .fetch_one(&a.state.db)
+            .await
+            .unwrap(),
+        cursor
+    );
+
+    sqlx::query("UPDATE peer_sync_state SET updated_at = '2020-01-01T00:00:00Z'")
+        .execute(&a.state.db)
+        .await
+        .unwrap();
+    let stale = super::activity::page(&a.state, "active", 1, 0, None)
+        .await
+        .unwrap();
+    assert_eq!(stale.total, 501);
+    assert_eq!(stale.warnings.len(), 1);
+    assert!(stale.progress.eta_seconds.is_none());
+}
+
+#[tokio::test]
+async fn sync_runs_use_last_minute_bytes_for_eta_and_reset_without_losing_history() {
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    let peer = super::net::peers(&b.state).await.unwrap().remove(0);
+    let share = super::shares(&b.state).await.unwrap().remove(0);
+    super::queue_transfer(
+        &b.state,
+        &peer.id,
+        &share,
+        "first.jpg",
+        &crate::crypto::sha256_hex(b"synthetic"),
+        1000,
+        &ism_core::version::VersionVector::default(),
+    )
+    .await
+    .unwrap();
+    let now = chrono::Utc::now();
+    sqlx::query("UPDATE sync_runs SET started_at = ?")
+        .bind(crate::db::ts(now - chrono::Duration::minutes(2)))
+        .execute(&b.state.db)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE transfers SET bytes_done = 400, status = 'running'")
+        .execute(&b.state.db)
+        .await
+        .unwrap();
+    for (age, bytes) in [(61_000, 60_000), (30_000, 600)] {
+        sqlx::query("INSERT INTO sync_byte_samples (peer_id,at,bytes) VALUES (?,?,?)")
+            .bind(&peer.id)
+            .bind(now.timestamp_millis() - age)
+            .bind(bytes)
+            .execute(&b.state.db)
+            .await
+            .unwrap();
+    }
+    let progress = super::activity::page(&b.state, "active", 250, 0, None)
+        .await
+        .unwrap()
+        .progress;
+    assert_eq!(progress.files_total, 1);
+    assert_eq!(progress.files_completed, 0);
+    assert_eq!(progress.bytes_done, 400);
+    assert_eq!(progress.bytes_total, 1000);
+    assert_eq!(
+        progress.bytes_per_second, 10.0,
+        "ignore samples older than a minute"
+    );
+    assert_eq!(
+        progress.eta_seconds,
+        Some(60),
+        "600 bytes remain at 10 bytes/sec"
+    );
+    sqlx::query("UPDATE sync_byte_samples SET at = ?")
+        .bind(now.timestamp_millis() - 61_000)
+        .execute(&b.state.db)
+        .await
+        .unwrap();
+    let idle = super::activity::page(&b.state, "active", 250, 0, None)
+        .await
+        .unwrap()
+        .progress;
+    assert_eq!(idle.bytes_per_second, 0.0);
+    assert!(
+        idle.eta_seconds.is_none(),
+        "never invent an ETA without throughput"
+    );
+    sqlx::query(
+        "INSERT INTO transfer_history (id,peer_id,share_id,rel_path,sha256,size,queued_at,finished_at,run_id)
+         SELECT id,peer_id,share_id,rel_path,sha256,size,queued_at,?,run_id FROM transfers",
+    ).bind(crate::db::now()).execute(&b.state.db).await.unwrap();
+    sqlx::query("DELETE FROM transfers")
+        .execute(&b.state.db)
+        .await
+        .unwrap();
+    let finished = super::activity::page(&b.state, "completed", 250, 0, None)
+        .await
+        .unwrap();
+    assert_eq!(finished.progress.files_completed, 1);
+    super::queue_transfer(
+        &b.state,
+        &peer.id,
+        &share,
+        "second.jpg",
+        &crate::crypto::sha256_hex(b"new synthetic"),
+        2000,
+        &ism_core::version::VersionVector::default(),
+    )
+    .await
+    .unwrap();
+    let next = super::activity::page(&b.state, "active", 250, 0, None)
+        .await
+        .unwrap();
+    assert_eq!(next.progress.files_total, 1);
+    assert_eq!(next.progress.files_completed, 0);
+    assert_eq!(next.progress.bytes_total, 2000);
+    assert_eq!(next.progress.bytes_done, 0);
+    assert_eq!(
+        super::activity::page(&b.state, "completed", 250, 0, None)
+            .await
+            .unwrap()
+            .total,
+        1
+    );
+}
+
+#[tokio::test]
+async fn downloads_recheck_recovery_and_local_changes_before_publication() {
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    write_old(&a.shared.join("photo.jpg"), b"remote photo");
+    scan(&a).await;
+    let peer = super::net::peers(&b.state).await.unwrap().remove(0);
+    super::pull(&b.state, &peer).await.unwrap();
+    let mut requests = gate_peer_content(&mut a, &b).await;
+    b.tasks
+        .push(tokio::spawn(super::transfer::run(b.state.clone())));
+    let (_, release) = tokio::time::timeout(Duration::from_secs(3), requests.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO operations (id,idempotency_key,principal,source,request_json,status,created_at)
+         VALUES ('interrupted','interrupted','admin:test','admin','{}','recovery_required',?)",
+    )
+    .bind(crate::db::now())
+    .execute(&b.state.db)
+    .await
+    .unwrap();
+    release.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let (status, attempts): (String, i64) =
+                sqlx::query_as("SELECT status, attempts FROM transfers")
+                    .fetch_one(&b.state.db)
+                    .await
+                    .unwrap();
+            assert_eq!(attempts, 0, "recovery must not consume retries");
+            if status == "queued" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!b.shared.join("photo.jpg").exists());
+    let history: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM transfer_history")
+        .fetch_one(&b.state.db)
+        .await
+        .unwrap();
+    assert_eq!(history, 0, "an interrupted download is not completed");
+
+    sqlx::query("UPDATE operations SET recovery_resolved = 1 WHERE id = 'interrupted'")
+        .execute(&b.state.db)
+        .await
+        .unwrap();
+    b.state.sync_wake.notify_waiters();
+    let (_, release) = tokio::time::timeout(Duration::from_secs(8), requests.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    write_old(&b.shared.join("photo.jpg"), b"local edit during download");
+    scan(&b).await;
+    release.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if !admin::list_conflicts(&b.state, false)
+                .await
+                .unwrap()
+                .is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        std::fs::read(b.shared.join("photo.jpg")).unwrap(),
+        b"local edit during download"
+    );
+    let history: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM transfer_history")
+        .fetch_one(&b.state.db)
+        .await
+        .unwrap();
+    assert_eq!(history, 0, "conflicted files must not appear completed");
+}
+
 #[tokio::test]
 async fn share_scan_excludes_synology_metadata_but_replicates_originals_and_companions() {
     let (mut a, mut b) = pair().await;

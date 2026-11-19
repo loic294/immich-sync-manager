@@ -7,12 +7,13 @@ import type { PeerView } from '@/api/generated/PeerView';
 import type { ScheduleView } from '@/api/generated/ScheduleView';
 import type { ShareView } from '@/api/generated/ShareView';
 import type { SyncActivity } from '@/api/generated/SyncActivity';
+import type { SyncProgress } from '@/api/generated/SyncProgress';
 import type { SyncStatus } from '@/api/generated/SyncStatus';
 import type { Window } from '@/api/generated/Window';
 import { IsmPage } from '@/base/ism-page';
 import type { PageChange } from '@/components/ism-pagination';
 import type { IsmSyncDetail } from '@/components/ism-sync-detail';
-import { formatBytes, formatDate, humanize, percent } from '@/util/format';
+import { formatBytes, formatDate, formatDuration, humanize, percent } from '@/util/format';
 import { statusBadge } from '@/util/status';
 import { tabKeydown } from '@/util/tabs';
 import '@/components/ism-pagination';
@@ -44,6 +45,8 @@ export class IsmSyncPage extends IsmPage {
     view: { state: true },
     limit: { state: true },
     offset: { state: true },
+    progress: { state: true },
+    warnings: { state: true },
   };
 
   declare status: SyncStatus | undefined;
@@ -57,6 +60,9 @@ export class IsmSyncPage extends IsmPage {
   declare view: string;
   declare limit: number;
   declare offset: number;
+  declare progress: SyncProgress | undefined;
+  declare warnings: string[];
+  private refreshTimer: number | undefined;
   protected override reloadOn = [
     'sync_changed',
     'operation_updated',
@@ -80,6 +86,21 @@ export class IsmSyncPage extends IsmPage {
     this.view = 'active';
     this.limit = 250;
     this.offset = 0;
+    this.progress = undefined;
+    this.warnings = [];
+  }
+
+  override connectedCallback() {
+    super.connectedCallback();
+    this.refreshTimer = window.setInterval(() => {
+      if (!document.hidden) void this.reload();
+    }, 3000);
+  }
+
+  override disconnectedCallback() {
+    window.clearInterval(this.refreshTimer);
+    this.refreshTimer = undefined;
+    super.disconnectedCallback();
   }
 
   protected override async load() {
@@ -109,6 +130,8 @@ export class IsmSyncPage extends IsmPage {
     this.overrides = overrides;
     this.shares = shares;
     this.peers = peers;
+    this.progress = page.progress;
+    this.warnings = page.warnings ?? [];
     if (view === this.view && limit === this.limit && offset === this.offset) {
       this.rows = page.rows;
       this.total = page.total;
@@ -117,6 +140,47 @@ export class IsmSyncPage extends IsmPage {
         void this.reload();
       }
     }
+  }
+
+  private renderProgress() {
+    const p = this.progress;
+    if (!p) return nothing;
+    const complete = p.files_total > 0 && p.files_completed === p.files_total;
+    const value =
+      p.bytes_total > 0
+        ? percent(p.bytes_done, p.bytes_total)
+        : percent(p.files_completed, p.files_total);
+    const eta = complete
+      ? 'Complete'
+      : p.eta_seconds !== null
+        ? `${formatDuration(p.eta_seconds)} remaining`
+        : p.publishing > 0 && p.bytes_done === p.bytes_total
+          ? 'Finishing publication'
+          : p.files_total === 0
+            ? 'No transfers queued'
+            : p.failed > 0 && p.running === 0 && p.queued === 0
+              ? 'Needs attention'
+              : 'Waiting for transfer speed';
+    return html`<section class="rounded-box border border-base-300 bg-base-100 p-4" aria-labelledby="sync-progress-title">
+      <div class="flex flex-wrap items-baseline justify-between gap-x-6 gap-y-1">
+        <h2 id="sync-progress-title" class="text-base font-semibold">Current sync</h2>
+        <span class="text-sm tabular-nums">${p.files_completed.toLocaleString()} of ${p.files_total.toLocaleString()} files transferred</span>
+      </div>
+      <div class="my-3 flex items-center gap-3">
+        <progress class="progress progress-primary flex-1" aria-label="Total sync progress" value=${value} max="100"></progress>
+        <span class="min-w-10 text-right text-sm tabular-nums">${value}%</span>
+      </div>
+      <div class="flex flex-wrap items-baseline justify-between gap-x-6 gap-y-2 text-sm tabular-nums">
+        <span>${formatBytes(p.bytes_done)} of ${formatBytes(p.bytes_total)}</span>
+        <span>${formatBytes(p.bytes_per_second)}/s <span class="text-base-content/70">(last minute)</span></span>
+        <span>${eta}</span>
+      </div>
+      <p class="mt-3 text-xs text-base-content/70">
+        ${p.running} transferring, ${p.publishing} publishing, ${p.queued} queued, ${p.failed} need attention.
+        Includes incoming and outgoing files.
+      </p>
+    </section>
+    ${this.warnings.map((warning) => html`<p role="alert" class="alert alert-warning alert-soft">${warning} Speed and remaining time may be unavailable.</p>`)}`;
   }
 
   private editSchedule(change: (schedule: ScheduleView) => ScheduleView) {
@@ -192,7 +256,7 @@ export class IsmSyncPage extends IsmPage {
         )}
       </div>
       <div id="sync-panel" role="tabpanel" aria-labelledby=${`sync-tab-${this.view}`}>
-        ${this.view === 'active' ? html`<p class="px-4 pt-3 text-xs text-base-content/70">Current runs first, then files in queue order. Files waiting for a peer, retry delay or allowed hours may be skipped until eligible.</p>` : nothing}
+        ${this.view === 'active' ? html`<p class="px-4 pt-3 text-xs text-base-content/70">Incoming and outgoing transfers, with current runs first, then files in queue order. Files waiting for a peer, retry delay or allowed hours may be skipped until eligible.</p>` : nothing}
         <div class="overflow-x-auto">
           <table class="table table-sm">
             <thead><tr><th><span class="sr-only">Preview</span></th><th>File</th><th>Sync direction</th><th>Size</th><th>Status & progress</th>${this.view === 'completed' ? html`<th>Finished</th>` : nothing}</tr></thead>
@@ -377,11 +441,13 @@ export class IsmSyncPage extends IsmPage {
                 The saved schedule is invalid. File transfers are paused unless an override is active.
                 Choose replacement hours and save them to resume scheduling.
               </div>
+              ${this.renderProgress()}
               ${this.renderTransfers()}
             `;
           }
           if (!s) return html``;
           return html`
+            ${this.renderProgress()}
             <div role="status" class=${s.allowed_now || s.override_active ? 'alert alert-success alert-soft' : 'alert alert-info alert-soft'}>
               <ism-icon name=${s.allowed_now || s.override_active ? 'play' : 'pause'}></ism-icon>
               <span>
@@ -389,10 +455,10 @@ export class IsmSyncPage extends IsmPage {
                   s.override_active
                     ? `Transfers allowed by an override until ${formatDate(s.override_active.until)}.`
                     : s.allowed_now
-                      ? 'File transfers are allowed now.'
-                      : `Outside the allowed hours. New file content waits until ${formatDate(s.next_allowed_at)}.`
+                      ? 'Incoming transfers are allowed now.'
+                      : `Incoming transfers wait until ${formatDate(s.next_allowed_at)}.`
                 }
-                ${s.queued_total} queued, ${s.failed_total} failed.
+                Outgoing transfers follow the receiving instance's hours.
               </span>
             </div>
             ${this.renderTransfers()}

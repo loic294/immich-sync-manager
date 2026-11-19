@@ -5,6 +5,7 @@ import '@/components/ism-sync-thumbnail';
 
 const transfer: SyncActivity = {
   id: 'transfer1',
+  outgoing: false,
   peer_id: 'peer1',
   share_name: 'Photos',
   relative_path: 'Trip/a.jpg',

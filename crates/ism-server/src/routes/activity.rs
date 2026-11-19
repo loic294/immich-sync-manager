@@ -9,7 +9,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use ism_core::dto::{
     Location, OperationActivity, OperationDetail, OperationPage, OperationStatus,
-    OperationTaskProgress, Progress, SyncActivity, SyncFileDetails, SyncFileInfo, SyncPage,
+    OperationTaskProgress, Progress, SyncFileDetails, SyncFileInfo, SyncPage,
 };
 use serde::Deserialize;
 use sqlx::Row;
@@ -236,29 +236,15 @@ async fn mark_handled(
     Ok(axum::http::StatusCode::NO_CONTENT.into_response())
 }
 
-const SYNC_CTE: &str = "
-    WITH activity AS (
-        SELECT id, peer_id, share_id, rel_path, sha256, size, bytes_done, error, queued_at,
-               NULL AS finished_at, NULL AS operation_id, status FROM transfers
-        UNION ALL
-        SELECT h.id, h.peer_id, h.share_id, h.rel_path, h.sha256, h.size, h.size,
-               CASE WHEN o.status IN ('failed','partial','recovery_required') THEN 'Publishing needs attention; open the related operation.' ELSE NULL END,
-               h.queued_at, CASE WHEN h.operation_id IS NULL THEN h.finished_at ELSE o.finished_at END, h.operation_id,
-               CASE WHEN h.operation_id IS NULL OR o.status = 'completed' THEN 'completed'
-                    WHEN o.status IN ('failed','partial','recovery_required') THEN 'failed'
-                    WHEN o.status = 'cancelled' THEN 'cancelled' ELSE 'publishing' END
-        FROM transfer_history h LEFT JOIN operations o ON o.id = h.operation_id
-    )";
-
 async fn sync(
     State(state): State<AppState>,
     Admin(_): Admin,
     Query(q): Query<PageQuery>,
 ) -> AppResult<Json<SyncPage>> {
     let (limit, offset) = q.bounds()?;
-    let filter = match q.status.as_deref() {
-        None | Some("active") => "t.status != 'completed'",
-        Some("completed") => "t.status = 'completed'",
+    let status = match q.status.as_deref() {
+        None | Some("active") => "active",
+        Some("completed") => "completed",
         _ => {
             return Err(AppError::bad_request(
                 "invalid_status",
@@ -266,56 +252,16 @@ async fn sync(
             ));
         }
     };
-    let filter = if q.id.is_some() { "1" } else { filter };
-    let total = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
-        "{SYNC_CTE} SELECT COUNT(*) FROM activity t WHERE {filter} AND (? IS NULL OR t.id = ?)"
-    )))
-    .bind(&q.id)
-    .bind(&q.id)
-    .fetch_one(&state.db)
-    .await?;
-    let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
-        "{SYNC_CTE} SELECT t.*, p.name AS peer_name, s.name AS share_name, s.root_id,
-            CASE WHEN s.path = '' THEN t.rel_path ELSE s.path || '/' || t.rel_path END AS path,
-            m.container_path
-         FROM activity t JOIN peers p ON p.id = t.peer_id JOIN shares s ON s.id = t.share_id
-         JOIN mappings m ON m.root_id = s.root_id WHERE {filter} AND (? IS NULL OR t.id = ?)
-         ORDER BY CASE t.status WHEN 'running' THEN 0 WHEN 'publishing' THEN 1 WHEN 'queued' THEN 2 ELSE 3 END,
-             CASE WHEN t.status = 'completed' THEN t.finished_at END DESC, t.queued_at, t.id
-         LIMIT ? OFFSET ?"
-    ))).bind(&q.id).bind(&q.id).bind(limit).bind(offset).fetch_all(&state.db).await?;
-    let name = state.instance_name().await;
-    let rows = rows
-        .into_iter()
-        .map(|r| {
-            let path: String = r.try_get("path")?;
-            Ok(SyncActivity {
-                id: r.try_get("id")?,
-                peer_id: r.try_get("peer_id")?,
-                share_name: r.try_get("share_name")?,
-                relative_path: r.try_get("rel_path")?,
-                location: Location {
-                    root_id: r.try_get("root_id")?,
-                    path: path.clone(),
-                },
-                source: format!("ISM: {}", r.try_get::<String, _>("peer_name")?),
-                destination: format!("ISM: {name}"),
-                destination_path: format!(
-                    "{}/{path}",
-                    r.try_get::<String, _>("container_path")?
-                        .trim_end_matches('/')
-                ),
-                status: r.try_get("status")?,
-                size: r.try_get::<i64, _>("size")?.max(0) as u64,
-                bytes_done: r.try_get::<i64, _>("bytes_done")?.max(0) as u64,
-                error: r.try_get("error")?,
-                queued_at: r.try_get("queued_at")?,
-                finished_at: r.try_get("finished_at")?,
-                operation_id: r.try_get("operation_id")?,
-            })
-        })
-        .collect::<Result<Vec<_>, sqlx::Error>>()?;
-    Ok(Json(SyncPage { rows, total }))
+    Ok(Json(
+        crate::peers::activity::page(
+            &state,
+            if q.id.is_some() { "all" } else { status },
+            limit,
+            offset,
+            q.id.as_deref(),
+        )
+        .await?,
+    ))
 }
 
 #[derive(Deserialize)]

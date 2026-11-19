@@ -12,6 +12,16 @@ export function formatBytes(bytes: number): string {
   return `${unit === 0 ? value : value.toFixed(value < 10 ? 1 : 0)} ${UNITS[unit]}`;
 }
 
+export function formatDuration(seconds: number): string {
+  const value = Math.max(0, Math.ceil(seconds));
+  if (value < 60) return `${value} sec`;
+  const minutes = Math.ceil(value / 60);
+  if (minutes < 60) return `${minutes} min`;
+  if (minutes < 1440) return `${Math.floor(minutes / 60)} hr ${minutes % 60} min`;
+  const days = Math.floor(minutes / 1440);
+  return `${days} ${days === 1 ? 'day' : 'days'} ${Math.floor((minutes % 1440) / 60)} hr`;
+}
+
 /** A timestamp in the browser's locale, or `—`. */
 export function formatDate(value: string | null | undefined): string {
   if (!value) return '—';

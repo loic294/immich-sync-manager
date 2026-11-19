@@ -21,6 +21,7 @@ use crate::files::{self, STAGING_DIR};
 use crate::state::{AppState, ServerEvent};
 
 const MAX_ATTEMPTS: i64 = 8;
+const MAX_CONCURRENT_TRANSFERS: usize = 3;
 const PROGRESS_EVERY: u64 = 4 * 1024 * 1024;
 
 fn existing_original_for_companion(
@@ -157,6 +158,32 @@ struct Transfer {
     vv: VersionVector,
 }
 
+async fn original_pending(state: &AppState, share_id: &str, rel: &str) -> AppResult<bool> {
+    let extensions = state.sidecar_extensions();
+    if !is_companion_name(rel, &extensions) {
+        return Ok(false);
+    }
+    let (stem, _) = ism_core::paths::split_ext(rel);
+    let paths: Vec<String> = sqlx::query_scalar(
+        "SELECT rel_path FROM transfers
+         WHERE share_id = ?1 AND status IN ('queued','running')
+           AND (rel_path = ?2 OR substr(rel_path, 1, length(?2) + 1) = ?2 || '.')
+         UNION ALL
+         SELECT h.rel_path FROM transfer_history h JOIN operations o ON o.id = h.operation_id
+         WHERE h.share_id = ?1 AND o.status IN ('queued','waiting_maintenance','running')
+           AND (h.rel_path = ?2 OR substr(h.rel_path, 1, length(?2) + 1) = ?2 || '.')",
+    )
+    .bind(share_id)
+    .bind(stem)
+    .fetch_all(&state.db)
+    .await?;
+    Ok(paths.iter().any(|path| {
+        !is_companion_name(path, &extensions)
+            && std::path::Path::new(path).parent() == std::path::Path::new(rel).parent()
+            && !companions_of(path, &[rel.to_owned()], &extensions).is_empty()
+    }))
+}
+
 async fn next(state: &AppState) -> AppResult<Option<(Transfer, Option<String>)>> {
     type R = (
         String,
@@ -169,125 +196,141 @@ async fn next(state: &AppState) -> AppResult<Option<(Transfer, Option<String>)>>
         i64,
         String,
     );
-    let rows: Vec<R> = sqlx::query_as(
-        "SELECT t.id, t.peer_id, t.share_id, t.rel_path, t.sha256, t.size, t.vv_json, t.attempts, t.updated_at
-         FROM transfers t JOIN peers p ON p.id = t.peer_id
-         WHERE t.status = 'queued' AND p.status = 'online' ORDER BY t.queued_at, t.id LIMIT 200",
-    )
-    .fetch_all(&state.db)
-    .await?;
     let now = chrono::Utc::now();
-    for (id, peer_id, share_id, rel, sha256, size, vv, attempts, updated) in rows {
-        // Back off after failures: one minute per attempt.
-        if attempts > 0
-            && db::parse_ts(&updated).is_some_and(|u| now - u < chrono::Duration::minutes(attempts))
-        {
-            continue;
+    let mut offset = 0_i64;
+    loop {
+        let rows: Vec<R> = sqlx::query_as(
+            "SELECT t.id, t.peer_id, t.share_id, t.rel_path, t.sha256, t.size, t.vv_json, t.attempts, t.updated_at
+             FROM transfers t JOIN peers p ON p.id = t.peer_id
+             WHERE t.status = 'queued' AND p.status = 'online' ORDER BY t.queued_at, t.id LIMIT 200 OFFSET ?",
+        )
+        .bind(offset)
+        .fetch_all(&state.db)
+        .await?;
+        if rows.is_empty() {
+            return Ok(None);
         }
-        let (ok, ov) = allowed(state, &share_id, &peer_id).await?;
-        if ok {
-            return Ok(Some((
-                Transfer {
-                    id,
-                    peer_id,
-                    share_id,
-                    rel,
-                    sha256,
-                    size,
-                    vv: serde_json::from_str(&vv)?,
-                },
-                ov,
-            )));
+        offset += rows.len() as i64;
+        for (id, peer_id, share_id, rel, sha256, size, vv, attempts, updated) in rows {
+            // Back off after failures: one minute per attempt.
+            if attempts > 0
+                && db::parse_ts(&updated)
+                    .is_some_and(|u| now - u < chrono::Duration::minutes(attempts))
+            {
+                continue;
+            }
+            let (ok, ov) = allowed(state, &share_id, &peer_id).await?;
+            if ok && !original_pending(state, &share_id, &rel).await? {
+                return Ok(Some((
+                    Transfer {
+                        id,
+                        peer_id,
+                        share_id,
+                        rel,
+                        sha256,
+                        size,
+                        vv: serde_json::from_str(&vv)?,
+                    },
+                    ov,
+                )));
+            }
         }
     }
-    Ok(None)
 }
 
 pub async fn run(state: AppState) {
     let tick = Duration::from_secs(state.config.tick_secs.max(1));
+    let mut tasks = tokio::task::JoinSet::new();
     loop {
-        match next(&state).await {
-            Ok(Some((t, ov))) => {
-                match claim(&state, &t.id, ov.as_deref()).await {
-                    Ok(true) => {}
-                    Ok(false) => continue,
-                    Err(e) => {
-                        tracing::error!(transfer = %t.id, "claim transfer: {}", e.message());
-                        tokio::time::sleep(tick).await;
-                        continue;
+        if tasks.len() < MAX_CONCURRENT_TRANSFERS {
+            match next(&state).await {
+                Ok(Some((t, ov))) => {
+                    match claim(&state, &t.id, ov.as_deref()).await {
+                        Ok(true) => {}
+                        Ok(false) => continue,
+                        Err(e) => {
+                            tracing::error!(transfer = %t.id, "claim transfer: {}", e.message());
+                            tokio::time::sleep(tick).await;
+                            continue;
+                        }
                     }
+                    state.emit(ServerEvent::SyncChanged);
+                    let state = state.clone();
+                    tasks.spawn(async move {
+                        run_claimed(&state, &t).await;
+                    });
+                    continue;
                 }
-                state.emit(ServerEvent::SyncChanged);
-                let result = run_one(&state, &t).await;
-                let deferred = matches!(result, Ok(Outcome::Deferred));
-                let now = db::now();
-                let updated = match result {
-                    Ok(Outcome::Done) => {
-                        sqlx::query("DELETE FROM transfers WHERE id = ? AND status = 'running'")
-                            .bind(&t.id)
-                            .execute(&state.db)
-                            .await
-                    }
-                    Ok(Outcome::Dropped) => {
-                        sqlx::query("DELETE FROM transfers WHERE id = ? AND status = 'running'")
-                            .bind(&t.id)
-                            .execute(&state.db)
-                            .await
-                    }
-                    Ok(Outcome::Blocked(reason)) => {
-                        sqlx::query(
-                            "UPDATE transfers SET status = 'failed', error = ?, updated_at = ? WHERE id = ? AND status = 'running'",
-                        )
-                        .bind(reason)
-                        .bind(&now)
-                        .bind(&t.id)
-                        .execute(&state.db)
-                        .await
-                    }
-                    Ok(Outcome::Deferred) => {
-                        sqlx::query(
-                            "UPDATE transfers SET status = 'queued', updated_at = ? WHERE id = ? AND status = 'running'",
-                        )
-                        .bind(&now)
-                        .bind(&t.id)
-                        .execute(&state.db)
-                        .await
-                    }
-                    Err(e) => {
-                        tracing::warn!(transfer = %t.id, "transfer failed: {e}");
-                        sqlx::query(
-                            "UPDATE transfers SET attempts = attempts + 1, error = ?, updated_at = ?,
-                             status = CASE WHEN status = 'cancelled' THEN 'cancelled'
-                                           WHEN attempts + 1 >= ? THEN 'failed' ELSE 'queued' END
-                             WHERE id = ?",
-                        )
-                        .bind(&e)
-                        .bind(&now)
-                        .bind(MAX_ATTEMPTS)
-                        .bind(&t.id)
-                        .execute(&state.db)
-                        .await
-                    }
-                };
-                if let Err(e) = updated {
-                    tracing::error!(transfer = %t.id, "record transfer outcome: {e}");
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::error!("transfer queue: {}", e.message());
                 }
-                state.emit(ServerEvent::SyncChanged);
-                if deferred {
-                    tokio::time::sleep(tick).await;
-                }
-            }
-            Ok(None) => {
-                tokio::select! {
-                    () = tokio::time::sleep(tick * 6) => {}
-                    () = state.sync_wake.notified() => {}
-                }
-            }
-            Err(e) => {
-                tracing::error!("transfer queue: {}", e.message());
-                tokio::time::sleep(tick * 6).await;
             }
         }
+        tokio::select! {
+            Some(result) = tasks.join_next(), if !tasks.is_empty() => {
+                if let Err(e) = result {
+                    tracing::error!("transfer task: {e}");
+                }
+            }
+            () = tokio::time::sleep(tick * 6) => {}
+            () = state.sync_wake.notified() => {}
+        }
+    }
+}
+
+async fn run_claimed(state: &AppState, t: &Transfer) {
+    let result = run_one(state, t).await;
+    let deferred = matches!(result, Ok(Outcome::Deferred));
+    let now = db::now();
+    let updated = match result {
+        Ok(Outcome::Done | Outcome::Dropped) => {
+            sqlx::query("DELETE FROM transfers WHERE id = ? AND status = 'running'")
+                .bind(&t.id)
+                .execute(&state.db)
+                .await
+        }
+        Ok(Outcome::Blocked(reason)) => {
+            sqlx::query(
+                "UPDATE transfers SET status = 'failed', error = ?, updated_at = ? WHERE id = ? AND status = 'running'",
+            )
+            .bind(reason)
+            .bind(&now)
+            .bind(&t.id)
+            .execute(&state.db)
+            .await
+        }
+        Ok(Outcome::Deferred) => {
+            sqlx::query(
+                "UPDATE transfers SET status = 'queued', updated_at = ? WHERE id = ? AND status = 'running'",
+            )
+            .bind(&now)
+            .bind(&t.id)
+            .execute(&state.db)
+            .await
+        }
+        Err(e) => {
+            tracing::warn!(transfer = %t.id, "transfer failed: {e}");
+            sqlx::query(
+                "UPDATE transfers SET attempts = attempts + 1, error = ?, updated_at = ?,
+                 status = CASE WHEN status = 'cancelled' THEN 'cancelled'
+                               WHEN attempts + 1 >= ? THEN 'failed' ELSE 'queued' END
+                 WHERE id = ?",
+            )
+            .bind(&e)
+            .bind(&now)
+            .bind(MAX_ATTEMPTS)
+            .bind(&t.id)
+            .execute(&state.db)
+            .await
+        }
+    };
+    if let Err(e) = updated {
+        tracing::error!(transfer = %t.id, "record transfer outcome: {e}");
+    }
+    state.emit(ServerEvent::SyncChanged);
+    if deferred {
+        tokio::time::sleep(Duration::from_secs(state.config.tick_secs.max(1))).await;
     }
 }
 
@@ -323,7 +366,7 @@ async fn run_one(state: &AppState, t: &Transfer) -> Result<Outcome, String> {
             "NAS metadata and ignored names are excluded from peer replication",
         ));
     }
-    let _operation_guard = state.replication_operation_lock.lock().await;
+    let operation_guard = state.replication_operation_lock.lock().await;
     if let Err(e) = super::require_stable_operations(state).await {
         return if e.code() == "recovery_required" {
             Ok(Outcome::Deferred)
@@ -421,6 +464,9 @@ async fn run_one(state: &AppState, t: &Transfer) -> Result<Outcome, String> {
         tx.commit().await.map_err(|e| e.to_string())?;
         return Ok(Outcome::Done);
     }
+    // Only staging I/O runs concurrently; adoption and publication remain serialized with
+    // managed operations, scans and peer bookkeeping.
+    drop(operation_guard);
 
     let staging_dir = root.base().join(STAGING_DIR).join("peer");
     tokio::fs::create_dir_all(&staging_dir)
@@ -466,32 +512,30 @@ async fn run_one(state: &AppState, t: &Transfer) -> Result<Outcome, String> {
         .map_err(|e| e.to_string())?;
     let mut done = if status == 206 { offset } else { 0 };
     let mut reported = done;
+    let mut last_report = tokio::time::Instant::now();
     let mut stream = resp.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| net::net_error(&e))?;
         file.write_all(&chunk).await.map_err(|e| e.to_string())?;
         done += chunk.len() as u64;
-        if done - reported >= PROGRESS_EVERY {
-            reported = done;
-            let cancelled: Option<String> =
-                sqlx::query_scalar("SELECT status FROM transfers WHERE id = ?")
-                    .bind(&t.id)
-                    .fetch_optional(&state.db)
-                    .await
-                    .ok()
-                    .flatten();
-            if cancelled.as_deref() != Some("running") {
+        if done - reported >= PROGRESS_EVERY || last_report.elapsed() >= Duration::from_secs(1) {
+            if !super::activity::record_progress(state, &t.id, &t.peer_id, done, done - reported)
+                .await
+                .map_err(m)?
+            {
                 let _ = tokio::fs::remove_file(&staging).await;
                 return Ok(Outcome::Dropped);
             }
-            let _ = sqlx::query("UPDATE transfers SET bytes_done = ?, updated_at = ? WHERE id = ?")
-                .bind(done as i64)
-                .bind(db::now())
-                .bind(&t.id)
-                .execute(&state.db)
-                .await;
-            state.emit(ServerEvent::SyncChanged);
+            reported = done;
+            last_report = tokio::time::Instant::now();
         }
+    }
+    if !super::activity::record_progress(state, &t.id, &t.peer_id, done, done - reported)
+        .await
+        .map_err(m)?
+    {
+        let _ = tokio::fs::remove_file(&staging).await;
+        return Ok(Outcome::Dropped);
     }
     file.sync_all().await.map_err(|e| e.to_string())?;
     drop(file);
@@ -503,6 +547,41 @@ async fn run_one(state: &AppState, t: &Transfer) -> Result<Outcome, String> {
     if hash != t.sha256 {
         let _ = tokio::fs::remove_file(&staging).await;
         return Err("downloaded data does not match its checksum".into());
+    }
+
+    let _operation_guard = state.replication_operation_lock.lock().await;
+    if let Err(e) = super::require_stable_operations(state).await {
+        return if e.code() == "recovery_required" {
+            Ok(Outcome::Deferred)
+        } else {
+            Err(e.message().to_owned())
+        };
+    }
+    let status: Option<String> = sqlx::query_scalar("SELECT status FROM transfers WHERE id = ?")
+        .bind(&t.id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| e.to_string())?;
+    if status.as_deref() != Some("running") {
+        return Ok(Outcome::Dropped);
+    }
+    let Some(current_share) = super::shares(state)
+        .await
+        .map_err(m)?
+        .into_iter()
+        .find(|s| s.id == t.share_id && s.includes(&peer.id))
+    else {
+        return Ok(Outcome::Dropped);
+    };
+    if current_share.root_id != share.root_id
+        || current_share.root_rel(&t.rel).map_err(m)? != target_rel
+    {
+        return Err("share location changed while downloading".into());
+    }
+    let root = files::root(&state.db, &share.root_id).await.map_err(m)?;
+    root.ensure_available().map_err(m)?;
+    if root.abs(&target_rel).map_err(m)? != target {
+        return Err("root location changed while downloading".into());
     }
 
     // Publish only if nothing changed here since the transfer was queued.
@@ -662,8 +741,8 @@ async fn archive_transfer(
     operation_id: Option<&str>,
 ) -> AppResult<()> {
     sqlx::query(
-        "INSERT INTO transfer_history (id, peer_id, share_id, rel_path, sha256, size, queued_at, finished_at, operation_id)
-         SELECT id, peer_id, share_id, rel_path, sha256, size, queued_at, ?, ? FROM transfers WHERE id = ?",
+        "INSERT INTO transfer_history (id, peer_id, share_id, rel_path, sha256, size, queued_at, finished_at, operation_id, run_id)
+         SELECT id, peer_id, share_id, rel_path, sha256, size, queued_at, ?, ?, run_id FROM transfers WHERE id = ?",
     )
     .bind(db::now()).bind(operation_id).bind(id).execute(conn).await?;
     Ok(())
