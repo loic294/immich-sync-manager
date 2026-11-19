@@ -5,6 +5,9 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 
+const DEFAULT_PEER_TRANSFER_CONCURRENCY: usize = 3;
+const MAX_PEER_TRANSFER_CONCURRENCY: usize = 32;
+
 #[derive(Debug, Clone)]
 pub struct Config {
     /// `ISM_LISTEN`, default `0.0.0.0:8080`.
@@ -21,6 +24,8 @@ pub struct Config {
     pub tick_secs: u64,
     /// `ISM_SCAN_INTERVAL_SECS`, default 300. How often shared folders are scanned for changes.
     pub scan_interval_secs: u64,
+    /// Maximum number of peer file transfers running concurrently, default 3.
+    pub peer_transfer_concurrency: usize,
     /// Timings of the Immich maintenance barrier.
     pub timing: Timing,
 }
@@ -73,8 +78,24 @@ fn env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.trim().is_empty())
 }
 
+fn peer_transfer_concurrency(raw: Option<&str>) -> anyhow::Result<usize> {
+    let Some(raw) = raw else {
+        return Ok(DEFAULT_PEER_TRANSFER_CONCURRENCY);
+    };
+    let value = raw
+        .trim()
+        .parse::<usize>()
+        .with_context(|| "ISM_PEER_TRANSFER_CONCURRENCY must be an integer from 1 to 32")?;
+    anyhow::ensure!(
+        (1..=MAX_PEER_TRANSFER_CONCURRENCY).contains(&value),
+        "ISM_PEER_TRANSFER_CONCURRENCY must be from 1 to 32"
+    );
+    Ok(value)
+}
+
 impl Config {
     pub fn from_env() -> anyhow::Result<Self> {
+        let transfer_concurrency_raw = env("ISM_PEER_TRANSFER_CONCURRENCY");
         Ok(Self {
             listen: env("ISM_LISTEN")
                 .unwrap_or_else(|| "0.0.0.0:8080".into())
@@ -94,6 +115,9 @@ impl Config {
             scan_interval_secs: env("ISM_SCAN_INTERVAL_SECS")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(300),
+            peer_transfer_concurrency: peer_transfer_concurrency(
+                transfer_concurrency_raw.as_deref(),
+            )?,
             timing: {
                 let mut t = Timing::default();
                 if let Some(v) = env("ISM_QUIESCE_TIMEOUT_SECS").and_then(|v| v.parse().ok()) {
@@ -124,6 +148,7 @@ impl Config {
             secure_cookies: false,
             tick_secs: 1,
             scan_interval_secs: 5,
+            peer_transfer_concurrency: DEFAULT_PEER_TRANSFER_CONCURRENCY,
             timing: Timing {
                 poll: Duration::from_millis(20),
                 quiesce_timeout: Duration::from_millis(500),
@@ -137,5 +162,19 @@ impl Config {
                 full_pass_gap: Duration::ZERO,
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::peer_transfer_concurrency;
+
+    #[test]
+    fn validates_peer_transfer_concurrency() {
+        assert_eq!(peer_transfer_concurrency(None).unwrap(), 3);
+        assert_eq!(peer_transfer_concurrency(Some("8")).unwrap(), 8);
+        assert!(peer_transfer_concurrency(Some("0")).is_err());
+        assert!(peer_transfer_concurrency(Some("33")).is_err());
+        assert!(peer_transfer_concurrency(Some("many")).is_err());
     }
 }

@@ -11,7 +11,7 @@ use ism_core::schedule::Schedule;
 use ism_core::sidecar::{CompanionRole, companion_role, companions_of, is_companion_name};
 use ism_core::version::{Causality, VersionVector};
 use reqwest::Method;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncWriteExt, BufWriter};
 
 use super::{ConflictInput, Row, Share, net};
 use crate::auth::Principal;
@@ -21,8 +21,8 @@ use crate::files::{self, STAGING_DIR};
 use crate::state::{AppState, ServerEvent};
 
 const MAX_ATTEMPTS: i64 = 8;
-const MAX_CONCURRENT_TRANSFERS: usize = 3;
 const PROGRESS_EVERY: u64 = 4 * 1024 * 1024;
+const STAGING_WRITE_BUFFER: usize = 256 * 1024;
 
 fn existing_original_for_companion(
     folder: &std::path::Path,
@@ -242,7 +242,7 @@ pub async fn run(state: AppState) {
     let tick = Duration::from_secs(state.config.tick_secs.max(1));
     let mut tasks = tokio::task::JoinSet::new();
     loop {
-        if tasks.len() < MAX_CONCURRENT_TRANSFERS {
+        if tasks.len() < state.config.peer_transfer_concurrency {
             match next(&state).await {
                 Ok(Some((t, ov))) => {
                     match claim(&state, &t.id, ov.as_deref()).await {
@@ -502,14 +502,17 @@ async fn run_one(state: &AppState, t: &Transfer) -> Result<Outcome, String> {
         .get("x-ism-mtime-ns")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse().ok());
-    let mut file = tokio::fs::OpenOptions::new()
-        .create(true)
-        .append(status == 206)
-        .write(true)
-        .truncate(status == 200)
-        .open(&staging)
-        .await
-        .map_err(|e| e.to_string())?;
+    let mut file = BufWriter::with_capacity(
+        STAGING_WRITE_BUFFER,
+        tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(status == 206)
+            .write(true)
+            .truncate(status == 200)
+            .open(&staging)
+            .await
+            .map_err(|e| e.to_string())?,
+    );
     let mut done = if status == 206 { offset } else { 0 };
     let mut reported = done;
     let mut last_report = tokio::time::Instant::now();
@@ -537,6 +540,8 @@ async fn run_one(state: &AppState, t: &Transfer) -> Result<Outcome, String> {
         let _ = tokio::fs::remove_file(&staging).await;
         return Ok(Outcome::Dropped);
     }
+    file.flush().await.map_err(|e| e.to_string())?;
+    let file = file.into_inner();
     file.sync_all().await.map_err(|e| e.to_string())?;
     drop(file);
     let check = staging.clone();

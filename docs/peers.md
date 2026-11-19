@@ -65,12 +65,15 @@ while one of its changes is still being applied.
   during **allowed hours** (Sync → Schedule). An override permits a share or peer outside those
   hours for a set time. Uploads and other writes by ISM schedule a rescan of the affected shares,
   so their content is announced without waiting for the full scan.
-  Each receiving instance downloads up to three files concurrently, starting the next eligible
-  file as soon as a slot becomes free rather than waiting for a batch. Publication still runs
-  through the serialized managed-operation barrier. On the receiver, **Sync → Active & queued**
-  shows incoming files and their progress, including files awaiting publication; successful
-  publications move to **Completed syncs**. Sidecars wait for their matching original to finish
-  publishing, so concurrent downloads cannot publish a companion before its original exists.
+  Each receiving instance downloads three files concurrently by default, starting the next
+  eligible file as soon as a slot becomes free rather than waiting for a batch. Set
+  `ISM_PEER_TRANSFER_CONCURRENCY` to 1–32 to tune the global peer download limit; 6–8 is a
+  reasonable starting point for high-latency links, provided both source and destination storage
+  can sustain the extra I/O. Publication still runs through the serialized managed-operation
+  barrier. On the receiver, **Sync → Active & queued** shows incoming files and their progress,
+  including files awaiting publication; successful publications move to **Completed syncs**.
+  Sidecars wait for their matching original to finish publishing, so concurrent downloads cannot
+  publish a companion before its original exists.
 - If the saved schedule is invalid, transfers stop rather than defaulting to unrestricted hours.
   An active, explicitly scoped override still applies. The Sync page provides a replacement
   schedule with no allowed days; choose the desired hours and save to resume scheduling.

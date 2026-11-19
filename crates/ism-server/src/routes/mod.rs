@@ -24,6 +24,7 @@ use crate::state::AppState;
 
 /// Largest request body: one upload chunk.
 pub const MAX_BODY: usize = 64 * 1024 * 1024;
+const FILE_STREAM_BUFFER: usize = 256 * 1024;
 
 pub fn router(state: AppState) -> Router {
     let web = state.config.web_dir.clone();
@@ -119,12 +120,18 @@ pub async fn serve_file(
                 .status(StatusCode::PARTIAL_CONTENT)
                 .header(header::CONTENT_RANGE, format!("bytes {start}-{end}/{len}"))
                 .header(header::CONTENT_LENGTH, take)
-                .body(Body::from_stream(ReaderStream::new(file.take(take))))
+                .body(Body::from_stream(ReaderStream::with_capacity(
+                    file.take(take),
+                    FILE_STREAM_BUFFER,
+                )))
         }
         None => builder
             .status(StatusCode::OK)
             .header(header::CONTENT_LENGTH, len)
-            .body(Body::from_stream(ReaderStream::new(file))),
+            .body(Body::from_stream(ReaderStream::with_capacity(
+                file,
+                FILE_STREAM_BUFFER,
+            ))),
     };
     resp.map_err(AppError::internal)
 }
@@ -148,6 +155,9 @@ pub fn last_event_id(headers: &HeaderMap) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::parse_range;
+    use super::serve_file;
+    use axum::http::HeaderMap;
+    use futures_util::StreamExt;
 
     #[test]
     fn parses_single_ranges() {
@@ -158,6 +168,25 @@ mod tests {
         assert_eq!(parse_range("bytes=100-", 100), None);
         assert_eq!(parse_range("bytes=0-1,5-6", 100), None);
         assert_eq!(parse_range("items=0-1", 100), None);
+    }
+
+    #[tokio::test]
+    async fn serves_files_in_wan_sized_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transfer.bin");
+        std::fs::write(&path, vec![0; 256 * 1024]).unwrap();
+
+        let response = serve_file(&path, &HeaderMap::new(), "synthetic", &[])
+            .await
+            .unwrap();
+        let mut body = response.into_body().into_data_stream();
+        let first = body.next().await.unwrap().unwrap();
+
+        assert!(
+            first.len() >= 64 * 1024,
+            "peer downloads should not be split into {} byte frames",
+            first.len()
+        );
     }
 }
 
