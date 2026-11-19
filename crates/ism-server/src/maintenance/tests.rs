@@ -32,6 +32,12 @@ impl Respond for FakeImmich {
     fn respond(&self, req: &Request) -> ResponseTemplate {
         let p = req.url.path();
         match (req.method.as_str(), p) {
+            ("GET", "/api/api-keys/me") => ResponseTemplate::new(200).set_body_json(json!({
+                "id": "test-key-id", "permissions": ["library.update"]
+            })),
+            ("GET", "/api/users/me") => ResponseTemplate::new(200).set_body_json(json!({
+                "id": "u1", "isAdmin": true
+            })),
             ("GET", "/api/admin/config") => {
                 ResponseTemplate::new(200).set_body_json(self.config.lock().unwrap().clone())
             }

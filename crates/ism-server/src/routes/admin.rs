@@ -15,7 +15,8 @@ use ism_core::dto::{
     AccountInput, AccountView, AuditEntry, ClientAction, ClientTokenCreated, ClientTokenInput,
     ClientTokenView, ImmichServerInput, ImmichServerView, LibraryView, LoginRequest, MappingInput,
     MappingView, MountView, OverrideInput, Overview, PeerAcceptInput, ResolveConflictInput,
-    ScheduleView, SessionInfo, SetupRequest, ShareInput, WatchSettingsInput, WatchStatusView,
+    ScheduleView, SessionInfo, SettingsInput, SettingsView, SetupRequest, ShareInput,
+    WatchSettingsInput, WatchStatusView,
 };
 use ism_core::maintenance::{MaintenanceState, Phase};
 use ism_core::mapping::{RootMapping, validate_set};
@@ -317,51 +318,31 @@ async fn overview(State(state): State<AppState>, Admin(_): Admin) -> AppResult<J
     }))
 }
 
-#[derive(Serialize, Deserialize)]
-struct Settings {
-    instance_name: String,
-    companion_extensions: Vec<String>,
-}
-
-async fn get_settings(State(state): State<AppState>, Admin(_): Admin) -> AppResult<Json<Settings>> {
-    Ok(Json(Settings {
-        instance_name: state.instance_name().await,
-        companion_extensions: files::companion_extensions(&state.db).await,
-    }))
+async fn get_settings(
+    State(state): State<AppState>,
+    Admin(_): Admin,
+) -> AppResult<Json<SettingsView>> {
+    Ok(Json(crate::settings::admin_view(&state).await?))
 }
 
 async fn put_settings(
     State(state): State<AppState>,
     Admin(p): Admin,
-    Json(s): Json<Settings>,
-) -> AppResult<Json<Settings>> {
-    let name = s.instance_name.trim();
+    Json(input): Json<SettingsInput>,
+) -> AppResult<Json<SettingsView>> {
+    let name = input.instance_name.trim();
     if name.is_empty() || name.len() > 64 {
         return Err(AppError::bad_request(
             "invalid_request",
             "the instance name needs 1-64 characters",
         ));
     }
-    let mut exts: Vec<String> = s
-        .companion_extensions
-        .iter()
-        .map(|e| e.trim().trim_start_matches('.').to_ascii_lowercase())
-        .filter(|e| !e.is_empty())
-        .collect();
-    exts.sort();
-    exts.dedup();
-    if exts
-        .iter()
-        .any(|e| e.len() > 16 || !e.chars().all(|c| c.is_ascii_alphanumeric()))
-        || exts.len() > 64
-    {
-        return Err(AppError::bad_request(
-            "invalid_request",
-            "extensions use 1-16 letters or digits",
-        ));
+    crate::settings::apply_admin(&state, &input).await?;
+    if state.instance_name().await != name {
+        db::set_setting(&state.db, "instance_name", name).await?;
+        // Clients show the primary's name.
+        state.emit(crate::state::ServerEvent::SettingsChanged);
     }
-    db::set_setting(&state.db, "instance_name", name).await?;
-    db::set_setting(&state.db, "companion_extensions", &exts.join(",")).await?;
     db::audit(&state.db, &actor(&p), "settings.update", name).await;
     get_settings(State(state), Admin(p)).await
 }

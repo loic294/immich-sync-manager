@@ -42,9 +42,11 @@ while one of its changes is still being applied.
 
 ### What is synchronized
 
-- Synology `@eaDir` metadata is excluded at every path depth, independently of Immich library
-  exclusions. Originals and XMP/JSON/XML companions remain eligible, as do ordinary dot-prefixed
-  and `@`-prefixed folders; ISM's reserved paths remain excluded.
+- Synology `@eaDir` metadata and every name matching the **Ignored names** or **Ignored prefixes**
+  of the file settings (see [Shared file settings](#shared-file-settings)) are excluded at every
+  path depth, independently of Immich library exclusions. Originals and their sidecars remain
+  eligible, as do other dot-prefixed and `@`-prefixed folders; ISM's reserved paths remain
+  excluded.
   Previously tracked metadata is ignored, not announced as deleted, and historical metadata events
   and inventory entries are not advertised or applied. Moves with an excluded source or destination
   are not replayed; ordinary files moved out of metadata are discovered by the next share scan.
@@ -86,6 +88,24 @@ while one of its changes is still being applied.
   types, reused event identities with different content, and equal file versions with different
   contents stop the affected peer's event cursor rather than being silently acknowledged. The Peers
   page shows the processing error while retaining its connected status when the peer is reachable.
+
+## Shared file settings
+
+**Settings → Files and sidecars** holds the sidecar extensions (files that move, rename, download
+and sync with their original), the ignored names and prefixes, and the longest name a client may
+generate. Open Photo Manager reads the same values from `GET /api/v1/client/settings`.
+
+**Settings → Primary instance** picks the instance whose values are the reference: this instance
+or a paired peer. While a primary is chosen:
+- only the primary can edit the file settings; every other instance shows its values read-only
+  (`409 settings_managed_by_primary` on a change);
+- each instance fetches `GET /api/peer/v1/settings` from its peers on every sync poll and adopts
+  the primary's values when they are newer than its own copy, so they also reach instances that
+  are not paired with the primary directly;
+- the choice itself spreads the same way; the latest choice wins.
+
+With no primary, every instance keeps and edits its own values. Older peers without the settings
+endpoint are skipped.
 
 ## Conflicts
 

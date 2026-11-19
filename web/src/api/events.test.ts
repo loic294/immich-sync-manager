@@ -36,6 +36,8 @@ describe('WebSocket events client', () => {
     expect(seen).toEqual([{ type: 'resync' }]);
     sources[0]?.send('{"type":"sync_changed"}');
     expect(seen.at(-1)).toEqual({ type: 'sync_changed' });
+    sources[0]?.send('{"type":"settings_changed"}');
+    expect(seen.at(-1)).toEqual({ type: 'settings_changed' });
     sources[0]?.onclose?.(new CloseEvent('close'));
     expect(client.connection.value).toBe('reconnecting');
     await vi.advanceTimersByTimeAsync(3000);

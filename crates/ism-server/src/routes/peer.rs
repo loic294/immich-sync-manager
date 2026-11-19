@@ -26,6 +26,7 @@ pub fn router() -> Router<AppState> {
         .route("/content", get(content))
         .route("/file-info", get(file_info))
         .route("/thumbnail", get(thumbnail))
+        .route("/settings", get(settings))
 }
 
 async fn file_info(
@@ -112,6 +113,14 @@ async fn hello(
         name: state.instance_name().await,
         shares,
     }))
+}
+
+/// The shared file settings and primary designation, for the peer to merge.
+async fn settings(
+    State(state): State<AppState>,
+    PeerAuth(_): PeerAuth,
+) -> Json<ism_core::file_settings::SharedSettings> {
+    Json(state.shared_settings().settings.clone())
 }
 
 #[derive(Deserialize)]

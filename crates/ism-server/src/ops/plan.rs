@@ -178,7 +178,7 @@ impl<'a> Ctx<'a> {
             principal,
             allow_owner_transfer,
             roots: files::load_roots(&state.db).await?,
-            companions: files::companion_extensions(&state.db).await,
+            companions: state.sidecar_extensions(),
             servers: registry::servers(state).await?,
         })
     }

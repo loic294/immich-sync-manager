@@ -3012,16 +3012,27 @@ async fn sidecar_only_and_provenance_uploads_are_validated() {
 }
 
 #[tokio::test]
-async fn an_upload_gets_its_asset_id_after_the_library_scan() {
+async fn an_upload_gets_its_asset_id_after_the_scoped_scan_fallback() {
     let h = harness().await;
     h.map_root().await;
-    let (_server, fake) = crate::maintenance::tests::fake_server(&h.state).await;
+    let (server, fake) = crate::maintenance::tests::fake_server(&h.state).await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/api/libraries/lib1/scan"))
+        .and(wiremock::matchers::body_json(json!({
+            "path": "/library/photos/2024/Trip"
+        })))
+        .respond_with(wiremock::ResponseTemplate::new(204))
+        .with_priority(1)
+        .expect(1)
+        .mount(&server)
+        .await;
     sqlx::query("INSERT INTO immich_libraries (id, server_id, name, owner_user_id, import_paths_json, refreshed_at) VALUES ('lib1', 's1', 'Photos', 'u1', '[\"/library/photos\"]', ?)")
         .bind(crate::db::now())
         .execute(&h.state.db)
         .await
         .unwrap();
-    sqlx::query("UPDATE immich_servers SET direct_writes_enabled = 1, database_url_enc = 'unused', external_library_move_mode = 'db_only' WHERE id = 's1'")
+    // Exercise scan-based publication with the fork's scoped-scan capability verified.
+    sqlx::query("UPDATE immich_servers SET direct_writes_enabled = 1, database_url_enc = 'unused', external_library_move_mode = 'db_only', external_library_api_capable = 1 WHERE id = 's1'")
         .execute(&h.state.db)
         .await
         .unwrap();
@@ -3047,7 +3058,7 @@ async fn an_upload_gets_its_asset_id_after_the_library_scan() {
             .await
             .unwrap()
             .flatten();
-    assert!(due.is_some(), "the upload schedules a library scan");
+    assert!(due.is_some(), "the upload schedules a scoped fallback");
 
     // Not imported yet: nothing to fill.
     let filled = crate::ops::uploads::fill_asset_ids(&h.state, "s1", "lib1")
@@ -3069,15 +3080,18 @@ async fn an_upload_gets_its_asset_id_after_the_library_scan() {
         .unwrap()
         .push(("/library/photos/2024/Trip/c.jpg".into(), "asset-1".into()));
     let mut events = h.state.events.subscribe();
-    let filled = crate::ops::uploads::fill_asset_ids(&h.state, "s1", "lib1")
+    crate::watch::scheduler::step(&h.state, i64::MAX / 2)
         .await
         .unwrap();
-    assert_eq!(filled, 1);
-    let mut announced = false;
-    while let Ok(event) = events.try_recv() {
-        announced |= matches!(event, crate::state::ServerEvent::OperationUpdated { operation_id: ref id } if id == operation_id);
-    }
-    assert!(announced, "SSE subscribers hear about the filled asset id");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if matches!(events.recv().await.unwrap(),
+                crate::state::ServerEvent::OperationUpdated { operation_id: ref id } if id == operation_id)
+            {
+                break;
+            }
+        }
+    }).await.expect("the scheduler fills imported asset IDs and notifies SSE subscribers");
     let streamed = tokio::time::timeout(Duration::from_secs(20), listener)
         .await
         .expect("the stream ends once the asset id is known")

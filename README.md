@@ -27,8 +27,9 @@ permanently, and ISM watches the mapped folders itself (see [file watching](docs
    `library` queue and waits until no library job is running.
 2. The batch runs. Every step can be undone; a failing item rolls back and never half-applies.
    Moves update Immich's database directly and need no scan.
-3. When the last batch finishes, the queue is resumed. Uploads, peer copies and outside changes get
-   a library scan **2 minutes** after the last change.
+3. When the last batch finishes, the queue is resumed. Uploads, peer copies and outside changes use
+   file APIs first. Unhandled work is debounced for **2 minutes**, with scans limited to affected
+   folders on the supported Immich fork; automatic full-library scans are never a fallback.
 
 The Immich API is always preferred. Immich has no API to change the path or owner of an
 external-library asset, so those few updates go straight to Immich's PostgreSQL, guarded by row locks

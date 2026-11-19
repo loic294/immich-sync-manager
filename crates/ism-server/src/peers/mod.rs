@@ -12,9 +12,11 @@ pub mod transfer;
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::sync::Arc;
 
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use ism_core::dto::{ConflictSide, Location, OperationAction, OperationRequest};
+use ism_core::file_settings::{JunkRules, SharedSettings};
 use ism_core::paths::RelPath;
 use ism_core::version::{Causality, VersionVector};
 use serde::{Deserialize, Serialize};
@@ -31,9 +33,10 @@ pub(crate) const SETTLE_SECS: i64 = 30;
 const EVENT_BATCH: i64 = 500;
 const SYNOLOGY_METADATA_DIR: &str = "@eaDir";
 
-/// NAS-generated metadata is not replicated content, regardless of its depth or extension.
-pub(crate) fn excluded_path(path: &str) -> bool {
-    path.split('/').any(|name| name == SYNOLOGY_METADATA_DIR)
+/// NAS-generated metadata and ignored names are not replicated content, at any depth.
+fn excluded_path(path: &str, junk: &JunkRules) -> bool {
+    path.split('/')
+        .any(|name| name == SYNOLOGY_METADATA_DIR || junk.is_junk(name))
 }
 
 #[derive(Debug, Clone)]
@@ -44,6 +47,8 @@ pub struct Share {
     pub path: RelPath,
     pub peer_ids: Vec<String>,
     pub enabled: bool,
+    /// The ignored names and prefixes when the share was loaded.
+    pub junk: Arc<JunkRules>,
 }
 
 impl Share {
@@ -53,7 +58,7 @@ impl Share {
             return None;
         }
         let p = RelPath::parse(&loc.path).ok()?;
-        if !p.starts_with(&self.path) || p == self.path || excluded_path(p.as_str()) {
+        if !p.starts_with(&self.path) || p == self.path || excluded_path(p.as_str(), &self.junk) {
             return None;
         }
         Some(if self.path.is_root() {
@@ -70,9 +75,9 @@ impl Share {
             (false, true) => self.path.as_str().to_owned(),
             (false, false) => format!("{}/{rel}", self.path.as_str()),
         };
-        if excluded_path(&joined) {
+        if excluded_path(&joined, &self.junk) {
             return Err(AppError::invalid_location(
-                "Synology metadata is excluded from peer replication",
+                "NAS metadata and ignored names are excluded from peer replication",
             ));
         }
         files::parse_rel(&joined)
@@ -87,7 +92,7 @@ impl Share {
 
     pub fn includes(&self, peer_id: &str) -> bool {
         self.enabled
-            && !excluded_path(self.path.as_str())
+            && !excluded_path(self.path.as_str(), &self.junk)
             && self.peer_ids.iter().any(|p| p == peer_id)
     }
 }
@@ -98,6 +103,7 @@ pub async fn shares(state: &AppState) -> AppResult<Vec<Share>> {
     )
     .fetch_all(&state.db)
     .await?;
+    let junk = state.junk_rules();
     rows.into_iter()
         .map(|(id, name, root_id, path, peers, enabled)| {
             Ok(Share {
@@ -107,6 +113,7 @@ pub async fn shares(state: &AppState) -> AppResult<Vec<Share>> {
                 path: files::parse_rel(&path)?,
                 peer_ids: serde_json::from_str(&peers)?,
                 enabled: enabled != 0,
+                junk: junk.clone(),
             })
         })
         .collect()
@@ -129,8 +136,12 @@ pub struct EventData {
 }
 
 impl EventData {
-    fn excluded(&self) -> bool {
-        excluded_path(&self.path) || self.from.as_deref().is_some_and(excluded_path)
+    fn excluded(&self, junk: &JunkRules) -> bool {
+        excluded_path(&self.path, junk)
+            || self
+                .from
+                .as_deref()
+                .is_some_and(|from| excluded_path(from, junk))
     }
 }
 
@@ -262,7 +273,8 @@ pub async fn events_for(
         })
         .collect::<AppResult<Vec<_>>>()?;
     // Keep the unfiltered cursor so historical metadata events do not stall pagination.
-    events.retain(|e| e.kind == SHARE_ENABLED || !e.data.excluded());
+    let junk = state.junk_rules();
+    events.retain(|e| e.kind == SHARE_ENABLED || !e.data.excluded(&junk));
     Ok(EventPage { events, next })
 }
 
@@ -418,8 +430,8 @@ fn reserved(name: &str) -> bool {
     HIDDEN.contains(&name) || name.starts_with(".ism")
 }
 
-fn hidden(name: &str) -> bool {
-    reserved(name) || excluded_path(name)
+fn hidden(name: &str, junk: &JunkRules) -> bool {
+    reserved(name) || excluded_path(name, junk)
 }
 
 /// Hashes one file on disk and records it as a local change when it differs from its row.
@@ -537,12 +549,13 @@ pub async fn scan_share(state: &AppState, share: &Share) -> AppResult<()> {
             share.path
         )));
     }
+    let junk = share.junk.clone();
     let found: Vec<(String, i64, i64)> = tokio::task::spawn_blocking(move || {
         let mut found = Vec::new();
         for entry in walkdir::WalkDir::new(&base)
             .min_depth(1)
             .into_iter()
-            .filter_entry(|e| !hidden(&e.file_name().to_string_lossy()))
+            .filter_entry(|e| !hidden(&e.file_name().to_string_lossy(), &junk))
         {
             let entry = entry.map_err(std::io::Error::other)?;
             if !entry.file_type().is_file() {
@@ -587,7 +600,7 @@ pub async fn scan_share(state: &AppState, share: &Share) -> AppResult<()> {
     }
     for (rel, (_, _, deleted)) in known {
         // A newly ignored row is not evidence that the file was deleted.
-        if deleted || seen.contains(&rel) || rel.split('/').any(hidden) {
+        if deleted || seen.contains(&rel) || rel.split('/').any(|name| hidden(name, &share.junk)) {
             continue;
         }
         if let Some(mut r) = row(state, &share.id, &rel).await? {
@@ -1689,7 +1702,7 @@ pub async fn pull(state: &AppState, peer: &net::Peer) -> Result<usize, String> {
             {
                 return Err("invalid peer folder event".into());
             }
-            if e.data.excluded() {
+            if e.data.excluded(&share.junk) {
                 cursor = e.seq;
                 continue;
             }
@@ -1729,7 +1742,7 @@ pub async fn pull(state: &AppState, peer: &net::Peer) -> Result<usize, String> {
         }
         // Validate legacy metadata events, then acknowledge without applying or forwarding
         // them, including moves whose source is now excluded.
-        if e.data.excluded() {
+        if e.data.excluded(&share.junk) {
             tracing::debug!(path = %e.data.path, "skipping excluded peer metadata event");
             cursor = e.seq;
             continue;
@@ -2112,7 +2125,7 @@ pub async fn backfill(state: &AppState, peer: &net::Peer) -> Result<usize, Strin
     let mut stopped = false;
     for entry in &page.entries {
         let hidden_path = RelPath::parse(&entry.path)
-            .map(|p| p.segments().any(hidden))
+            .map(|p| p.segments().any(|name| hidden(name, &share.junk)))
             .unwrap_or(true);
         if !hidden_path
             && !has_open_conflict(state, &share.id, &entry.path)
@@ -2418,6 +2431,7 @@ async fn poll_peer(state: &AppState, peer: &net::Peer) {
     match hello {
         Ok(h) if peer.instance_id.as_deref() == Some(h.instance_id.as_str()) => {
             net::mark(state, &peer.id, Ok(())).await;
+            sync_settings(state, peer).await;
             let mut outcome = pull(state, peer).await;
             if outcome.is_ok() {
                 outcome = backfill(state, peer).await;
@@ -2438,6 +2452,20 @@ async fn poll_peer(state: &AppState, peer: &net::Peer) {
             .await
         }
         Err(e) => net::mark(state, &peer.id, Err(e)).await,
+    }
+}
+
+/// Merges the peer's shared file settings. Peers from before shared settings answer 404.
+async fn sync_settings(state: &AppState, peer: &net::Peer) {
+    let remote: Result<SharedSettings, String> =
+        net::get_json(state, peer, "/api/peer/v1/settings").await;
+    match remote {
+        Ok(remote) => {
+            if let Err(error) = crate::settings::merge_remote(state, &remote).await {
+                tracing::warn!(peer = %peer.name, "cannot merge shared settings: {}", error.message());
+            }
+        }
+        Err(error) => tracing::debug!(peer = %peer.name, "no shared settings: {error}"),
     }
 }
 

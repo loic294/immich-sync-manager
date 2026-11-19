@@ -3,7 +3,10 @@
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
-use super::client::{ClientAction, Location, Operation, OperationStatus, PlannedFile, Progress};
+use super::client::{
+    ClientAction, FileSettings, InstanceRef, Location, Operation, OperationStatus, PlannedFile,
+    Progress,
+};
 use crate::maintenance::Phase;
 use crate::schedule::Window;
 
@@ -151,6 +154,43 @@ mod move_mode_tests {
         }
         assert_eq!(ImmichMoveMode::parse("unknown"), None);
     }
+}
+
+/// An instance the admin may make primary: this one or a paired peer.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct PrimaryCandidate {
+    pub instance_id: String,
+    pub name: String,
+    pub this_instance: bool,
+}
+
+/// `GET /api/admin/settings`.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct SettingsView {
+    pub instance_id: String,
+    pub instance_name: String,
+    pub files: FileSettings,
+    pub files_revision: i64,
+    /// The primary instance, or null when every instance keeps its own file settings.
+    pub primary: Option<InstanceRef>,
+    /// False while another instance is primary: its values are shown read-only.
+    pub files_editable: bool,
+    pub primary_candidates: Vec<PrimaryCandidate>,
+}
+
+/// `PUT /api/admin/settings`.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct SettingsInput {
+    pub instance_name: String,
+    /// The instance to make primary, or null for none.
+    #[serde(default)]
+    pub primary_instance_id: Option<String>,
+    /// New file settings; omit to keep them. Refused while another instance is primary.
+    #[serde(default)]
+    pub files: Option<FileSettings>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]

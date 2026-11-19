@@ -11,6 +11,7 @@ mod maintenance;
 mod ops;
 mod peers;
 mod routes;
+mod settings;
 mod state;
 mod watch;
 

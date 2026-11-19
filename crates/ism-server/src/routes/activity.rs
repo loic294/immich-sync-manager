@@ -330,7 +330,7 @@ pub async fn shared_location(
     peer_id: Option<&str>,
     q: &SyncFileQuery,
 ) -> AppResult<Location> {
-    if q.path.is_empty() || crate::peers::excluded_path(&q.path) {
+    if q.path.is_empty() {
         return Err(AppError::not_found("file not found"));
     }
     let share = crate::peers::shares(state)
@@ -366,11 +366,16 @@ pub async fn file_details(state: &AppState, location: &Location) -> AppResult<Sy
     let (_, entries) = tokio::task::spawn_blocking(move || files::list_dir(&folder_abs, &folder2))
         .await
         .map_err(AppError::internal)??;
-    let names: Vec<String> = entries.into_iter().map(|(name, _)| name).collect();
+    let junk = state.junk_rules();
+    let names: Vec<String> = entries
+        .into_iter()
+        .map(|(name, _)| name)
+        .filter(|name| !junk.is_junk(name))
+        .collect();
     let name = rel
         .name()
         .ok_or_else(|| AppError::invalid_location("not a file"))?;
-    let extensions = files::companion_extensions(&state.db).await;
+    let extensions = state.sidecar_extensions();
     let mut selected = vec![(
         name.to_owned(),
         ism_core::sidecar::companion_role(name, &extensions)

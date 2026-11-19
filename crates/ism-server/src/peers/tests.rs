@@ -598,7 +598,7 @@ async fn legacy_queued_synology_metadata_fails_without_adoption_or_publication()
         loop {
             let failed: i64 = sqlx::query_scalar(
                 "SELECT COUNT(*) FROM transfers WHERE status = 'failed'
-                 AND error = 'Synology metadata is excluded from peer replication'",
+                 AND error = 'NAS metadata and ignored names are excluded from peer replication'",
             )
             .fetch_one(&b.state.db)
             .await
@@ -3717,4 +3717,75 @@ async fn replicates_files_moves_and_conflicts() {
     let xb = std::fs::read(b.shared.join("2024/Trip/x.jpg")).unwrap();
     assert_eq!(xa, xb, "the original name converges too");
     assert_ne!(xa, ca);
+}
+
+#[tokio::test]
+async fn the_primary_file_settings_reach_peers_and_lock_their_editing() {
+    use ism_core::dto::{FileSettings, SettingsInput};
+
+    let (a, b) = pair().await;
+    let files = FileSettings {
+        sidecar_extensions: vec!["xmp".into(), "dop".into()],
+        junk_names: vec!["Thumbs.db".into()],
+        junk_prefixes: vec!["._".into(), "~$".into()],
+        name_max_len: 143,
+    };
+    crate::settings::apply_admin(
+        &a.state,
+        &SettingsInput {
+            instance_name: "Alpha".into(),
+            primary_instance_id: Some(a.state.instance_id.clone()),
+            files: Some(files.clone()),
+        },
+    )
+    .await
+    .unwrap();
+
+    eventually("B adopts A's file settings", &[&a, &b], || {
+        let s = &b.state.shared_settings().settings;
+        s.primary_id() == Some(a.state.instance_id.as_str()) && s.files == files
+    })
+    .await;
+    assert!(b.state.junk_rules().is_junk("~$draft.docx"));
+    let view = crate::settings::admin_view(&b.state).await.unwrap();
+    assert!(!view.files_editable);
+    assert_eq!(view.primary.unwrap().name, "Alpha");
+
+    let refused = crate::settings::apply_admin(
+        &b.state,
+        &SettingsInput {
+            instance_name: "Beta".into(),
+            primary_instance_id: Some(a.state.instance_id.clone()),
+            files: Some(FileSettings {
+                name_max_len: 200,
+                ..files.clone()
+            }),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(refused.code(), "settings_managed_by_primary");
+
+    // B clears the primary: the latest choice wins on both sides and each keeps its values.
+    crate::settings::apply_admin(
+        &b.state,
+        &SettingsInput {
+            instance_name: "Beta".into(),
+            primary_instance_id: None,
+            files: None,
+        },
+    )
+    .await
+    .unwrap();
+    eventually("A sees that no instance is primary", &[&a, &b], || {
+        a.state.shared_settings().settings.primary_id().is_none()
+    })
+    .await;
+    assert_eq!(a.state.shared_settings().settings.files, files);
+    assert!(
+        crate::settings::admin_view(&b.state)
+            .await
+            .unwrap()
+            .files_editable
+    );
 }

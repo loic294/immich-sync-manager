@@ -156,6 +156,28 @@ pub async fn assets_under(
     rows.iter().map(asset_row).collect()
 }
 
+/// Live (not trashed) assets below `folder` (an absolute Immich path) as `(id, originalPath)`,
+/// ordered by byte order of the path and starting after `after`.
+pub async fn live_assets_page(
+    conn: &mut PgConnection,
+    folder: &str,
+    after: Option<&str>,
+    limit: i64,
+) -> Result<Vec<(String, String)>, sqlx::Error> {
+    sqlx::query_as(
+        r#"SELECT id::text, "originalPath" FROM asset
+           WHERE "originalPath" LIKE $1 ESCAPE '\' AND "deletedAt" IS NULL
+             AND ($2::text IS NULL OR "originalPath" COLLATE "C" > $2::text COLLATE "C")
+           ORDER BY "originalPath" COLLATE "C"
+           LIMIT $3"#,
+    )
+    .bind(like_prefix(folder))
+    .bind(after)
+    .bind(limit)
+    .fetch_all(&mut *conn)
+    .await
+}
+
 #[derive(Debug, Clone)]
 pub struct SidecarRow {
     pub id: String,

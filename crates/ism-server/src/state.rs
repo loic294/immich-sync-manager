@@ -33,6 +33,8 @@ pub enum ServerEvent {
         server_id: String,
         library_id: String,
     },
+    /// The shared file settings or the primary instance changed.
+    SettingsChanged,
 }
 
 pub struct Inner {
@@ -61,6 +63,10 @@ pub struct Inner {
     pub maintenance_lock: Mutex<()>,
     /// Serializes replica bookkeeping with managed operations.
     pub replication_operation_lock: Mutex<()>,
+    /// The shared file settings in force; replaced as a whole by `settings::update`.
+    pub shared_settings: std::sync::RwLock<Arc<crate::settings::Snapshot>>,
+    /// Serializes read-modify-write of the shared file settings.
+    pub shared_settings_lock: Mutex<()>,
     request_locks: Mutex<HashMap<String, Weak<Mutex<()>>>>,
 }
 
@@ -84,6 +90,7 @@ impl AppState {
                 id
             }
         };
+        let shared_settings = crate::settings::load(&db, &instance_id).await?;
         let http = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(10))
             .timeout(std::time::Duration::from_secs(120))
@@ -106,6 +113,10 @@ impl AppState {
             pg_pools: Mutex::new(HashMap::new()),
             maintenance_lock: Mutex::new(()),
             replication_operation_lock: Mutex::new(()),
+            shared_settings: std::sync::RwLock::new(Arc::new(crate::settings::Snapshot::new(
+                shared_settings,
+            ))),
+            shared_settings_lock: Mutex::new(()),
             request_locks: Mutex::new(HashMap::new()),
         })))
     }

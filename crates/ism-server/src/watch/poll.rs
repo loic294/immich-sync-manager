@@ -4,6 +4,8 @@ use std::collections::BTreeMap;
 use std::io;
 use std::path::Path;
 
+use ism_core::file_settings::JunkRules;
+
 use super::{Change, ChangeKind, ignore};
 use crate::error::AppResult;
 use crate::state::AppState;
@@ -39,16 +41,18 @@ fn rel_of(base: &Path, path: &Path) -> Option<String> {
     Some(parts?.join("/"))
 }
 
-/// Files under `base/scope` (the whole folder without a scope). Symlinks are not followed and
-/// ignored paths are skipped. A missing scope is empty; any other error fails the pass.
-pub fn walk(base: &Path, scope: Option<&str>) -> io::Result<Tree> {
+/// Files under `base/scope` (the whole folder without a scope). Symlinks are not followed;
+/// ISM-ignored paths and `junk` names are skipped. A missing scope is empty; any other error
+/// fails the pass.
+pub fn walk(base: &Path, scope: Option<&str>, junk: &JunkRules) -> io::Result<Tree> {
+    let skip = |rel: &str| ignore::ignored(rel) || junk.path_is_junk(rel);
     let start = scope.map_or_else(|| base.to_path_buf(), |s| base.join(s));
     let mut tree = Tree::new();
     match std::fs::symlink_metadata(&start) {
         Err(e) if e.kind() == io::ErrorKind::NotFound && scope.is_some() => return Ok(tree),
         Err(e) => return Err(e),
         Ok(meta) if meta.is_file() => {
-            if let Some(rel) = scope.filter(|r| !ignore::ignored(r)) {
+            if let Some(rel) = scope.filter(|r| !skip(r)) {
                 tree.insert(rel.to_owned(), entry(&meta));
             }
             return Ok(tree);
@@ -59,9 +63,7 @@ pub fn walk(base: &Path, scope: Option<&str>) -> io::Result<Tree> {
     let walker = walkdir::WalkDir::new(&start)
         .follow_links(false)
         .into_iter()
-        .filter_entry(|e| {
-            e.depth() == 0 || e.file_name().to_str().is_some_and(|n| !ignore::ignored(n))
-        });
+        .filter_entry(|e| e.depth() == 0 || e.file_name().to_str().is_some_and(|n| !skip(n)));
     for item in walker {
         let item = match item {
             Ok(item) => item,
@@ -80,7 +82,7 @@ pub fn walk(base: &Path, scope: Option<&str>) -> io::Result<Tree> {
         let Some(rel) = rel_of(base, item.path()) else {
             continue;
         };
-        if ignore::ignored(&rel) {
+        if skip(&rel) {
             continue;
         }
         match item.metadata() {
@@ -220,13 +222,16 @@ mod tests {
         std::fs::write(base.join("trip/b.jpg"), "bb").unwrap();
         std::fs::write(base.join("trip/.ism-trash/x.jpg"), "x").unwrap();
         std::fs::write(base.join("trip/c.jpg.part"), "c").unwrap();
-        let old = walk(base, None).unwrap();
+        std::fs::write(base.join("trip/Thumbs.db"), "t").unwrap();
+        std::fs::write(base.join("trip/._a.jpg"), "r").unwrap();
+        let junk = JunkRules::default();
+        let old = walk(base, None, &junk).unwrap();
         assert_eq!(old.keys().collect::<Vec<_>>(), ["trip/a.jpg", "trip/b.jpg"]);
 
         std::fs::write(base.join("trip/a.jpg"), "changed").unwrap();
         std::fs::remove_file(base.join("trip/b.jpg")).unwrap();
         std::fs::write(base.join("new.jpg"), "n").unwrap();
-        let new = walk(base, None).unwrap();
+        let new = walk(base, None, &junk).unwrap();
         let mut changes: Vec<_> = diff(&old, &new)
             .into_iter()
             .map(|c| (c.rel, c.kind))
@@ -241,9 +246,18 @@ mod tests {
             ]
         );
         assert!(diff(&new, &new).is_empty());
-        assert_eq!(walk(base, Some("trip")).unwrap().len(), 1);
-        assert_eq!(walk(base, Some("trip/a.jpg")).unwrap().len(), 1);
-        assert!(walk(base, Some("gone")).unwrap().is_empty());
-        assert!(walk(&base.join("missing"), None).is_err());
+        assert_eq!(walk(base, Some("trip"), &junk).unwrap().len(), 1);
+        assert_eq!(walk(base, Some("trip/a.jpg"), &junk).unwrap().len(), 1);
+        assert!(
+            walk(base, Some("trip/Thumbs.db"), &junk)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            walk(base, Some("trip"), &JunkRules::none()).unwrap().len(),
+            3
+        );
+        assert!(walk(base, Some("gone"), &junk).unwrap().is_empty());
+        assert!(walk(&base.join("missing"), None, &junk).is_err());
     }
 }

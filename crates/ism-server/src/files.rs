@@ -262,25 +262,6 @@ pub fn file_entry(rel: &RelPath, name: &str, meta: &Metadata) -> AppResult<FileE
     })
 }
 
-/// Configured companion extensions (settings key `companion_extensions`, comma separated).
-pub async fn companion_extensions(pool: &SqlitePool) -> Vec<String> {
-    match db::get_setting(pool, "companion_extensions")
-        .await
-        .ok()
-        .flatten()
-    {
-        Some(raw) => raw
-            .split(',')
-            .map(|s| s.trim().trim_start_matches('.').to_ascii_lowercase())
-            .filter(|s| !s.is_empty())
-            .collect(),
-        None => ism_core::sidecar::DEFAULT_COMPANION_EXTENSIONS
-            .iter()
-            .map(|s| (*s).to_owned())
-            .collect(),
-    }
-}
-
 /// Atomically renames `from` to `to` without replacing an existing entry.
 pub fn move_no_replace(from: &Path, to: &Path) -> io::Result<()> {
     if let Some(parent) = to.parent() {

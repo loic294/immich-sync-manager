@@ -557,6 +557,64 @@ pub struct OperationCommitted {
     pub changes: Vec<Change>,
 }
 
+/// The "Files and sidecars" settings ISM shares with its peers and with OPM. Validation and
+/// defaults live in [`crate::file_settings`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct FileSettings {
+    /// Extensions (lowercase, without the dot) of the files that travel with the original next
+    /// to them, such as `xmp`.
+    pub sidecar_extensions: Vec<String>,
+    /// File or folder names that are never content (whole name, case-insensitive).
+    pub junk_names: Vec<String>,
+    /// Name prefixes that are never content, such as `._`.
+    pub junk_prefixes: Vec<String>,
+    /// Longest name, in bytes, a client may generate.
+    pub name_max_len: u16,
+}
+
+/// An ISM instance, by id and display name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct InstanceRef {
+    pub instance_id: String,
+    pub name: String,
+}
+
+/// `GET /api/v1/client/settings` and the `settings_changed` event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct ClientSettings {
+    pub files: FileSettings,
+    /// Grows whenever the primary instance changes the values.
+    pub revision: i64,
+    /// The instance whose values these are.
+    pub origin_instance_id: String,
+    /// The primary instance, or null when every instance keeps its own values.
+    pub primary: Option<InstanceRef>,
+}
+
+/// One live Immich asset below a root.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct ClientAsset {
+    pub asset_id: String,
+    /// Root-relative path of the asset's original.
+    pub path: String,
+}
+
+/// `GET /api/v1/assets`: a page of live Immich assets below a root, ordered by path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct ClientAssetPage {
+    pub root_id: String,
+    /// False when the root is not linked to an Immich library (the list is then empty).
+    pub linked: bool,
+    pub assets: Vec<ClientAsset>,
+    /// Pass as `after` to read the next page; null on the last page.
+    pub next: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct TrashEntry {
