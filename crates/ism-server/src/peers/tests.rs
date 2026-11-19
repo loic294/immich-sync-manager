@@ -416,6 +416,113 @@ async fn three_independent_transfers_refill_slots_and_update_receiver_activity()
 }
 
 #[tokio::test]
+async fn source_queue_keeps_mirroring_while_replication_is_waiting_for_the_operation_barrier() {
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    sqlx::query("DELETE FROM peer_sync_state")
+        .execute(&a.state.db)
+        .await
+        .unwrap();
+    let peer = super::net::peers(&b.state).await.unwrap().remove(0);
+    let share = super::shares(&b.state).await.unwrap().remove(0);
+    super::queue_transfer(
+        &b.state,
+        &peer.id,
+        &share,
+        "photo.jpg",
+        &crate::crypto::sha256_hex(b"synthetic"),
+        1000,
+        &ism_core::version::VersionVector::default(),
+    )
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO transfer_history
+         (id,peer_id,share_id,rel_path,sha256,size,queued_at,finished_at,run_id)
+         SELECT 'completed-photo',peer_id,share_id,'done.jpg',sha256,size,queued_at,?,run_id
+         FROM transfers",
+    )
+    .bind(crate::db::now())
+    .execute(&b.state.db)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE transfers SET status = 'running'")
+        .execute(&b.state.db)
+        .await
+        .unwrap();
+    let _operation_guard = a.state.replication_operation_lock.lock().await;
+    a.tasks.push(tokio::spawn(super::run(a.state.clone())));
+    async fn mirrored(source: &Instance, bytes: u64) -> ism_core::dto::SyncPage {
+        tokio::time::timeout(Duration::from_secs(7), async {
+            loop {
+                let page = super::activity::page(&source.state, "active", 250, 0, None)
+                    .await
+                    .unwrap();
+                if page.total == 1 && page.rows[0].bytes_done == bytes {
+                    return page;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("source queue must mirror the receiver even while replication is blocked")
+    }
+    let initial = mirrored(&a, 0).await;
+    assert!(initial.rows[0].outgoing);
+    assert_eq!(initial.rows[0].status, "running");
+    assert_eq!(initial.progress.files_total, 2);
+    assert_eq!(initial.progress.files_completed, 1);
+    assert_eq!(initial.progress.bytes_total, 2000);
+    assert_eq!(initial.progress.bytes_done, 1000);
+    assert!(initial.warnings.is_empty());
+    let completed = super::activity::page(&a.state, "completed", 250, 0, None)
+        .await
+        .unwrap();
+    assert_eq!(completed.total, 1);
+    assert_eq!(completed.rows[0].relative_path, "done.jpg");
+    assert!(completed.rows[0].outgoing);
+
+    let id: String = sqlx::query_scalar("SELECT id FROM transfers")
+        .fetch_one(&b.state.db)
+        .await
+        .unwrap();
+    assert!(
+        super::activity::record_progress(&b.state, &id, &peer.id, 400, 400)
+            .await
+            .unwrap()
+    );
+    let updated = mirrored(&a, 400).await;
+    assert_eq!(updated.progress.bytes_done, 1400);
+    assert!(updated.progress.bytes_per_second > 0.0);
+}
+
+#[tokio::test]
+async fn sync_activity_warns_until_the_receivers_first_status_response() {
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    sqlx::query("DELETE FROM peer_sync_state")
+        .execute(&a.state.db)
+        .await
+        .unwrap();
+    let unknown = super::activity::page(&a.state, "active", 250, 0, None)
+        .await
+        .unwrap();
+    assert_eq!(unknown.warnings.len(), 1);
+    assert!(unknown.warnings[0].contains("No recent status from the receiver"));
+
+    let peer = super::net::peers(&a.state).await.unwrap().remove(0);
+    super::activity::refresh(&a.state, &peer).await.unwrap();
+    let idle = super::activity::page(&a.state, "active", 250, 0, None)
+        .await
+        .unwrap();
+    assert!(idle.warnings.is_empty());
+    assert_eq!(idle.total, 0);
+}
+
+#[tokio::test]
 async fn mirrored_sync_drains_multiple_pages_and_never_exposes_another_peers_queue() {
     let (mut a, mut b) = pair().await;
     stop_workers(&mut a).await;
@@ -517,6 +624,7 @@ async fn sync_runs_use_last_minute_bytes_for_eta_and_reset_without_losing_histor
     stop_workers(&mut a).await;
     stop_workers(&mut b).await;
     let peer = super::net::peers(&b.state).await.unwrap().remove(0);
+    super::activity::refresh(&b.state, &peer).await.unwrap();
     let share = super::shares(&b.state).await.unwrap().remove(0);
     super::queue_transfer(
         &b.state,

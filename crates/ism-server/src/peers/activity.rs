@@ -1,8 +1,9 @@
 //! Receiver-owned transfer activity, mirrored incrementally to the source.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
+use futures_util::{StreamExt, stream::FuturesUnordered};
 use ism_core::dto::{Location, SyncActivity, SyncPage, SyncProgress};
 use serde::{Deserialize, Serialize};
 use sqlx::{Row, SqliteConnection};
@@ -13,6 +14,38 @@ use crate::error::{AppError, AppResult};
 use crate::state::{AppState, ServerEvent};
 
 const CHANGE_LIMIT: i64 = 500;
+
+pub async fn run(state: AppState) {
+    let mut active = FuturesUnordered::new();
+    let mut running = HashSet::new();
+    let mut interval = tokio::time::interval(Duration::from_secs(5));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                match net::peers(&state).await {
+                    Ok(peers) => {
+                        for peer in peers {
+                            if running.insert(peer.id.clone()) {
+                                let state = state.clone();
+                                active.push(async move {
+                                    if let Err(error) = refresh(&state, &peer).await {
+                                        unavailable(&state, &peer.id, &error).await;
+                                    }
+                                    peer.id
+                                });
+                            }
+                        }
+                    }
+                    Err(error) => tracing::error!("cannot load peers for sync activity: {}", error.message()),
+                }
+            }
+            Some(id) = active.next(), if !active.is_empty() => {
+                running.remove(&id);
+            }
+        }
+    }
+}
 
 const CTE: &str = "
 WITH received AS (
@@ -209,19 +242,17 @@ pub async fn page(
     let mut progress = progress(&mut tx, None).await?;
     type CachedProgress = (String, Option<String>, Option<String>, Option<String>);
     let cached: Vec<CachedProgress> = sqlx::query_as(
-        "SELECT p.name,c.progress_json,c.error,c.updated_at FROM peer_sync_state c
-         JOIN peers p ON p.id = c.peer_id ORDER BY p.name",
+        "SELECT p.name,c.progress_json,c.error,c.updated_at FROM peers p
+         LEFT JOIN peer_sync_state c ON c.peer_id = p.id ORDER BY p.name",
     )
     .fetch_all(&mut *tx)
     .await?;
     let mut warnings = Vec::new();
     for (peer, json, error, updated) in cached {
-        let fresh = updated.as_deref().and_then(db::parse_ts).is_some_and(|at| {
-            chrono::Utc::now() - at
-                <= chrono::Duration::seconds(
-                    (state.config.tick_secs.saturating_mul(3).max(30)) as i64,
-                )
-        });
+        let fresh = updated
+            .as_deref()
+            .and_then(db::parse_ts)
+            .is_some_and(|at| chrono::Utc::now() - at <= chrono::Duration::seconds(30));
         let error =
             error.or_else(|| (!fresh).then(|| "No recent status from the receiver.".into()));
         if let Some(json) = json {

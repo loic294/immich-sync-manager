@@ -156,6 +156,9 @@ shared; mirrored outgoing activity is never mirrored back. Both peers must be up
 outgoing visibility. An unreachable or older peer leaves the last-known queue visible with a
 warning rather than making it look empty or current. Outgoing transfer controls and publishing
 operations are managed on the receiving instance.
+Activity is polled independently every five seconds, so scans, replication backfills, and the
+operation barrier cannot block status updates. Before the first receiver response, the view
+reports unavailable peer status instead of silently treating the unknown queue as empty.
 Completed thumbnails try the local instance first and fall back to the peer's preview if Immich
 has not indexed the local copy yet, rather than immediately replacing the image with a file icon.
 

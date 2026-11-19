@@ -2445,17 +2445,8 @@ async fn poll_peer(state: &AppState, peer: &net::Peer) {
                 outcome.as_ref().err().map(String::as_str),
             )
             .await;
-            if let Err(error) = activity::refresh(state, peer).await {
-                activity::unavailable(state, &peer.id, &error).await;
-            }
         }
         Ok(_) => {
-            activity::unavailable(
-                state,
-                &peer.id,
-                "the peer answered with another instance id",
-            )
-            .await;
             net::mark(
                 state,
                 &peer.id,
@@ -2464,7 +2455,6 @@ async fn poll_peer(state: &AppState, peer: &net::Peer) {
             .await
         }
         Err(e) => {
-            activity::unavailable(state, &peer.id, &e).await;
             net::mark(state, &peer.id, Err(e)).await;
         }
     }
@@ -2484,8 +2474,20 @@ async fn sync_settings(state: &AppState, peer: &net::Peer) {
     }
 }
 
-/// Polls each peer independently so a slow connection does not delay the others.
 pub async fn run(state: AppState) {
+    let mut workers = tokio::task::JoinSet::new();
+    workers.spawn(replicate(state.clone()));
+    workers.spawn(activity::run(state));
+    while let Some(result) = workers.join_next().await {
+        match result {
+            Ok(()) => tracing::error!("peer background worker stopped unexpectedly"),
+            Err(error) => tracing::error!("peer background worker failed: {error}"),
+        }
+    }
+}
+
+/// Polls each peer independently so a slow connection does not delay the others.
+async fn replicate(state: AppState) {
     let tick = std::time::Duration::from_secs(state.config.tick_secs.max(1));
     let mut active = FuturesUnordered::new();
     let mut running = HashSet::new();
