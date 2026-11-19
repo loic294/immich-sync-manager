@@ -1,4 +1,5 @@
 const UNITS = ['B', 'KB', 'MB', 'GB', 'TB'] as const;
+const BIT_RATE_UNITS = ['bps', 'Kbps', 'Mbps', 'Gbps', 'Tbps'] as const;
 
 /** `1536` -> `1.5 KB`. */
 export function formatBytes(bytes: number): string {
@@ -10,6 +11,18 @@ export function formatBytes(bytes: number): string {
     unit += 1;
   }
   return `${unit === 0 ? value : value.toFixed(value < 10 ? 1 : 0)} ${UNITS[unit]}`;
+}
+
+/** Formats a byte-per-second rate in standard decimal network bit-rate units. */
+export function formatBitRate(bytesPerSecond: number): string {
+  if (!Number.isFinite(bytesPerSecond) || bytesPerSecond < 0) return '—';
+  let value = bytesPerSecond * 8;
+  let unit = 0;
+  while (value >= 1000 && unit < BIT_RATE_UNITS.length - 1) {
+    value /= 1000;
+    unit += 1;
+  }
+  return `${unit === 0 ? value : value.toFixed(1)} ${BIT_RATE_UNITS[unit]}`;
 }
 
 export function formatDuration(seconds: number): string {

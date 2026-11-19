@@ -155,7 +155,7 @@ describe('ism-sync-page', () => {
     const page = await mount('ism-sync-page');
     await vi.waitFor(() => expect(page.textContent).toContain('2 of 8 files transferred'));
     expect(page.textContent).toContain('4.0 MB of 10 MB');
-    expect(page.textContent).toContain('1.0 MB/s');
+    expect(page.textContent).toContain('8.4 Mbps');
     expect(page.textContent).toContain('last minute');
     expect(page.textContent).toContain('6 sec remaining');
     expect(

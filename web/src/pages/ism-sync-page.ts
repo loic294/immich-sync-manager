@@ -13,7 +13,14 @@ import type { Window } from '@/api/generated/Window';
 import { IsmPage } from '@/base/ism-page';
 import type { PageChange } from '@/components/ism-pagination';
 import type { IsmSyncDetail } from '@/components/ism-sync-detail';
-import { formatBytes, formatDate, formatDuration, humanize, percent } from '@/util/format';
+import {
+  formatBitRate,
+  formatBytes,
+  formatDate,
+  formatDuration,
+  humanize,
+  percent,
+} from '@/util/format';
 import { statusBadge } from '@/util/status';
 import { tabKeydown } from '@/util/tabs';
 import '@/components/ism-pagination';
@@ -172,7 +179,7 @@ export class IsmSyncPage extends IsmPage {
       </div>
       <div class="flex flex-wrap items-baseline justify-between gap-x-6 gap-y-2 text-sm tabular-nums">
         <span>${formatBytes(p.bytes_done)} of ${formatBytes(p.bytes_total)}</span>
-        <span>${formatBytes(p.bytes_per_second)}/s <span class="text-base-content/70">(last minute)</span></span>
+        <span>${formatBitRate(p.bytes_per_second)} <span class="text-base-content/70">(last minute)</span></span>
         <span>${eta}</span>
       </div>
     </section>

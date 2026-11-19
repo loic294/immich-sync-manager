@@ -168,10 +168,12 @@ has not indexed the local copy yet, rather than immediately replacing the image 
 The summary above the queue shows completed files versus total files, transferred bytes versus
 total bytes, average throughput over the last minute, and estimated remaining transfer time.
 The progress bar and estimate use bytes, not file counts. Throughput measures newly received
-network bytes (including retries), not adopted identical files or resumed bytes already on disk;
-before a minute has elapsed it uses the elapsed run time. The estimate is remaining bytes divided
-by that throughput; it excludes allowed-hours waits and managed publication, and is unavailable
-when no recent throughput is known or a peer's status is stale.
+network bytes (including retries), not adopted identical files or resumed bytes already on disk.
+The web UI displays that rate in decimal network bit-rate units (`Kbps`, `Mbps`, `Gbps`);
+byte totals continue to use data-size units. Before a minute has elapsed it uses the elapsed run
+time. The estimate is remaining bytes divided by that throughput; it excludes allowed-hours waits
+and managed publication, and is unavailable when no recent throughput is known or a peer's status
+is stale.
 
 Run totals are tracked per peer and direction, combined for the local instance. A new run starts
 when new work arrives after that queue has finished; completed history remains available in the

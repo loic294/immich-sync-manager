@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  formatBitRate,
   formatBytes,
   formatCountdown,
   formatDuration,
@@ -14,6 +15,13 @@ describe('format', () => {
     expect(formatBytes(1536)).toBe('1.5 KB');
     expect(formatBytes(50 * 1024 * 1024)).toBe('50 MB');
     expect(formatBytes(-1)).toBe('—');
+  });
+
+  it('formats network rates as decimal bits per second', () => {
+    expect(formatBitRate(0)).toBe('0 bps');
+    expect(formatBitRate(125_000)).toBe('1.0 Mbps');
+    expect(formatBitRate(2.2 * 1024 * 1024)).toBe('18.5 Mbps');
+    expect(formatBitRate(-1)).toBe('—');
   });
 
   it('formats locations and labels', () => {
