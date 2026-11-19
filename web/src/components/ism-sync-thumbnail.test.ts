@@ -23,6 +23,31 @@ const transfer: SyncActivity = {
 };
 
 describe('sync thumbnails', () => {
+  it.each([false, true])(
+    'keeps a completed preview if the local image is unavailable (outgoing: %s)',
+    async (outgoing) => {
+      const thumbnail = await mount('ism-sync-thumbnail', {
+        transfer: { ...transfer, outgoing, status: 'completed' },
+      });
+      const local = thumbnail.querySelector('img');
+      expect(local?.getAttribute('src')).not.toContain('peer_id');
+      local?.dispatchEvent(new Event('error'));
+      await thumbnail.updateComplete;
+      const source = thumbnail.querySelector('img');
+      expect(source).not.toBeNull();
+      expect(source?.getAttribute('src')).toContain('peer_id=peer1');
+
+      thumbnail.transfer = { ...transfer, outgoing, status: 'completed', bytes_done: 100 };
+      await thumbnail.updateComplete;
+      expect(thumbnail.querySelector('img')?.getAttribute('src')).toBe(source?.getAttribute('src'));
+
+      source?.dispatchEvent(new Event('error'));
+      await thumbnail.updateComplete;
+      expect(thumbnail.querySelector('img')).toBeNull();
+      expect(thumbnail.textContent).toContain('JPG');
+    },
+  );
+
   it('keeps the file-type fallback after a failed preview and retries locally on completion', async () => {
     const thumbnail = await mount('ism-sync-thumbnail', { transfer });
     thumbnail.querySelector('img')?.dispatchEvent(new Event('error'));

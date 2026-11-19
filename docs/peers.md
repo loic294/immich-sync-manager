@@ -156,6 +156,8 @@ shared; mirrored outgoing activity is never mirrored back. Both peers must be up
 outgoing visibility. An unreachable or older peer leaves the last-known queue visible with a
 warning rather than making it look empty or current. Outgoing transfer controls and publishing
 operations are managed on the receiving instance.
+Completed thumbnails try the local instance first and fall back to the peer's preview if Immich
+has not indexed the local copy yet, rather than immediately replacing the image with a file icon.
 
 The summary above the queue shows completed files versus total files, transferred bytes versus
 total bytes, average throughput over the last minute, and estimated remaining transfer time.
@@ -169,5 +171,5 @@ Run totals are tracked per peer and direction, combined for the local instance. 
 when new work arrives after that queue has finished; completed history remains available in the
 Completed tab. Pending publication or failed work keeps its current run. Totals and mirrored
 queues survive a restart, while the rolling rate naturally decays to zero after a minute without
-traffic. The page refreshes while open even without new events so rates and estimates do not
-remain stuck on an old value.
+traffic. The page refreshes every five seconds while open, even without new events, so rates and
+estimates do not remain stuck on an old value.

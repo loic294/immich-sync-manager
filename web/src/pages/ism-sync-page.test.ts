@@ -8,7 +8,33 @@ import { mount } from '@/test/helpers';
 import '@/pages/ism-sync-page';
 
 describe('ism-sync-page', () => {
-  afterEach(() => vi.restoreAllMocks());
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
+
+  it('refreshes transfer statistics every five seconds and stops when disconnected', async () => {
+    vi.useFakeTimers();
+    const get = vi.spyOn(api, 'get').mockImplementation(async (path) => {
+      if (path === '/api/admin/sync') return { allowed_now: true, override_active: null } as never;
+      if (path === '/api/admin/sync/page') return { rows: [], total: 0 } as never;
+      if (path === '/api/admin/sync/schedule') return { timezone: 'UTC', windows: [] } as never;
+      return [] as never;
+    });
+    const page = await mount('ism-sync-page');
+    await page.reload();
+    get.mockClear();
+    await vi.advanceTimersByTimeAsync(4999);
+    expect(get).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(get).toHaveBeenCalledWith('/api/admin/sync/page', {
+      query: { status: 'active', limit: 250, offset: 0 },
+    });
+    get.mockClear();
+    page.remove();
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(get).not.toHaveBeenCalled();
+  });
 
   it('uses one live paginated table with direction, previews and completed tabs', async () => {
     const transfer: SyncActivity = {

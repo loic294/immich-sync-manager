@@ -94,7 +94,7 @@ export class IsmSyncPage extends IsmPage {
     super.connectedCallback();
     this.refreshTimer = window.setInterval(() => {
       if (!document.hidden) void this.reload();
-    }, 3000);
+    }, 5000);
   }
 
   override disconnectedCallback() {
