@@ -1,15 +1,17 @@
-//! Debounced Immich library scans.
+//! Debounced, API-first Immich synchronization with folder-scoped scan fallbacks.
 //!
-//! A detected change in a library's folder, or an explicit ISM request (uploads and peer copies
-//! that Immich must import), sets the library's scan due `scan_delay` (two minutes) from now;
-//! every further request restarts the timer. A due scan starts only while no managed operation
-//! holds or is about to hold the server's write barrier, then waits for the library queue to go
-//! idle and announces [`ServerEvent::LibraryScanned`].
+//! Requests retain exact Immich paths across restarts. Every request restarts the library's
+//! two-minute timer. Once the write barrier allows it, file APIs handle additions/removals;
+//! only unsupported work scans affected folders. Successful synchronization announces
+//! [`ServerEvent::LibraryScanned`] even when no scan was necessary.
 
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 use std::time::Duration;
 
-use ism_core::dto::ScanScheduleView;
+use ism_core::dto::{ImmichMoveMode, ScanScheduleView};
 use ism_core::maintenance::IdleConfirmation;
+use serde::{Deserialize, Serialize};
 
 use super::selfwrite::now_ms;
 use crate::error::{AppError, AppResult};
@@ -18,27 +20,62 @@ use crate::state::{AppState, ServerEvent};
 
 const MAX_REASONS: usize = 10;
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) enum WorkKind {
+    Added,
+    Changed,
+    Removed,
+    Folder,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct Work {
+    pub path: String,
+    pub kind: WorkKind,
+}
+
+impl Work {
+    pub fn folder_for_file(path: &str) -> AppResult<Self> {
+        let parent = Path::new(path)
+            .parent()
+            .filter(|p| p.is_absolute())
+            .and_then(Path::to_str)
+            .ok_or_else(|| AppError::invalid_location("file has no absolute parent folder"))?;
+        Ok(Self {
+            path: parent.to_owned(),
+            kind: WorkKind::Folder,
+        })
+    }
+}
+
 fn delay_ms(state: &AppState) -> i64 {
     i64::try_from(state.config.timing.scan_delay.as_millis()).unwrap_or(i64::MAX / 4)
 }
 
-/// Schedules (or postpones) a scan of `library_id` on `server_id`.
-pub async fn request_scan(
+/// Schedules (or postpones) scoped synchronization, preserving requests made during a run.
+pub(crate) async fn request_work(
     state: &AppState,
     server_id: &str,
     library_id: &str,
     reason: &str,
+    work: &[Work],
 ) -> AppResult<()> {
-    request_scan_at(state, server_id, library_id, reason, now_ms()).await
+    request_work_at(state, server_id, library_id, reason, work, now_ms()).await
 }
 
-pub(crate) async fn request_scan_at(
+pub(crate) async fn request_work_at(
     state: &AppState,
     server_id: &str,
     library_id: &str,
     reason: &str,
+    work: &[Work],
     now_ms: i64,
 ) -> AppResult<()> {
+    if work.is_empty() || work.iter().any(|w| !Path::new(&w.path).is_absolute()) {
+        return Err(AppError::invalid_location(
+            "synchronization requires absolute scoped paths",
+        ));
+    }
     let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
     let reasons: Option<String> = sqlx::query_scalar(
         "SELECT reasons_json FROM scan_schedule WHERE library_id = ? AND due_at IS NOT NULL",
@@ -65,6 +102,13 @@ pub(crate) async fn request_scan_at(
     .bind(serde_json::to_string(&reasons)?)
     .execute(&mut *tx)
     .await?;
+    for item in work {
+        sqlx::query("INSERT INTO scan_work (library_id, work_json) VALUES (?, ?)")
+            .bind(library_id)
+            .bind(serde_json::to_string(item)?)
+            .execute(&mut *tx)
+            .await?;
+    }
     tx.commit().await?;
     state.scan_wake.notify_one();
     state.emit(ServerEvent::WatchChanged);
@@ -72,13 +116,7 @@ pub(crate) async fn request_scan_at(
 }
 
 pub async fn run(state: AppState) {
-    if let Err(e) = sqlx::query(
-        "UPDATE scan_schedule SET running = 0, due_at = COALESCE(due_at, ?) WHERE running = 1",
-    )
-    .bind(now_ms())
-    .execute(&state.db)
-    .await
-    {
+    if let Err(e) = recover(&state).await {
         tracing::warn!("scan scheduler: {e}");
     }
     let tick = Duration::from_secs(state.config.tick_secs.max(1));
@@ -100,7 +138,18 @@ pub async fn run(state: AppState) {
     }
 }
 
-/// Starts every due scan whose server allows it. Returns the next due time still pending.
+pub(crate) async fn recover(state: &AppState) -> AppResult<()> {
+    sqlx::query(
+        "UPDATE scan_schedule SET running = 0, running_through = NULL,
+         due_at = COALESCE(due_at, ?) WHERE running = 1",
+    )
+    .bind(now_ms())
+    .execute(&state.db)
+    .await?;
+    Ok(())
+}
+
+/// Starts every due synchronization whose server allows it.
 pub(crate) async fn step(state: &AppState, now_ms: i64) -> AppResult<Option<i64>> {
     let due: Vec<(String, String, i64)> = sqlx::query_as(
         "SELECT library_id, server_id, due_at FROM scan_schedule WHERE due_at IS NOT NULL AND running = 0",
@@ -119,10 +168,12 @@ pub(crate) async fn step(state: &AppState, now_ms: i64) -> AppResult<Option<i64>
             continue;
         }
         let started = sqlx::query(
-            "UPDATE scan_schedule SET due_at = NULL, running = 1, last_started_at = ?, last_error = NULL
+            "UPDATE scan_schedule SET due_at = NULL, running = 1, last_started_at = ?, last_error = NULL,
+             running_through = (SELECT MAX(id) FROM scan_work WHERE library_id = ?)
              WHERE library_id = ? AND due_at = ? AND running = 0",
         )
         .bind(crate::db::now())
+        .bind(&library_id)
         .bind(&library_id)
         .bind(due_at)
         .execute(&state.db)
@@ -142,13 +193,114 @@ pub(crate) async fn step(state: &AppState, now_ms: i64) -> AppResult<Option<i64>
     Ok(next)
 }
 
-async fn scan(state: &AppState, server_id: &str, library_id: &str) -> AppResult<()> {
+async fn scan(state: &AppState, server_id: &str, library_id: &str) -> AppResult<bool> {
+    // Direct file APIs do not pass through Immich's library queue. Serialize dispatch
+    // with barrier admission, but release this lock before waiting for queued scans.
+    let guard = state.maintenance_lock.lock().await;
     let server = registry::server(state, server_id).await?;
+    if !server.maintenance.scans_allowed() {
+        return Ok(false);
+    }
     let api = registry::admin_api(state, &server).await?;
     let immich = |e: crate::immich::api::ApiError| {
         AppError::conflict("immich_error", crate::error::redact(&e.to_string()))
     };
-    api.scan_library(library_id).await.map_err(immich)?;
+    let rows: Vec<String> = sqlx::query_scalar(
+        "SELECT work_json FROM scan_work WHERE library_id = ?
+         AND id <= (SELECT running_through FROM scan_schedule WHERE library_id = ?) ORDER BY id",
+    )
+    .bind(library_id)
+    .bind(library_id)
+    .fetch_all(&state.db)
+    .await?;
+    if rows.is_empty() {
+        return Err(AppError::conflict(
+            "missing_scan_scope",
+            "synchronization has no scoped paths",
+        ));
+    }
+    let mut files = BTreeMap::new();
+    let mut folders = BTreeSet::new();
+    for row in rows {
+        let work: Work = serde_json::from_str(&row)?;
+        if work.kind == WorkKind::Folder {
+            folders.insert(work.path);
+        } else {
+            let kind = match (files.get(&work.path), work.kind) {
+                (Some(WorkKind::Added), WorkKind::Changed) => WorkKind::Added,
+                (Some(WorkKind::Removed | WorkKind::Changed), WorkKind::Added) => WorkKind::Changed,
+                _ => work.kind,
+            };
+            files.insert(work.path, kind);
+        }
+    }
+    for (path, kind) in files {
+        if server.external_library_move_mode == ImmichMoveMode::DbOnly {
+            if kind == WorkKind::Removed {
+                return Err(AppError::conflict(
+                    "file_sync_unavailable",
+                    "outside removals require the external-library file remove API; folder scans cannot reconcile removals",
+                ));
+            }
+            folders.insert(Work::folder_for_file(&path)?.path);
+            continue;
+        }
+        // The add endpoint is deliberately a no-op for existing assets. There is no update
+        // endpoint; changed files (including sidecars) can only request a folder scan.
+        let result = match kind {
+            WorkKind::Added => Some(api.sync_library_file_add(library_id, &path).await),
+            WorkKind::Removed => Some(api.sync_library_file_remove(library_id, &path).await),
+            WorkKind::Changed | WorkKind::Folder => None,
+        };
+        match result {
+            Some(Ok(())) => continue,
+            Some(Err(error)) => {
+                let unavailable = error.is_external_library_api_unavailable()
+                    && server.external_library_move_mode == ImmichMoveMode::ApiWithDbFallback
+                    && server.external_library_api_capable != Some(true);
+                let unsupported = matches!(&error, crate::immich::api::ApiError::Status {
+                    status: 400, message
+                } if message == "Added file is not a supported image or video");
+                // Folder scans only discover files in the fork; they cannot reconcile
+                // failed removals. Keep that failure visible rather than reporting success.
+                if kind == WorkKind::Removed || !(unavailable || unsupported) {
+                    return Err(immich(error));
+                }
+                tracing::warn!(library = %library_id, "file synchronization failed; requesting a scoped fallback: {}", crate::error::redact(&error.to_string()));
+            }
+            None => {}
+        }
+        folders.insert(Work::folder_for_file(&path)?.path);
+    }
+    let mut scanned: Vec<String> = Vec::new();
+    if !folders.is_empty() {
+        let capable = match server.external_library_api_capable {
+            Some(capable) => capable,
+            None => api.external_library_api_capable().await.map_err(immich)?,
+        };
+        if !capable {
+            return Err(AppError::conflict(
+                "targeted_scan_unavailable",
+                "the Immich fork's scoped scan API is required; refusing a potentially full-library scan",
+            ));
+        }
+    }
+    for folder in folders {
+        if scanned
+            .iter()
+            .any(|parent| Path::new(&folder).starts_with(parent))
+        {
+            continue;
+        }
+        api.scan_library_folder(library_id, &folder)
+            .await
+            .map_err(immich)?;
+        scanned.push(folder);
+    }
+    drop(guard);
+    if scanned.is_empty() {
+        return Ok(true);
+    }
     let timing = &state.config.timing;
     let mut deadline = tokio::time::Instant::now() + timing.scan_timeout;
     let mut idle = IdleConfirmation::default();
@@ -159,7 +311,7 @@ async fn scan(state: &AppState, server_id: &str, library_id: &str) -> AppResult<
             .iter()
             .find(|q| q.name == crate::maintenance::LIBRARY_QUEUE);
         if idle.observe(library.is_some_and(crate::immich::api::Queue::is_idle)) {
-            return Ok(());
+            return Ok(true);
         }
         if library.is_some_and(|q| q.is_paused) {
             // A write barrier holds the scan job; the timeout counts only while it may run.
@@ -178,19 +330,44 @@ async fn finish(
     state: &AppState,
     server_id: &str,
     library_id: &str,
-    result: AppResult<()>,
+    result: AppResult<bool>,
 ) -> AppResult<()> {
+    if matches!(result, Ok(false)) {
+        sqlx::query(
+            "UPDATE scan_schedule SET running = 0, running_through = NULL, due_at = COALESCE(due_at, ?)
+             WHERE library_id = ?",
+        )
+        .bind(now_ms())
+        .bind(library_id)
+        .execute(&state.db)
+        .await?;
+        state.emit(ServerEvent::WatchChanged);
+        state.scan_wake.notify_one();
+        return Ok(());
+    }
     let error = result.as_ref().err().map(|e| e.message().to_owned());
+    let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
+    if error.is_none() {
+        sqlx::query(
+            "DELETE FROM scan_work WHERE library_id = ?
+             AND id <= (SELECT running_through FROM scan_schedule WHERE library_id = ?)",
+        )
+        .bind(library_id)
+        .bind(library_id)
+        .execute(&mut *tx)
+        .await?;
+    }
     sqlx::query(
-        "UPDATE scan_schedule SET running = 0, last_finished_at = ?, last_error = ? WHERE library_id = ?",
+        "UPDATE scan_schedule SET running = 0, running_through = NULL, last_finished_at = ?, last_error = ? WHERE library_id = ?",
     )
     .bind(crate::db::now())
     .bind(&error)
     .bind(library_id)
-    .execute(&state.db)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     match error {
-        Some(e) => tracing::warn!(library = %library_id, "library scan failed: {e}"),
+        Some(e) => tracing::warn!(library = %library_id, "library synchronization failed: {e}"),
         None => library_scanned(state, server_id, library_id),
     }
     state.emit(ServerEvent::WatchChanged);
@@ -198,10 +375,10 @@ async fn finish(
     Ok(())
 }
 
-/// Hook after an ISM-requested scan finished: Immich has imported what it found. Published
+/// Hook after ISM-requested synchronization finished. Published
 /// uploads get their new Immich asset IDs here; other listeners use `LibraryScanned`.
 fn library_scanned(state: &AppState, server_id: &str, library_id: &str) {
-    tracing::info!(library = %library_id, "library scan finished");
+    tracing::info!(library = %library_id, "library synchronization finished");
     state.emit(ServerEvent::LibraryScanned {
         server_id: server_id.to_owned(),
         library_id: library_id.to_owned(),

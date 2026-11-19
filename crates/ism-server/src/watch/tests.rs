@@ -3,10 +3,31 @@
 use std::path::PathBuf;
 
 use ism_core::maintenance::{MaintenanceState, Phase};
+use serde_json::json;
+use wiremock::{
+    Mock, ResponseTemplate,
+    matchers::{body_json, method, path},
+};
 
 use super::*;
 use crate::immich::registry;
-use crate::maintenance::tests::setup;
+use crate::maintenance::tests::{FakeImmich, setup as setup_base};
+
+async fn setup() -> (
+    tempfile::TempDir,
+    AppState,
+    wiremock::MockServer,
+    FakeImmich,
+) {
+    let setup = setup_base().await;
+    Mock::given(method("POST"))
+        .and(path("/api/libraries/invalid/files/move"))
+        .respond_with(ResponseTemplate::new(400))
+        .with_priority(1)
+        .mount(&setup.2)
+        .await;
+    setup
+}
 
 /// Maps `<tmp>/photos` as root 'photos' of library 'lib1' on server 's1'.
 async fn map_root(state: &AppState, dir: &Path) -> (Root, PathBuf) {
@@ -200,13 +221,27 @@ async fn expired_self_writes_are_pruned() {
 async fn each_change_restarts_the_scan_timer() {
     let (_dir, state, _server, _fake) = setup().await;
     let delay = i64::try_from(state.config.timing.scan_delay.as_millis()).unwrap();
-    scheduler::request_scan_at(&state, "s1", "lib1", "first", 1_000)
-        .await
-        .unwrap();
+    scheduler::request_work_at(
+        &state,
+        "s1",
+        "lib1",
+        "first",
+        &[folder_work("/library/trip")],
+        1_000,
+    )
+    .await
+    .unwrap();
     assert_eq!(due_at(&state).await, Some(1_000 + delay));
-    scheduler::request_scan_at(&state, "s1", "lib1", "second", 5_000)
-        .await
-        .unwrap();
+    scheduler::request_work_at(
+        &state,
+        "s1",
+        "lib1",
+        "second",
+        &[folder_work("/library/other")],
+        5_000,
+    )
+    .await
+    .unwrap();
     assert_eq!(due_at(&state).await, Some(5_000 + delay));
     assert_eq!(
         scheduler::step(&state, 5_000 + delay - 1).await.unwrap(),
@@ -230,13 +265,353 @@ async fn scan_requests(server: &wiremock::MockServer) -> usize {
         .count()
 }
 
+fn folder_work(path: &str) -> scheduler::Work {
+    scheduler::Work {
+        path: path.into(),
+        kind: scheduler::WorkKind::Folder,
+    }
+}
+
+#[tokio::test]
+async fn watcher_uses_file_api_without_scanning_on_success() {
+    let (dir, state, server, _fake) = setup().await;
+    let (root, _) = map_root(&state, dir.path()).await;
+    Mock::given(method("POST"))
+        .and(path("/api/libraries/lib1/files/add"))
+        .and(body_json(json!({ "path": "/library/trip/new.jpg" })))
+        .respond_with(ResponseTemplate::new(204))
+        .with_priority(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/libraries/lib1/files/remove"))
+        .and(body_json(json!({ "path": "/library/trip/old.jpg" })))
+        .respond_with(ResponseTemplate::new(204))
+        .with_priority(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    handle(
+        &state,
+        &root,
+        vec![
+            outside_change("trip/new.jpg", ChangeKind::Added),
+            outside_change("trip/new.jpg", ChangeKind::Changed),
+            outside_change("trip/old.jpg", ChangeKind::Removed),
+        ],
+    )
+    .await
+    .unwrap();
+    scheduler::step(&state, i64::MAX / 2).await.unwrap();
+    wait_for_sync(&state).await;
+    assert_eq!(
+        scan_requests(&server).await,
+        0,
+        "successful file sync must not scan"
+    );
+}
+
+fn outside_change(rel: &str, kind: ChangeKind) -> Change {
+    Change {
+        rel: rel.into(),
+        kind,
+        size: Some(1),
+        mtime_ns: Some(1),
+    }
+}
+
+async fn scan_bodies(server: &wiremock::MockServer) -> Vec<serde_json::Value> {
+    server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path() == "/api/libraries/lib1/scan")
+        .map(|r| r.body_json().unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn only_unhandled_folders_are_scanned_and_scopes_are_coalesced() {
+    let (dir, state, server, _fake) = setup().await;
+    let (root, _) = map_root(&state, dir.path()).await;
+    Mock::given(method("POST"))
+        .and(path("/api/libraries/lib1/files/add"))
+        .respond_with(ResponseTemplate::new(204))
+        .with_priority(2)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/libraries/lib1/files/add"))
+        .and(body_json(json!({ "path": "/library/trip/new.jpg" })))
+        .respond_with(ResponseTemplate::new(405))
+        .with_priority(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    handle(
+        &state,
+        &root,
+        vec![
+            outside_change("handled/new.jpg", ChangeKind::Added),
+            outside_change("trip/new.jpg", ChangeKind::Added),
+            outside_change("trip/a.jpg", ChangeKind::Changed),
+            outside_change("trip/sub/b.jpg", ChangeKind::Changed),
+            outside_change("trips/c.jpg", ChangeKind::Changed),
+            outside_change("@eaDir/thumb.jpg", ChangeKind::Added),
+        ],
+    )
+    .await
+    .unwrap();
+    scheduler::step(&state, i64::MAX / 2).await.unwrap();
+    wait_for_sync(&state).await;
+    assert_eq!(
+        scan_bodies(&server).await,
+        [
+            json!({ "path": "/library/trip" }),
+            json!({ "path": "/library/trips" }),
+        ]
+    );
+    assert_eq!(scheduler::views(&state).await.unwrap()[0].last_error, None);
+}
+
+#[tokio::test]
+async fn targeted_scan_errors_are_visible_and_never_broadened() {
+    let (dir, state, server, _fake) = setup().await;
+    let (root, _) = map_root(&state, dir.path()).await;
+    Mock::given(method("POST"))
+        .and(path("/api/libraries/lib1/scan"))
+        .and(body_json(json!({ "path": "/library/trip" })))
+        .respond_with(ResponseTemplate::new(500))
+        .with_priority(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut events = state.events.subscribe();
+    handle(
+        &state,
+        &root,
+        vec![outside_change("trip/a.jpg", ChangeKind::Changed)],
+    )
+    .await
+    .unwrap();
+    scheduler::step(&state, i64::MAX / 2).await.unwrap();
+    wait_for_sync(&state).await;
+    assert_eq!(
+        scan_bodies(&server).await,
+        [json!({ "path": "/library/trip" })]
+    );
+    assert!(
+        scheduler::views(&state).await.unwrap()[0]
+            .last_error
+            .as_ref()
+            .unwrap()
+            .contains("500")
+    );
+    let retained: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM scan_work")
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(retained, 1, "failed work remains durable");
+    while let Ok(event) = events.try_recv() {
+        assert!(!matches!(event, ServerEvent::LibraryScanned { .. }));
+    }
+}
+
+#[tokio::test]
+async fn unsupported_servers_never_receive_a_scope_they_might_ignore() {
+    let (dir, state, server, _fake) = setup().await;
+    let (root, _) = map_root(&state, dir.path()).await;
+    sqlx::query("UPDATE immich_servers SET external_library_api_capable = 0 WHERE id = 's1'")
+        .execute(&state.db)
+        .await
+        .unwrap();
+    handle(
+        &state,
+        &root,
+        vec![outside_change("trip/a.jpg", ChangeKind::Changed)],
+    )
+    .await
+    .unwrap();
+    scheduler::step(&state, i64::MAX / 2).await.unwrap();
+    wait_for_sync(&state).await;
+    assert_eq!(scan_requests(&server).await, 0);
+    assert!(
+        scheduler::views(&state).await.unwrap()[0]
+            .last_error
+            .as_ref()
+            .unwrap()
+            .contains("refusing a potentially full-library scan")
+    );
+}
+
+#[tokio::test]
+async fn file_api_errors_do_not_mask_authentication_or_claim_removals_were_scanned() {
+    for (kind, endpoint, status, capable) in [
+        (ChangeKind::Added, "add", 403, None),
+        (ChangeKind::Added, "add", 404, None),
+        (ChangeKind::Added, "add", 405, Some(true)),
+        (ChangeKind::Removed, "remove", 405, None),
+    ] {
+        let (dir, state, server, _fake) = setup().await;
+        let (root, _) = map_root(&state, dir.path()).await;
+        sqlx::query("UPDATE immich_servers SET external_library_api_capable = ? WHERE id = 's1'")
+            .bind(capable)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        Mock::given(method("POST"))
+            .and(path(format!("/api/libraries/lib1/files/{endpoint}")))
+            .respond_with(ResponseTemplate::new(status))
+            .with_priority(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        handle(&state, &root, vec![outside_change("trip/a.jpg", kind)])
+            .await
+            .unwrap();
+        scheduler::step(&state, i64::MAX / 2).await.unwrap();
+        wait_for_sync(&state).await;
+        assert_eq!(scan_requests(&server).await, 0);
+        assert!(
+            scheduler::views(&state).await.unwrap()[0]
+                .last_error
+                .is_some()
+        );
+    }
+}
+
+#[tokio::test]
+async fn requests_during_a_run_and_restart_keep_their_scopes() {
+    let (_dir, state, server, _fake) = setup().await;
+    scheduler::request_work_at(
+        &state,
+        "s1",
+        "lib1",
+        "first",
+        &[folder_work("/library/trip")],
+        0,
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE scan_schedule SET running = 1, due_at = NULL, running_through = 1")
+        .execute(&state.db)
+        .await
+        .unwrap();
+    scheduler::recover(&state).await.unwrap();
+    // Block dispatch so a new request deterministically arrives after the batch is claimed.
+    let guard = state.maintenance_lock.lock().await;
+    scheduler::step(&state, i64::MAX / 2).await.unwrap();
+    scheduler::request_work_at(
+        &state,
+        "s1",
+        "lib1",
+        "second",
+        &[folder_work("/library/other")],
+        1_000,
+    )
+    .await
+    .unwrap();
+    drop(guard);
+    wait_for_sync(&state).await;
+    assert_eq!(
+        scan_bodies(&server).await,
+        [json!({ "path": "/library/trip" })]
+    );
+    assert!(due_at(&state).await.is_some());
+    scheduler::step(&state, i64::MAX / 2).await.unwrap();
+    wait_for_sync(&state).await;
+    assert_eq!(
+        scan_bodies(&server).await,
+        [
+            json!({ "path": "/library/trip" }),
+            json!({ "path": "/library/other" }),
+        ]
+    );
+    assert_eq!(due_at(&state).await, None);
+    let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM scan_work")
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(remaining, 0);
+}
+
+#[tokio::test]
+async fn barrier_admission_between_claim_and_dispatch_defers_the_batch() {
+    let (_dir, state, server, _fake) = setup().await;
+    scheduler::request_work_at(
+        &state,
+        "s1",
+        "lib1",
+        "change",
+        &[folder_work("/library/trip")],
+        0,
+    )
+    .await
+    .unwrap();
+    let guard = state.maintenance_lock.lock().await;
+    scheduler::step(&state, i64::MAX / 2).await.unwrap();
+    let mut held = MaintenanceState::default();
+    held.begin_prepare();
+    registry::save_maintenance(&state, "s1", &held)
+        .await
+        .unwrap();
+    drop(guard);
+    wait_for_sync(&state).await;
+    assert!(server.received_requests().await.unwrap().is_empty());
+    assert!(due_at(&state).await.is_some());
+    registry::save_maintenance(&state, "s1", &MaintenanceState::default())
+        .await
+        .unwrap();
+    scheduler::step(&state, i64::MAX / 2).await.unwrap();
+    wait_for_sync(&state).await;
+    assert_eq!(
+        scan_bodies(&server).await,
+        [json!({ "path": "/library/trip" })]
+    );
+}
+
+async fn wait_for_sync(state: &AppState) {
+    for _ in 0..100 {
+        let running: bool =
+            sqlx::query_scalar("SELECT running FROM scan_schedule WHERE library_id = 'lib1'")
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+        if !running {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("synchronization did not finish");
+}
+
 #[tokio::test]
 async fn due_scans_wait_for_the_write_barrier() {
     let (_dir, state, server, _fake) = setup().await;
     let mut events = state.events.subscribe();
-    scheduler::request_scan_at(&state, "s1", "lib1", "upload", 0)
-        .await
-        .unwrap();
+    scheduler::request_work_at(
+        &state,
+        "s1",
+        "lib1",
+        "upload",
+        &[scheduler::Work {
+            path: "/library/trip/new.jpg".into(),
+            kind: scheduler::WorkKind::Added,
+        }],
+        0,
+    )
+    .await
+    .unwrap();
+    Mock::given(method("POST"))
+        .and(path("/api/libraries/lib1/files/add"))
+        .respond_with(ResponseTemplate::new(405))
+        .with_priority(1)
+        .expect(1)
+        .mount(&server)
+        .await;
     let mut held = MaintenanceState::default();
     held.begin_prepare();
     held.prepared();
@@ -253,6 +628,10 @@ async fn due_scans_wait_for_the_write_barrier() {
     let view = scheduler::views(&state).await.unwrap();
     assert!(view[0].waiting_for_barrier);
     assert_eq!(view[0].due_in_secs, Some(0));
+    assert!(
+        server.received_requests().await.unwrap().is_empty(),
+        "direct file APIs must also wait for the barrier"
+    );
 
     registry::save_maintenance(&state, "s1", &MaintenanceState::default())
         .await

@@ -347,24 +347,22 @@ pub async fn run_operation(state: &AppState, id: &str) -> AppResult<()> {
             continue;
         }
         journal(state, id, index, &plan).await?;
-        match execute(state, id, &plan).await {
+        let result = match execute(state, id, &plan).await {
+            Ok(()) if needs_scan(action, &plan) => schedule_imports(state, id, &plan)
+                .await
+                .map_err(|error| Failure {
+                    code: "recovery_required".into(),
+                    message: format!(
+                        "cannot schedule Immich synchronization: {}",
+                        error.message()
+                    ),
+                    recovery: true,
+                }),
+            result => result,
+        };
+        match result {
             Ok(()) => {
                 done += 1;
-                if needs_scan(action, &plan) {
-                    for (server, library) in ctx.touched_servers(action).await? {
-                        if let Some(library) = library
-                            && let Err(e) = crate::watch::scheduler::request_scan(
-                                state,
-                                &server,
-                                &library,
-                                &format!("operation {id}"),
-                            )
-                            .await
-                        {
-                            tracing::warn!(operation = %id, "cannot schedule a library scan: {}", e.message());
-                        }
-                    }
-                }
                 changes.extend(plan.changes.clone());
                 local_changes.extend(local_changes_of(action, &plan));
                 let result = json!({ "files": plan.files, "asset_id": plan.asset_id, "warnings": plan.warnings });
@@ -870,7 +868,7 @@ async fn call_api(state: &AppState, step: &ApiStep) -> AppResult<()> {
         }
         ApiKind::SyncAdd { library_id, path } => {
             if server.external_library_move_mode == ImmichMoveMode::DbOnly {
-                schedule_add_fallback(state, &server, library_id).await
+                schedule_add_fallback(state, &server, library_id, path).await
             } else {
                 match sync_file_add_with_admins(state, &server, library_id, path).await? {
                     Ok(()) => Ok(()),
@@ -880,7 +878,7 @@ async fn call_api(state: &AppState, step: &ApiStep) -> AppResult<()> {
                             && server.external_library_api_capable != Some(true)
                             && error.is_external_library_api_unavailable() =>
                     {
-                        schedule_add_fallback(state, &server, library_id).await
+                        schedule_add_fallback(state, &server, library_id, path).await
                     }
                     Err(error) => Err(error),
                 }
@@ -962,12 +960,16 @@ async fn schedule_add_fallback(
     state: &AppState,
     server: &registry::Server,
     library_id: &str,
+    path: &str,
 ) -> Result<(), crate::immich::api::ApiError> {
-    crate::watch::scheduler::request_scan(
+    let work = crate::watch::scheduler::Work::folder_for_file(path)
+        .map_err(|error| crate::immich::api::ApiError::Decode(error.to_string()))?;
+    crate::watch::scheduler::request_work(
         state,
         &server.id,
         library_id,
         "external-library file add API unavailable",
+        &[work],
     )
     .await
     .map_err(|error| crate::immich::api::ApiError::Decode(error.to_string()))
@@ -1292,14 +1294,52 @@ fn expected_writes(plan: &Plan) -> Vec<crate::watch::Expected> {
     out
 }
 
-/// Whether Immich must scan to see the result: new or restored files, or files moved without
-/// a direct database update (no asset yet). Moves of known assets update Immich directly.
+async fn schedule_imports(state: &AppState, id: &str, plan: &Plan) -> AppResult<()> {
+    use crate::watch::scheduler::{self, Work, WorkKind};
+
+    let has_original = plan
+        .files
+        .iter()
+        .any(|file| file.role == FileRole::Original);
+    for file in &plan.files {
+        if has_original && file.role != FileRole::Original {
+            continue;
+        }
+        let Some(location) = &file.to else { continue };
+        let root = files::root(&state.db, &location.root_id).await?;
+        if let (Some(server), Some(library)) = (&root.server_id, &root.library_id) {
+            let rel = files::parse_rel(&location.path)?;
+            let path = root
+                .immich_path(&rel)
+                .ok_or_else(|| AppError::invalid_location("destination has no Immich path"))?;
+            let metadata = fs::metadata(root.abs(&rel)?)?;
+            let kind = if metadata.is_dir() {
+                WorkKind::Folder
+            } else if !has_original {
+                WorkKind::Changed
+            } else {
+                WorkKind::Added
+            };
+            scheduler::request_work(
+                state,
+                server,
+                library,
+                &format!("operation {id}"),
+                &[Work { path, kind }],
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+/// Whether file imports remain after the plan's direct API/database updates.
 fn needs_scan(action: &OperationAction, plan: &Plan) -> bool {
     if plan.steps.iter().any(|step| {
         matches!(
             step,
             Step::Api(ApiStep {
-                kind: ApiKind::SyncAdd { .. },
+                kind: ApiKind::SyncAdd { .. } | ApiKind::SyncMove { .. },
                 ..
             })
         )
