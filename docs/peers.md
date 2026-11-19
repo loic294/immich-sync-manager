@@ -84,6 +84,11 @@ while one of its changes is still being applied.
   Local operation replica updates and events are committed together; if they fail after files have
   changed, the operation requires recovery rather than reporting success. This transaction does not
   make the filesystem, operation status and peer events atomic across a crash.
+- File contents are checked by SHA-256 on the source instance before a download starts and on the
+  receiving instance after the download. The receiving instance checks the staged file again
+  immediately before publishing it and checks the final library file after the rename. A mismatch
+  stops publication and rolls the managed operation back; none of these checks depend on a remote
+  hash result.
 - Invalid event page ordering, cursors or identities, invalid file metadata, unsupported event
   types, reused event identities with different content, and equal file versions with different
   contents stop the affected peer's event cursor rather than being silently acknowledged. The Peers

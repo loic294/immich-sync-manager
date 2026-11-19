@@ -521,6 +521,7 @@ async fn journal(state: &AppState, id: &str, index: i64, plan: &Plan) -> AppResu
             Step::Mkdir(p) => format!("mkdir {}", p.display()),
             Step::CheckRevision { path, .. } => format!("check revision {}", path.display()),
             Step::CheckTree { path, .. } => format!("check folder inventory {}", path.display()),
+            Step::CheckHash { path, .. } => format!("check sha256 {}", path.display()),
             Step::Fs(m) => format!(
                 "{} {} -> {}",
                 if m.copy { "copy" } else { "move" },
@@ -1196,6 +1197,45 @@ async fn apply(state: &AppState, step: &Step) -> Result<Option<Undo>, Failure> {
             }
             Ok(None)
         }
+        Step::CheckHash {
+            path,
+            expected_size,
+            expected_sha256,
+        } => {
+            let path = path.clone();
+            let actual = blocking(move || {
+                let Some((revision, sha256)) = files::replacement_fingerprint(&path)? else {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "file disappeared before hash verification",
+                    ));
+                };
+                let metadata = std::fs::metadata(&path)?;
+                if files::revision(&metadata) != revision {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "file changed while verifying its hash",
+                    ));
+                }
+                Ok((metadata.len(), sha256))
+            })
+            .await
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::InvalidInput => {
+                    Failure::new("revision_changed", "file changed while verifying its hash")
+                }
+                _ => io(e),
+            })?;
+            if actual.0 != *expected_size
+                || !actual.1.eq_ignore_ascii_case(expected_sha256.as_str())
+            {
+                return Err(Failure::new(
+                    "checksum_mismatch",
+                    "file content does not match its expected SHA-256 checksum",
+                ));
+            }
+            Ok(None)
+        }
         Step::Mkdir(p) => {
             if p.exists() {
                 return Ok(None);
@@ -1350,7 +1390,10 @@ fn expected_writes(plan: &Plan) -> Vec<crate::watch::Expected> {
         match step {
             Step::Mkdir(p) | Step::Remove(p) => out.push(Expected::tree(p.clone())),
             Step::Fs(m) => out.extend(Expected::moved(&m.from, &m.to)),
-            Step::CheckRevision { .. } | Step::CheckTree { .. } | Step::Api(_) => {}
+            Step::CheckRevision { .. }
+            | Step::CheckTree { .. }
+            | Step::CheckHash { .. }
+            | Step::Api(_) => {}
         }
     }
     out
@@ -1551,6 +1594,69 @@ mod tests {
         Mock, MockServer, ResponseTemplate,
         matchers::{body_json, header, method, path},
     };
+
+    #[tokio::test]
+    async fn upload_publication_checks_hash_before_and_after_the_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = crate::db::connect(dir.path()).await.unwrap();
+        let secrets = crate::crypto::SecretBox::open_or_create(dir.path()).unwrap();
+        let state = AppState::new(crate::config::Config::for_tests(dir.path()), pool, secrets)
+            .await
+            .unwrap();
+        let staging = dir.path().join("staging-photo");
+        let target = dir.path().join("published-photo");
+        let contents = b"verified photo contents";
+        std::fs::write(&staging, contents).unwrap();
+        let expected_sha256 = crate::crypto::sha256_hex(contents);
+        let check_staging = Step::CheckHash {
+            path: staging.clone(),
+            expected_size: contents.len() as u64,
+            expected_sha256: expected_sha256.clone(),
+        };
+
+        let before = Step::CheckHash {
+            path: staging.clone(),
+            expected_size: contents.len() as u64,
+            expected_sha256: crate::crypto::sha256_hex(b"different photo"),
+        };
+        let error = match apply(&state, &before).await {
+            Ok(_) => panic!("mismatched staging hash was accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, "checksum_mismatch");
+        assert_eq!(std::fs::read(&staging).unwrap(), contents);
+
+        assert!(apply(&state, &check_staging).await.is_ok());
+        let move_file = match apply(
+            &state,
+            &Step::Fs(plan::FsMove {
+                from: staging.clone(),
+                to: target.clone(),
+                copy: false,
+            }),
+        )
+        .await
+        {
+            Ok(Some(undo)) => undo,
+            Ok(None) => panic!("move did not return rollback information"),
+            Err(_) => panic!("move failed"),
+        };
+        std::fs::write(&target, b"tampered photo contents").unwrap();
+        let check_target = Step::CheckHash {
+            path: target.clone(),
+            expected_size: contents.len() as u64,
+            expected_sha256,
+        };
+        let error = match apply(&state, &check_target).await {
+            Ok(_) => panic!("mismatched published hash was accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, "checksum_mismatch");
+
+        undo(&state, move_file).await.unwrap();
+        assert!(!target.exists());
+        assert_eq!(std::fs::read(&staging).unwrap(), b"tampered photo contents");
+    }
 
     #[tokio::test]
     async fn sync_move_retries_a_forbidden_admin_key_without_changing_asset_identity() {

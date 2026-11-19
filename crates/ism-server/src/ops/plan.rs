@@ -85,6 +85,11 @@ pub enum Step {
         path: PathBuf,
         expected: Vec<TrashEntry>,
     },
+    CheckHash {
+        path: PathBuf,
+        expected_size: u64,
+        expected_sha256: String,
+    },
     Fs(FsMove),
     Api(ApiStep),
     /// Irreversible; always last.
@@ -1767,11 +1772,22 @@ async fn plan_publish(ctx: &Ctx<'_>, plan: &mut Plan, upload_id: &str) -> AppRes
             role: f.role,
             copy: false,
         });
+        let staged = staging.join(index.to_string());
+        plan.steps.push(Step::CheckHash {
+            path: staged.clone(),
+            expected_size: f.size,
+            expected_sha256: f.sha256.clone(),
+        });
         plan.steps.push(Step::Fs(FsMove {
-            from: staging.join(index.to_string()),
+            from: staged,
             to: dir.join(&name),
             copy: false,
         }));
+        plan.steps.push(Step::CheckHash {
+            path: dir.join(&name),
+            expected_size: f.size,
+            expected_sha256: f.sha256.clone(),
+        });
         if upload_file_needs_sync_add(f.role) {
             published_original_path = Some(r.clone());
         }
