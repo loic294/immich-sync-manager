@@ -58,6 +58,11 @@ unwrap_used = "warn"
 debug = 0
 incremental = false
 
+# Apple's linker can misalign SQLx's proc-macro string pool when stripping it.
+# Keep its symbol table without enabling debug info; test inherits this override.
+[profile.dev.package.sqlx-macros]
+strip = "none"
+
 [profile.test]
 debug = 0
 incremental = false

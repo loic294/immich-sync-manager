@@ -157,6 +157,9 @@ Open Photo Manager. `make check` runs every gate; `make clean` removes generated
 artifacts. See [AGENTS.md](AGENTS.md).
 Development and test builds disable debug symbols and incremental compilation to limit disk use.
 Set `CARGO_PROFILE_DEV_DEBUG=1` or `CARGO_PROFILE_TEST_DEBUG=1` for line-level debugging.
+Only the SQLx proc-macro symbol table is kept unstripped: Apple's linker can otherwise emit a
+`mis-aligned LINKEDIT string pool` dylib that prevents builds from reaching the tests. This does
+not enable debug information or require clearing Cargo's cache.
 
 ## License
 
