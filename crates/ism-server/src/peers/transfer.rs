@@ -8,7 +8,9 @@ use ism_core::dto::{
     OperationRequest, UploadFileSpec,
 };
 use ism_core::schedule::Schedule;
-use ism_core::sidecar::{CompanionRole, companion_role, companions_of, is_companion_name};
+use ism_core::sidecar::{
+    CompanionRole, companion_role, companions_of, is_companion_name, preferred_paired_original,
+};
 use ism_core::version::{Causality, VersionVector};
 use reqwest::Method;
 use tokio::io::{AsyncWriteExt, BufWriter};
@@ -23,6 +25,7 @@ use crate::state::{AppState, ServerEvent};
 const MAX_ATTEMPTS: i64 = 8;
 const PROGRESS_EVERY: u64 = 4 * 1024 * 1024;
 const STAGING_WRITE_BUFFER: usize = 256 * 1024;
+pub(crate) const DOWNLOAD_CHUNK_SIZE: u64 = 16 * 1024 * 1024;
 
 fn existing_original_for_companion(
     folder: &std::path::Path,
@@ -47,7 +50,13 @@ fn existing_original_for_companion(
                 .any(|companion| companion.name == name)
         })
         .collect::<Vec<_>>();
-    let [original] = owners.as_slice() else {
+    let selected = preferred_paired_original(
+        &owners
+            .iter()
+            .map(|original| original.as_str())
+            .collect::<Vec<_>>(),
+    );
+    let Some(original) = selected else {
         return Err(if owners.is_empty() {
             AppError::conflict(
                 "companion_original_missing",
@@ -68,7 +77,7 @@ fn existing_original_for_companion(
         ));
     };
     Ok(ExistingOriginal {
-        name: (*original).clone(),
+        name: original.to_owned(),
         expected_revision,
     })
 }
@@ -103,10 +112,18 @@ fn peer_upload_file(
 /// download is handed to a managed operation in the same transaction that removes its
 /// transfer, so the executor's own recovery covers publication.
 pub async fn recover_after_restart(state: &AppState) -> AppResult<()> {
-    sqlx::query("UPDATE transfers SET status = 'queued', error = NULL, updated_at = ? WHERE status = 'running'")
-        .bind(db::now())
-        .execute(&state.db)
-        .await?;
+    sqlx::query(
+        "UPDATE transfers
+         SET status = 'queued', attempts = 0, error = NULL, updated_at = ?
+         WHERE status = 'running'
+            OR (status = 'failed' AND (
+                 error GLOB 'HTTP 504 from *'
+                 OR error LIKE 'companion % belongs to multiple originals'
+            ))",
+    )
+    .bind(db::now())
+    .execute(&state.db)
+    .await?;
     Ok(())
 }
 
@@ -120,6 +137,13 @@ pub fn encode(raw: &str) -> String {
         }
     }
     out
+}
+
+fn parse_content_range(raw: &str) -> Option<(u64, u64, u64)> {
+    let (range, total) = raw.strip_prefix("bytes ")?.split_once('/')?;
+    let (start, end) = range.split_once('-')?;
+    let parsed = (start.parse().ok()?, end.parse().ok()?, total.parse().ok()?);
+    (parsed.0 <= parsed.1 && parsed.1 < parsed.2).then_some(parsed)
 }
 
 /// Whether file contents may move now for this share and peer.
@@ -479,64 +503,113 @@ async fn run_one(state: &AppState, t: &Transfer) -> Result<Outcome, String> {
         .await
         .map_err(|e| e.to_string())?;
     let staging = staging_dir.join(&t.id);
-    let offset = tokio::fs::metadata(&staging)
+    let mut offset = tokio::fs::metadata(&staging)
         .await
         .map(|m| m.len())
         .unwrap_or(0);
+    let expected_size = t.size as u64;
+    if offset > expected_size {
+        tokio::fs::remove_file(&staging)
+            .await
+            .map_err(|e| e.to_string())?;
+        offset = 0;
+    }
     let path = format!(
         "/api/peer/v1/content?share={}&path={}&sha256={}",
         encode(&share.name),
         encode(&t.rel),
         t.sha256
     );
-    let mut req = net::request(state, &peer.url, &peer.secret, Method::GET, &path, None)
-        .timeout(Duration::from_secs(24 * 3600));
-    if offset > 0 && (offset as i64) < t.size {
-        req = req.header("range", format!("bytes={offset}-"));
-    }
-    let resp = req.send().await.map_err(|e| net::net_error(&e))?;
-    let status = resp.status().as_u16();
-    if status == 404 || status == 409 || status == 410 {
-        let _ = tokio::fs::remove_file(&staging).await;
-        return Ok(Outcome::Dropped);
-    }
-    if status != 200 && status != 206 {
-        return Err(format!("HTTP {status} from {}", peer.name));
-    }
-    let mtime_ns: Option<i64> = resp
-        .headers()
-        .get("x-ism-mtime-ns")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse().ok());
     let mut file = BufWriter::with_capacity(
         STAGING_WRITE_BUFFER,
         tokio::fs::OpenOptions::new()
             .create(true)
-            .append(status == 206)
+            .append(offset > 0)
             .write(true)
-            .truncate(status == 200)
+            .truncate(offset == 0)
             .open(&staging)
             .await
             .map_err(|e| e.to_string())?,
     );
-    let mut done = if status == 206 { offset } else { 0 };
+    let mut done = offset;
     let mut reported = done;
     let mut last_report = tokio::time::Instant::now();
-    let mut stream = resp.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| net::net_error(&e))?;
-        file.write_all(&chunk).await.map_err(|e| e.to_string())?;
-        done += chunk.len() as u64;
-        if done - reported >= PROGRESS_EVERY || last_report.elapsed() >= Duration::from_secs(1) {
-            if !super::activity::record_progress(state, &t.id, &t.peer_id, done, done - reported)
+    let mut mtime_ns: Option<i64> = None;
+    while done < expected_size {
+        let end = (done + DOWNLOAD_CHUNK_SIZE - 1).min(expected_size - 1);
+        let resp = net::request(state, &peer.url, &peer.secret, Method::GET, &path, None)
+            .timeout(Duration::from_secs(24 * 3600))
+            .header("range", format!("bytes={done}-{end}"))
+            .header("if-range", format!("\"{}\"", t.sha256))
+            .send()
+            .await
+            .map_err(|e| net::net_error(&e))?;
+        let status = resp.status().as_u16();
+        if status == 404 || status == 409 || status == 410 {
+            drop(file);
+            let _ = tokio::fs::remove_file(&staging).await;
+            return Ok(Outcome::Dropped);
+        }
+        if status != 206 {
+            return Err(format!("HTTP {status} from {}", peer.name));
+        }
+        let content_range = resp
+            .headers()
+            .get("content-range")
+            .and_then(|value| value.to_str().ok())
+            .and_then(parse_content_range)
+            .ok_or_else(|| "peer returned an invalid Content-Range".to_owned())?;
+        if content_range != (done, end, expected_size) {
+            return Err(format!(
+                "peer returned unexpected Content-Range {content_range:?}"
+            ));
+        }
+        if let Some(current_mtime) = resp
+            .headers()
+            .get("x-ism-mtime-ns")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse().ok())
+        {
+            if mtime_ns.is_some_and(|previous| previous != current_mtime) {
+                return Err("peer file changed during the transfer".into());
+            }
+            mtime_ns = Some(current_mtime);
+        }
+        let expected_bytes = end - done + 1;
+        let mut received = 0_u64;
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| net::net_error(&e))?;
+            if received + chunk.len() as u64 > expected_bytes {
+                return Err("peer sent more data than the requested range".into());
+            }
+            file.write_all(&chunk).await.map_err(|e| e.to_string())?;
+            received += chunk.len() as u64;
+            done += chunk.len() as u64;
+            if done - reported >= PROGRESS_EVERY || last_report.elapsed() >= Duration::from_secs(1)
+            {
+                if !super::activity::record_progress(
+                    state,
+                    &t.id,
+                    &t.peer_id,
+                    done,
+                    done - reported,
+                )
                 .await
                 .map_err(m)?
-            {
-                let _ = tokio::fs::remove_file(&staging).await;
-                return Ok(Outcome::Dropped);
+                {
+                    drop(file);
+                    let _ = tokio::fs::remove_file(&staging).await;
+                    return Ok(Outcome::Dropped);
+                }
+                reported = done;
+                last_report = tokio::time::Instant::now();
             }
-            reported = done;
-            last_report = tokio::time::Instant::now();
+        }
+        if received != expected_bytes {
+            return Err(format!(
+                "peer returned {received} of {expected_bytes} requested bytes"
+            ));
         }
     }
     if !super::activity::record_progress(state, &t.id, &t.peer_id, done, done - reported)
@@ -839,5 +912,29 @@ mod tests {
         let error =
             existing_original_for_companion(dir.path(), "retry.xmp", &extensions).unwrap_err();
         assert_eq!(error.code(), "companion_original_ambiguous");
+    }
+
+    #[test]
+    fn accepts_known_paired_originals_for_peer_sidecars() {
+        let extensions = DEFAULT_SIDECAR_EXTENSIONS
+            .iter()
+            .map(|extension| extension.to_string())
+            .collect::<Vec<_>>();
+        for (originals, expected) in [
+            (["retry.JPG", "retry.MOV"], "retry.JPG"),
+            (["retry.jpg", "retry.CR3"], "retry.jpg"),
+            (["retry.jpg", "retry.edited.1730000000.jpg"], "retry.jpg"),
+            (["retry.jpg", "retry-edited-1730000000.jpg"], "retry.jpg"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            for original in originals {
+                std::fs::write(dir.path().join(original), original).unwrap();
+            }
+            std::fs::write(dir.path().join("retry.xmp"), b"metadata").unwrap();
+
+            let existing =
+                existing_original_for_companion(dir.path(), "retry.xmp", &extensions).unwrap();
+            assert_eq!(existing.name, expected);
+        }
     }
 }

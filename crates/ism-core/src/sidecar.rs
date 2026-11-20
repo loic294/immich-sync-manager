@@ -58,13 +58,126 @@ pub fn is_companion_name(name: &str, companions: &[String]) -> bool {
     companion_role(name, companions).is_some()
 }
 
+fn edited_base(stem: &str) -> Option<&str> {
+    let lower = stem.to_ascii_lowercase();
+    for marker in [".edited.", "-edited-"] {
+        if let Some(index) = lower.rfind(marker) {
+            let suffix = &stem[index + marker.len()..];
+            if !suffix.is_empty()
+                && suffix.chars().any(|c| c.is_ascii_digit())
+                && suffix
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':' | '+'))
+            {
+                return Some(&stem[..index]);
+            }
+        }
+    }
+    None
+}
+
+fn original_pair_key(name: &str) -> &str {
+    let stem = split_ext(name).0;
+    edited_base(stem).unwrap_or(stem)
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum OriginalKind {
+    Still,
+    Raw,
+    Video,
+    Other,
+}
+
+fn original_kind(name: &str) -> OriginalKind {
+    let (_, Some(extension)) = split_ext(name) else {
+        return OriginalKind::Other;
+    };
+    match extension.to_ascii_lowercase().as_str() {
+        "jpg" | "jpeg" | "heic" | "heif" | "png" | "webp" | "avif" | "tif" | "tiff" => {
+            OriginalKind::Still
+        }
+        "3fr" | "ari" | "arw" | "bay" | "cap" | "cr2" | "cr3" | "crw" | "dcr" | "dng" | "erf"
+        | "fff" | "gpr" | "iiq" | "k25" | "kdc" | "mef" | "mos" | "mrw" | "nef" | "nrw" | "orf"
+        | "pef" | "ptx" | "r3d" | "raf" | "raw" | "rw2" | "rwl" | "rwz" | "sr2" | "srf" | "srw"
+        | "x3f" => OriginalKind::Raw,
+        "3gp" | "avi" | "m2ts" | "m4v" | "mkv" | "mov" | "mp4" | "mpeg" | "mpg" | "mts" | "ogv"
+        | "ts" | "webm" => OriginalKind::Video,
+        _ => OriginalKind::Other,
+    }
+}
+
+fn kind_preference(name: &str) -> u8 {
+    if edited_base(split_ext(name).0).is_some() {
+        return 8;
+    }
+    match original_kind(name) {
+        OriginalKind::Still
+            if split_ext(name).1.is_some_and(|ext| {
+                ext.eq_ignore_ascii_case("jpg") || ext.eq_ignore_ascii_case("jpeg")
+            }) =>
+        {
+            0
+        }
+        OriginalKind::Still => 1,
+        OriginalKind::Raw => 2,
+        OriginalKind::Video => 3,
+        OriginalKind::Other => 4,
+    }
+}
+
+/// Selects a deterministic anchor for a companion shared by paired originals.
+///
+/// Paired groups are one still image plus RAW/video variants, or an original and one of its
+/// timestamped edited variants. Unrelated files with the same stem remain ambiguous.
+pub fn preferred_paired_original<'a>(names: &[&'a str]) -> Option<&'a str> {
+    let first = *names.first()?;
+    if names.len() == 1 {
+        return Some(first);
+    }
+    let key = original_pair_key(first);
+    if names
+        .iter()
+        .any(|name| !original_pair_key(name).eq_ignore_ascii_case(key))
+    {
+        return None;
+    }
+    let has_edit = names
+        .iter()
+        .any(|name| edited_base(split_ext(name).0).is_some());
+    let kinds: Vec<_> = names.iter().map(|name| original_kind(name)).collect();
+    let known_media = kinds.iter().all(|kind| *kind != OriginalKind::Other);
+    let paired = known_media
+        && (has_edit
+            || kinds
+                .iter()
+                .filter(|kind| **kind == OriginalKind::Still)
+                .count()
+                == 1);
+    if !paired {
+        return None;
+    }
+    names
+        .iter()
+        .min_by_key(|name| {
+            (
+                kind_preference(name),
+                name.to_ascii_lowercase(),
+                (*name).to_owned(),
+            )
+        })
+        .copied()
+}
+
 /// The companions of `original` among `siblings` (names in the same folder, may include the
 /// original itself).
 pub fn companions_of(original: &str, siblings: &[String], companions: &[String]) -> Vec<Companion> {
-    let (stem, _) = split_ext(original);
+    let pair_key = original_pair_key(original);
     let originals_with_stem = siblings
         .iter()
-        .filter(|s| !is_companion_name(s, companions) && split_ext(s).0 == stem)
+        .filter(|s| {
+            !is_companion_name(s, companions) && original_pair_key(s).eq_ignore_ascii_case(pair_key)
+        })
         .count()
         .max(1);
     let mut out: Vec<Companion> = siblings
@@ -79,7 +192,10 @@ pub fn companions_of(original: &str, siblings: &[String], companions: &[String])
                     role,
                     shared: false,
                 })
-            } else if name_stem == stem {
+            } else if !siblings.iter().any(|candidate| {
+                candidate == name_stem && !is_companion_name(candidate, companions)
+            }) && original_pair_key(name_stem).eq_ignore_ascii_case(pair_key)
+            {
                 Some(Companion {
                     name: name.clone(),
                     role,
@@ -106,7 +222,14 @@ pub fn renamed_companion(companion: &str, old_original: &str, new_original: &str
     let (new_stem, _) = split_ext(new_original);
     match companion.strip_prefix(old_stem) {
         Some(rest) if rest.starts_with('.') => format!("{new_stem}{rest}"),
-        _ => companion.to_owned(),
+        _ => {
+            let old_key = original_pair_key(old_original);
+            let new_key = original_pair_key(new_original);
+            match companion.strip_prefix(old_key) {
+                Some(rest) if rest.starts_with('.') => format!("{new_key}{rest}"),
+                _ => companion.to_owned(),
+            }
+        }
     }
 }
 
@@ -141,6 +264,31 @@ mod tests {
         assert!(raw[0].shared, "a.xmp is shared by a.CR3 and a.jpg");
         let jpg = companions_of("a.jpg", &siblings, &defaults());
         assert!(jpg.iter().any(|c| c.name == "a.jpg.xmp" && !c.shared));
+    }
+
+    #[test]
+    fn edited_variants_share_stem_sidecars() {
+        for edited in ["a.edited.1730000000.jpg", "a-edited-1730000000.jpg"] {
+            let siblings = names(&["a.jpg", edited, "a.xmp"]);
+            for original in ["a.jpg", edited] {
+                let companions = companions_of(original, &siblings, &defaults());
+                assert!(companions.iter().any(|c| c.name == "a.xmp" && c.shared));
+            }
+        }
+    }
+
+    #[test]
+    fn selects_safe_anchor_for_paired_originals() {
+        for (originals, expected) in [
+            (vec!["a.jpg", "a.CR3"], "a.jpg"),
+            (vec!["a.JPG", "a.MOV"], "a.JPG"),
+            (vec!["a.jpg", "a.MOV", "a.CR3"], "a.jpg"),
+            (vec!["a.jpg", "a.edited.1730000000.jpg"], "a.jpg"),
+            (vec!["a.jpg", "a-edited-1730000000.jpg"], "a.jpg"),
+        ] {
+            assert_eq!(preferred_paired_original(&originals), Some(expected));
+        }
+        assert_eq!(preferred_paired_original(&["a.jpg", "a.png"]), None);
     }
 
     #[test]

@@ -72,8 +72,17 @@ while one of its changes is still being applied.
   can sustain the extra I/O. Publication still runs through the serialized managed-operation
   barrier. On the receiver, **Sync → Active & queued** shows incoming files and their progress,
   including files awaiting publication; successful publications move to **Completed syncs**.
+  Downloads use bounded 16 MiB byte-range requests and resume from the staged offset, so a large
+  video is not one long request through an HTTP proxy. Before serving a range, the source checks
+  that the file's tracked checksum, size and modification time still match the announced version;
+  it also freshly rehashes small files to detect same-metadata edits before responding. The
+  receiver verifies the SHA-256 of the complete staged file before publication.
   Sidecars wait for their matching original to finish publishing, so concurrent downloads cannot
-  publish a companion before its original exists.
+  publish a companion before its original exists. A stem sidecar shared by a JPEG and its RAW or
+  video counterpart, or by an original and a timestamped `.edited`/`-edited-` variant, is
+  published using a deterministic original as its upload anchor; unrelated same-stem files still
+  fail closed as ambiguous. After an upgrade, startup recovery automatically retries transfers
+  that previously failed from a 504 or this paired-companion ambiguity.
 - If the saved schedule is invalid, transfers stop rather than defaulting to unrestricted hours.
   An active, explicitly scoped override still applies. The Sync page provides a replacement
   schedule with no allowed days; choose the desired hours and save to resume scheduling.
@@ -96,11 +105,11 @@ while one of its changes is still being applied.
   Local operation replica updates and events are committed together; if they fail after files have
   changed, the operation requires recovery rather than reporting success. This transaction does not
   make the filesystem, operation status and peer events atomic across a crash.
-- File contents are checked by SHA-256 on the source instance before a download starts and on the
-  receiving instance after the download. The receiving instance checks the staged file again
-  immediately before publishing it and checks the final library file after the rename. A mismatch
-  stops publication and rolls the managed operation back; none of these checks depend on a remote
-  hash result.
+- File contents are checked by SHA-256 when the source instance records an announced version, and
+  again by the receiving instance after the download. The receiving instance checks the staged
+  file immediately before publishing it and checks the final library file after the rename. A
+  mismatch stops publication and rolls the managed operation back; none of these checks depend on a
+  remote hash result.
 - Invalid event page ordering, cursors or identities, invalid file metadata, unsupported event
   types, reused event identities with different content, and equal file versions with different
   contents stop the affected peer's event cursor rather than being silently acknowledged. The Peers

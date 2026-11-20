@@ -207,6 +207,92 @@ async fn gate_peer_content(
 }
 
 #[tokio::test]
+async fn large_peer_transfers_use_bounded_ranges() {
+    const MAX_RANGE: u64 = 16 * 1024 * 1024;
+
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    let contents = vec![7_u8; MAX_RANGE as usize + 1];
+    write_old(&a.shared.join("large.mov"), &contents);
+    scan(&a).await;
+    let peer = super::net::peers(&b.state).await.unwrap().remove(0);
+    super::pull(&b.state, &peer).await.unwrap();
+
+    let (ranges_tx, mut ranges_rx) = tokio::sync::mpsc::unbounded_channel();
+    let source = crate::routes::router(a.state.clone()).layer(axum::middleware::from_fn(
+        move |request: axum::extract::Request, next: axum::middleware::Next| {
+            let ranges_tx = ranges_tx.clone();
+            async move {
+                if request.uri().path() == "/api/peer/v1/content" {
+                    let range = request
+                        .headers()
+                        .get(axum::http::header::RANGE)
+                        .and_then(|value| value.to_str().ok())
+                        .and_then(|value| value.strip_prefix("bytes="))
+                        .and_then(|value| value.split_once('-'))
+                        .and_then(|(start, end)| {
+                            Some((start.parse::<u64>().ok()?, end.parse::<u64>().ok()?))
+                        });
+                    let Some((start, end)) = range.filter(|(start, end)| end >= start) else {
+                        return axum::response::Response::builder()
+                            .status(axum::http::StatusCode::GATEWAY_TIMEOUT)
+                            .body(axum::body::Body::empty())
+                            .unwrap();
+                    };
+                    if end - start + 1 > MAX_RANGE {
+                        return axum::response::Response::builder()
+                            .status(axum::http::StatusCode::GATEWAY_TIMEOUT)
+                            .body(axum::body::Body::empty())
+                            .unwrap();
+                    }
+                    ranges_tx.send((start, end)).unwrap();
+                }
+                next.run(request).await
+            }
+        },
+    ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let source_url = format!("http://{}", listener.local_addr().unwrap());
+    a.tasks.push(tokio::spawn(async move {
+        axum::serve(listener, source).await.unwrap();
+    }));
+    sqlx::query("UPDATE peers SET url = ?, status = 'online'")
+        .bind(source_url)
+        .execute(&b.state.db)
+        .await
+        .unwrap();
+    b.tasks
+        .push(tokio::spawn(crate::ops::exec::run(b.state.clone())));
+    b.tasks
+        .push(tokio::spawn(super::transfer::run(b.state.clone())));
+
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            if std::fs::read(b.shared.join("large.mov")).ok().as_deref() == Some(&contents) {
+                break;
+            }
+            b.state.sync_wake.notify_waiters();
+            b.state.ops_wake.notify_waiters();
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("bounded transfer should complete");
+
+    let mut ranges = Vec::new();
+    while let Ok(range) = ranges_rx.try_recv() {
+        ranges.push(range);
+    }
+    assert!(ranges.len() >= 2);
+    assert!(
+        ranges
+            .iter()
+            .all(|(start, end)| end >= start && end - start < MAX_RANGE)
+    );
+}
+
+#[tokio::test]
 async fn three_independent_transfers_refill_slots_and_update_receiver_activity() {
     let (mut a, mut b) = pair().await;
     stop_workers(&mut a).await;
@@ -779,15 +865,11 @@ async fn downloads_recheck_recovery_and_local_changes_before_publication() {
         .await
         .unwrap();
     b.state.sync_wake.notify_waiters();
-    let (_, release) = tokio::time::timeout(Duration::from_secs(8), requests.recv())
-        .await
-        .unwrap()
-        .unwrap();
     write_old(&b.shared.join("photo.jpg"), b"local edit during download");
     scan(&b).await;
-    release.send(()).unwrap();
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
+            b.state.sync_wake.notify_waiters();
             if !admin::list_conflicts(&b.state, false)
                 .await
                 .unwrap()
@@ -3745,7 +3827,7 @@ async fn identical_file_adoption_rejects_a_mismatched_advertised_size() {
 }
 
 #[tokio::test]
-async fn restart_requeues_only_interrupted_transfers() {
+async fn restart_requeues_interrupted_and_newly_recoverable_transfers() {
     let (_a, b) = pair().await;
     for task in &b.tasks {
         task.abort();
@@ -3753,7 +3835,13 @@ async fn restart_requeues_only_interrupted_transfers() {
     let share = super::shares(&b.state).await.unwrap().remove(0);
     let peer = admin::list_peers(&b.state).await.unwrap().remove(0);
     let vv = ism_core::version::VersionVector::default();
-    for path in ["running.jpg", "cancelled.jpg", "failed.jpg"] {
+    for path in [
+        "running.jpg",
+        "cancelled.jpg",
+        "failed.jpg",
+        "http-504.mov",
+        "paired.xmp",
+    ] {
         super::queue_transfer(
             &b.state,
             &peer.id,
@@ -3766,10 +3854,23 @@ async fn restart_requeues_only_interrupted_transfers() {
         .await
         .unwrap();
     }
-    sqlx::query("UPDATE transfers SET status = CASE rel_path WHEN 'running.jpg' THEN 'running' WHEN 'cancelled.jpg' THEN 'cancelled' ELSE 'failed' END")
-        .execute(&b.state.db)
-        .await
-        .unwrap();
+    sqlx::query(
+        "UPDATE transfers
+         SET status = CASE rel_path
+                 WHEN 'running.jpg' THEN 'running'
+                 WHEN 'cancelled.jpg' THEN 'cancelled'
+                 ELSE 'failed'
+             END,
+             attempts = CASE rel_path WHEN 'running.jpg' THEN 0 ELSE 8 END,
+             error = CASE rel_path
+                 WHEN 'http-504.mov' THEN 'HTTP 504 from peer'
+                 WHEN 'paired.xmp' THEN 'companion ''paired.xmp'' belongs to multiple originals'
+                 ELSE 'unresolved failure'
+             END",
+    )
+    .execute(&b.state.db)
+    .await
+    .unwrap();
     sqlx::query(
         "CREATE TRIGGER fail_transfer_recovery BEFORE UPDATE OF status ON transfers
          WHEN OLD.status = 'running' BEGIN SELECT RAISE(FAIL, 'test failure'); END",
@@ -3789,17 +3890,29 @@ async fn restart_requeues_only_interrupted_transfers() {
     super::transfer::recover_after_restart(&b.state)
         .await
         .unwrap();
-    let statuses: Vec<(String, String)> =
-        sqlx::query_as("SELECT rel_path, status FROM transfers ORDER BY rel_path")
+    let statuses: Vec<(String, String, i64, Option<String>)> =
+        sqlx::query_as("SELECT rel_path, status, attempts, error FROM transfers ORDER BY rel_path")
             .fetch_all(&b.state.db)
             .await
             .unwrap();
     assert_eq!(
         statuses,
         [
-            ("cancelled.jpg".into(), "cancelled".into()),
-            ("failed.jpg".into(), "failed".into()),
-            ("running.jpg".into(), "queued".into())
+            (
+                "cancelled.jpg".into(),
+                "cancelled".into(),
+                8,
+                Some("unresolved failure".into())
+            ),
+            (
+                "failed.jpg".into(),
+                "failed".into(),
+                8,
+                Some("unresolved failure".into())
+            ),
+            ("http-504.mov".into(), "queued".into(), 0, None),
+            ("paired.xmp".into(), "queued".into(), 0, None),
+            ("running.jpg".into(), "queued".into(), 0, None)
         ]
     );
 }

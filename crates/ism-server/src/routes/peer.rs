@@ -209,36 +209,46 @@ async fn content(
     if !meta.is_file() {
         return Err(AppError::not_found("file not found"));
     }
-    let path = abs.clone();
-    let (revision, sha) =
-        tokio::task::spawn_blocking(move || files::replacement_fingerprint(&path))
-            .await
-            .map_err(AppError::internal)?
-            .map_err(|e| {
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidInput
-                ) {
-                    AppError::conflict("content_changed", "the file changed during the request")
-                } else {
-                    e.into()
-                }
-            })?
-            .ok_or_else(|| AppError::not_found("file not found"))?;
-    if revision != files::revision(&meta) {
-        return Err(AppError::conflict(
-            "content_changed",
-            "the file changed during the request",
-        ));
-    }
-    if !sha.eq_ignore_ascii_case(&q.sha256) {
+    let tracked = peers::row(&state, &share.id, &q.path).await?;
+    if !tracked.is_some_and(|row| {
+        !row.deleted
+            && row.size == meta.len() as i64
+            && row.mtime_ns == files::mtime_ns(&meta)
+            && row
+                .sha256
+                .is_some_and(|sha| sha.eq_ignore_ascii_case(&q.sha256))
+    }) {
         return Err(AppError::conflict(
             "content_changed",
             "the file changed since the event",
         ));
     }
+    if meta.len() <= crate::peers::transfer::DOWNLOAD_CHUNK_SIZE {
+        let path = abs.clone();
+        let fingerprint =
+            tokio::task::spawn_blocking(move || files::replacement_fingerprint(&path))
+                .await
+                .map_err(AppError::internal)?
+                .map_err(|e| {
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidInput
+                    ) {
+                        AppError::conflict("content_changed", "the file changed during the request")
+                    } else {
+                        e.into()
+                    }
+                })?;
+        let (revision, sha) = fingerprint.ok_or_else(|| AppError::not_found("file not found"))?;
+        if revision != files::revision(&meta) || !sha.eq_ignore_ascii_case(&q.sha256) {
+            return Err(AppError::conflict(
+                "content_changed",
+                "the file changed since the event",
+            ));
+        }
+    }
     let mtime = files::mtime_ns(&meta).to_string();
-    let resp = serve_file(&abs, &headers, &sha, &[("x-ism-mtime-ns", mtime)]).await?;
+    let resp = serve_file(&abs, &headers, &q.sha256, &[("x-ism-mtime-ns", mtime)]).await?;
     if files::revision(&tokio::fs::metadata(&abs).await?) != files::revision(&meta) {
         return Err(AppError::conflict(
             "content_changed",
