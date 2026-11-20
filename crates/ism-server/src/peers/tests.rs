@@ -4139,6 +4139,39 @@ async fn transfers_are_deferred_without_consuming_retries_during_recovery() {
 }
 
 #[tokio::test]
+async fn full_scans_wait_for_a_peer_transfer_backlog() {
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    let peer = super::net::peers(&b.state).await.unwrap().remove(0);
+    let share = super::shares(&b.state).await.unwrap().remove(0);
+    super::queue_transfer(
+        &b.state,
+        &peer.id,
+        &share,
+        "photo.jpg",
+        &crate::crypto::sha256_hex(b"photo"),
+        5,
+        &ism_core::version::VersionVector::default(),
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        !super::full_scan_allowed(&b.state).await.unwrap(),
+        "a full rehash must not pause an active peer backlog"
+    );
+    sqlx::query("DELETE FROM transfers")
+        .execute(&b.state.db)
+        .await
+        .unwrap();
+    assert!(
+        super::full_scan_allowed(&b.state).await.unwrap(),
+        "the safety scan must resume after peer work drains"
+    );
+}
+
+#[tokio::test]
 async fn transfer_does_not_adopt_stale_cached_hash() {
     let (_a, b) = pair().await;
     let path = b.shared.join("same.jpg");

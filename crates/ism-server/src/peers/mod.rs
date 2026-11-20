@@ -2546,10 +2546,22 @@ async fn replicate(state: AppState) {
 /// change had time to settle), and every `scan_interval_secs` as a safety net.
 pub async fn scan_worker(state: AppState) {
     let scan_every = std::time::Duration::from_secs(state.config.scan_interval_secs.max(5));
+    let retry = std::time::Duration::from_secs(state.config.tick_secs.max(1));
     let mut next_full = tokio::time::Instant::now();
     loop {
         let now = std::time::Instant::now();
-        let full = tokio::time::Instant::now() >= next_full;
+        let full_due = tokio::time::Instant::now() >= next_full;
+        let full = if full_due {
+            match full_scan_allowed(&state).await {
+                Ok(allowed) => allowed,
+                Err(error) => {
+                    tracing::warn!("full share scan check skipped: {}", error.message());
+                    false
+                }
+            }
+        } else {
+            false
+        };
         let due: Vec<String> = match state.share_changes.lock() {
             Ok(mut map) => {
                 let due: Vec<String> = map
@@ -2581,6 +2593,8 @@ pub async fn scan_worker(state: AppState) {
         }
         if full {
             next_full = tokio::time::Instant::now() + scan_every;
+        } else if full_due {
+            next_full = tokio::time::Instant::now() + retry;
         }
         let next_change = state
             .share_changes
@@ -2594,6 +2608,20 @@ pub async fn scan_worker(state: AppState) {
             () = state.share_wake.notified() => {}
         }
     }
+}
+
+async fn full_scan_allowed(state: &AppState) -> AppResult<bool> {
+    let pending: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1 FROM transfers WHERE status IN ('queued','running')
+         ) OR EXISTS(
+             SELECT 1 FROM transfer_history h JOIN operations o ON o.id = h.operation_id
+             WHERE o.status IN ('queued','waiting_maintenance','running')
+         )",
+    )
+    .fetch_one(&state.db)
+    .await?;
+    Ok(!pending)
 }
 
 /// Paths relative to a share, for the admin UI.

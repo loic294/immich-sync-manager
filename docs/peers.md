@@ -81,7 +81,10 @@ while one of its changes is still being applied.
   shared folder rescans that share shortly after it settles, and a full rescan still runs every
   `ISM_SCAN_INTERVAL_SECS` as a safety net. Each scan
   hashes settled files, including files with unchanged size and modification time; this can cause
-  substantial disk reads on large shares. To avoid recording half-completed managed operations,
+  substantial disk reads on large shares. Full safety-net scans wait while a peer transfer backlog
+  or its publication work is active, so restarting or updating ISM does not pause ongoing
+  replication behind a complete library rehash. Native watcher-detected outside changes are still
+  rescanned promptly. To avoid recording half-completed managed operations,
   each scan and managed operation runs exclusively of the other within this instance. A long scan
   can therefore delay managed operations and application of incoming events, even though polling
   and scanning run separately. Peer connections are polled independently, so a slow peer does not
