@@ -87,6 +87,7 @@ export const admin = {
   operation: (id: string) => api.get<Operation>(`${A}/operations/${enc(id)}`),
   cancelOperation: (id: string) => api.post<Operation>(`${A}/operations/${enc(id)}/cancel`),
   resolveOperation: (id: string) => api.post<void>(`${A}/operations/${enc(id)}/resolve`),
+  recheckOperation: (id: string) => api.post<void>(`${A}/operations/${enc(id)}/recheck`),
   operationPage: (status = '', limit = 250, offset = 0) =>
     api.get<OperationPage>(`${A}/operations/page`, { query: { status, limit, offset } }),
   operationDetail: (id: string) => api.get<OperationDetail>(`${A}/operations/${enc(id)}/detail`),

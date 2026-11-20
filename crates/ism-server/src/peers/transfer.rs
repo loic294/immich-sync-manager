@@ -5,8 +5,9 @@ use std::time::{Duration, UNIX_EPOCH};
 use futures_util::StreamExt;
 use ism_core::dto::{
     CreateUpload, ExistingOriginal, FileRole, Location, OnConflict, OperationAction,
-    OperationRequest, UploadFileSpec,
+    OperationRequest, PlannedFile, UploadFileSpec,
 };
+use ism_core::paths::RelPath;
 use ism_core::schedule::Schedule;
 use ism_core::sidecar::{
     CompanionRole, companion_role, companions_of, is_companion_name, preferred_paired_original,
@@ -124,6 +125,308 @@ pub async fn recover_after_restart(state: &AppState) -> AppResult<()> {
     .bind(db::now())
     .execute(&state.db)
     .await?;
+    Ok(())
+}
+
+fn recovery_check_failed(message: impl Into<String>) -> AppError {
+    AppError::conflict("recovery_recheck_failed", message.into())
+}
+
+/// Rechecks a peer upload whose file checks finished but replica/event bookkeeping did not.
+///
+/// This never moves, replaces or deletes a library file. It only verifies the final content and
+/// finishes the persisted peer bookkeeping when every expected file still matches exactly.
+pub async fn recheck_publish_recovery(state: &AppState, operation_id: &str) -> AppResult<()> {
+    let _operation_guard = state.replication_operation_lock.lock().await;
+    let operation: Option<(String, String, i64)> = sqlx::query_as(
+        "SELECT status, admitted_server_ids_json, recovery_resolved
+         FROM operations WHERE id = ?",
+    )
+    .bind(operation_id)
+    .fetch_optional(&state.db)
+    .await?;
+    let Some((status, admitted, _resolved)) = operation else {
+        return Err(AppError::not_found("operation not found"));
+    };
+    if status != "recovery_required" {
+        return Err(recovery_check_failed(
+            "only recovery-required operations can be rechecked",
+        ));
+    }
+    let admitted: Vec<String> = serde_json::from_str(&admitted)?;
+    if !admitted.is_empty() {
+        return Err(recovery_check_failed(
+            "this recovery includes Immich maintenance work; inspect it manually instead",
+        ));
+    }
+
+    let pending: Vec<(i64, String, String, String, String, String)> = sqlx::query_as(
+        "SELECT idx, share_id, kind, to_path, vv_json, peer_id
+         FROM pending_peer_ops WHERE operation_id = ? ORDER BY idx",
+    )
+    .bind(operation_id)
+    .fetch_all(&state.db)
+    .await?;
+    let [(idx, share_id, kind, to_path, vv_json, _peer_id)] = pending.as_slice() else {
+        return Err(recovery_check_failed(
+            "this operation does not have exactly one interrupted peer publication to recheck",
+        ));
+    };
+    if kind != "publish" {
+        return Err(recovery_check_failed(
+            "this operation is not an interrupted peer publication",
+        ));
+    }
+
+    type ItemRecovery = (i64, String, String, Option<String>, Option<String>);
+    let items: Vec<ItemRecovery> = sqlx::query_as(
+        "SELECT idx, kind, status, error_code, progress_json
+         FROM operation_items WHERE operation_id = ? ORDER BY idx",
+    )
+    .bind(operation_id)
+    .fetch_all(&state.db)
+    .await?;
+    let [(item_idx, item_kind, item_status, error_code, progress)] = items.as_slice() else {
+        return Err(recovery_check_failed(
+            "this peer publication does not have exactly one checkable action",
+        ));
+    };
+    if *idx != *item_idx || item_kind != "publish_upload" || item_status != "recovery_required" {
+        return Err(recovery_check_failed(
+            "the operation item is not the interrupted upload action",
+        ));
+    }
+    if error_code
+        .as_deref()
+        .is_some_and(|code| code != "peer_bookkeeping_failed")
+    {
+        return Err(recovery_check_failed(format!(
+            "the item failed for '{code}', which cannot be resolved by rechecking the file",
+            code = error_code.as_deref().unwrap_or_default()
+        )));
+    }
+    let Some(progress) = progress.as_deref() else {
+        return Err(recovery_check_failed(
+            "the operation did not retain its completed file checks",
+        ));
+    };
+    let progress: serde_json::Value = serde_json::from_str(progress)?;
+    let Some(steps) = progress["steps"].as_array() else {
+        return Err(recovery_check_failed(
+            "the operation did not retain its completed file checks",
+        ));
+    };
+    if steps.len() < 2
+        || steps[..steps.len() - 1]
+            .iter()
+            .any(|step| step["status"] != "done")
+        || steps.last().and_then(|step| step["label"].as_str()) != Some("Record changes")
+        || !matches!(
+            steps.last().and_then(|step| step["status"].as_str()),
+            Some("running" | "done")
+        )
+    {
+        return Err(recovery_check_failed(
+            "the saved checks did not finish before the interrupted bookkeeping step",
+        ));
+    }
+
+    let upload: Option<(String, String, String)> =
+        sqlx::query_as("SELECT id, request_json, status FROM uploads WHERE operation_id = ?")
+            .bind(operation_id)
+            .fetch_optional(&state.db)
+            .await?;
+    let Some((upload_id, request_json, _upload_status)) = upload else {
+        return Err(recovery_check_failed(
+            "the interrupted upload record is missing",
+        ));
+    };
+    let request: CreateUpload = serde_json::from_str(&request_json)?;
+    let [spec] = request.files.as_slice() else {
+        return Err(recovery_check_failed(
+            "this action published more than one file; inspect it manually",
+        ));
+    };
+    let share = super::shares(state)
+        .await?
+        .into_iter()
+        .find(|share| share.id == *share_id)
+        .ok_or_else(|| recovery_check_failed("the peer share no longer exists"))?;
+    if request.target.root_id != share.root_id {
+        return Err(recovery_check_failed(
+            "the upload root does not match the interrupted peer share",
+        ));
+    }
+    let target_folder = RelPath::parse(&request.target.path)
+        .map_err(|e| AppError::invalid_location(e.to_string()))?;
+    let target_rel = target_folder
+        .join(&spec.name)
+        .map_err(|e| AppError::invalid_location(e.to_string()))?;
+    if share.rel_of(&Location {
+        root_id: request.target.root_id.clone(),
+        path: target_rel.as_str().to_owned(),
+    }) != Some(to_path.clone())
+    {
+        return Err(recovery_check_failed(
+            "the final file path does not match the interrupted peer publication",
+        ));
+    }
+    let root = files::root(&state.db, &share.root_id).await?;
+    root.ensure_available()?;
+    let path = root.abs(&target_rel)?;
+    let checked_path = path.clone();
+    let fingerprint =
+        tokio::task::spawn_blocking(move || files::replacement_fingerprint(&checked_path))
+            .await
+            .map_err(AppError::internal)?
+            .map_err(|e| {
+                if matches!(e.kind(), std::io::ErrorKind::NotFound) {
+                    recovery_check_failed("the expected destination file is missing")
+                } else {
+                    recovery_check_failed(format!("the destination file cannot be verified: {e}"))
+                }
+            })?;
+    let Some((revision, sha256)) = fingerprint else {
+        return Err(recovery_check_failed(
+            "the expected destination file is missing",
+        ));
+    };
+    let meta = std::fs::metadata(&path).map_err(AppError::internal)?;
+    if !meta.is_file() || meta.len() != spec.size || !sha256.eq_ignore_ascii_case(&spec.sha256) {
+        return Err(recovery_check_failed(
+            "the destination file no longer matches the upload size and checksum",
+        ));
+    }
+
+    let vv: VersionVector = serde_json::from_str(vv_json)?;
+    let result = serde_json::json!({
+        "asset_id": null,
+        "files": [PlannedFile {
+            from: None,
+            to: Some(Location {
+                root_id: request.target.root_id.clone(),
+                path: target_rel.as_str().to_owned(),
+            }),
+            role: spec.role,
+            copy: false,
+        }],
+        "warnings": [],
+    });
+    let mut completed_progress = progress;
+    if let Some(last) = completed_progress
+        .get_mut("steps")
+        .and_then(|steps| steps.as_array_mut())
+        .and_then(|steps| steps.last_mut())
+    {
+        last["status"] = "done".into();
+    }
+
+    let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
+    let unchanged: Option<String> =
+        sqlx::query_scalar("SELECT status FROM operations WHERE id = ?")
+            .bind(operation_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if unchanged.as_deref() != Some("recovery_required") {
+        return Err(recovery_check_failed(
+            "the operation changed while it was being rechecked",
+        ));
+    }
+    let pending_now: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pending_peer_ops WHERE operation_id = ? AND idx = ? AND kind = 'publish' AND to_path = ?",
+    )
+    .bind(operation_id)
+    .bind(idx)
+    .bind(to_path)
+    .fetch_one(&mut *tx)
+    .await?;
+    if pending_now != 1 {
+        return Err(recovery_check_failed(
+            "the interrupted peer bookkeeping changed while it was being rechecked",
+        ));
+    }
+    if files::revision(&std::fs::metadata(&path).map_err(AppError::internal)?) != revision {
+        return Err(recovery_check_failed(
+            "the destination file changed while it was being rechecked",
+        ));
+    }
+    let mut row = super::row_in(&mut tx, &share.id, to_path)
+        .await?
+        .unwrap_or(Row {
+            size: 0,
+            mtime_ns: 0,
+            sha256: None,
+            deleted: false,
+            vv: VersionVector::default(),
+        });
+    row.vv.merge(&vv);
+    row.size = meta.len() as i64;
+    row.mtime_ns = files::mtime_ns(&meta);
+    row.sha256 = Some(sha256);
+    row.deleted = false;
+    super::put_row_in(&mut tx, &share.id, to_path, &row).await?;
+    sqlx::query("DELETE FROM pending_peer_ops WHERE operation_id = ? AND idx = ?")
+        .bind(operation_id)
+        .bind(idx)
+        .execute(&mut *tx)
+        .await?;
+    let updated_item = sqlx::query(
+        "UPDATE operation_items
+         SET status = 'done', error_code = NULL, error_message = NULL,
+             result_json = ?, progress_json = ?
+         WHERE operation_id = ? AND idx = ? AND status = 'recovery_required'",
+    )
+    .bind(result.to_string())
+    .bind(completed_progress.to_string())
+    .bind(operation_id)
+    .bind(idx)
+    .execute(&mut *tx)
+    .await?;
+    if updated_item.rows_affected() != 1 {
+        return Err(recovery_check_failed(
+            "the interrupted operation item changed while it was being rechecked",
+        ));
+    }
+    let updated_upload =
+        sqlx::query("UPDATE uploads SET status = 'committed' WHERE id = ? AND operation_id = ?")
+            .bind(&upload_id)
+            .bind(operation_id)
+            .execute(&mut *tx)
+            .await?;
+    if updated_upload.rows_affected() != 1 {
+        return Err(recovery_check_failed(
+            "the upload record changed while it was being rechecked",
+        ));
+    }
+    let updated_operation = sqlx::query(
+        "UPDATE operations
+         SET status = 'completed', recovery_resolved = 1, finished_at = COALESCE(finished_at, ?)
+         WHERE id = ? AND status = 'recovery_required'",
+    )
+    .bind(db::now())
+    .bind(operation_id)
+    .execute(&mut *tx)
+    .await?;
+    if updated_operation.rows_affected() != 1 {
+        return Err(recovery_check_failed(
+            "the operation changed while it was being rechecked",
+        ));
+    }
+    tx.commit().await?;
+
+    let (operation, _) = crate::ops::load(state, operation_id).await?;
+    crate::ops::record(
+        state,
+        operation_id,
+        "finished",
+        &serde_json::to_value(operation)?,
+    )
+    .await?;
+    state.sync_wake.notify_waiters();
+    state.emit(ServerEvent::OperationUpdated {
+        operation_id: operation_id.to_owned(),
+    });
+    state.emit(ServerEvent::SyncChanged);
     Ok(())
 }
 

@@ -2288,6 +2288,144 @@ async fn operation_requires_recovery_if_peer_bookkeeping_fails() {
 }
 
 #[tokio::test]
+async fn recheck_finishes_only_verified_interrupted_peer_publication() {
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    write_old(&a.shared.join("photo.jpg"), b"remote photo");
+    scan(&a).await;
+    let peer = super::net::peers(&b.state).await.unwrap().remove(0);
+    super::pull(&b.state, &peer).await.unwrap();
+    b.tasks
+        .push(tokio::spawn(super::transfer::run(b.state.clone())));
+    let operation_id = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let operation_id: Option<String> =
+                sqlx::query_scalar("SELECT operation_id FROM pending_peer_ops LIMIT 1")
+                    .fetch_optional(&b.state.db)
+                    .await
+                    .unwrap();
+            if let Some(operation_id) = operation_id {
+                break operation_id;
+            }
+            b.state.sync_wake.notify_waiters();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the download must reach publication");
+    b.tasks.pop().unwrap().abort();
+
+    sqlx::query(
+        "CREATE TRIGGER reject_rechecked_publish BEFORE INSERT ON replica_files
+         WHEN NEW.rel_path = 'photo.jpg' BEGIN SELECT RAISE(FAIL, 'injected'); END",
+    )
+    .execute(&b.state.db)
+    .await
+    .unwrap();
+    crate::ops::exec::run_operation(&b.state, &operation_id)
+        .await
+        .unwrap();
+    sqlx::query("DROP TRIGGER reject_rechecked_publish")
+        .execute(&b.state.db)
+        .await
+        .unwrap();
+    assert_eq!(
+        crate::ops::load(&b.state, &operation_id)
+            .await
+            .unwrap()
+            .0
+            .status,
+        ism_core::dto::OperationStatus::RecoveryRequired
+    );
+    assert_eq!(
+        std::fs::read(b.shared.join("photo.jpg")).unwrap(),
+        b"remote photo"
+    );
+    let progress_json: String = sqlx::query_scalar(
+        "SELECT progress_json FROM operation_items WHERE operation_id = ? AND idx = 0",
+    )
+    .bind(&operation_id)
+    .fetch_one(&b.state.db)
+    .await
+    .unwrap();
+    let mut progress: serde_json::Value = serde_json::from_str(&progress_json).unwrap();
+    progress["steps"]
+        .as_array_mut()
+        .unwrap()
+        .last_mut()
+        .unwrap()["status"] = "running".into();
+    sqlx::query(
+        "UPDATE operation_items
+         SET error_code = NULL, error_message = NULL, progress_json = ?
+         WHERE operation_id = ? AND idx = 0",
+    )
+    .bind(progress.to_string())
+    .bind(&operation_id)
+    .execute(&b.state.db)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE operations SET recovery_resolved = 1 WHERE id = ?")
+        .bind(&operation_id)
+        .execute(&b.state.db)
+        .await
+        .unwrap();
+
+    write_old(&b.shared.join("photo.jpg"), b"wrong photo");
+    let error = super::transfer::recheck_publish_recovery(&b.state, &operation_id)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), "recovery_recheck_failed");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM pending_peer_ops WHERE operation_id = ?",
+        )
+        .bind(&operation_id)
+        .fetch_one(&b.state.db)
+        .await
+        .unwrap(),
+        1
+    );
+
+    std::fs::copy(a.shared.join("photo.jpg"), b.shared.join("photo.jpg")).unwrap();
+    super::transfer::recheck_publish_recovery(&b.state, &operation_id)
+        .await
+        .unwrap();
+    let operation = crate::ops::load(&b.state, &operation_id).await.unwrap().0;
+    assert_eq!(operation.status, ism_core::dto::OperationStatus::Completed);
+    assert!(
+        operation
+            .items
+            .iter()
+            .all(|item| item.status == ism_core::dto::ItemStatus::Done)
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM pending_peer_ops WHERE operation_id = ?",
+        )
+        .bind(&operation_id)
+        .fetch_one(&b.state.db)
+        .await
+        .unwrap(),
+        0
+    );
+    let upload_status: String =
+        sqlx::query_scalar("SELECT status FROM uploads WHERE operation_id = ?")
+            .bind(&operation_id)
+            .fetch_one(&b.state.db)
+            .await
+            .unwrap();
+    assert_eq!(upload_status, "committed");
+    let share = super::shares(&b.state).await.unwrap().remove(0);
+    let row = super::row(&b.state, &share.id, "photo.jpg")
+        .await
+        .unwrap()
+        .unwrap();
+    let expected_hash = crate::crypto::sha256_hex(b"remote photo");
+    assert_eq!(row.sha256.as_deref(), Some(expected_hash.as_str()));
+}
+
+#[tokio::test]
 async fn failed_move_event_rolls_back_replica_rename() {
     let b = instance("Beta").await;
     for task in &b.tasks {

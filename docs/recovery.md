@@ -15,6 +15,12 @@ If an item reports `peer_bookkeeping_failed`, its filesystem changes may already
 replica rows and events may be only partly updated. Inspect and reconcile both before resolving the
 operation; peer scans and event processing remain paused while recovery is unresolved.
 
+For an interrupted peer publication, **Recheck files** repeats the saved upload's final file-size
+and SHA-256 checks. If every expected file still matches, ISM finishes the interrupted replica
+bookkeeping and completes the operation; it does not move, replace or delete library files. A
+missing or changed file, a non-peer action, or a recovery involving Immich maintenance work is
+refused and remains for manual inspection.
+
 If the container is restarted mid-operation, unfinished items are marked for recovery on start and the
 server keeps Immich's `library` queue paused until an admin confirms. If ISM had paused the queue
 and no operation was running, it resumes the queue on start. Corrupt maintenance state or a failed restart recovery

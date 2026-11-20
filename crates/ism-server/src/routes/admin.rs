@@ -74,6 +74,7 @@ pub fn router() -> Router<AppState> {
         .route("/operations/{id}", get(get_operation))
         .route("/operations/{id}/cancel", post(cancel_operation))
         .route("/operations/{id}/resolve", post(resolve_operation))
+        .route("/operations/{id}/recheck", post(recheck_operation))
         .route("/trash", get(trash))
         .route("/peers", get(list_peers))
         .route("/peers/invite", post(create_invite))
@@ -1273,6 +1274,16 @@ async fn resolve_operation(
     Path(id): Path<String>,
 ) -> AppResult<Response> {
     ops::resolve_recovery(&state, &id).await?;
+    Ok(no_content())
+}
+
+async fn recheck_operation(
+    State(state): State<AppState>,
+    Admin(p): Admin,
+    Path(id): Path<String>,
+) -> AppResult<Response> {
+    crate::peers::transfer::recheck_publish_recovery(&state, &id).await?;
+    db::audit(&state.db, &actor(&p), "operation.recheck", &id).await;
     Ok(no_content())
 }
 

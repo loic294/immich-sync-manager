@@ -5,6 +5,10 @@ import type { OperationActivity } from '@/api/generated/OperationActivity';
 import { mount } from '@/test/helpers';
 import '@/pages/ism-operations-page';
 
+vi.mock('@/components/confirm', () => ({
+  confirmAction: vi.fn(async () => true),
+}));
+
 const OP: OperationActivity = {
   operation_id: 'op1',
   title: 'Move',
@@ -102,5 +106,47 @@ describe('operations activity', () => {
     await vi.waitFor(() => expect(post).toHaveBeenCalledWith('/api/admin/operations/op1/handled'));
     expect(post).not.toHaveBeenCalledWith('/api/admin/operations/op1/resolve');
     await vi.waitFor(() => expect(page.textContent).toContain('Handled'));
+  });
+
+  it('offers a file recheck for interrupted recovery', async () => {
+    vi.spyOn(api, 'get').mockImplementation(async (path) => {
+      if (path === '/api/admin/operations/op1/detail')
+        return {
+          activity: { ...OP, status: 'recovery_required' },
+          operation: {
+            ...OP,
+            source: 'admin',
+            status: 'recovery_required',
+            items: [
+              {
+                index: 0,
+                kind: 'publish_upload',
+                status: 'recovery_required',
+                error: null,
+                result: null,
+              },
+            ],
+          },
+          tasks: [
+            {
+              files: [],
+              steps: [
+                { label: 'check sha256 photo.jpg', status: 'done' },
+                { label: 'Record changes', status: 'running' },
+              ],
+            },
+          ],
+        } as never;
+      return { rows: [OP], total: 1 } as never;
+    });
+    const post = vi.spyOn(api, 'post').mockResolvedValue(undefined as never);
+    const page = await mount('ism-operations-page');
+    await vi.waitFor(() => expect(page.textContent).toContain('OPM: editor'));
+    page.querySelector<HTMLButtonElement>('ism-operation-table button')?.click();
+    await vi.waitFor(() => expect(page.textContent).toContain('Record changes'));
+    [...page.querySelectorAll('button')]
+      .find((button) => button.textContent?.includes('Recheck files'))
+      ?.click();
+    await vi.waitFor(() => expect(post).toHaveBeenCalledWith('/api/admin/operations/op1/recheck'));
   });
 });

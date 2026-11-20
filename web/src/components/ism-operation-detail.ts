@@ -57,6 +57,23 @@ export class IsmOperationDetail extends IsmPage {
     )
       await this.act('resolve', () => admin.resolveOperation(id), 'Recovery resolved.');
   }
+  private async recheck() {
+    const id = this.operationId;
+    if (!id) return;
+    if (
+      await confirmAction({
+        title: 'Recheck files and finish recovery',
+        message:
+          'ISM will verify the expected destination size and checksum, then finish the interrupted peer bookkeeping. It will not move, replace, or delete any file.',
+        confirmLabel: 'Recheck files',
+      })
+    )
+      await this.act(
+        'recheck',
+        () => admin.recheckOperation(id),
+        'Files verified and recovery completed.',
+      );
+  }
   private async cancel() {
     const id = this.operationId;
     if (!id) return;
@@ -74,6 +91,16 @@ export class IsmOperationDetail extends IsmPage {
     const detail = this.detail;
     const op = detail?.operation;
     const activity = detail?.activity;
+    const canRecheck = op?.items.some((item) => {
+      if (item.kind !== 'publish_upload' || item.status !== 'recovery_required') return false;
+      const steps = detail?.tasks[item.index]?.steps;
+      return (
+        !!steps?.length &&
+        steps.at(-1)?.label === 'Record changes' &&
+        ['running', 'done'].includes(steps.at(-1)?.status ?? '') &&
+        steps.slice(0, -1).every((step) => step.status === 'done')
+      );
+    });
     return html`<dialog class="modal" aria-labelledby="operation-detail-title" ${ref(this.dialog)}
       @close=${() => {
         this.operationId = undefined;
@@ -147,6 +174,11 @@ export class IsmOperationDetail extends IsmPage {
           ${!activity.recovery_resolved && (op.status === 'recovery_required' || op.status === 'partial') ? html`<p class="my-2 text-sm text-warning">Marking handled does not resolve recovery or release any safety barrier.</p>` : nothing}
           <div class="modal-action flex-wrap">
             ${['queued', 'running', 'waiting_maintenance'].includes(op.status) ? html`<button class="btn btn-sm" ?disabled=${!!this.busy} @click=${this.cancel}>${this.spin('cancel')}Cancel operation</button>` : nothing}
+            ${
+              canRecheck
+                ? html`<button class="btn btn-warning btn-sm" ?disabled=${!!this.busy} @click=${this.recheck}>${this.spin('recheck')}Recheck files</button>`
+                : nothing
+            }
             ${
               !activity.recovery_resolved &&
               (op.status === 'recovery_required' || op.status === 'partial')
