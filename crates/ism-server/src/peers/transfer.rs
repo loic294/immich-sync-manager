@@ -243,28 +243,34 @@ pub async fn run(state: AppState) {
     let mut tasks = tokio::task::JoinSet::new();
     loop {
         if tasks.len() < state.config.peer_transfer_concurrency {
-            match next(&state).await {
-                Ok(Some((t, ov))) => {
-                    match claim(&state, &t.id, ov.as_deref()).await {
-                        Ok(true) => {}
-                        Ok(false) => continue,
-                        Err(e) => {
-                            tracing::error!(transfer = %t.id, "claim transfer: {}", e.message());
-                            tokio::time::sleep(tick).await;
-                            continue;
+            match super::require_recovery_resolved(&state).await {
+                Ok(()) => match next(&state).await {
+                    Ok(Some((t, ov))) => {
+                        match claim(&state, &t.id, ov.as_deref()).await {
+                            Ok(true) => {}
+                            Ok(false) => continue,
+                            Err(e) => {
+                                tracing::error!(transfer = %t.id, "claim transfer: {}", e.message());
+                                tokio::time::sleep(tick).await;
+                                continue;
+                            }
                         }
+                        state.emit(ServerEvent::SyncChanged);
+                        let state = state.clone();
+                        tasks.spawn(async move {
+                            run_claimed(&state, &t).await;
+                        });
+                        continue;
                     }
-                    state.emit(ServerEvent::SyncChanged);
-                    let state = state.clone();
-                    tasks.spawn(async move {
-                        run_claimed(&state, &t).await;
-                    });
-                    continue;
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::error!("transfer queue: {}", e.message());
+                    }
+                },
+                Err(e) if e.code() != "recovery_required" => {
+                    tracing::error!("transfer recovery check: {}", e.message());
                 }
-                Ok(None) => {}
-                Err(e) => {
-                    tracing::error!("transfer queue: {}", e.message());
-                }
+                Err(_) => {}
             }
         }
         tokio::select! {

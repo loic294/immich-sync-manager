@@ -2,6 +2,9 @@
 
 use std::sync::{Arc, Mutex};
 
+use ism_core::dto::{
+    CreateUpload, FileRole, Location, OnConflict, OperationAction, OperationRequest, UploadFileSpec,
+};
 use serde_json::{Value, json};
 use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
@@ -426,6 +429,151 @@ async fn restart_recovery_updates_operations_uploads_and_server_atomically() {
     assert_eq!(m.phase, Phase::RecoveryRequired);
     assert_eq!(m.unresolved_recoveries, 1);
     assert_eq!(m.active_ops, 0);
+}
+
+#[tokio::test]
+async fn restart_requeues_an_untouched_peer_upload() {
+    let (dir, state, _, _) = setup().await;
+    let root = dir.path().join("photos");
+    std::fs::create_dir_all(root.join("incoming")).unwrap();
+    std::fs::write(root.join(crate::files::SENTINEL), "photos\n").unwrap();
+    sqlx::query(
+        "INSERT INTO mappings (root_id,name,container_path,created_at) VALUES ('photos','Photos',?,?)",
+    )
+    .bind(root.to_string_lossy().to_string())
+    .bind(crate::db::now())
+    .execute(&state.db)
+    .await
+    .unwrap();
+
+    let data = b"synthetic peer upload";
+    let upload = CreateUpload {
+        idempotency_key: Some("peer-transfer:transfer".into()),
+        target: Location {
+            root_id: "photos".into(),
+            path: "incoming".into(),
+        },
+        provenance: None,
+        files: vec![UploadFileSpec {
+            name: "photo.jpg".into(),
+            role: FileRole::Original,
+            size: data.len() as u64,
+            sha256: crate::crypto::sha256_hex(data),
+            expected_revision: None,
+            expected_sha256: None,
+        }],
+        on_conflict: OnConflict::Fail,
+        existing_original: None,
+    };
+    let staging = crate::ops::plan::staging_dir(
+        &crate::files::root(&state.db, "photos").await.unwrap(),
+        "upload",
+    )
+    .unwrap();
+    std::fs::create_dir_all(&staging).unwrap();
+    std::fs::write(staging.join("0"), data).unwrap();
+    let request = OperationRequest {
+        idempotency_key: "upload:upload".into(),
+        label: Some("incoming/photo.jpg from peer".into()),
+        actions: vec![OperationAction::PublishUpload {
+            upload_id: "upload".into(),
+        }],
+        allow_owner_transfer: false,
+        allow_partial: false,
+    };
+    sqlx::query(
+        "INSERT INTO operations (id,idempotency_key,principal,source,label,request_json,status,admitted_server_ids_json,created_at,started_at)
+         VALUES ('op','upload:upload','peer:test','peer','incoming/photo.jpg from peer',?,'running','[]',?,?)",
+    )
+    .bind(serde_json::to_string(&request).unwrap())
+    .bind(crate::db::now())
+    .bind(crate::db::now())
+    .execute(&state.db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO operation_items (operation_id,idx,kind,action_json,status)
+         VALUES ('op',0,'publish_upload',?,'running')",
+    )
+    .bind(serde_json::to_string(&request.actions[0]).unwrap())
+    .execute(&state.db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO uploads (id,operation_id,principal,request_json,status,created_at)
+         VALUES ('upload','op','peer:test',?,'publishing',?)",
+    )
+    .bind(serde_json::to_string(&upload).unwrap())
+    .bind(crate::db::now())
+    .execute(&state.db)
+    .await
+    .unwrap();
+
+    recover_after_restart(&state).await.unwrap();
+
+    let operation: (String, Option<String>) =
+        sqlx::query_as("SELECT status,finished_at FROM operations WHERE id = 'op'")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+    assert_eq!(operation, ("queued".into(), None));
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT status FROM operation_items WHERE operation_id = 'op'"
+        )
+        .fetch_one(&state.db)
+        .await
+        .unwrap(),
+        "pending"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT status FROM uploads WHERE id = 'upload'")
+            .fetch_one(&state.db)
+            .await
+            .unwrap(),
+        "publishing"
+    );
+
+    sqlx::query(
+        "UPDATE operations SET status = 'recovery_required', finished_at = ? WHERE id = 'op'",
+    )
+    .bind(crate::db::now())
+    .execute(&state.db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE operation_items SET status = 'recovery_required' WHERE operation_id = 'op'",
+    )
+    .execute(&state.db)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE uploads SET status = 'failed' WHERE id = 'upload'")
+        .execute(&state.db)
+        .await
+        .unwrap();
+
+    recover_after_restart(&state).await.unwrap();
+
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT status FROM operations WHERE id = 'op'")
+            .fetch_one(&state.db)
+            .await
+            .unwrap(),
+        "queued",
+        "an upload marked recoverable by the previous build is also resumed"
+    );
+    crate::ops::exec::run_operation(&state, "op").await.unwrap();
+    assert_eq!(
+        std::fs::read(root.join("incoming/photo.jpg")).unwrap(),
+        data
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT status FROM operations WHERE id = 'op'")
+            .fetch_one(&state.db)
+            .await
+            .unwrap(),
+        "completed"
+    );
 }
 
 #[tokio::test]

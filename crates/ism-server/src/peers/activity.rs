@@ -276,6 +276,13 @@ pub async fn page(
             ));
         }
     }
+    match super::require_recovery_resolved(state).await {
+        Ok(()) => {}
+        Err(error) if error.code() == "recovery_required" => warnings.push(
+            "File transfers are paused by unresolved operation recovery. Open Operations and check the interrupted operation.".into(),
+        ),
+        Err(error) => return Err(error),
+    }
     if warnings.is_empty() {
         estimate(&mut progress);
     } else {

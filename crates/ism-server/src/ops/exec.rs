@@ -492,7 +492,7 @@ fn local_changes_of(action: &OperationAction, plan: &Plan) -> Vec<LocalChange> {
     }
 }
 
-fn parse_action(raw: &str) -> AppResult<OperationAction> {
+pub(crate) fn parse_action(raw: &str) -> AppResult<OperationAction> {
     // `PublishUpload` is internal and never deserialised from clients; stored items may hold it.
     let v: serde_json::Value = serde_json::from_str(raw)?;
     if v["kind"] == "publish_upload" {

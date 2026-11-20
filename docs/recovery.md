@@ -20,6 +20,11 @@ server keeps Immich's `library` queue paused until an admin confirms. If ISM had
 and no operation was running, it resumes the queue on start. Corrupt maintenance state or a failed restart recovery
 prevents the server from starting rather than assuming it is safe.
 
+An interrupted peer upload is requeued automatically only when every staging file is still present
+and exactly matches the recorded size and checksum, no execution step has been recorded, and the
+operation does not hold an Immich maintenance barrier. Any missing, changed, partially executed,
+or otherwise uncertain upload remains in **Recovery required** for an administrator to inspect.
+
 Interrupted peer transfers return to the queue on restart while peer publication is disabled.
 Failed and cancelled transfers are left unchanged.
 

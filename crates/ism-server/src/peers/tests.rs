@@ -4096,12 +4096,12 @@ async fn transfers_are_deferred_without_consuming_retries_during_recovery() {
         .unwrap();
     let mut events = b.state.events.subscribe();
     let worker = tokio::spawn(super::transfer::run(b.state.clone()));
-    for _ in 0..2 {
-        tokio::time::timeout(Duration::from_secs(3), events.recv())
+    assert!(
+        tokio::time::timeout(Duration::from_millis(250), events.recv())
             .await
-            .unwrap()
-            .unwrap();
-    }
+            .is_err(),
+        "blocked transfers must wait without claim/defer churn"
+    );
     let (status, attempts): (String, i64) =
         sqlx::query_as("SELECT status, attempts FROM transfers WHERE share_id = ?")
             .bind(&share.id)
@@ -4109,6 +4109,14 @@ async fn transfers_are_deferred_without_consuming_retries_during_recovery() {
             .await
             .unwrap();
     assert_eq!((status.as_str(), attempts), ("queued", 0));
+    let page = super::activity::page(&b.state, "active", 250, 0, None)
+        .await
+        .unwrap();
+    assert!(
+        page.warnings
+            .iter()
+            .any(|warning| warning.contains("paused by unresolved operation recovery"))
+    );
     crate::ops::resolve_recovery(&b.state, &accepted.operation_id)
         .await
         .unwrap();

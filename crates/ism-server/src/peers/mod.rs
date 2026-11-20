@@ -512,17 +512,16 @@ async fn register_local(
     Ok(Some(r))
 }
 
-async fn require_stable_operations(state: &AppState) -> AppResult<()> {
+async fn require_recovery_resolved(state: &AppState) -> AppResult<()> {
     let unresolved: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM operations
-         WHERE status IN ('running', 'waiting_maintenance')
-            OR (recovery_resolved = 0 AND
-                (status = 'recovery_required'
-                 OR (status = 'partial' AND CASE
-                     WHEN json_valid(admitted_server_ids_json) THEN
-                         CASE WHEN json_type(admitted_server_ids_json) = 'array'
-                              THEN json_array_length(admitted_server_ids_json) ELSE 1 END
-                     ELSE 1 END > 0))))",
+         WHERE recovery_resolved = 0 AND
+               (status = 'recovery_required'
+                OR (status = 'partial' AND CASE
+                    WHEN json_valid(admitted_server_ids_json) THEN
+                        CASE WHEN json_type(admitted_server_ids_json) = 'array'
+                             THEN json_array_length(admitted_server_ids_json) ELSE 1 END
+                    ELSE 1 END > 0)))",
     )
     .fetch_one(&state.db)
     .await?;
@@ -530,6 +529,23 @@ async fn require_stable_operations(state: &AppState) -> AppResult<()> {
         return Err(AppError::conflict(
             "recovery_required",
             "peer bookkeeping waits for unresolved managed operations",
+        ));
+    }
+    Ok(())
+}
+
+async fn require_stable_operations(state: &AppState) -> AppResult<()> {
+    require_recovery_resolved(state).await?;
+    let active: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM operations
+         WHERE status IN ('running', 'waiting_maintenance'))",
+    )
+    .fetch_one(&state.db)
+    .await?;
+    if active {
+        return Err(AppError::conflict(
+            "recovery_required",
+            "peer bookkeeping waits for active managed operations",
         ));
     }
     Ok(())

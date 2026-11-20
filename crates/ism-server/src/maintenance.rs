@@ -19,6 +19,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use ism_core::dto::{CreateUpload, OperationAction};
 use ism_core::maintenance::{Admission, IdleConfirmation, MaintenanceState, Phase};
 
 use crate::error::{AppError, AppResult};
@@ -404,6 +405,7 @@ async fn check_drift(state: &AppState, server: &Server) -> AppResult<()> {
 /// pause nobody holds any more is resumed by the run loop.
 pub async fn recover_after_restart(state: &AppState) -> AppResult<()> {
     let _guard = state.maintenance_lock.lock().await;
+    let resumable = resumable_publish_uploads(state).await?;
     let mut servers: std::collections::BTreeMap<_, _> = registry::servers(state)
         .await?
         .into_iter()
@@ -416,6 +418,9 @@ pub async fn recover_after_restart(state: &AppState) -> AppResult<()> {
     .fetch_all(&mut *tx)
     .await?;
     for (op_id, admitted_servers) in &interrupted {
+        if resumable.contains_key(op_id) {
+            continue;
+        }
         for server_id in serde_json::from_str::<Vec<String>>(admitted_servers)? {
             let m = servers.get_mut(&server_id).ok_or_else(|| {
                 AppError::internal(format!(
@@ -442,6 +447,31 @@ pub async fn recover_after_restart(state: &AppState) -> AppResult<()> {
             .await?;
         tracing::warn!(operation = %op_id, "operation interrupted by restart; recovery required");
     }
+    for (op_id, upload_id) in resumable {
+        sqlx::query(
+            "UPDATE operations
+             SET status = 'queued', started_at = NULL, finished_at = NULL
+             WHERE id = ? AND status IN ('running', 'recovery_required') AND recovery_resolved = 0",
+        )
+        .bind(&op_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE operation_items
+             SET status = 'pending', error_code = NULL, error_message = NULL,
+                 result_json = NULL, journal_json = NULL, progress_json = NULL
+             WHERE operation_id = ?",
+        )
+        .bind(&op_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("UPDATE uploads SET status = 'publishing' WHERE id = ? AND operation_id = ?")
+            .bind(upload_id)
+            .bind(&op_id)
+            .execute(&mut *tx)
+            .await?;
+        tracing::info!(operation = %op_id, "untouched upload requeued after restart");
+    }
     sqlx::query("UPDATE operations SET status = 'queued' WHERE status = 'waiting_maintenance'")
         .execute(&mut *tx)
         .await?;
@@ -454,7 +484,151 @@ pub async fn recover_after_restart(state: &AppState) -> AppResult<()> {
             .await?;
     }
     tx.commit().await?;
+    state.ops_wake.notify_waiters();
     Ok(())
+}
+
+async fn resumable_publish_uploads(state: &AppState) -> AppResult<HashMap<String, String>> {
+    let candidates: Vec<String> = sqlx::query_scalar(
+        "SELECT id FROM operations
+         WHERE status = 'running'
+            OR (status = 'recovery_required' AND recovery_resolved = 0)",
+    )
+    .fetch_all(&state.db)
+    .await?;
+    let mut found = HashMap::new();
+    for id in candidates {
+        if let Some(upload_id) = resumable_publish_upload(state, &id).await? {
+            found.insert(id, upload_id);
+        }
+    }
+    Ok(found)
+}
+
+async fn resumable_publish_upload(
+    state: &AppState,
+    operation_id: &str,
+) -> AppResult<Option<String>> {
+    type OperationRow = (String, String, String, i64);
+    let Some((principal, request, admitted, cancelled)): Option<OperationRow> = sqlx::query_as(
+        "SELECT principal,request_json,admitted_server_ids_json,cancel_requested
+         FROM operations WHERE id = ?",
+    )
+    .bind(operation_id)
+    .fetch_optional(&state.db)
+    .await?
+    else {
+        return Ok(None);
+    };
+    let admitted: Vec<String> = serde_json::from_str(&admitted)?;
+    if cancelled != 0 || !admitted.is_empty() {
+        return Ok(None);
+    }
+    let request: serde_json::Value = serde_json::from_str(&request)?;
+    let Some(actions) = request["actions"].as_array() else {
+        return Ok(None);
+    };
+    let [action] = actions.as_slice() else {
+        return Ok(None);
+    };
+    let action = crate::ops::exec::parse_action(&serde_json::to_string(action)?)?;
+    let OperationAction::PublishUpload { upload_id } = action else {
+        return Ok(None);
+    };
+
+    type ItemRow = (
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+    let items: Vec<ItemRow> = sqlx::query_as(
+        "SELECT kind,action_json,status,error_code,error_message,result_json,journal_json,progress_json
+         FROM operation_items WHERE operation_id = ? ORDER BY idx",
+    )
+    .bind(operation_id)
+    .fetch_all(&state.db)
+    .await?;
+    let [(kind, action, status, error_code, error_message, result, journal, progress)] =
+        items.as_slice()
+    else {
+        return Ok(None);
+    };
+    if kind != "publish_upload"
+        || !matches!(status.as_str(), "pending" | "running" | "recovery_required")
+        || error_code.is_some()
+        || error_message.is_some()
+        || result.is_some()
+        || journal.is_some()
+        || progress.is_some()
+    {
+        return Ok(None);
+    }
+    match crate::ops::exec::parse_action(action)? {
+        OperationAction::PublishUpload {
+            upload_id: item_upload,
+        } if item_upload == upload_id => {}
+        _ => return Ok(None),
+    }
+
+    type UploadRow = (String, String, String, String);
+    let uploads: Vec<UploadRow> = sqlx::query_as(
+        "SELECT id,principal,request_json,status FROM uploads WHERE operation_id = ?",
+    )
+    .bind(operation_id)
+    .fetch_all(&state.db)
+    .await?;
+    let [(id, owner, upload_request, upload_status)] = uploads.as_slice() else {
+        return Ok(None);
+    };
+    if id != &upload_id
+        || owner != &principal
+        || !matches!(upload_status.as_str(), "publishing" | "failed")
+    {
+        return Ok(None);
+    }
+    let upload: CreateUpload = serde_json::from_str(upload_request)?;
+    if upload.files.is_empty() {
+        return Ok(None);
+    }
+    let root = match crate::files::root(&state.db, &upload.target.root_id).await {
+        Ok(root) => root,
+        Err(_) => return Ok(None),
+    };
+    if root.ensure_available().is_err() {
+        return Ok(None);
+    }
+    let staging = crate::ops::plan::staging_dir(&root, &upload_id)?;
+    let checks = upload
+        .files
+        .iter()
+        .enumerate()
+        .map(|(index, file)| {
+            (
+                staging.join(index.to_string()),
+                file.size,
+                file.sha256.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let valid = tokio::task::spawn_blocking(move || -> std::io::Result<bool> {
+        for (path, expected_size, expected_hash) in checks {
+            let Some((_, hash)) = crate::files::replacement_fingerprint(&path)? else {
+                return Ok(false);
+            };
+            if std::fs::metadata(path)?.len() != expected_size || hash != expected_hash {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    })
+    .await
+    .map_err(AppError::internal)??;
+    Ok(valid.then_some(upload_id))
 }
 
 pub async fn run(state: AppState) {
