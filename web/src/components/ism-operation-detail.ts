@@ -20,6 +20,7 @@ export class IsmOperationDetail extends IsmPage {
   declare limit: number;
   declare offset: number;
   protected override reloadOn = ['operation_updated', 'operation_committed'] as const;
+  protected override liveReloadInterval = 1000;
   private operationId: string | undefined;
   private dialog = createRef<HTMLDialogElement>();
   constructor() {

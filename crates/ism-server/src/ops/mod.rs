@@ -308,6 +308,15 @@ type OpRow = (
     Option<String>,
 );
 
+type ItemRow = (
+    i64,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
 pub async fn load(state: &AppState, id: &str) -> AppResult<(Operation, String)> {
     let row: Option<OpRow> = sqlx::query_as(
         "SELECT id, status, label, source, created_at, principal, finished_at FROM operations WHERE id = ?",
@@ -319,14 +328,6 @@ pub async fn load(state: &AppState, id: &str) -> AppResult<(Operation, String)> 
     else {
         return Err(AppError::not_found("operation not found"));
     };
-    type ItemRow = (
-        i64,
-        String,
-        String,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-    );
     let rows: Vec<ItemRow> = sqlx::query_as(
         "SELECT idx, kind, status, error_code, error_message, result_json FROM operation_items
          WHERE operation_id = ? ORDER BY idx",
@@ -367,6 +368,34 @@ pub async fn load(state: &AppState, id: &str) -> AppResult<(Operation, String)> 
         },
         principal,
     ))
+}
+
+pub(crate) async fn load_item(
+    state: &AppState,
+    operation_id: &str,
+    index: i64,
+) -> AppResult<OperationItem> {
+    let row: Option<ItemRow> = sqlx::query_as(
+        "SELECT idx, kind, status, error_code, error_message, result_json
+             FROM operation_items WHERE operation_id = ? AND idx = ?",
+    )
+    .bind(operation_id)
+    .bind(index)
+    .fetch_optional(&state.db)
+    .await?;
+    let Some((idx, kind, status, code, message, result)) = row else {
+        return Err(AppError::not_found("operation item not found"));
+    };
+    Ok(OperationItem {
+        index: idx as u32,
+        kind,
+        status: ItemStatus::parse(&status),
+        error: code.map(|code| Issue {
+            code,
+            message: message.unwrap_or_default(),
+        }),
+        result: result.and_then(|value| serde_json::from_str(&value).ok()),
+    })
 }
 
 /// Loads an operation visible to `principal` (clients only see their own).
@@ -575,11 +604,12 @@ pub async fn record(
     event: &str,
     data: &serde_json::Value,
 ) -> AppResult<i64> {
+    let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
     let seq: i64 = sqlx::query_scalar(
         "SELECT COALESCE(MAX(seq), 0) + 1 FROM operation_events WHERE operation_id = ?",
     )
     .bind(operation_id)
-    .fetch_one(&state.db)
+    .fetch_one(&mut *tx)
     .await?;
     sqlx::query(
         "INSERT INTO operation_events (operation_id, seq, event, data, at) VALUES (?, ?, ?, ?, ?)",
@@ -589,14 +619,15 @@ pub async fn record(
     .bind(event)
     .bind(data.to_string())
     .bind(db::now())
-    .execute(&state.db)
+    .execute(&mut *tx)
     .await?;
     // Keep the stream bounded; clients with older cursors resync.
     sqlx::query("DELETE FROM operation_events WHERE operation_id = ? AND seq <= ?")
         .bind(operation_id)
         .bind(seq - 2000)
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await?;
+    tx.commit().await?;
     state.emit(ServerEvent::OperationUpdated {
         operation_id: operation_id.to_owned(),
     });

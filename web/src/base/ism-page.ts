@@ -25,8 +25,11 @@ export abstract class IsmPage extends IsmElement {
 
   /** Change events that make this page reload. `resync` always does. */
   protected reloadOn: readonly ChangeType[] = [];
+  /** Minimum interval between event-driven refreshes for pages with expensive data loads. */
+  protected liveReloadInterval = 250;
   private stopEvents: (() => void) | undefined;
   private reloadTimer: number | undefined;
+  private lastLiveReload = 0;
   private reloading: Promise<void> | undefined;
   private reloadAgain = false;
 
@@ -54,12 +57,13 @@ export abstract class IsmPage extends IsmElement {
 
   protected onChange(event: ChangeEvent) {
     if (event.type !== 'resync' && !this.reloadOn.includes(event.type)) return;
-    // Coalesce bursts (one event per committed item) into one request.
     if (this.reloadTimer !== undefined) return;
+    const delay = Math.max(0, this.liveReloadInterval - (Date.now() - this.lastLiveReload));
     this.reloadTimer = window.setTimeout(() => {
       this.reloadTimer = undefined;
+      this.lastLiveReload = Date.now();
       void this.reload();
-    }, 250);
+    }, delay);
   }
 
   reload(): Promise<void> {

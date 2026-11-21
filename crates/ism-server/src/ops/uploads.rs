@@ -670,10 +670,8 @@ pub async fn fill_asset_ids(
         .rows_affected();
         if updated == 1 {
             filled += 1;
-            let (op, _) = super::load(state, &operation_id).await?;
-            if let Some(item) = op.items.get(usize::try_from(index).unwrap_or(usize::MAX)) {
-                super::record(state, &operation_id, "item", &serde_json::to_value(item)?).await?;
-            }
+            let item = super::load_item(state, &operation_id, index).await?;
+            super::record(state, &operation_id, "item", &serde_json::to_value(item)?).await?;
         }
     }
     Ok(filled)

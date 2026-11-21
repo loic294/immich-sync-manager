@@ -39,6 +39,7 @@ export class IsmOperationsPage extends IsmPage {
   declare limit: number;
   declare offset: number;
   protected override reloadOn = ['operation_updated', 'operation_committed'] as const;
+  protected override liveReloadInterval = 1000;
   private detail = createRef<IsmOperationDetail>();
   constructor() {
     super();

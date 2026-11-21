@@ -162,10 +162,8 @@ async fn set_item(
     .bind(index)
     .execute(&state.db)
     .await?;
-    let (op, _) = super::load(state, id).await?;
-    if let Some(item) = op.items.get(index as usize) {
-        super::record(state, id, "item", &serde_json::to_value(item)?).await?;
-    }
+    let item = super::load_item(state, id, index).await?;
+    super::record(state, id, "item", &serde_json::to_value(item)?).await?;
     Ok(())
 }
 
@@ -180,6 +178,9 @@ pub async fn run_operation(state: &AppState, id: &str) -> AppResult<()> {
     if claimed.rows_affected() == 0 {
         return Ok(());
     }
+    state.emit(ServerEvent::OperationUpdated {
+        operation_id: id.to_owned(),
+    });
     let (request_json, principal_key): (String, String) =
         sqlx::query_as("SELECT request_json, principal FROM operations WHERE id = ?")
             .bind(id)
