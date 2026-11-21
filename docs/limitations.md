@@ -24,8 +24,13 @@
   asset ID. Paths with an open conflict are skipped until the conflict is resolved.
 - **Skipping a conflict changes nothing.** The two sides stay different until one of them changes
   that path again.
-- **Cross-filesystem moves are refused.** A verified, recoverable cross-filesystem move is not yet
-  implemented; move files only within the same filesystem.
+- **Cross-filesystem moves copy before removing the source.** Files, companions and whole folders
+  are staged on the destination filesystem, verified with SHA-256, and published without replacing
+  existing entries. Modification times and permissions are preserved and verified; ownership,
+  ACLs and extended attributes are not copied. Symlinks and special files are refused. These moves
+  need enough free destination space for the entire copy and take longer than same-filesystem
+  renames. A failure after publication or an interruption requires manual recovery (see
+  [recovery.md](recovery.md)); the destination copy is retained if source removal fails.
 - **External writers are not excluded.** Path checks reject existing symlinks, but they do not
   prevent another process from swapping a path after it has been checked. Coordinate access to
   managed roots; these checks are not an exclusive filesystem barrier.

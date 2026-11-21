@@ -14,6 +14,9 @@ use sqlx::SqlitePool;
 use crate::db;
 use crate::error::{AppError, AppResult};
 
+mod moves;
+pub use moves::move_verified;
+
 /// The marker file proving a root is mounted. A missing marker means "unavailable", never "empty".
 pub const SENTINEL: &str = ".ism-root";
 /// Quarantine folder for recoverable trash, inside each root (same volume, so moves are renames).
@@ -262,14 +265,6 @@ pub fn file_entry(rel: &RelPath, name: &str, meta: &Metadata) -> AppResult<FileE
     })
 }
 
-/// Atomically renames `from` to `to` without replacing an existing entry.
-pub fn move_no_replace(from: &Path, to: &Path) -> io::Result<()> {
-    if let Some(parent) = to.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    rename_no_replace(from, to)
-}
-
 #[cfg(any(target_os = "linux", target_vendor = "apple"))]
 fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
     rustix::fs::renameat_with(
@@ -426,9 +421,9 @@ mod tests {
         let a = dir.path().join("a");
         let b = dir.path().join("sub/b");
         fs::write(&a, "1").unwrap();
-        move_no_replace(&a, &b).unwrap();
+        move_verified(&a, &b).unwrap();
         fs::write(&a, "2").unwrap();
-        assert!(move_no_replace(&a, &b).is_err());
+        assert!(move_verified(&a, &b).is_err());
         assert_eq!(fs::read_to_string(&b).unwrap(), "1");
     }
 
@@ -445,10 +440,10 @@ mod tests {
             let (left, right) = std::thread::scope(|s| {
                 let first = s.spawn(|| {
                     barrier.wait();
-                    move_no_replace(&a, &target)
+                    move_verified(&a, &target)
                 });
                 barrier.wait();
-                let second = move_no_replace(&b, &target);
+                let second = move_verified(&b, &target);
                 (first.join().unwrap(), second)
             });
             assert_ne!(left.is_ok(), right.is_ok());

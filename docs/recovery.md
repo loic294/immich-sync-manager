@@ -31,6 +31,16 @@ server keeps Immich's `library` queue paused until an admin confirms. If ISM had
 and no operation was running, it resumes the queue on start. Corrupt maintenance state or a failed restart recovery
 prevents the server from starting rather than assuming it is safe.
 
+Cross-filesystem moves retain the source until a complete destination copy has passed content
+and metadata verification and has been published. If verification or source removal fails after
+publication, the item requires recovery: the source may be complete or partly removed, while the
+destination copy is retained. Inspect both paths listed in the operation journal and reconcile
+Immich's paths before resolving the operation; do not blindly retry against an existing destination.
+Rollback also uses verified cross-filesystem moves and never replaces an existing source path.
+After an interruption, a hidden `.ism-move-*` directory beside the destination may contain an
+unpublished `payload`. Preserve it until the source and destination have been checked against a
+trusted inventory or backup, then remove only the confirmed redundant staging directory.
+
 An interrupted peer upload is requeued automatically only when every staging file is still present
 and exactly matches the recorded size and checksum, no execution step has been recorded, and the
 operation does not hold an Immich maintenance barrier. Any missing, changed, partially executed,

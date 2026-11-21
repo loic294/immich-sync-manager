@@ -1271,9 +1271,20 @@ async fn apply(state: &AppState, step: &Step) -> Result<Option<Undo>, Failure> {
                 .map_err(io)?;
                 Ok(Some(Undo::RemoveCopy(m.to.clone())))
             } else {
-                blocking(move || files::move_no_replace(&from, &to))
+                blocking(move || Ok(files::move_verified(&from, &to)))
                     .await
-                    .map_err(io)?;
+                    .map_err(io)?
+                    .map_err(|error| {
+                        if error.recovery_required {
+                            Failure {
+                                code: "recovery_required".into(),
+                                message: error.to_string(),
+                                recovery: true,
+                            }
+                        } else {
+                            io(error.error)
+                        }
+                    })?;
                 Ok(Some(Undo::MoveBack {
                     from: m.to.clone(),
                     to: m.from.clone(),
@@ -1323,8 +1334,9 @@ async fn undo(state: &AppState, undo: Undo) -> Result<(), String> {
         }
         Undo::MoveBack { from, to } => {
             let label = format!("{} -> {}", from.display(), to.display());
-            blocking(move || files::move_no_replace(&from, &to))
+            blocking(move || Ok(files::move_verified(&from, &to)))
                 .await
+                .map_err(|e| format!("could not move back {label}: {e}"))?
                 .map_err(|e| format!("could not move back {label}: {e}"))
         }
         Undo::RemoveCopy(p) => blocking(move || fs::remove_file(p))
@@ -1595,6 +1607,60 @@ mod tests {
         Mock, MockServer, ResponseTemplate,
         matchers::{body_json, header, method, path},
     };
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "requires a separate filesystem in ISM_TEST_CROSS_DEVICE_DIR"
+    )]
+    async fn cross_device_step_rolls_back_when_a_later_step_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        #[cfg(target_os = "linux")]
+        let destination = tempfile::tempdir_in("/dev/shm").unwrap();
+        #[cfg(target_os = "macos")]
+        let destination =
+            tempfile::tempdir_in(std::env::var_os("ISM_TEST_CROSS_DEVICE_DIR").unwrap()).unwrap();
+        let pool = crate::db::connect(dir.path()).await.unwrap();
+        let secrets = crate::crypto::SecretBox::open_or_create(dir.path()).unwrap();
+        let state = AppState::new(crate::config::Config::for_tests(dir.path()), pool, secrets)
+            .await
+            .unwrap();
+        let from = dir.path().join("album");
+        let to = destination.path().join("album");
+        fs::create_dir_all(from.join("empty")).unwrap();
+        fs::write(from.join("photo.jpg"), b"synthetic photo").unwrap();
+        fs::write(from.join("photo.jpg.xmp"), b"synthetic sidecar").unwrap();
+        let moved = match apply(
+            &state,
+            &Step::Fs(plan::FsMove {
+                from: from.clone(),
+                to: to.clone(),
+                copy: false,
+            }),
+        )
+        .await
+        {
+            Ok(Some(undo)) => undo,
+            _ => panic!("cross-device step failed"),
+        };
+        assert!(!from.exists());
+        assert_eq!(fs::read(to.join("photo.jpg")).unwrap(), b"synthetic photo");
+        let failure = rollback(
+            &state,
+            vec![moved],
+            Failure::new("test_failure", "later step failed"),
+        )
+        .await;
+        assert!(!failure.recovery);
+        assert_eq!(failure.code, "test_failure");
+        assert!(!to.exists());
+        assert!(from.join("empty").is_dir());
+        assert_eq!(
+            fs::read(from.join("photo.jpg.xmp")).unwrap(),
+            b"synthetic sidecar"
+        );
+    }
 
     #[tokio::test]
     async fn upload_publication_checks_hash_before_and_after_the_rename() {
