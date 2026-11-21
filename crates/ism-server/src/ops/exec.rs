@@ -28,7 +28,8 @@ pub async fn run(state: AppState) {
     loop {
         loop {
             let next: Option<String> = match sqlx::query_scalar(
-                "SELECT id FROM operations WHERE status = 'queued' ORDER BY created_at LIMIT 1",
+                "SELECT id FROM operations WHERE status = 'queued'
+                 ORDER BY CASE WHEN source = 'opm' THEN 0 ELSE 1 END, created_at, rowid LIMIT 1",
             )
             .fetch_optional(&state.db)
             .await

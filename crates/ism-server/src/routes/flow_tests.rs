@@ -865,6 +865,95 @@ impl Harness {
 }
 
 #[tokio::test]
+async fn queued_opm_operations_run_before_sync_and_keep_arrival_order() {
+    use crate::auth::Principal;
+    use ism_core::dto::OperationRequest;
+
+    let h = harness().await;
+    h.map_root().await;
+    let opm = h.token(&["manage"]).await;
+    let second_opm = h.token(&["manage"]).await;
+    let ila = h.token_for("ila", &["manage"]).await;
+    let mut ids = Vec::new();
+    for (name, bearer) in [
+        ("peer-first", None),
+        ("ila-first", Some(&ila)),
+        ("opm-first", Some(&opm)),
+        ("peer-second", None),
+        ("opm-second", Some(&second_opm)),
+    ] {
+        let request = json!({
+            "idempotency_key": name,
+            "actions": [{ "kind": "create_folder", "target": { "root_id": "photos", "path": name } }]
+        });
+        let id = if let Some(bearer) = bearer {
+            let response = send(
+                &h.app,
+                json_req(
+                    "POST",
+                    "/api/v1/operations",
+                    &[("authorization", bearer)],
+                    &request,
+                ),
+            )
+            .await;
+            assert_eq!(
+                response.status,
+                StatusCode::ACCEPTED,
+                "{:?}",
+                response.json()
+            );
+            response.json()["operation_id"].as_str().unwrap().to_owned()
+        } else {
+            crate::ops::insert(
+                &h.state,
+                &Principal::Peer {
+                    peer_id: "example-peer".into(),
+                },
+                &serde_json::from_value::<OperationRequest>(request).unwrap(),
+            )
+            .await
+            .unwrap()
+            .operation_id
+        };
+        ids.push(id);
+    }
+    // Same-timestamp arrivals must retain their insertion order within each priority.
+    sqlx::query("UPDATE operations SET created_at = '2024-01-01T00:00:00Z'")
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    let worker = tokio::spawn(crate::ops::exec::run(h.state.clone()));
+    let result = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let completed: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM operations WHERE status = 'completed'")
+                    .fetch_one(&h.state.db)
+                    .await
+                    .unwrap();
+            if completed == 5 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await;
+    worker.abort();
+    let _ = worker.await;
+    result.expect("all queued operations must complete");
+    let finished: Vec<String> = sqlx::query_scalar(
+        "SELECT operation_id FROM operation_events WHERE event = 'finished' ORDER BY rowid",
+    )
+    .fetch_all(&h.state.db)
+    .await
+    .unwrap();
+    assert_eq!(finished, [2, 4, 0, 1, 3].map(|index| ids[index].as_str()));
+    assert!(h.root.join("opm-first").is_dir());
+    assert!(h.root.join("opm-second").is_dir());
+    assert!(h.root.join("peer-first").is_dir());
+}
+
+#[tokio::test]
 async fn admin_session_and_login() {
     let h = harness().await;
     let r = send(&h.app, get("/api/admin/session", &[("cookie", &h.cookie)])).await;

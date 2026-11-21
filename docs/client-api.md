@@ -238,6 +238,10 @@ the `cancel_receiving_upload` capability before using this endpoint.
 
 ## Managed operations (moves, renames, folders, trash)
 
+Queued operations submitted with an `opm` client token run before other queued operations,
+including peer sync publications. OPM requests keep their arrival order, as do the remaining
+requests. An operation already waiting for maintenance or running is not interrupted.
+
 `POST /api/v1/operations/preview` and `POST /api/v1/operations` take the same body:
 
 ```json
