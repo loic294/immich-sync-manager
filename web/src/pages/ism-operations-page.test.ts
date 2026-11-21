@@ -149,4 +149,40 @@ describe('operations activity', () => {
       ?.click();
     await vi.waitFor(() => expect(post).toHaveBeenCalledWith('/api/admin/operations/op1/recheck'));
   });
+
+  it('offers a verified publication retry for a failed pending upload', async () => {
+    vi.spyOn(api, 'get').mockImplementation(async (path) => {
+      if (path === '/api/admin/operations/op1/detail')
+        return {
+          activity: { ...OP, status: 'failed' },
+          operation: {
+            ...OP,
+            source: 'admin',
+            status: 'failed',
+            items: [
+              {
+                index: 0,
+                kind: 'publish_upload',
+                status: 'pending',
+                error: null,
+                result: null,
+              },
+            ],
+          },
+          tasks: [{ files: [], steps: [] }],
+        } as never;
+      return { rows: [OP], total: 1 } as never;
+    });
+    const post = vi.spyOn(api, 'post').mockResolvedValue(undefined as never);
+    const page = await mount('ism-operations-page');
+    await vi.waitFor(() => expect(page.textContent).toContain('OPM: editor'));
+    page.querySelector<HTMLButtonElement>('ism-operation-table button')?.click();
+    await vi.waitFor(() => expect(page.textContent).toContain('Retry publication'));
+    [...page.querySelectorAll('button')]
+      .find((button) => button.textContent?.includes('Retry publication'))
+      ?.click();
+    await vi.waitFor(() =>
+      expect(post).toHaveBeenCalledWith('/api/admin/operations/op1/retry-publication'),
+    );
+  });
 });

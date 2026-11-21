@@ -534,25 +534,21 @@ async fn restart_requeues_an_untouched_peer_upload() {
         "publishing"
     );
 
-    sqlx::query(
-        "UPDATE operations SET status = 'recovery_required', finished_at = ? WHERE id = 'op'",
-    )
-    .bind(crate::db::now())
-    .execute(&state.db)
-    .await
-    .unwrap();
-    sqlx::query(
-        "UPDATE operation_items SET status = 'recovery_required' WHERE operation_id = 'op'",
-    )
-    .execute(&state.db)
-    .await
-    .unwrap();
+    sqlx::query("UPDATE operations SET status = 'failed', finished_at = ? WHERE id = 'op'")
+        .bind(crate::db::now())
+        .execute(&state.db)
+        .await
+        .unwrap();
     sqlx::query("UPDATE uploads SET status = 'failed' WHERE id = 'upload'")
         .execute(&state.db)
         .await
         .unwrap();
 
-    recover_after_restart(&state).await.unwrap();
+    std::fs::write(staging.join("0"), b"changed").unwrap();
+    let error = retry_failed_publish_upload(&state, "op").await.unwrap_err();
+    assert_eq!(error.code(), "publish_retry_unverified");
+    std::fs::write(staging.join("0"), data).unwrap();
+    retry_failed_publish_upload(&state, "op").await.unwrap();
 
     assert_eq!(
         sqlx::query_scalar::<_, String>("SELECT status FROM operations WHERE id = 'op'")
@@ -560,7 +556,7 @@ async fn restart_requeues_an_untouched_peer_upload() {
             .await
             .unwrap(),
         "queued",
-        "an upload marked recoverable by the previous build is also resumed"
+        "a failed untouched upload can be manually resumed"
     );
     crate::ops::exec::run_operation(&state, "op").await.unwrap();
     assert_eq!(

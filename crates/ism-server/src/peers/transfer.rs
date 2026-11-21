@@ -137,7 +137,12 @@ fn recovery_check_failed(message: impl Into<String>) -> AppError {
 /// This never moves, replaces or deletes a library file. It only verifies the final content and
 /// finishes the persisted peer bookkeeping when every expected file still matches exactly.
 pub async fn recheck_publish_recovery(state: &AppState, operation_id: &str) -> AppResult<()> {
-    let _operation_guard = state.replication_operation_lock.lock().await;
+    let _operation_guard = state.replication_operation_lock.try_lock().map_err(|_| {
+        AppError::conflict(
+            "recovery_busy",
+            "peer replication is busy finishing another scan or operation; retry in a moment",
+        )
+    })?;
     let operation: Option<(String, String, i64)> = sqlx::query_as(
         "SELECT status, admitted_server_ids_json, recovery_resolved
          FROM operations WHERE id = ?",

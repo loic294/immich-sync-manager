@@ -74,6 +74,23 @@ export class IsmOperationDetail extends IsmPage {
         'Files verified and recovery completed.',
       );
   }
+  private async retryPublication() {
+    const id = this.operationId;
+    if (!id) return;
+    if (
+      await confirmAction({
+        title: 'Retry failed publication',
+        message:
+          'ISM will verify the saved staged upload, then retry publication through the normal managed operation. It will not delete or replace a local file.',
+        confirmLabel: 'Retry publication',
+      })
+    )
+      await this.act(
+        'retry-publication',
+        () => admin.retryOperationPublication(id),
+        'Publication queued for retry.',
+      );
+  }
   private async cancel() {
     const id = this.operationId;
     if (!id) return;
@@ -91,6 +108,9 @@ export class IsmOperationDetail extends IsmPage {
     const detail = this.detail;
     const op = detail?.operation;
     const activity = detail?.activity;
+    const canRetryPublication =
+      op?.status === 'failed' &&
+      op.items.some((item) => item.kind === 'publish_upload' && item.status === 'pending');
     const canRecheck = op?.items.some((item) => {
       if (item.kind !== 'publish_upload' || item.status !== 'recovery_required') return false;
       const steps = detail?.tasks[item.index]?.steps;
@@ -177,6 +197,11 @@ export class IsmOperationDetail extends IsmPage {
             ${
               canRecheck
                 ? html`<button class="btn btn-warning btn-sm" ?disabled=${!!this.busy} @click=${this.recheck}>${this.spin('recheck')}Recheck files</button>`
+                : nothing
+            }
+            ${
+              canRetryPublication
+                ? html`<button class="btn btn-warning btn-sm" ?disabled=${!!this.busy} @click=${this.retryPublication}>${this.spin('retry-publication')}Retry publication</button>`
                 : nothing
             }
             ${

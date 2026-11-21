@@ -75,6 +75,10 @@ pub fn router() -> Router<AppState> {
         .route("/operations/{id}/cancel", post(cancel_operation))
         .route("/operations/{id}/resolve", post(resolve_operation))
         .route("/operations/{id}/recheck", post(recheck_operation))
+        .route(
+            "/operations/{id}/retry-publication",
+            post(retry_failed_publication),
+        )
         .route("/trash", get(trash))
         .route("/peers", get(list_peers))
         .route("/peers/invite", post(create_invite))
@@ -1284,6 +1288,16 @@ async fn recheck_operation(
 ) -> AppResult<Response> {
     crate::peers::transfer::recheck_publish_recovery(&state, &id).await?;
     db::audit(&state.db, &actor(&p), "operation.recheck", &id).await;
+    Ok(no_content())
+}
+
+async fn retry_failed_publication(
+    State(state): State<AppState>,
+    Admin(p): Admin,
+    Path(id): Path<String>,
+) -> AppResult<Response> {
+    crate::maintenance::retry_failed_publish_upload(&state, &id).await?;
+    db::audit(&state.db, &actor(&p), "operation.retry_publication", &id).await;
     Ok(no_content())
 }
 

@@ -21,6 +21,11 @@ bookkeeping and completes the operation; it does not move, replace or delete lib
 missing or changed file, a non-peer action, or a recovery involving Immich maintenance work is
 refused and remains for manual inspection.
 
+If a peer publication failed before its first action started, **Retry publication** is available
+when the staged upload still exists. ISM verifies every staged file against its recorded size and
+SHA-256 before requeueing the normal managed publication. If staging is missing or changed, retry
+is refused rather than recreating an operation from uncertain data.
+
 If the container is restarted mid-operation, unfinished items are marked for recovery on start and the
 server keeps Immich's `library` queue paused until an admin confirms. If ISM had paused the queue
 and no operation was running, it resumes the queue on start. Corrupt maintenance state or a failed restart recovery

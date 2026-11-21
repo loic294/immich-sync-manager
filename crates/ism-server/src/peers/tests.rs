@@ -2371,6 +2371,17 @@ async fn recheck_finishes_only_verified_interrupted_peer_publication() {
         .await
         .unwrap();
 
+    let lock = b.state.replication_operation_lock.lock().await;
+    let error = tokio::time::timeout(
+        Duration::from_millis(250),
+        super::transfer::recheck_publish_recovery(&b.state, &operation_id),
+    )
+    .await
+    .expect("a busy recheck must return instead of waiting on the lock")
+    .unwrap_err();
+    assert_eq!(error.code(), "recovery_busy");
+    drop(lock);
+
     write_old(&b.shared.join("photo.jpg"), b"wrong photo");
     let error = super::transfer::recheck_publish_recovery(&b.state, &operation_id)
         .await

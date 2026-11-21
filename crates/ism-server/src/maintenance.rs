@@ -488,6 +488,84 @@ pub async fn recover_after_restart(state: &AppState) -> AppResult<()> {
     Ok(())
 }
 
+/// Requeues an otherwise untouched peer upload that was failed before its first execution.
+///
+/// The staging files must still match the recorded sizes and hashes. No library file is changed by
+/// this function; the normal managed operation performs and verifies publication afterwards.
+pub async fn retry_failed_publish_upload(state: &AppState, operation_id: &str) -> AppResult<()> {
+    let status: Option<String> = sqlx::query_scalar("SELECT status FROM operations WHERE id = ?")
+        .bind(operation_id)
+        .fetch_optional(&state.db)
+        .await?;
+    let Some(status) = status else {
+        return Err(AppError::not_found("operation not found"));
+    };
+    if status != "failed" {
+        return Err(AppError::conflict(
+            "publish_retry_invalid",
+            "only a failed publication can be retried this way",
+        ));
+    }
+    let Some(upload_id) = resumable_publish_upload(state, operation_id).await? else {
+        return Err(AppError::conflict(
+            "publish_retry_unverified",
+            "the staged upload is missing, changed, or no longer matches an untouched peer publication",
+        ));
+    };
+    let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
+    let operation = sqlx::query(
+        "UPDATE operations
+         SET status = 'queued', started_at = NULL, finished_at = NULL
+         WHERE id = ? AND status = 'failed' AND recovery_resolved = 0",
+    )
+    .bind(operation_id)
+    .execute(&mut *tx)
+    .await?;
+    if operation.rows_affected() != 1 {
+        return Err(AppError::conflict(
+            "publish_retry_invalid",
+            "the operation changed while it was being verified",
+        ));
+    }
+    let item = sqlx::query(
+        "UPDATE operation_items
+         SET status = 'pending', error_code = NULL, error_message = NULL,
+             result_json = NULL, journal_json = NULL, progress_json = NULL
+         WHERE operation_id = ? AND status = 'pending' AND kind = 'publish_upload'",
+    )
+    .bind(operation_id)
+    .execute(&mut *tx)
+    .await?;
+    if item.rows_affected() != 1 {
+        return Err(AppError::conflict(
+            "publish_retry_invalid",
+            "the upload action changed while it was being verified",
+        ));
+    }
+    let upload = sqlx::query(
+        "UPDATE uploads
+         SET status = 'publishing'
+         WHERE id = ? AND operation_id = ? AND status = 'failed'",
+    )
+    .bind(&upload_id)
+    .bind(operation_id)
+    .execute(&mut *tx)
+    .await?;
+    if upload.rows_affected() != 1 {
+        return Err(AppError::conflict(
+            "publish_retry_invalid",
+            "the upload record changed while it was being verified",
+        ));
+    }
+    tx.commit().await?;
+    state.ops_wake.notify_waiters();
+    state.emit(ServerEvent::OperationUpdated {
+        operation_id: operation_id.to_owned(),
+    });
+    state.emit(ServerEvent::SyncChanged);
+    Ok(())
+}
+
 async fn resumable_publish_uploads(state: &AppState) -> AppResult<HashMap<String, String>> {
     let candidates: Vec<String> = sqlx::query_scalar(
         "SELECT id FROM operations
