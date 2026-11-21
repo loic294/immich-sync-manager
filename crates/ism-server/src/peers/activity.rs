@@ -50,7 +50,8 @@ pub async fn run(state: AppState) {
 const CTE: &str = "
 WITH received AS (
     SELECT id,peer_id,share_id,rel_path,size,bytes_done,error,queued_at,
-           NULL AS finished_at,NULL AS operation_id,status,run_id FROM transfers
+           NULL AS finished_at,NULL AS operation_id,status,run_id,0 AS readd_available
+    FROM transfers
     UNION ALL
     SELECT h.id,h.peer_id,h.share_id,h.rel_path,h.size,h.size,
            CASE WHEN o.status IN ('failed','partial','recovery_required')
@@ -59,8 +60,35 @@ WITH received AS (
            h.operation_id,
            CASE WHEN h.operation_id IS NULL OR o.status = 'completed' THEN 'completed'
                 WHEN o.status IN ('failed','partial','recovery_required') THEN 'failed'
-                WHEN o.status = 'cancelled' THEN 'cancelled' ELSE 'publishing' END,h.run_id
+                WHEN o.status = 'cancelled' THEN 'cancelled' ELSE 'publishing' END,
+           h.run_id,0
     FROM transfer_history h LEFT JOIN operations o ON o.id = h.operation_id
+    UNION ALL
+    SELECT 'operation:' || p.operation_id || ':' || p.idx,p.peer_id,p.share_id,
+           COALESCE(p.to_path,p.from_path),0,0,i.error_message,o.created_at,o.finished_at,
+           p.operation_id,
+           CASE WHEN o.status IN ('queued','waiting_maintenance') THEN 'queued'
+                WHEN o.status = 'running' THEN 'publishing'
+                WHEN o.status IN ('failed','partial','recovery_required','cancelled') THEN 'failed'
+                ELSE 'completed' END,'',
+           CASE WHEN o.status IN ('failed','partial','cancelled')
+                OR (o.status = 'recovery_required' AND o.recovery_resolved != 0)
+                THEN 1 ELSE 0 END
+    FROM pending_peer_ops p JOIN operations o ON o.id = p.operation_id
+    JOIN operation_items i ON i.operation_id = p.operation_id AND i.idx = p.idx
+    UNION ALL
+    SELECT 'operation:' || p.operation_id || ':0',p.peer_id,p.share_id,
+           json_extract(p.event_json,'$.data.path'),0,0,i.error_message,
+           o.created_at,o.finished_at,p.operation_id,
+           CASE WHEN o.status IN ('queued','waiting_maintenance') THEN 'queued'
+                WHEN o.status = 'running' THEN 'publishing'
+                WHEN o.status IN ('failed','partial','recovery_required','cancelled') THEN 'failed'
+                ELSE 'completed' END,'',
+           CASE WHEN o.status IN ('failed','partial','cancelled')
+                OR (o.status = 'recovery_required' AND o.recovery_resolved != 0)
+                THEN 1 ELSE 0 END
+    FROM pending_peer_events p JOIN operations o ON o.id = p.operation_id
+    JOIN operation_items i ON i.operation_id = p.operation_id AND i.idx = 0
 ), activity AS (
     SELECT received.*,0 AS outgoing,NULL AS remote_destination FROM received
     UNION ALL
@@ -68,7 +96,7 @@ WITH received AS (
            json_extract(c.activity_json,'$.size'),json_extract(c.activity_json,'$.bytes_done'),
            json_extract(c.activity_json,'$.error'),json_extract(c.activity_json,'$.queued_at'),
            json_extract(c.activity_json,'$.finished_at'),json_extract(c.activity_json,'$.operation_id'),
-           json_extract(c.activity_json,'$.status'),'',1,
+           json_extract(c.activity_json,'$.status'),'',0,1,
            json_extract(c.activity_json,'$.destination_path')
     FROM outgoing_sync c JOIN shares s ON s.name = json_extract(c.activity_json,'$.share_name')
 )";
@@ -153,6 +181,7 @@ async fn select(
                 queued_at: r.try_get("queued_at")?,
                 finished_at: r.try_get("finished_at")?,
                 operation_id: r.try_get("operation_id")?,
+                readd_available: r.try_get::<i64, _>("readd_available")? != 0,
             })
         })
         .collect::<Result<Vec<_>, sqlx::Error>>()?;
@@ -178,8 +207,9 @@ async fn progress(conn: &mut SqliteConnection, peer: Option<&str>) -> AppResult<
             COALESCE(SUM(t.status = 'running'),0) AS running,
             COALESCE(SUM(t.status = 'publishing'),0) AS publishing,
             COALESCE(SUM(t.status IN ('failed','cancelled')),0) AS failed
-         FROM received t JOIN sync_runs r ON r.peer_id = t.peer_id AND r.run_id = t.run_id
-         WHERE (?1 IS NULL OR t.peer_id = ?1)"
+         FROM received t LEFT JOIN sync_runs r ON r.peer_id = t.peer_id
+         WHERE (t.run_id = '' OR r.run_id = t.run_id)
+           AND (?1 IS NULL OR t.peer_id = ?1)"
     )))
     .bind(peer)
     .fetch_one(&mut *conn)
@@ -486,6 +516,7 @@ pub async fn refresh(state: &AppState, peer: &net::Peer) -> Result<(), String> {
                 {
                     return Err("invalid peer transfer activity".into());
                 }
+                row.readd_available = false;
                 if let Some(share) = shares
                     .iter()
                     .find(|s| s.name == row.share_name && s.includes(&peer.id))

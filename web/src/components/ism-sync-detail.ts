@@ -27,6 +27,12 @@ export class IsmSyncDetail extends IsmPage {
   private dialog = createRef<HTMLDialogElement>();
   private operation = createRef<IsmOperationDetail>();
   private selectedId: string | undefined;
+  private operationIndex(transfer: SyncActivity): number | undefined {
+    const prefix = `operation:${transfer.operation_id ?? ''}:`;
+    if (!transfer.id.startsWith(prefix)) return undefined;
+    const index = Number(transfer.id.slice(prefix.length));
+    return Number.isInteger(index) && index >= 0 ? index : undefined;
+  }
   async show(transfer: SyncActivity) {
     this.selectedId = transfer.id;
     this.transfer = transfer;
@@ -102,7 +108,21 @@ export class IsmSyncDetail extends IsmPage {
           }
           <div class="modal-action flex-wrap">
             ${t.outgoing ? html`<p class="text-sm text-base-content/70">The receiving instance manages this transfer and its publishing operation.</p>` : nothing}
-            ${!t.outgoing && t.operation_id ? html`<button class="btn btn-sm" @click=${() => this.operation.value?.show(t.operation_id ?? '')}>View publishing operation</button>` : nothing}
+            ${!t.outgoing && t.operation_id ? html`<button class="btn btn-sm" @click=${() => this.operation.value?.show(t.operation_id ?? '')}>View operation</button>` : nothing}
+            ${
+              !t.outgoing && t.operation_id && t.readd_available
+                ? html`<button class="btn btn-primary btn-sm" ?disabled=${!!this.busy}
+              @click=${() => {
+                const index = this.operationIndex(t);
+                if (index !== undefined)
+                  void this.act(
+                    'readd',
+                    () => admin.readdSyncOperation(t.operation_id ?? '', index),
+                    'Asset re-added to the sync queue.',
+                  );
+              }}>${this.spin('readd')}Re-add to sync queue</button>`
+                : nothing
+            }
             ${
               !t.outgoing && !t.operation_id && ['failed', 'cancelled'].includes(t.status)
                 ? html`<button class="btn btn-primary btn-sm" ?disabled=${!!this.busy}

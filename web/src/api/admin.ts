@@ -128,6 +128,8 @@ export const admin = {
   revokeOverride: (id: string) => api.delete<void>(`${A}/sync/overrides/${enc(id)}`),
   retryTransfer: (id: string) => api.post<void>(`${A}/sync/transfers/${enc(id)}/retry`),
   cancelTransfer: (id: string) => api.post<void>(`${A}/sync/transfers/${enc(id)}/cancel`),
+  readdSyncOperation: (id: string, index: number) =>
+    api.post<void>(`${A}/sync/operations/${enc(id)}/${index}/readd`),
 
   conflicts: (includeResolved = false) =>
     api.get<ConflictView[]>(`${A}/conflicts`, { query: { include_resolved: includeResolved } }),

@@ -466,6 +466,8 @@ pub struct SyncActivity {
     pub queued_at: String,
     pub finished_at: Option<String>,
     pub operation_id: Option<String>,
+    #[serde(default)]
+    pub readd_available: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]

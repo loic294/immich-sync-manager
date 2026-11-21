@@ -58,9 +58,10 @@ while one of its changes is still being applied.
 - **Management events:** moves, renames, folder creation, folder moves, file trash and folder trash
   done through ISM become peer events. A peer applies each one as a managed operation, so on an
   Immich-linked root the asset keeps its ID and only its path changes. An event is acknowledged
-  only after the operation and its bookkeeping succeed. A failed operation is retried after one
-  minute; a cancelled operation stays stopped until an administrator retries the peer.
-  Administrators must resolve interrupted operations before peer processing resumes.
+  only after the operation and its bookkeeping succeed. Failed or cancelled operations stay in
+  **Sync → Active & queued** and block later peer processing and rescans of the affected library.
+  Administrators inspect the issue and explicitly choose **Re-add to sync queue**; ISM never retries
+  a failed file operation automatically. Recovery-required operations must be resolved first.
 - **File contents** (new and modified files) are published as managed uploads, queued for transfer
   during **allowed hours** (Sync → Schedule). An override permits a share or peer outside those
   hours for a set time. Uploads and other writes by ISM schedule a rescan of the affected shares,
@@ -98,8 +99,9 @@ while one of its changes is still being applied.
   can therefore delay managed operations and application of incoming events, even though polling
   and scanning run separately. Peer connections are polled independently, so a slow peer does not
   prevent the others from being contacted. Scans and peer bookkeeping also stop while an operation
-  needs recovery, until an administrator resolves it. Managed file trash records deletion events
-  for the original and moved companions immediately, without waiting for the next scan.
+  needs recovery, or while a failed peer operation waits to be re-added, until an administrator
+  resolves it. Managed file trash records deletion events for the original and moved companions
+  immediately, without waiting for the next scan.
   This coordination does not stop external
   programs modifying files.
   Local operation replica updates and events are committed together; if they fail after files have
@@ -170,7 +172,9 @@ updates with the source during peer polling. Only activity involving the authent
 shared; mirrored outgoing activity is never mirrored back. Both peers must be upgraded for
 outgoing visibility. An unreachable or older peer leaves the last-known queue visible with a
 warning rather than making it look empty or current. Outgoing transfer controls and publishing
-operations are managed on the receiving instance.
+operations are managed on the receiving instance. Incoming move, rename, trash and folder
+operations appear beside file transfers; failed entries expose **Re-add to sync queue**, and the
+source's mirrored row updates after the receiver handles that action.
 Activity is polled independently every five seconds, so scans, replication backfills, and the
 operation barrier cannot block status updates. Before the first receiver response, the view
 reports unavailable peer status instead of silently treating the unknown queue as empty.

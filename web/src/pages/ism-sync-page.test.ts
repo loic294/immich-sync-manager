@@ -54,6 +54,7 @@ describe('ism-sync-page', () => {
       queued_at: '2026-01-01T00:00:00Z',
       finished_at: null,
       operation_id: null,
+      readd_available: false,
     };
     let done = 25;
     const get = vi.spyOn(api, 'get').mockImplementation(async (path) => {
@@ -183,6 +184,47 @@ describe('ism-sync-page', () => {
     await page.reload();
     await page.updateComplete;
     expect(page.textContent).toContain('Complete');
+  });
+
+  it('keeps failed peer operations visible until they are explicitly re-added', async () => {
+    const failed: SyncActivity = {
+      id: 'operation:op-peer:0',
+      outgoing: false,
+      peer_id: 'p1',
+      share_name: 'Photos',
+      relative_path: 'Trip/new.jpg',
+      location: { root_id: 'photos', path: 'Trip/new.jpg' },
+      source: 'ISM: Remote',
+      destination: 'ISM: Archive',
+      destination_path: '/example/photos/Trip/new.jpg',
+      status: 'failed',
+      size: 0,
+      bytes_done: 0,
+      error: 'target already exists',
+      queued_at: '2026-01-01T00:00:00Z',
+      finished_at: '2026-01-01T00:01:00Z',
+      operation_id: 'op-peer',
+      readd_available: true,
+    };
+    vi.spyOn(api, 'get').mockImplementation(async (path) => {
+      if (path === '/api/admin/sync') return { allowed_now: true, override_active: null } as never;
+      if (path === '/api/admin/sync/page') return { rows: [failed], total: 1 } as never;
+      if (path === '/api/admin/sync/schedule') return { timezone: 'UTC', windows: [] } as never;
+      if (path === '/api/admin/sync/files')
+        return { folder: '/example/photos/Trip', files: [] } as never;
+      return [] as never;
+    });
+    const post = vi.spyOn(api, 'post').mockResolvedValue(undefined as never);
+    const page = await mount('ism-sync-page');
+    await vi.waitFor(() => expect(page.textContent).toContain('target already exists'));
+    page.querySelector<HTMLButtonElement>('tbody button')?.click();
+    await vi.waitFor(() => expect(page.textContent).toContain('Re-add to sync queue'));
+    [...page.querySelectorAll<HTMLButtonElement>('ism-sync-detail button')]
+      .find((button) => button.textContent?.includes('Re-add to sync queue'))
+      ?.click();
+    await vi.waitFor(() =>
+      expect(post).toHaveBeenCalledWith('/api/admin/sync/operations/op-peer/0/readd'),
+    );
   });
 
   it('offers an explicit, initially closed replacement for a corrupt schedule', async () => {

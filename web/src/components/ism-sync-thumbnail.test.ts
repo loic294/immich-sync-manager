@@ -20,6 +20,7 @@ const transfer: SyncActivity = {
   queued_at: '2026-01-01T00:00:00Z',
   finished_at: null,
   operation_id: null,
+  readd_available: false,
 };
 
 describe('sync thumbnails', () => {

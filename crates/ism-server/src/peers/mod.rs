@@ -548,6 +548,23 @@ async fn require_stable_operations(state: &AppState) -> AppResult<()> {
             "peer bookkeeping waits for active managed operations",
         ));
     }
+    let pending: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1 FROM pending_peer_events p JOIN operations o ON o.id = p.operation_id
+             WHERE o.status IN ('failed','partial','cancelled','recovery_required')
+         ) OR EXISTS(
+             SELECT 1 FROM pending_peer_ops p JOIN operations o ON o.id = p.operation_id
+             WHERE o.status IN ('failed','partial','cancelled','recovery_required')
+         )",
+    )
+    .fetch_one(&state.db)
+    .await?;
+    if pending {
+        return Err(AppError::conflict(
+            "recovery_required",
+            "peer bookkeeping waits for a failed or unresolved peer operation",
+        ));
+    }
     Ok(())
 }
 
@@ -721,12 +738,15 @@ async fn finish_pending_event(state: &AppState, operation_id: &str) -> AppResult
     let Some((peer_id, share_id, expected_cursor, raw)) = pending else {
         return Ok(false);
     };
-    let status: String =
-        sqlx::query_scalar("SELECT status FROM operation_items WHERE operation_id = ? AND idx = 0")
-            .bind(operation_id)
-            .fetch_one(&state.db)
-            .await?;
-    if status != "done" {
+    let (status, recovery_resolved): (String, i64) = sqlx::query_as(
+        "SELECT i.status, o.recovery_resolved
+             FROM operation_items i JOIN operations o ON o.id = i.operation_id
+             WHERE i.operation_id = ? AND i.idx = 0",
+    )
+    .bind(operation_id)
+    .fetch_one(&state.db)
+    .await?;
+    if status != "done" && !(status == "recovery_required" && recovery_resolved != 0) {
         return Ok(true);
     }
     let event: PeerEvent = serde_json::from_str(&raw)?;
@@ -792,6 +812,23 @@ async fn finish_pending_event(state: &AppState, operation_id: &str) -> AppResult
         .bind(operation_id)
         .execute(&mut *tx)
         .await?;
+    if status == "recovery_required" {
+        sqlx::query(
+            "UPDATE operation_items SET status = 'done', error_code = NULL, error_message = NULL
+             WHERE operation_id = ? AND idx = 0 AND status = 'recovery_required'",
+        )
+        .bind(operation_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE operations SET status = 'completed', finished_at = COALESCE(finished_at, ?)
+             WHERE id = ? AND status = 'recovery_required'",
+        )
+        .bind(db::now())
+        .bind(operation_id)
+        .execute(&mut *tx)
+        .await?;
+    }
     tx.commit().await?;
     state.emit(ServerEvent::SyncChanged);
     Ok(true)
@@ -1596,28 +1633,16 @@ pub async fn pull(state: &AppState, peer: &net::Peer) -> Result<usize, String> {
     let Some(instance) = peer.instance_id.clone() else {
         return Ok(0);
     };
-    let pending_event: Option<(String, String, i64, Option<String>)> = sqlx::query_as(
-        "SELECT p.operation_id, o.status, o.recovery_resolved, o.finished_at
+    let pending_event: Option<(String, String)> = sqlx::query_as(
+        "SELECT p.operation_id, o.status
          FROM pending_peer_events p JOIN operations o ON o.id = p.operation_id WHERE p.peer_id = ?",
     )
     .bind(&peer.id)
     .fetch_optional(&state.db)
     .await
     .map_err(|e| e.to_string())?;
-    if let Some((id, status, resolved, finished)) = pending_event {
-        let retry = (status == "failed"
-            && finished
-                .as_deref()
-                .and_then(db::parse_ts)
-                .is_some_and(|at| chrono::Utc::now() - at >= chrono::Duration::minutes(1)))
-            || (status == "recovery_required" && resolved != 0);
-        if retry {
-            sqlx::query("DELETE FROM pending_peer_events WHERE operation_id = ?")
-                .bind(&id)
-                .execute(&state.db)
-                .await
-                .map_err(|e| e.to_string())?;
-        } else if matches!(
+    if let Some((id, status)) = pending_event {
+        if matches!(
             status.as_str(),
             "failed" | "cancelled" | "partial" | "recovery_required" | "completed"
         ) {
@@ -2254,7 +2279,7 @@ async fn finish_pending(state: &AppState, operation_id: &str) -> AppResult<bool>
         return Ok(false);
     }
     let shares = shares(state).await?;
-    for (idx, share_id, kind, from, to, vv_json, peer_id, conflict_id) in rows {
+    for (idx, share_id, kind, from, to, vv_json, _peer_id, conflict_id) in rows {
         let Some(share) = shares.iter().find(|s| s.id == share_id) else {
             continue;
         };
@@ -2268,6 +2293,7 @@ async fn finish_pending(state: &AppState, operation_id: &str) -> AppResult<bool>
         .await?;
         let ok = status == "done";
         let to = to.unwrap_or_default();
+        let delete_pending = ok;
         match (kind.as_str(), ok) {
             ("delete", _) if ok || code.as_deref() == Some("not_found") => {
                 let mut r = row(state, &share.id, &to).await?.unwrap_or(Row {
@@ -2367,49 +2393,22 @@ async fn finish_pending(state: &AppState, operation_id: &str) -> AppResult<bool>
                      detail = detail || ' (resolution failed: ' || ? || ')'
                      WHERE id = ? AND status = 'resolving'",
                 )
-                .bind(message.or(code).unwrap_or_default())
+                .bind(message.or(code.clone()).unwrap_or_default())
                 .bind(conflict_id.as_deref())
                 .execute(&state.db)
                 .await?;
                 state.emit(ServerEvent::ConflictsChanged);
             }
-            (_, false) => {
-                let detail = format!(
-                    "applying a change from a peer failed: {}",
-                    message.unwrap_or_else(|| code.clone().unwrap_or_default())
-                );
-                let path = if to.is_empty() {
-                    from.clone().unwrap_or_default()
-                } else {
-                    to.clone()
-                };
-                conflict(
-                    state,
-                    ConflictInput {
-                        share,
-                        rel: &path,
-                        kind: "apply_failed",
-                        detail,
-                        remote: ConflictSide {
-                            instance: peer_id.clone(),
-                            sha256: None,
-                            size: None,
-                            modified_at: None,
-                            deleted: kind == "delete" || kind == "folder_trash",
-                        },
-                        remote_vv: &vv,
-                        peer_id: &peer_id,
-                        from: None,
-                    },
-                )
+            (_, false) => {}
+        }
+        if delete_pending || (kind == "delete" && code.as_deref() == Some("not_found")) {
+            sqlx::query("DELETE FROM pending_peer_ops WHERE operation_id = ? AND idx = ?")
+                .bind(operation_id)
+                .bind(idx)
+                .execute(&state.db)
                 .await?;
-            }
         }
     }
-    sqlx::query("DELETE FROM pending_peer_ops WHERE operation_id = ?")
-        .bind(operation_id)
-        .execute(&state.db)
-        .await?;
     Ok(true)
 }
 

@@ -93,6 +93,10 @@ pub fn router() -> Router<AppState> {
         .route("/sync/overrides/{id}", delete(revoke_override))
         .route("/sync/transfers/{id}/retry", post(retry_transfer))
         .route("/sync/transfers/{id}/cancel", post(cancel_transfer))
+        .route(
+            "/sync/operations/{id}/{idx}/readd",
+            post(readd_sync_operation),
+        )
         .route("/conflicts", get(list_conflicts))
         .route("/conflicts/{id}/resolve", post(resolve_conflict))
         .route("/audit", get(audit))
@@ -1470,6 +1474,22 @@ async fn cancel_transfer(
     Path(id): Path<String>,
 ) -> AppResult<Response> {
     peers::cancel_transfer(&state, &id).await?;
+    Ok(no_content())
+}
+
+async fn readd_sync_operation(
+    State(state): State<AppState>,
+    Admin(p): Admin,
+    Path((id, idx)): Path<(String, i64)>,
+) -> AppResult<Response> {
+    peers::readd_sync_operation(&state, &id, idx).await?;
+    db::audit(
+        &state.db,
+        &actor(&p),
+        "sync.operation.readd",
+        &format!("{id}:{idx}"),
+    )
+    .await;
     Ok(no_content())
 }
 

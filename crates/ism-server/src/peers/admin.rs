@@ -4,9 +4,9 @@ use axum::http::HeaderMap;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ism_core::dto::{
-    ConflictResolution, ConflictSide, ConflictView, Location, OperationAction, OperationRequest,
-    OverrideInput, OverrideView, PeerAcceptInput, PeerInvite, PeerView, ScheduleView, ShareInput,
-    ShareView, SyncStatus, TransferView,
+    ConflictResolution, ConflictSide, ConflictView, CreateUpload, Location, OperationAction,
+    OperationRequest, OverrideInput, OverrideView, PeerAcceptInput, PeerInvite, PeerView,
+    ScheduleView, ShareInput, ShareView, SyncStatus, TransferView,
 };
 use ism_core::schedule::Schedule;
 use ism_core::version::VersionVector;
@@ -338,9 +338,19 @@ pub async fn delete_peer(state: &AppState, id: &str) -> AppResult<()> {
 pub async fn retry_peer(state: &AppState, id: &str) -> AppResult<()> {
     let _guard = state.replication_operation_lock.lock().await;
     peer_view(state, id).await?;
-    let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
-    discard_finished_pending(&mut tx, "peer_id", id).await?;
-    tx.commit().await?;
+    let pending: i64 = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM pending_peer_events WHERE peer_id = ?1)
+         OR EXISTS(SELECT 1 FROM pending_peer_ops WHERE peer_id = ?1)",
+    )
+    .bind(id)
+    .fetch_one(&state.db)
+    .await?;
+    if pending != 0 {
+        return Err(AppError::conflict(
+            "peer_operation_pending",
+            "re-add the failed operation from the sync queue before retrying this peer",
+        ));
+    }
     state.sync_wake.notify_waiters();
     Ok(())
 }
@@ -821,6 +831,220 @@ pub async fn cancel_transfer(state: &AppState, id: &str) -> AppResult<()> {
     }
     state.emit(ServerEvent::SyncChanged);
     Ok(())
+}
+
+/// Requeues one failed peer-side operation. Nothing resumes automatically: retaining the pending
+/// row blocks later peer events until an administrator explicitly re-adds the affected asset.
+pub async fn readd_sync_operation(state: &AppState, operation_id: &str, idx: i64) -> AppResult<()> {
+    let _operation_guard = state.replication_operation_lock.lock().await;
+    let operation: Option<(String, String, i64)> =
+        sqlx::query_as("SELECT status, principal, recovery_resolved FROM operations WHERE id = ?")
+            .bind(operation_id)
+            .fetch_optional(&state.db)
+            .await?;
+    let Some((status, principal_key, recovery_resolved)) = operation else {
+        return Err(AppError::not_found("sync operation not found"));
+    };
+    if !(matches!(status.as_str(), "failed" | "partial" | "cancelled")
+        || status == "recovery_required" && recovery_resolved != 0)
+    {
+        return Err(AppError::conflict(
+            "sync_operation_not_retryable",
+            "only failed, cancelled or resolved peer operations can be re-added",
+        ));
+    }
+    let Some(peer_id) = principal_key.strip_prefix("peer:") else {
+        return Err(AppError::conflict(
+            "sync_operation_not_peer",
+            "this operation did not come from a peer",
+        ));
+    };
+    let action_json: Option<String> = sqlx::query_scalar(
+        "SELECT action_json FROM operation_items
+         WHERE operation_id = ? AND idx = ? AND status IN ('failed','skipped','recovery_required')",
+    )
+    .bind(operation_id)
+    .bind(idx)
+    .fetch_optional(&state.db)
+    .await?;
+    let Some(action_json) = action_json else {
+        return Err(AppError::not_found(
+            "no failed sync operation item with this index",
+        ));
+    };
+    let action = crate::ops::exec::parse_action(&action_json)?;
+
+    type PendingOperation = (
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        String,
+        Option<String>,
+    );
+    let pending: Option<PendingOperation> = sqlx::query_as(
+        "SELECT share_id, kind, from_path, to_path, vv_json, conflict_id
+         FROM pending_peer_ops WHERE operation_id = ? AND idx = ? AND peer_id = ?",
+    )
+    .bind(operation_id)
+    .bind(idx)
+    .bind(peer_id)
+    .fetch_optional(&state.db)
+    .await?;
+    if let Some((share_id, kind, from_path, to_path, vv_json, conflict_id)) = pending {
+        let vv: VersionVector = serde_json::from_str(&vv_json)?;
+        if kind == "publish" {
+            let upload_request: Option<String> =
+                sqlx::query_scalar("SELECT request_json FROM uploads WHERE operation_id = ?")
+                    .bind(operation_id)
+                    .fetch_optional(&state.db)
+                    .await?;
+            let upload_request = upload_request.ok_or_else(|| {
+                AppError::conflict(
+                    "sync_publication_missing",
+                    "the failed publication metadata is missing",
+                )
+            })?;
+            let upload: CreateUpload = serde_json::from_str(&upload_request)?;
+            let file = upload.files.first().ok_or_else(|| {
+                AppError::conflict(
+                    "sync_publication_missing",
+                    "the failed publication has no file metadata",
+                )
+            })?;
+            let share = super::shares(state)
+                .await?
+                .into_iter()
+                .find(|share| share.id == share_id)
+                .ok_or_else(|| {
+                    AppError::conflict(
+                        "peer_share_changed",
+                        "the peer share changed while this operation was pending",
+                    )
+                })?;
+            let rel = to_path.as_deref().ok_or_else(|| {
+                AppError::conflict(
+                    "sync_publication_missing",
+                    "the failed publication has no destination",
+                )
+            })?;
+            super::queue_transfer(state, peer_id, &share, rel, &file.sha256, file.size, &vv)
+                .await?;
+            sqlx::query("DELETE FROM pending_peer_ops WHERE operation_id = ? AND idx = ?")
+                .bind(operation_id)
+                .bind(idx)
+                .execute(&state.db)
+                .await?;
+        } else {
+            let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
+            let request = retry_request(action);
+            let principal = Principal::Peer {
+                peer_id: peer_id.to_owned(),
+            };
+            let accepted = crate::ops::insert_in(&mut tx, &principal, &request, None).await?;
+            sqlx::query(
+                "INSERT INTO pending_peer_ops (operation_id, idx, share_id, kind, from_path, to_path, vv_json, peer_id, conflict_id)
+                 VALUES (?, 0, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&accepted.operation_id)
+            .bind(&share_id)
+            .bind(&kind)
+            .bind(&from_path)
+            .bind(&to_path)
+            .bind(&vv_json)
+            .bind(peer_id)
+            .bind(&conflict_id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query("DELETE FROM pending_peer_ops WHERE operation_id = ? AND idx = ?")
+                .bind(operation_id)
+                .bind(idx)
+                .execute(&mut *tx)
+                .await?;
+            mark_readded_in(&mut tx, operation_id).await?;
+            tx.commit().await?;
+            crate::ops::announce_queued(state, &accepted);
+        }
+        state.emit(ServerEvent::SyncChanged);
+        return Ok(());
+    }
+
+    type PendingEvent = (String, String, i64, String);
+    let pending_event: Option<PendingEvent> = sqlx::query_as(
+        "SELECT share_id, event_json, expected_cursor, peer_id
+         FROM pending_peer_events WHERE operation_id = ? AND peer_id = ?",
+    )
+    .bind(operation_id)
+    .bind(peer_id)
+    .fetch_optional(&state.db)
+    .await?;
+    let Some((share_id, event_json, expected_cursor, peer_id)) = pending_event else {
+        return Err(AppError::not_found(
+            "the failed item is no longer pending in the sync queue",
+        ));
+    };
+    if status == "recovery_required" {
+        super::finish_pending_event(state, operation_id).await?;
+        mark_readded_in_db(state, operation_id).await?;
+        state.emit(ServerEvent::OperationUpdated {
+            operation_id: operation_id.to_owned(),
+        });
+        state.emit(ServerEvent::SyncChanged);
+        return Ok(());
+    }
+    let event: super::PeerEvent = serde_json::from_str(&event_json)?;
+    let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
+    let principal = Principal::Peer {
+        peer_id: peer_id.clone(),
+    };
+    let request = retry_request(action);
+    let accepted = crate::ops::insert_in(&mut tx, &principal, &request, None).await?;
+    sqlx::query("DELETE FROM pending_peer_events WHERE operation_id = ?")
+        .bind(operation_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "INSERT INTO pending_peer_events (operation_id, peer_id, share_id, origin, origin_seq, expected_cursor, event_json)
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&accepted.operation_id)
+    .bind(&peer_id)
+    .bind(&share_id)
+    .bind(&event.origin)
+    .bind(event.origin_seq)
+    .bind(expected_cursor)
+    .bind(&event_json)
+    .execute(&mut *tx)
+    .await?;
+    mark_readded_in(&mut tx, operation_id).await?;
+    tx.commit().await?;
+    crate::ops::announce_queued(state, &accepted);
+    state.emit(ServerEvent::SyncChanged);
+    Ok(())
+}
+
+fn retry_request(action: OperationAction) -> OperationRequest {
+    OperationRequest {
+        idempotency_key: crate::crypto::new_id("sync-readd"),
+        label: Some("Re-added peer change".into()),
+        actions: vec![action],
+        allow_owner_transfer: false,
+        allow_partial: false,
+    }
+}
+
+async fn mark_readded_in(conn: &mut sqlx::SqliteConnection, operation_id: &str) -> AppResult<()> {
+    sqlx::query("UPDATE operations SET handled_at = COALESCE(handled_at, ?) WHERE id = ?")
+        .bind(db::now())
+        .bind(operation_id)
+        .execute(conn)
+        .await?;
+    Ok(())
+}
+
+async fn mark_readded_in_db(state: &AppState, operation_id: &str) -> AppResult<()> {
+    let mut conn = state.db.acquire().await.map_err(AppError::internal)?;
+    mark_readded_in(&mut conn, operation_id).await
 }
 
 // ---------------------------------------------------------------------------------------------

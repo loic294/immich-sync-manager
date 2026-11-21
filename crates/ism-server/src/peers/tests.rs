@@ -9,6 +9,7 @@ use ism_core::dto::{
     ConflictResolution, ConflictSide, Location, OperationAction, OperationRequest, PeerAcceptInput,
     ShareInput,
 };
+use ism_core::version::VersionVector;
 
 use super::admin;
 use crate::auth::Principal;
@@ -3488,7 +3489,17 @@ async fn peer_folder_bookkeeping_failure_requires_recovery_before_acknowledgemen
     crate::ops::resolve_recovery(&b.state, &operation_id)
         .await
         .unwrap();
-    super::pull(&b.state, &peer).await.unwrap();
+    admin::readd_sync_operation(&b.state, &operation_id, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        crate::ops::load(&b.state, &operation_id)
+            .await
+            .unwrap()
+            .0
+            .status,
+        ism_core::dto::OperationStatus::Completed
+    );
     assert!(super::net::peer(&b.state, &peer.id).await.unwrap().cursor > peer.cursor);
 }
 
@@ -3536,7 +3547,7 @@ async fn pending_peer_folder_blocks_share_changes_and_cancelled_work_is_not_appl
 }
 
 #[tokio::test]
-async fn failed_peer_folder_creation_retries_without_acknowledging_the_event() {
+async fn failed_peer_folder_creation_waits_for_manual_readd() {
     let (_a, b, peer, _) = pending_folder_fixture().await;
     super::pull(&b.state, &peer).await.unwrap();
     let operation_id: String = sqlx::query_scalar("SELECT operation_id FROM pending_peer_events")
@@ -3560,13 +3571,19 @@ async fn failed_peer_folder_creation_retries_without_acknowledging_the_event() {
         super::net::peer(&b.state, &peer.id).await.unwrap().cursor,
         peer.cursor
     );
-    std::fs::remove_file(b.shared.join("new-folder")).unwrap();
-    sqlx::query("UPDATE operations SET finished_at = '2024-01-01T00:00:00.000Z' WHERE id = ?")
-        .bind(&operation_id)
-        .execute(&b.state.db)
+    let page = super::activity::page(&b.state, "active", 50, 0, None)
         .await
         .unwrap();
-    super::pull(&b.state, &peer).await.unwrap();
+    assert_eq!(page.rows.len(), 1);
+    assert_eq!(
+        page.rows[0].operation_id.as_deref(),
+        Some(operation_id.as_str())
+    );
+    assert!(page.rows[0].readd_available);
+    std::fs::remove_file(b.shared.join("new-folder")).unwrap();
+    admin::readd_sync_operation(&b.state, &operation_id, 0)
+        .await
+        .unwrap();
     let retry_id: String = sqlx::query_scalar("SELECT operation_id FROM pending_peer_events")
         .fetch_one(&b.state.db)
         .await
@@ -3577,6 +3594,99 @@ async fn failed_peer_folder_creation_retries_without_acknowledging_the_event() {
         .unwrap();
     assert!(b.shared.join("new-folder").is_dir());
     assert!(super::net::peer(&b.state, &peer.id).await.unwrap().cursor > peer.cursor);
+}
+
+#[tokio::test]
+async fn failed_peer_file_move_blocks_later_sync_until_readded() {
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    let share = super::shares(&b.state).await.unwrap().remove(0);
+    let peer = super::net::peers(&b.state).await.unwrap().remove(0);
+    write_old(&b.shared.join("old.jpg"), b"photo");
+    super::scan_share(&b.state, &share).await.unwrap();
+    std::fs::write(b.shared.join("new.jpg"), b"blocking destination").unwrap();
+
+    let principal = Principal::Peer {
+        peer_id: peer.id.clone(),
+    };
+    let request = OperationRequest {
+        idempotency_key: "peer-move-blocked".into(),
+        label: Some("Move from peer".into()),
+        actions: vec![OperationAction::Move {
+            source: loc("shared/old.jpg"),
+            target: loc("shared/new.jpg"),
+            expected_revision: None,
+        }],
+        allow_owner_transfer: false,
+        allow_partial: false,
+    };
+    let mut tx = b.state.db.begin().await.unwrap();
+    let accepted = crate::ops::insert_in(&mut tx, &principal, &request, None)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO pending_peer_ops (operation_id, idx, share_id, kind, from_path, to_path, vv_json, peer_id)
+         VALUES (?, 0, ?, 'move', 'old.jpg', 'new.jpg', ?, ?)",
+    )
+    .bind(&accepted.operation_id)
+    .bind(&share.id)
+    .bind(serde_json::to_string(&VersionVector::default()).unwrap())
+    .bind(&peer.id)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    crate::ops::exec::run_operation(&b.state, &accepted.operation_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        crate::ops::load(&b.state, &accepted.operation_id)
+            .await
+            .unwrap()
+            .0
+            .status,
+        ism_core::dto::OperationStatus::Failed
+    );
+    let page = super::activity::page(&b.state, "active", 50, 0, None)
+        .await
+        .unwrap();
+    assert_eq!(page.rows.len(), 1);
+    assert!(page.rows[0].readd_available);
+    assert_eq!(page.rows[0].relative_path, "new.jpg");
+    assert_eq!(page.progress.failed, 1);
+    assert_eq!(super::pull(&b.state, &peer).await.unwrap(), 0);
+    assert_eq!(
+        super::scan_share(&b.state, &share)
+            .await
+            .unwrap_err()
+            .code(),
+        "recovery_required"
+    );
+
+    std::fs::remove_file(b.shared.join("new.jpg")).unwrap();
+    admin::readd_sync_operation(&b.state, &accepted.operation_id, 0)
+        .await
+        .unwrap();
+    let retry_id: String =
+        sqlx::query_scalar("SELECT operation_id FROM pending_peer_ops WHERE operation_id != ?")
+            .bind(&accepted.operation_id)
+            .fetch_one(&b.state.db)
+            .await
+            .unwrap();
+    crate::ops::exec::run_operation(&b.state, &retry_id)
+        .await
+        .unwrap();
+    assert!(!b.shared.join("old.jpg").exists());
+    assert_eq!(std::fs::read(b.shared.join("new.jpg")).unwrap(), b"photo");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM pending_peer_ops")
+            .fetch_one(&b.state.db)
+            .await
+            .unwrap(),
+        0
+    );
 }
 
 #[tokio::test]
@@ -3603,8 +3713,16 @@ async fn cancelled_peer_folder_creation_can_be_explicitly_retried() {
     )
     .await
     .unwrap();
-    admin::retry_peer(&b.state, &peer.id).await.unwrap();
-    super::pull(&b.state, &peer).await.unwrap();
+    assert_eq!(
+        admin::retry_peer(&b.state, &peer.id)
+            .await
+            .unwrap_err()
+            .code(),
+        "peer_operation_pending"
+    );
+    admin::readd_sync_operation(&b.state, &operation_id, 0)
+        .await
+        .unwrap();
     let retry_id: String = sqlx::query_scalar("SELECT operation_id FROM pending_peer_events")
         .fetch_one(&b.state.db)
         .await
