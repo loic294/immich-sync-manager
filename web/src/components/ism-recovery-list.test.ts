@@ -121,7 +121,7 @@ describe('sync recovery', () => {
     [...page.querySelectorAll<HTMLButtonElement>('button')]
       .find((button) => button.textContent?.trim() === 'Compare selected versions')
       ?.click();
-    await vi.waitFor(() => expect(page.versions.size).toBe(2));
+    await vi.waitFor(() => expect(page.querySelectorAll('ism-recovery-versions')).toHaveLength(2));
     await page.updateComplete;
     const review = page.querySelector('[aria-label="Selected conflicts on other pages"]');
     expect(review?.textContent).toContain('Selected photo 0');
@@ -170,6 +170,42 @@ describe('sync recovery', () => {
     );
   });
 
+  it('keeps successful comparisons and retries only the one that failed', async () => {
+    const rows = ['ok', 'locked'].map(
+      (id): RecoveryView => ({
+        ...ISSUE,
+        target: { kind: 'conflict', id, peer_id: null },
+        title: id,
+        state: 'needs_decision',
+        can_fix: false,
+      }),
+    );
+    let failing = true;
+    vi.spyOn(api, 'get').mockImplementation(async (path, options) => {
+      if (!path.endsWith('/versions')) return { rows, total: 2 } as never;
+      if (options?.query?.id === 'locked' && failing) throw new Error('database is locked');
+      return VERSIONS as never;
+    });
+    const page = await mount('ism-recovery-list');
+    await page.reload();
+    await page.updateComplete;
+    page.querySelector<HTMLInputElement>('thead input')?.click();
+    await page.updateComplete;
+    [...page.querySelectorAll<HTMLButtonElement>('button')]
+      .find((button) => button.textContent?.trim() === 'Compare selected versions')
+      ?.click();
+    await vi.waitFor(() => expect(page.querySelector('[role="alert"]')).not.toBeNull());
+    expect(page.querySelectorAll('ism-recovery-versions')).toHaveLength(1);
+    expect(page.querySelector('[role="alert"]')?.textContent).toContain('database is locked');
+    expect(page.busy).toBeUndefined();
+    failing = false;
+    [...page.querySelectorAll<HTMLButtonElement>('button')]
+      .find((button) => button.textContent?.trim() === 'Try again')
+      ?.click();
+    await vi.waitFor(() => expect(page.querySelectorAll('ism-recovery-versions')).toHaveLength(2));
+    expect(page.querySelector('[role="alert"]')).toBeNull();
+  });
+
   it('refreshes changed versions without applying a stale batch choice', async () => {
     const conflict: RecoveryView = {
       ...ISSUE,
@@ -190,13 +226,15 @@ describe('sync recovery', () => {
     [...page.querySelectorAll<HTMLButtonElement>('button')]
       .find((button) => button.textContent?.trim() === 'Compare versions')
       ?.click();
-    await vi.waitFor(() => expect(page.versions.size).toBe(1));
+    await vi.waitFor(() => expect(page.querySelector('ism-recovery-versions')).not.toBeNull());
     await vi.waitFor(() => expect(page.busy).toBeUndefined());
     revision = 'b'.repeat(64);
     [...page.querySelectorAll<HTMLButtonElement>('button')]
       .find((button) => button.textContent?.trim() === 'Keep both')
       ?.click();
-    await vi.waitFor(() => expect([...page.versions.values()][0].revision).toBe(revision));
+    await vi.waitFor(() =>
+      expect(page.querySelector('ism-recovery-versions')?.versions?.revision).toBe(revision),
+    );
     expect(post).not.toHaveBeenCalled();
   });
 

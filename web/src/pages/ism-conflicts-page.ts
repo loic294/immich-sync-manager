@@ -3,13 +3,13 @@ import { admin } from '@/api/admin';
 import type { ConflictResolution } from '@/api/generated/ConflictResolution';
 import type { ConflictSide } from '@/api/generated/ConflictSide';
 import type { ConflictView } from '@/api/generated/ConflictView';
-import type { RecoveryVersions } from '@/api/generated/RecoveryVersions';
+import type { RecoveryTarget } from '@/api/generated/RecoveryTarget';
 import { IsmPage } from '@/base/ism-page';
 import { confirmAction } from '@/components/confirm';
 import { toast } from '@/components/toast';
+import { VersionReview } from '@/components/version-review';
 import { formatBytes, formatDate, formatLocation, humanize } from '@/util/format';
 import { statusBadge } from '@/util/status';
-import '@/components/ism-recovery-versions';
 
 const EXPLAIN: Readonly<Record<string, string>> = {
   changed_on_both: 'The file changed on both instances since they last agreed.',
@@ -40,71 +40,100 @@ export class IsmConflictsPage extends IsmPage {
     ...IsmPage.properties,
     conflicts: { state: true },
     includeResolved: { state: true },
-    versions: { state: true },
+    selected: { state: true },
   };
 
   declare conflicts: ConflictView[];
   declare includeResolved: boolean;
-  declare versions: Map<string, RecoveryVersions>;
+  /** Ids of selected open conflicts. */
+  declare selected: Set<string>;
+  private readonly review = new VersionReview(this);
   protected override reloadOn = ['conflicts_changed'] as const;
 
   constructor() {
     super();
     this.conflicts = [];
     this.includeResolved = false;
-    this.versions = new Map();
+    this.selected = new Set();
   }
 
   protected override async load() {
     this.conflicts = await admin.conflicts(this.includeResolved);
+    const open = new Set(this.open().map((c) => c.id));
+    this.selected = new Set([...this.selected].filter((id) => open.has(id)));
   }
 
-  private async resolve(conflict: ConflictView, resolution: ConflictResolution) {
-    const previous = this.versions.get(conflict.id);
-    if (!(await this.compare(conflict))) return;
-    const current = this.versions.get(conflict.id);
-    if (!current || current.revision !== previous?.revision) {
+  private open() {
+    return this.conflicts.filter((c) => c.status === 'open');
+  }
+
+  private chosen() {
+    return this.open().filter((c) => this.selected.has(c.id));
+  }
+
+  private select(ids: readonly string[], checked: boolean) {
+    const selected = new Set(this.selected);
+    for (const id of ids) {
+      if (checked) selected.add(id);
+      else selected.delete(id);
+    }
+    this.selected = selected;
+  }
+
+  private compare(conflicts: readonly ConflictView[]) {
+    return this.review.compare(conflicts.map(target));
+  }
+
+  /** Decides every reviewed conflict whose versions are still the ones the user compared. */
+  private async decide(resolution: ConflictResolution, conflicts: readonly ConflictView[]) {
+    const reviewed = conflicts.filter((c) => this.review.has(target(c)));
+    if (!reviewed.length) return;
+    const unchanged = new Set(
+      (await this.review.compare(reviewed.map(target))).unchanged.map((t) => t.id),
+    );
+    const ready = reviewed.filter((c) => unchanged.has(c.id));
+    if (!ready.length) {
       toast.warning('Versions changed. Review the refreshed comparison before choosing again.');
       return;
     }
-    const choice = RESOLUTIONS.find((r) => r.value === resolution);
-    const label = this.choiceLabel(conflict, resolution);
+    const label = this.choiceLabel(ready, resolution);
+    const skipped = reviewed.length - ready.length;
+    const hint = RESOLUTIONS.find((r) => r.value === resolution)?.hint ?? '';
     const ok = await confirmAction({
-      title: label,
-      message: `${formatLocation(conflict.location)}\n\n${choice?.hint ?? ''}`,
+      title: ready.length === 1 ? label : `${label} for ${ready.length} conflicts`,
+      message: `${ready.length === 1 ? `${formatLocation(ready[0].location)}\n\n` : ''}${hint}${
+        skipped ? `\n\n${skipped} changed since review and stay open.` : ''
+      }`,
       confirmLabel: label,
     });
-    if (ok)
-      await this.act(
-        `${conflict.id}:${resolution}`,
-        () =>
-          admin.decideIssues({
-            decisions: [
-              {
-                target: { kind: 'conflict', id: conflict.id, peer_id: null },
-                revision: current.revision,
-              },
-            ],
-            resolution,
+    if (!ok) return;
+    const done = await this.act(
+      `decide:${resolution}`,
+      () =>
+        admin.decideIssues({
+          decisions: ready.map((c) => {
+            const versions = this.review.get(target(c));
+            if (!versions) throw new Error('Current version evidence is unavailable.');
+            return { target: target(c), revision: versions.revision };
           }),
-        'Version decision queued.',
+          resolution,
+        }),
+      ready.length === 1 ? 'Version decision queued.' : `${ready.length} version decisions queued.`,
+    );
+    if (done)
+      this.select(
+        ready.map((c) => c.id),
+        false,
       );
   }
 
-  private async compare(conflict: ConflictView) {
-    return this.act('versions', async () => {
-      const current = await admin.recoveryVersions({
-        kind: 'conflict',
-        id: conflict.id,
-        peer_id: null,
-      });
-      this.versions = new Map(this.versions).set(conflict.id, current);
-    });
-  }
-
-  private choiceLabel(conflict: ConflictView, resolution: ConflictResolution) {
+  private choiceLabel(conflicts: readonly ConflictView[], resolution: ConflictResolution) {
     if (resolution === 'keep_both') return 'Keep both';
-    return `Keep ${resolution === 'keep_local' ? conflict.local.instance : conflict.remote.instance}`;
+    const names = new Set(
+      conflicts.map((c) => (resolution === 'keep_local' ? c.local.instance : c.remote.instance)),
+    );
+    if (names.size === 1) return `Keep ${[...names][0]}`;
+    return resolution === 'keep_local' ? 'Keep this instance' : 'Keep peer';
   }
 
   private side(title: string, side: ConflictSide) {
@@ -131,6 +160,14 @@ export class IsmConflictsPage extends IsmPage {
       <article class="card card-border bg-base-100">
         <div class="card-body gap-3 p-4">
           <div class="flex flex-wrap items-center gap-2">
+            ${
+              open
+                ? html`<label class="flex h-11 w-11 items-center justify-center sm:h-auto sm:w-auto">
+                    <input type="checkbox" class="checkbox checkbox-sm" aria-label=${`Select ${formatLocation(c.location)}`}
+                      .checked=${this.selected.has(c.id)}
+                      @change=${(e: Event) => this.select([c.id], (e.target as HTMLInputElement).checked)}></label>`
+                : nothing
+            }
             <h2 class="card-title break-all text-base">${formatLocation(c.location)}</h2>
             <span class=${statusBadge(c.status)}>${humanize(c.status)}</span>
           </div>
@@ -140,25 +177,21 @@ export class IsmConflictsPage extends IsmPage {
           ${c.detail ? html`<details class="text-sm text-base-content/70"><summary class="cursor-pointer">Technical details</summary><p class="mt-1">${c.detail}</p></details>` : nothing}
           ${c.moved_from ? html`<p class="text-sm">Moved by the peer from <span class="break-all font-mono text-xs">${formatLocation(c.moved_from)}</span></p>` : nothing}
           ${
-            this.versions.has(c.id)
-              ? html`<ism-recovery-versions
-            .target=${{ kind: 'conflict', id: c.id, peer_id: null }}
-            .versions=${this.versions.get(c.id)}></ism-recovery-versions>`
-              : !open
-                ? html`<div class="grid grid-cols-1 gap-3 md:grid-cols-2">
+            open
+              ? this.review.render(target(c))
+              : html`<div class="grid grid-cols-1 gap-3 md:grid-cols-2">
               ${this.side('This instance', c.local)} ${this.side('Peer', c.remote)}
             </div>`
-                : nothing
           }
           ${
             open
               ? html`<div class="card-actions">
-                  <button class="btn btn-sm max-sm:min-h-11" ?disabled=${!!this.busy}
-                    @click=${() => this.compare(c)}>Compare versions</button>
+                  <button class="btn btn-sm max-sm:min-h-11" ?disabled=${this.review.isLoading(target(c))}
+                    @click=${() => this.compare([c])}>Compare versions</button>
                   ${choices.map(
                     (r) => html`<div class="tooltip" data-tip=${r.hint}>
-                      <button type="button" class="btn btn-sm max-sm:min-h-11" ?disabled=${this.busy !== undefined || !this.versions.has(c.id)} @click=${() => this.resolve(c, r.value)}>
-                        ${this.spin(`${c.id}:${r.value}`)}${this.choiceLabel(c, r.value)}
+                      <button type="button" class="btn btn-sm max-sm:min-h-11" ?disabled=${this.busy !== undefined || !this.review.has(target(c))} @click=${() => this.decide(r.value, [c])}>
+                        ${this.choiceLabel([c], r.value)}
                       </button>
                     </div>`,
                   )}
@@ -170,6 +203,39 @@ export class IsmConflictsPage extends IsmPage {
     `;
   }
 
+  private batch() {
+    const open = this.open();
+    if (!open.length) return nothing;
+    const chosen = this.chosen();
+    const reviewed = chosen.filter((c) => this.review.has(target(c))).length;
+    const all = chosen.length === open.length;
+    return html`<div class="flex flex-wrap items-center gap-2" aria-label="Batch conflict decisions">
+      <label class="inline-flex items-center gap-2 max-sm:min-h-11">
+        <input type="checkbox" class="checkbox checkbox-sm" aria-label="Select all open conflicts"
+          .checked=${all} .indeterminate=${chosen.length > 0 && !all}
+          @change=${(e: Event) =>
+            this.select(
+              open.map((c) => c.id),
+              (e.target as HTMLInputElement).checked,
+            )}>
+        <span role="status" class="text-sm">${chosen.length} of ${open.length} selected</span>
+      </label>
+      ${
+        chosen.length
+          ? html`<button class="btn btn-sm max-sm:min-h-11" @click=${() => this.compare(chosen)}>
+          ${this.review.busy ? html`<span class="loading loading-spinner loading-xs"></span>` : nothing}Compare selected versions</button>
+        <span class="text-sm text-base-content/70">${reviewed} reviewed</span>
+        ${RESOLUTIONS.map(
+          (
+            r,
+          ) => html`<button class="btn btn-sm max-sm:min-h-11" ?disabled=${!!this.busy || !reviewed}
+            @click=${() => this.decide(r.value, chosen)}>${this.spin(`decide:${r.value}`)}${this.choiceLabel(chosen, r.value)}</button>`,
+        )}`
+          : nothing
+      }
+    </div>`;
+  }
+
   protected override render() {
     return this.frame(
       () =>
@@ -179,7 +245,7 @@ export class IsmConflictsPage extends IsmPage {
               <h2 class="card-title">No conflicts</h2>
               <p class="text-sm text-base-content/70">No conflicts have been recorded.</p>
             </div></div>`
-          : html`${this.conflicts.map((c) => this.card(c))}`,
+          : html`${this.batch()}${this.conflicts.map((c) => this.card(c))}`,
       html`<label class="label">
         <input
           type="checkbox"
@@ -194,6 +260,10 @@ export class IsmConflictsPage extends IsmPage {
       </label>`,
     );
   }
+}
+
+function target(conflict: ConflictView): RecoveryTarget {
+  return { kind: 'conflict', id: conflict.id, peer_id: null };
 }
 
 customElements.define('ism-conflicts-page', IsmConflictsPage);

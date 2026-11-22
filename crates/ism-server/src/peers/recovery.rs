@@ -317,6 +317,27 @@ async fn decorate(state: &AppState, mut item: RecoveryView) -> AppResult<Recover
 }
 
 pub async fn discover(state: &AppState) -> AppResult<()> {
+    // Reads run on every page load; only take the write lock when something is missing.
+    let missing: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM operations o
+             WHERE o.status IN ('failed','partial','recovery_required') AND (
+                 o.principal LIKE 'peer:%' OR EXISTS (
+                     SELECT 1 FROM operation_items i WHERE i.operation_id = o.id
+                     AND i.error_code = 'peer_bookkeeping_failed'))
+             AND NOT EXISTS (SELECT 1 FROM sync_recovery r
+                 WHERE r.kind='operation' AND r.target_id=o.id))
+         OR EXISTS(SELECT 1 FROM transfers t WHERE t.status='failed'
+             AND NOT EXISTS (SELECT 1 FROM sync_recovery r
+                 WHERE r.kind='transfer' AND r.target_id=t.id))
+         OR EXISTS(SELECT 1 FROM conflicts c WHERE c.status='open'
+             AND NOT EXISTS (SELECT 1 FROM sync_recovery r
+                 WHERE r.kind='conflict' AND r.target_id=c.id))",
+    )
+    .fetch_one(&state.db)
+    .await?;
+    if !missing {
+        return Ok(());
+    }
     let now = db::now();
     let mut tx = state.db.begin().await?;
     sqlx::query(

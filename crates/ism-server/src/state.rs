@@ -67,6 +67,9 @@ pub struct Inner {
     pub shared_settings: std::sync::RwLock<Arc<crate::settings::Snapshot>>,
     /// Serializes read-modify-write of the shared file settings.
     pub shared_settings_lock: Mutex<()>,
+    /// Recently reviewed version evidence, kept in memory so comparing never waits on writers.
+    pub version_snapshots:
+        std::sync::Mutex<HashMap<(String, String), crate::peers::versions::Snapshot>>,
     request_locks: Mutex<HashMap<String, Weak<Mutex<()>>>>,
 }
 
@@ -117,6 +120,7 @@ impl AppState {
                 shared_settings,
             ))),
             shared_settings_lock: Mutex::new(()),
+            version_snapshots: std::sync::Mutex::new(HashMap::new()),
             request_locks: Mutex::new(HashMap::new()),
         })))
     }

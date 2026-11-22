@@ -3,15 +3,13 @@ import { admin } from '@/api/admin';
 import type { ConflictResolution } from '@/api/generated/ConflictResolution';
 import type { RecoveryBatchResult } from '@/api/generated/RecoveryBatchResult';
 import type { RecoveryState } from '@/api/generated/RecoveryState';
-import type { RecoveryTarget } from '@/api/generated/RecoveryTarget';
-import type { RecoveryVersions } from '@/api/generated/RecoveryVersions';
 import type { RecoveryView } from '@/api/generated/RecoveryView';
 import { IsmPage } from '@/base/ism-page';
 import { confirmAction } from '@/components/confirm';
 import type { PageChange } from '@/components/ism-pagination';
 import '@/components/ism-pagination';
-import '@/components/ism-recovery-versions';
 import { toast } from '@/components/toast';
+import { targetKey as key, VersionReview } from '@/components/version-review';
 
 const LABELS: Record<RecoveryState, string> = {
   queued: 'Fix queued',
@@ -31,10 +29,6 @@ const BADGES: Record<RecoveryState, string> = {
   not_retryable: 'badge badge-error badge-soft',
 };
 
-function key(target: RecoveryTarget) {
-  return JSON.stringify([target.kind, target.id, target.peer_id]);
-}
-
 export class IsmRecoveryList extends IsmPage {
   static override properties = {
     ...IsmPage.properties,
@@ -44,7 +38,6 @@ export class IsmRecoveryList extends IsmPage {
     offset: { state: true },
     selected: { state: true },
     result: { state: true },
-    versions: { state: true },
   };
 
   declare rows: RecoveryView[];
@@ -53,7 +46,7 @@ export class IsmRecoveryList extends IsmPage {
   declare offset: number;
   declare selected: Map<string, RecoveryView>;
   declare result: RecoveryBatchResult | undefined;
-  declare versions: Map<string, RecoveryVersions>;
+  private readonly review = new VersionReview(this);
   protected override reloadOn = ['sync_changed', 'operation_updated', 'conflicts_changed'] as const;
   protected override liveReloadInterval = 1000;
 
@@ -64,7 +57,6 @@ export class IsmRecoveryList extends IsmPage {
     this.limit = 250;
     this.offset = 0;
     this.selected = new Map();
-    this.versions = new Map();
   }
 
   protected override async load() {
@@ -115,24 +107,23 @@ export class IsmRecoveryList extends IsmPage {
   }
 
   private async decide(resolution: ConflictResolution, rows = [...this.selected.values()]) {
-    const targets = this.conflictRows(rows).map((row) => row.target);
+    const targets = this.conflictRows(rows)
+      .map((row) => row.target)
+      .filter((target) => this.review.has(target));
     if (!targets.length) return;
-    const previous = new Map(this.versions);
-    if (!(await this.compare(rows))) return;
-    if (
-      targets.some(
-        (target) =>
-          previous.get(key(target))?.revision !== this.versions.get(key(target))?.revision,
-      )
-    ) {
+    const ready = (await this.review.compare(targets)).unchanged;
+    if (!ready.length) {
       toast.warning('Versions changed. Review the refreshed comparison before choosing again.');
       return;
     }
     const label = this.choiceLabel(resolution, rows);
+    const skipped = targets.length - ready.length;
     if (
       !(await confirmAction({
-        title: `${label} for ${targets.length} conflicts`,
-        message: 'ISM will preserve replaced content in its trash and verify each managed change.',
+        title: `${label} for ${ready.length} ${ready.length === 1 ? 'conflict' : 'conflicts'}`,
+        message: `ISM will preserve replaced content in its trash and verify each managed change.${
+          skipped ? `\n\n${skipped} changed since review and stay open.` : ''
+        }`,
         confirmLabel: label,
       }))
     )
@@ -141,8 +132,8 @@ export class IsmRecoveryList extends IsmPage {
       'decision',
       async () => {
         this.result = await admin.decideIssues({
-          decisions: targets.map((target) => {
-            const versions = this.versions.get(key(target));
+          decisions: ready.map((target) => {
+            const versions = this.review.get(target);
             if (!versions) throw new Error('Current version evidence is unavailable.');
             return { target, revision: versions.revision };
           }),
@@ -151,30 +142,24 @@ export class IsmRecoveryList extends IsmPage {
       },
       'Decisions queued for verified recovery.',
     );
-    if (ok) this.selected = new Map();
+    if (ok) {
+      const selected = new Map(this.selected);
+      for (const target of ready) selected.delete(key(target));
+      this.selected = selected;
+    }
   }
 
   private conflictRows(rows = [...this.selected.values()]) {
     return rows.filter((row) => row.target.kind === 'conflict' && row.state === 'needs_decision');
   }
 
-  private async compare(rows: RecoveryView[]) {
-    return this.act('versions', async () => {
-      const versions = new Map(this.versions);
-      for (let offset = 0; offset < rows.length; offset += 4) {
-        const batch = rows.slice(offset, offset + 4);
-        const results = await Promise.all(batch.map((row) => admin.recoveryVersions(row.target)));
-        batch.forEach((row, index) => {
-          versions.set(key(row.target), results[index]);
-        });
-      }
-      this.versions = versions;
-    });
+  private compare(rows: RecoveryView[]) {
+    return this.review.compare(rows.map((row) => row.target));
   }
 
   protected override render() {
     const selectedConflicts = this.conflictRows().length;
-    const reviewed = this.conflictRows().every((row) => this.versions.has(key(row.target)));
+    const reviewed = this.conflictRows().filter((row) => this.review.has(row.target)).length;
     const canFixSelected = [...this.selected.values()].some((row) => row.can_fix);
     const visible = new Set(this.rows.map((row) => key(row.target)));
     const offPage = this.conflictRows().filter((row) => !visible.has(key(row.target)));
@@ -195,9 +180,10 @@ export class IsmRecoveryList extends IsmPage {
         selectedConflicts
           ? html`<div class="flex flex-wrap items-center gap-2" aria-label="Batch conflict decisions">
         <span class="text-sm">${selectedConflicts} conflicts:</span>
-        <button class="btn btn-sm max-sm:min-h-11" ?disabled=${!!this.busy}
-          @click=${() => this.compare(this.conflictRows())}>Compare selected versions</button>
-        <button class="btn btn-sm max-sm:min-h-11" ?disabled=${!!this.busy || !reviewed} @click=${() => this.decide('keep_local')}>${this.choiceLabel('keep_local')}</button>
+        <button class="btn btn-sm max-sm:min-h-11" @click=${() => this.compare(this.conflictRows())}>
+          ${this.review.busy ? html`<span class="loading loading-spinner loading-xs"></span>` : nothing}Compare selected versions</button>
+        <span class="text-sm text-base-content/70">${reviewed} reviewed</span>
+        <button class="btn btn-sm max-sm:min-h-11" ?disabled=${!!this.busy || !reviewed} @click=${() => this.decide('keep_local')}>${this.spin('decision')}${this.choiceLabel('keep_local')}</button>
         <button class="btn btn-sm max-sm:min-h-11" ?disabled=${!!this.busy || !reviewed} @click=${() => this.decide('keep_remote')}>${this.choiceLabel('keep_remote')}</button>
         <button class="btn btn-sm max-sm:min-h-11" ?disabled=${!!this.busy || !reviewed} @click=${() => this.decide('keep_both')}>Keep both</button>
       </div>`
@@ -214,11 +200,7 @@ export class IsmRecoveryList extends IsmPage {
                   <h3 class="break-all font-medium">${row.title}</h3>
                   <button class="btn btn-ghost btn-sm max-sm:min-h-11" @click=${() => this.select(row, false)}>Remove selection</button>
                 </div>
-                ${
-                  this.versions.has(key(row.target))
-                    ? html`<ism-recovery-versions .target=${row.target} .versions=${this.versions.get(key(row.target))}></ism-recovery-versions>`
-                    : html`<p class="text-sm text-base-content/70">Compare selected versions to review this conflict.</p>`
-                }
+                ${this.review.render(row.target)}
               </div>`,
             )}
           </div>
@@ -259,12 +241,7 @@ export class IsmRecoveryList extends IsmPage {
             <td class="max-w-96 break-all max-sm:max-w-none max-sm:px-2 max-sm:py-1">
               <span class="font-medium">${row.title}</span>
               ${row.local_instance ? html`<p class="text-sm text-base-content/70">${row.local_instance}${row.peer_instance ? html` / ${row.peer_instance}` : nothing}</p>` : nothing}
-              ${
-                this.versions.has(key(row.target))
-                  ? html`<ism-recovery-versions
-                .target=${row.target} .versions=${this.versions.get(key(row.target))}></ism-recovery-versions>`
-                  : nothing
-              }
+              ${this.review.render(row.target)}
               ${
                 row.detail || row.code
                   ? html`<details class="mt-1 text-xs text-base-content/70">
@@ -282,11 +259,11 @@ export class IsmRecoveryList extends IsmPage {
                 : row.state === 'needs_decision'
                   ? row.target.kind === 'conflict'
                     ? html`<div class="flex flex-wrap gap-2">
-                      <button class="btn btn-sm max-sm:min-h-11" ?disabled=${!!this.busy}
+                      <button class="btn btn-sm max-sm:min-h-11" ?disabled=${this.review.isLoading(row.target)}
                         @click=${() => this.compare([row])}>Compare versions</button>
-                      <button class="btn btn-sm max-sm:min-h-11" ?disabled=${!!this.busy || !this.versions.has(key(row.target))} @click=${() => this.decide('keep_local', [row])}>${this.choiceLabel('keep_local', [row])}</button>
-                      <button class="btn btn-sm max-sm:min-h-11" ?disabled=${!!this.busy || !this.versions.has(key(row.target))} @click=${() => this.decide('keep_remote', [row])}>${this.choiceLabel('keep_remote', [row])}</button>
-                      <button class="btn btn-sm max-sm:min-h-11" ?disabled=${!!this.busy || !this.versions.has(key(row.target))} @click=${() => this.decide('keep_both', [row])}>Keep both</button>
+                      <button class="btn btn-sm max-sm:min-h-11" ?disabled=${!!this.busy || !this.review.has(row.target)} @click=${() => this.decide('keep_local', [row])}>${this.choiceLabel('keep_local', [row])}</button>
+                      <button class="btn btn-sm max-sm:min-h-11" ?disabled=${!!this.busy || !this.review.has(row.target)} @click=${() => this.decide('keep_remote', [row])}>${this.choiceLabel('keep_remote', [row])}</button>
+                      <button class="btn btn-sm max-sm:min-h-11" ?disabled=${!!this.busy || !this.review.has(row.target)} @click=${() => this.decide('keep_both', [row])}>Keep both</button>
                     </div>`
                     : html`<span class="text-sm">Awaiting its version decision</span>`
                   : nothing

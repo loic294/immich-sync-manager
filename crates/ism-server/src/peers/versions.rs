@@ -12,6 +12,68 @@ use crate::error::{AppError, AppResult};
 use crate::files;
 use crate::state::AppState;
 
+const SNAPSHOT_TTL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+const SNAPSHOTS_PER_TARGET: usize = 4;
+
+#[derive(Clone)]
+pub struct Snapshot {
+    pub share_id: String,
+    pub peer_id: String,
+    pub view: RecoveryVersions,
+    pub created: std::time::Instant,
+}
+
+fn remember(
+    state: &AppState,
+    target: &str,
+    share_id: &str,
+    peer_id: &str,
+    view: &RecoveryVersions,
+) {
+    let mut snapshots = state
+        .version_snapshots
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    snapshots.retain(|_, snapshot| snapshot.created.elapsed() < SNAPSHOT_TTL);
+    snapshots.insert(
+        (target.to_owned(), view.revision.clone()),
+        Snapshot {
+            share_id: share_id.to_owned(),
+            peer_id: peer_id.to_owned(),
+            view: view.clone(),
+            created: std::time::Instant::now(),
+        },
+    );
+    let mut revisions: Vec<_> = snapshots
+        .iter()
+        .filter(|((id, _), _)| id == target)
+        .map(|((_, revision), snapshot)| (snapshot.created, revision.clone()))
+        .collect();
+    revisions.sort_by(|a, b| b.0.cmp(&a.0));
+    for (_, revision) in revisions.into_iter().skip(SNAPSHOTS_PER_TARGET) {
+        snapshots.remove(&(target.to_owned(), revision));
+    }
+}
+
+fn recall(state: &AppState, target: &str, revision: &str) -> Option<Snapshot> {
+    state
+        .version_snapshots
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&(target.to_owned(), revision.to_owned()))
+        .filter(|snapshot| snapshot.created.elapsed() < SNAPSHOT_TTL)
+        .cloned()
+}
+
+#[cfg(test)]
+pub(super) fn expire(state: &AppState, target: &str) {
+    state
+        .version_snapshots
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .retain(|(id, _), _| id != target);
+}
+
 #[derive(Deserialize)]
 pub struct Query {
     pub kind: RecoveryKind,
@@ -225,21 +287,13 @@ pub async fn get(state: &AppState, target: &RecoveryTarget) -> AppResult<Recover
         receiving,
         source,
     };
-    let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
-    sqlx::query("DELETE FROM recovery_version_snapshots WHERE created_at<?")
-        .bind((chrono::Utc::now() - chrono::Duration::minutes(5)).to_rfc3339())
-        .execute(&mut *tx)
-        .await?;
-    sqlx::query(
-        "INSERT INTO recovery_version_snapshots(target_id,revision,share_id,peer_id,view_json,created_at)
-         VALUES (?,?,?,?,?,?) ON CONFLICT(target_id,revision) DO UPDATE SET created_at=excluded.created_at",
-    ).bind(&target.id).bind(&view.revision).bind(&context.share.id).bind(&context.peer_id)
-    .bind(serde_json::to_string(&view)?).bind(crate::db::now()).execute(&mut *tx).await?;
-    sqlx::query(
-        "DELETE FROM recovery_version_snapshots WHERE target_id=? AND revision NOT IN
-            (SELECT revision FROM recovery_version_snapshots WHERE target_id=? ORDER BY created_at DESC LIMIT 4)",
-    ).bind(&target.id).bind(&target.id).execute(&mut *tx).await?;
-    tx.commit().await?;
+    remember(
+        state,
+        &target.id,
+        &context.share.id,
+        &context.peer_id,
+        &view,
+    );
     Ok(view)
 }
 
@@ -252,18 +306,13 @@ pub(super) async fn validate_reviewed(
     remote: Option<&super::recovery::FileEvidence>,
     moved: Option<MovedVersion<'_>>,
 ) -> AppResult<()> {
-    let snapshot: Option<(String, String, String)> = sqlx::query_as(
-        "SELECT share_id,peer_id,view_json FROM recovery_version_snapshots
-         WHERE target_id=? AND revision=? AND created_at>=?",
-    )
-    .bind(id)
-    .bind(revision)
-    .bind((chrono::Utc::now() - chrono::Duration::minutes(5)).to_rfc3339())
-    .fetch_optional(&state.db)
-    .await?;
-    let (share_id, peer_id, json) = snapshot
+    let Snapshot {
+        share_id,
+        peer_id,
+        view,
+        ..
+    } = recall(state, id, revision)
         .ok_or_else(|| AppError::conflict("version_conflict", "review current versions again"))?;
-    let view: RecoveryVersions = serde_json::from_str(&json)?;
     let share = super::shares(state)
         .await?
         .into_iter()
@@ -376,18 +425,13 @@ pub async fn preview(state: &AppState, query: &PreviewQuery) -> AppResult<Respon
     if query.target.kind != RecoveryKind::Conflict {
         return Err(AppError::not_found("version preview not found"));
     }
-    let snapshot: Option<(String, String, String)> = sqlx::query_as(
-        "SELECT share_id,peer_id,view_json FROM recovery_version_snapshots
-         WHERE target_id=? AND revision=? AND created_at>=?",
-    )
-    .bind(&query.target.id)
-    .bind(&query.revision)
-    .bind((chrono::Utc::now() - chrono::Duration::minutes(5)).to_rfc3339())
-    .fetch_optional(&state.db)
-    .await?;
-    let (share_id, peer_id, json) = snapshot
+    let Snapshot {
+        share_id,
+        peer_id,
+        view,
+        ..
+    } = recall(state, &query.target.id, &query.revision)
         .ok_or_else(|| AppError::conflict("preview_expired", "refresh current versions"))?;
-    let view: RecoveryVersions = serde_json::from_str(&json)?;
     let selected = if query.source {
         view.source
             .files

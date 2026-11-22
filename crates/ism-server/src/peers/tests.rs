@@ -672,13 +672,7 @@ async fn recovery_previews_are_owner_scoped_current_and_independent_of_immich_in
         std::fs::read(b.shared.join("preview.jpg")).unwrap(),
         b"changed after review"
     );
-    sqlx::query(
-        "UPDATE recovery_version_snapshots SET created_at='2000-01-01T00:00:00Z' WHERE target_id=?",
-    )
-    .bind(&target.id)
-    .execute(&b.state.db)
-    .await
-    .unwrap();
+    super::versions::expire(&b.state, &target.id);
     assert_eq!(
         super::versions::preview(&b.state, &query)
             .await
