@@ -16,8 +16,11 @@ Batch admission returns an outcome for each target. A queued request is not repo
 Selections persist across pages, and **Fix all** snapshots the outstanding local and mirrored
 receiver-owned issues, up to 5000 per batch. Outgoing actions are authenticated and forwarded
 to the receiver; each peer can act only on its own work. Requests survive receiver
-unavailability and restart. Version choices use current, owner-scoped comparisons and are
-rechecked before admission and again before publication. Folder comparisons include empty
+unavailability and restart. Version choices reuse the owner-scoped comparisons already reviewed
+in the current page tab. Admission saves the selected revisions in one local batch transaction,
+without fetching peer evidence or hashing files again. The recovery worker revalidates those
+revisions before any file changes, including after restart; changed versions stay open for a new
+decision. Folder comparisons include empty
 directories; changed content or directory structure requires a refreshed decision. Preview
 availability does not determine whether repair can proceed.
 

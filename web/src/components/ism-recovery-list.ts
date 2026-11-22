@@ -107,45 +107,38 @@ export class IsmRecoveryList extends IsmPage {
   }
 
   private async decide(resolution: ConflictResolution, rows = [...this.selected.values()]) {
-    const targets = this.conflictRows(rows)
+    const ready = this.conflictRows(rows)
       .map((row) => row.target)
       .filter((target) => this.review.has(target));
-    if (!targets.length) return;
-    const ready = (await this.review.compare(targets)).unchanged;
-    if (!ready.length) {
-      toast.warning('Versions changed. Review the refreshed comparison before choosing again.');
-      return;
-    }
+    if (!ready.length) return;
+    const decisions = ready.map((target) => {
+      const versions = this.review.get(target);
+      if (!versions) throw new Error('Current version evidence is unavailable.');
+      return { target, revision: versions.revision };
+    });
     const label = this.choiceLabel(resolution, rows);
-    const skipped = targets.length - ready.length;
     if (
       !(await confirmAction({
         title: `${label} for ${ready.length} ${ready.length === 1 ? 'conflict' : 'conflicts'}`,
-        message: `ISM will preserve replaced content in its trash and verify each managed change.${
-          skipped ? `\n\n${skipped} changed since review and stay open.` : ''
-        }`,
+        message: 'ISM will preserve replaced content in its trash and verify each managed change.',
         confirmLabel: label,
       }))
     )
       return;
-    const ok = await this.act(
-      'decision',
-      async () => {
-        this.result = await admin.decideIssues({
-          decisions: ready.map((target) => {
-            const versions = this.review.get(target);
-            if (!versions) throw new Error('Current version evidence is unavailable.');
-            return { target, revision: versions.revision };
-          }),
-          resolution,
-        });
-      },
-      'Decisions queued for verified recovery.',
-    );
+    const ok = await this.act('decision', async () => {
+      this.result = await admin.decideIssues({
+        decisions,
+        resolution,
+      });
+    });
     if (ok) {
       const selected = new Map(this.selected);
-      for (const target of ready) selected.delete(key(target));
+      for (const item of this.result?.items ?? []) {
+        if (['queued', 'fixing', 'fixed'].includes(item.state)) selected.delete(key(item.target));
+      }
+      const admitted = this.selected.size - selected.size;
       this.selected = selected;
+      if (admitted) toast.success(`${admitted} decisions queued for verified recovery.`);
     }
   }
 

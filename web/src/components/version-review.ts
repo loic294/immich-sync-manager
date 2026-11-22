@@ -38,7 +38,8 @@ export class VersionReview implements ReactiveController {
   }
 
   has(target: RecoveryTarget) {
-    return this.versions.has(targetKey(target));
+    const id = targetKey(target);
+    return this.versions.has(id) && !this.loading.has(id) && !this.errors.has(id);
   }
 
   isLoading(target: RecoveryTarget) {

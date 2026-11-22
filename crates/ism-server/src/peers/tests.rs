@@ -604,6 +604,158 @@ async fn recovery_comparison_does_not_wait_for_unrelated_peer_operations() {
 }
 
 #[tokio::test]
+async fn reviewed_batch_admission_queues_without_contacting_the_peer() {
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, StatusCode};
+    use ism_core::dto::{
+        RecoveryBatchResult, RecoveryDecision, RecoveryDecisionInput, RecoveryKind, RecoveryState,
+        RecoveryTarget,
+    };
+    use tower::ServiceExt;
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    for index in 0..200 {
+        let path = format!("compare-{index}.jpg");
+        write_old(&a.shared.join(&path), b"source version");
+        write_old(&b.shared.join(&path), b"receiving version");
+    }
+    scan(&a).await;
+    scan(&b).await;
+    let peer = super::net::peers(&b.state).await.unwrap().remove(0);
+    super::pull(&b.state, &peer).await.unwrap_err();
+    let ids: Vec<String> = sqlx::query_scalar("SELECT id FROM conflicts ORDER BY id")
+        .fetch_all(&b.state.db)
+        .await
+        .unwrap();
+    assert_eq!(ids.len(), 200);
+    let mut decisions = Vec::new();
+    for id in ids {
+        let target = RecoveryTarget {
+            kind: RecoveryKind::Conflict,
+            id,
+            peer_id: None,
+        };
+        let review = super::versions::get(&b.state, &target).await.unwrap();
+        decisions.push(RecoveryDecision {
+            target,
+            revision: review.revision,
+        });
+    }
+    a.tasks[0].abort();
+    let stalled_peer = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    sqlx::query("UPDATE peers SET url=? WHERE id=?")
+        .bind(format!("http://{}", stalled_peer.local_addr().unwrap()))
+        .bind(&peer.id)
+        .execute(&b.state.db)
+        .await
+        .unwrap();
+    let user: i64 = sqlx::query_scalar(
+        "INSERT INTO admin_users(username,password_hash,created_at)
+         VALUES ('test','unused synthetic hash',?) RETURNING id",
+    )
+    .bind(crate::db::now())
+    .fetch_one(&b.state.db)
+    .await
+    .unwrap();
+    let token = crate::auth::create_session(&b.state, user).await.unwrap();
+    let input = RecoveryDecisionInput {
+        decisions,
+        resolution: ConflictResolution::KeepRemote,
+    };
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/admin/recovery/decisions")
+        .header("content-type", "application/json")
+        .header("x-ism-request", "1")
+        .header("cookie", format!("ism_session={token}"))
+        .body(Body::from(serde_json::to_vec(&input).unwrap()))
+        .unwrap();
+    let _operation = b.state.replication_operation_lock.lock().await;
+    let response = tokio::time::timeout(
+        Duration::from_secs(2),
+        crate::routes::router(b.state.clone()).oneshot(request),
+    )
+    .await
+    .expect("batch admission waited for files, peers, or an unrelated operation")
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let result: RecoveryBatchResult =
+        serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+            .unwrap();
+    assert_eq!(result.items.len(), 200);
+    assert!(
+        result
+            .items
+            .iter()
+            .all(|item| item.state == RecoveryState::Queued)
+    );
+    let queued: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sync_recovery WHERE state='queued'")
+        .fetch_one(&b.state.db)
+        .await
+        .unwrap();
+    assert_eq!(queued, 200);
+    assert_eq!(
+        std::fs::read(b.shared.join("compare-0.jpg")).unwrap(),
+        b"receiving version"
+    );
+    let replay = super::recovery::submit_decisions(&b.state, input.clone())
+        .await
+        .unwrap();
+    assert!(
+        replay
+            .items
+            .iter()
+            .all(|item| item.state == RecoveryState::Queued)
+    );
+    sqlx::query("UPDATE sync_recovery SET state='fixing' WHERE target_id=?")
+        .bind(&input.decisions[0].target.id)
+        .execute(&b.state.db)
+        .await
+        .unwrap();
+    let mut missing = input.decisions[0].clone();
+    missing.target.id = "missing-conflict".into();
+    let partial = super::recovery::submit_decisions(
+        &b.state,
+        RecoveryDecisionInput {
+            decisions: vec![
+                input.decisions[0].clone(),
+                input.decisions[1].clone(),
+                missing,
+                input.decisions[1].clone(),
+            ],
+            resolution: ConflictResolution::KeepLocal,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(partial.items.len(), 3);
+    assert_eq!(
+        partial.items[0].code.as_deref(),
+        Some("recovery_decision_in_progress")
+    );
+    assert_eq!(partial.items[1].state, RecoveryState::Queued);
+    assert_eq!(partial.items[2].code.as_deref(), Some("not_found"));
+    let saved: String =
+        sqlx::query_scalar("SELECT resolution FROM sync_recovery WHERE target_id=?")
+            .bind(&input.decisions[0].target.id)
+            .fetch_one(&b.state.db)
+            .await
+            .unwrap();
+    assert_eq!(saved, "\"keep_remote\"");
+    let replay = super::recovery::submit_decisions(
+        &b.state,
+        RecoveryDecisionInput {
+            decisions: vec![input.decisions[0].clone()],
+            resolution: ConflictResolution::KeepRemote,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(replay.items[0].state, RecoveryState::Fixing);
+}
+
+#[tokio::test]
 async fn recovery_previews_are_owner_scoped_current_and_independent_of_immich_indexing() {
     use ism_core::dto::{RecoveryKind, RecoveryTarget};
     let (mut a, mut b) = pair().await;
@@ -906,7 +1058,17 @@ async fn recovery_versions_are_current_owner_scoped_and_stale_decisions_do_not_e
     )
     .await
     .unwrap();
-    assert_eq!(result.items[0].state, RecoveryState::NeedsDecision);
+    assert_eq!(result.items[0].state, RecoveryState::Queued);
+    super::versions::expire(&b.state, &target.id);
+    super::recovery::tick(&b.state).await.unwrap();
+    assert_eq!(
+        super::recovery::get(&b.state, target.kind, &target.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        RecoveryState::NeedsDecision
+    );
     let pending: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM pending_peer_ops WHERE conflict_id=?")
             .bind(&target.id)

@@ -206,7 +206,7 @@ describe('sync recovery', () => {
     expect(page.querySelector('[role="alert"]')).toBeNull();
   });
 
-  it('refreshes changed versions without applying a stale batch choice', async () => {
+  it('submits the reviewed revision without refetching files before queueing', async () => {
     const conflict: RecoveryView = {
       ...ISSUE,
       target: { kind: 'conflict', id: 'choice', peer_id: null },
@@ -214,12 +214,16 @@ describe('sync recovery', () => {
       can_fix: false,
     };
     let revision = VERSIONS.revision;
-    vi.spyOn(api, 'get').mockImplementation(async (path) =>
-      path.endsWith('/versions')
-        ? ({ ...VERSIONS, revision } as never)
-        : ({ rows: [conflict], total: 1 } as never),
-    );
-    const post = vi.spyOn(api, 'post');
+    const get = vi
+      .spyOn(api, 'get')
+      .mockImplementation(async (path) =>
+        path.endsWith('/versions')
+          ? ({ ...VERSIONS, revision } as never)
+          : ({ rows: [conflict], total: 1 } as never),
+      );
+    const post = vi.spyOn(api, 'post').mockResolvedValue({
+      items: [{ ...conflict, state: 'queued' }],
+    } as never);
     const page = await mount('ism-recovery-list');
     await page.reload();
     await page.updateComplete;
@@ -233,9 +237,14 @@ describe('sync recovery', () => {
       .find((button) => button.textContent?.trim() === 'Keep both')
       ?.click();
     await vi.waitFor(() =>
-      expect(page.querySelector('ism-recovery-versions')?.versions?.revision).toBe(revision),
+      expect(post).toHaveBeenCalledWith('/api/admin/recovery/decisions', {
+        body: {
+          decisions: [{ target: conflict.target, revision: VERSIONS.revision }],
+          resolution: 'keep_both',
+        },
+      }),
     );
-    expect(post).not.toHaveBeenCalled();
+    expect(get.mock.calls.filter(([path]) => path.endsWith('/versions'))).toHaveLength(1);
   });
 
   it('keeps selection but removes batch version decisions when receiver evidence becomes unavailable', async () => {

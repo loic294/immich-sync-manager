@@ -226,7 +226,17 @@ async fn folder_decisions_reject_stale_empty_directory_evidence() {
         )
         .await
         .unwrap();
-        assert_eq!(result.items[0].code.as_deref(), Some("version_conflict"));
+        assert_eq!(result.items[0].state, ism_core::dto::RecoveryState::Queued);
+        super::super::recovery::tick(&a.state).await.unwrap();
+        assert_eq!(
+            super::super::recovery::get(&a.state, target.kind, &target.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .code
+                .as_deref(),
+            Some("version_conflict")
+        );
     }
 }
 
@@ -2052,7 +2062,7 @@ async fn relocated_folder_destination_is_included_in_review() {
         &a.state,
         ism_core::dto::RecoveryDecisionInput {
             decisions: vec![ism_core::dto::RecoveryDecision {
-                target,
+                target: target.clone(),
                 revision: before.revision,
             }],
             resolution: ConflictResolution::KeepRemote,
@@ -2060,7 +2070,17 @@ async fn relocated_folder_destination_is_included_in_review() {
     )
     .await
     .unwrap();
-    assert_eq!(result.items[0].code.as_deref(), Some("version_conflict"));
+    assert_eq!(result.items[0].state, ism_core::dto::RecoveryState::Queued);
+    super::super::recovery::tick(&a.state).await.unwrap();
+    assert_eq!(
+        super::super::recovery::get(&a.state, target.kind, &target.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .code
+            .as_deref(),
+        Some("version_conflict")
+    );
 }
 
 #[tokio::test]
@@ -2541,7 +2561,17 @@ async fn overlapping_folder_review_rejects_changes_outside_moved_subtree() {
         )
         .await
         .unwrap();
-        assert_eq!(result.items[0].code.as_deref(), Some("version_conflict"));
+        assert_eq!(result.items[0].state, ism_core::dto::RecoveryState::Queued);
+        super::super::recovery::tick(&a.state).await.unwrap();
+        assert_eq!(
+            super::super::recovery::get(&a.state, target.kind, &target.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .code
+                .as_deref(),
+            Some("version_conflict")
+        );
         assert_eq!(status(&a, &id).await, "open");
     }
 }

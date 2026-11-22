@@ -3,8 +3,8 @@
 use std::time::Duration;
 
 use ism_core::dto::{
-    ConflictResolution, RecoveryBatchInput, RecoveryBatchResult, RecoveryKind, RecoveryPage,
-    RecoveryState, RecoveryTarget, RecoveryView,
+    ConflictResolution, RecoveryBatchInput, RecoveryBatchResult, RecoveryDecision, RecoveryKind,
+    RecoveryPage, RecoveryState, RecoveryTarget, RecoveryView,
 };
 use ism_core::paths::RelPath;
 use ism_core::version::{Causality, VersionVector};
@@ -715,6 +715,129 @@ async fn submit_one(
     Ok(items)
 }
 
+/// Admission only records intent. Network and filesystem verification belong to the worker.
+async fn queue_local_decisions(
+    state: &AppState,
+    decisions: &[&RecoveryDecision],
+    resolution: ConflictResolution,
+) -> AppResult<Vec<RecoveryView>> {
+    if decisions.is_empty() {
+        return Ok(Vec::new());
+    }
+    let local_instance = state.instance_name().await;
+    let resolution = serde_json::to_string(&resolution)?;
+    let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
+    type AdmissionRow = (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+    let rows: Vec<AdmissionRow> = sqlx::query_as(
+        "SELECT c.rel_path,c.status,p.name,r.resolution,r.state,r.decision_revision
+         FROM json_each(?) d
+         LEFT JOIN conflicts c ON c.id=json_extract(d.value,'$.target.id')
+         LEFT JOIN peers p ON p.id=c.peer_id
+         LEFT JOIN sync_recovery r ON r.kind='conflict' AND r.target_id=c.id
+         ORDER BY CAST(d.key AS INTEGER)",
+    )
+    .bind(serde_json::to_string(decisions)?)
+    .fetch_all(&mut *tx)
+    .await?;
+    let mut items = Vec::new();
+    let mut accepted = Vec::new();
+    let mut positions = std::collections::HashMap::new();
+    for (decision, (title, status, peer_instance, prior, prior_state, prior_revision)) in
+        decisions.iter().zip(rows)
+    {
+        let error = if status.is_none() {
+            Some(("not_found", "recovery target not found"))
+        } else if prior.is_some()
+            && (prior.as_deref() != Some(&resolution)
+                || prior_revision.as_deref() != Some(&decision.revision))
+            && (status.as_deref() != Some("open")
+                || matches!(prior_state.as_deref(), Some("fixing" | "fixed")))
+        {
+            Some((
+                "recovery_decision_in_progress",
+                "the current version decision is already executing",
+            ))
+        } else if status.as_deref() != Some("open") && prior.is_none() {
+            Some(("not_open", "this conflict is already being resolved"))
+        } else {
+            None
+        };
+        let mut item = RecoveryView {
+            target: decision.target.clone(),
+            title: title.unwrap_or_else(|| decision.target.id.clone()),
+            state: RecoveryState::Queued,
+            code: None,
+            detail: None,
+            can_fix: false,
+            can_dismiss: false,
+            replacement_operation_id: None,
+            local_instance: Some(local_instance.clone()),
+            peer_instance,
+        };
+        if let Some((code, detail)) = error {
+            tracing::warn!(target=%decision.target.id, code, "version decision deferred: {detail}");
+            item.state = RecoveryState::Waiting;
+            item.code = Some(code.into());
+            item.detail = Some(detail.into());
+        } else {
+            positions.insert(decision.target.id.clone(), items.len());
+            accepted.push(*decision);
+        }
+        items.push(item);
+    }
+    if !accepted.is_empty() {
+        type QueuedRow = (
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        );
+        let queued: Vec<QueuedRow> = sqlx::query_as(
+            "INSERT INTO sync_recovery
+                (id,kind,target_id,state,resolution,decision_revision,created_at,updated_at)
+             SELECT 'conflict:' || json_extract(d.value,'$.target.id'),'conflict',
+                json_extract(d.value,'$.target.id'),'queued',?,
+                json_extract(d.value,'$.revision'),?,? FROM json_each(?) d WHERE 1
+             ON CONFLICT(kind,target_id) DO UPDATE SET
+                state=CASE WHEN sync_recovery.state IN ('fixing','fixed','not_retryable')
+                    THEN sync_recovery.state ELSE 'queued' END,
+                resolution=excluded.resolution,decision_revision=excluded.decision_revision,
+                code=CASE WHEN sync_recovery.state IN ('fixing','fixed','not_retryable')
+                    THEN sync_recovery.code ELSE NULL END,
+                detail=CASE WHEN sync_recovery.state IN ('fixing','fixed','not_retryable')
+                    THEN sync_recovery.detail ELSE NULL END,
+                updated_at=excluded.updated_at
+             RETURNING target_id,state,code,detail,replacement_operation_id",
+        )
+        .bind(&resolution)
+        .bind(db::now())
+        .bind(db::now())
+        .bind(serde_json::to_string(&accepted)?)
+        .fetch_all(&mut *tx)
+        .await?;
+        for (id, status, code, detail, replacement) in queued {
+            let position = positions.get(&id).ok_or_else(|| {
+                AppError::internal("queued decision is outside the admitted batch")
+            })?;
+            let item = &mut items[*position];
+            item.state = parse_state(&status)?;
+            item.code = code;
+            item.detail = detail;
+            item.replacement_operation_id = replacement;
+        }
+    }
+    tx.commit().await?;
+    Ok(items)
+}
+
 pub async fn submit_decisions(
     state: &AppState,
     input: ism_core::dto::RecoveryDecisionInput,
@@ -742,29 +865,38 @@ pub async fn submit_decisions(
         ));
     }
     let mut seen = std::collections::HashSet::new();
+    let decisions: Vec<_> = input
+        .decisions
+        .into_iter()
+        .filter(|decision| {
+            seen.insert((decision.target.id.clone(), decision.target.peer_id.clone()))
+        })
+        .collect();
+    let local: Vec<_> = decisions
+        .iter()
+        .filter(|decision| decision.target.peer_id.is_none())
+        .collect();
+    let mut queued: std::collections::HashMap<_, _> =
+        queue_local_decisions(state, &local, input.resolution)
+            .await?
+            .into_iter()
+            .map(|item| (item.target.id.clone(), item))
+            .collect();
     let mut items = Vec::new();
-    for decision in input.decisions {
+    for decision in decisions {
         let target = decision.target;
-        if !seen.insert((target.id.clone(), target.peer_id.clone())) {
+        if target.peer_id.is_none() {
+            items.push(queued.remove(&target.id).ok_or_else(|| {
+                AppError::internal("local decision admission returned an incomplete batch")
+            })?);
             continue;
         }
-        let outcome: AppResult<Vec<RecoveryView>> = async {
-            if target.peer_id.is_none()
-                && super::versions::get(state, &target).await?.revision != decision.revision
-            {
-                return Err(AppError::conflict(
-                    "version_conflict",
-                    "versions changed; the in-app evidence has been refreshed",
-                ));
-            }
-            submit_one(
-                state,
-                target.clone(),
-                Some(input.resolution),
-                Some(&decision.revision),
-            )
-            .await
-        }
+        let outcome = submit_one(
+            state,
+            target.clone(),
+            Some(input.resolution),
+            Some(&decision.revision),
+        )
         .await;
         match outcome {
             Ok(mut result) => items.append(&mut result),

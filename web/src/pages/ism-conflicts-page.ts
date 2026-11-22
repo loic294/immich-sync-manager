@@ -84,47 +84,42 @@ export class IsmConflictsPage extends IsmPage {
     return this.review.compare(conflicts.map(target));
   }
 
-  /** Decides every reviewed conflict whose versions are still the ones the user compared. */
+  /** Queue the reviewed revisions; recovery revalidates them before changing any files. */
   private async decide(resolution: ConflictResolution, conflicts: readonly ConflictView[]) {
-    const reviewed = conflicts.filter((c) => this.review.has(target(c)));
-    if (!reviewed.length) return;
-    const unchanged = new Set(
-      (await this.review.compare(reviewed.map(target))).unchanged.map((t) => t.id),
-    );
-    const ready = reviewed.filter((c) => unchanged.has(c.id));
-    if (!ready.length) {
-      toast.warning('Versions changed. Review the refreshed comparison before choosing again.');
-      return;
-    }
+    const ready = conflicts.filter((c) => this.review.has(target(c)));
+    if (!ready.length) return;
+    const decisions = ready.map((c) => {
+      const versions = this.review.get(target(c));
+      if (!versions) throw new Error('Current version evidence is unavailable.');
+      return { target: target(c), revision: versions.revision };
+    });
     const label = this.choiceLabel(ready, resolution);
-    const skipped = reviewed.length - ready.length;
     const hint = RESOLUTIONS.find((r) => r.value === resolution)?.hint ?? '';
     const ok = await confirmAction({
       title: ready.length === 1 ? label : `${label} for ${ready.length} conflicts`,
-      message: `${ready.length === 1 ? `${formatLocation(ready[0].location)}\n\n` : ''}${hint}${
-        skipped ? `\n\n${skipped} changed since review and stay open.` : ''
-      }`,
+      message: `${ready.length === 1 ? `${formatLocation(ready[0].location)}\n\n` : ''}${hint}`,
       confirmLabel: label,
     });
     if (!ok) return;
-    const done = await this.act(
-      `decide:${resolution}`,
-      () =>
-        admin.decideIssues({
-          decisions: ready.map((c) => {
-            const versions = this.review.get(target(c));
-            if (!versions) throw new Error('Current version evidence is unavailable.');
-            return { target: target(c), revision: versions.revision };
-          }),
-          resolution,
-        }),
-      ready.length === 1 ? 'Version decision queued.' : `${ready.length} version decisions queued.`,
-    );
-    if (done)
-      this.select(
-        ready.map((c) => c.id),
-        false,
-      );
+    const admitted: string[] = [];
+    const done = await this.act(`decide:${resolution}`, async () => {
+      const result = await admin.decideIssues({ decisions, resolution });
+      for (const item of result.items) {
+        if (['queued', 'fixing', 'fixed'].includes(item.state)) admitted.push(item.target.id);
+      }
+      const deferred = result.items.find((item) => !admitted.includes(item.target.id));
+      if (deferred)
+        toast.warning(deferred.detail ?? 'Some decisions could not be queued and remain selected.');
+    });
+    if (done) {
+      this.select(admitted, false);
+      if (admitted.length)
+        toast.success(
+          admitted.length === 1
+            ? 'Version decision queued.'
+            : `${admitted.length} version decisions queued.`,
+        );
+    }
   }
 
   private choiceLabel(conflicts: readonly ConflictView[], resolution: ConflictResolution) {
