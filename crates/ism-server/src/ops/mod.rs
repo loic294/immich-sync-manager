@@ -585,8 +585,28 @@ pub async fn cancel_by_key(
     .map_err(AppError::internal)?
 }
 
-/// Admin: the files were checked by hand; release the server barrier.
+/// Sync recovery is verified by ISM, never by a manual acknowledgement.
 pub async fn resolve_recovery(state: &AppState, id: &str) -> AppResult<()> {
+    crate::peers::recovery::discover(state).await?;
+    if crate::peers::recovery::get(state, ism_core::dto::RecoveryKind::Operation, id)
+        .await?
+        .is_some()
+    {
+        crate::peers::recovery::submit(
+            state,
+            ism_core::dto::RecoveryBatchInput {
+                targets: vec![ism_core::dto::RecoveryTarget {
+                    kind: ism_core::dto::RecoveryKind::Operation,
+                    id: id.into(),
+                    peer_id: None,
+                }],
+                all: false,
+                resolution: None,
+            },
+        )
+        .await?;
+        return Ok(());
+    }
     crate::maintenance::resolve_operation_recovery(state, id).await?;
     state.sync_wake.notify_waiters();
     state.emit(ServerEvent::OperationUpdated {

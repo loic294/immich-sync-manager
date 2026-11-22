@@ -49,6 +49,7 @@ The API-capable fork handles the asset path and owner/library change. ISM still 
 | --- | --- | --- |
 | Move/rename an asset | `asset.originalPath`, `originalFileName`, path checksum | Row lock, old path must match, no other asset may use the new path. |
 | Move a sidecar | `asset_file.path` | Old path must match. |
+| Remove a replicated sidecar association | `asset_file` row | Asset and association are locked and must match the planned identity and path; the original asset remains. |
 | Transfer to another owner/library | `asset.ownerId`, `libraryId` | Row lock, old owner must match, and no owner-bound rows (albums, faces, …) may block it. |
 
 Each statement runs inside the operation's write barrier and a transaction; a row that no longer

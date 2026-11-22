@@ -27,12 +27,6 @@ export class IsmSyncDetail extends IsmPage {
   private dialog = createRef<HTMLDialogElement>();
   private operation = createRef<IsmOperationDetail>();
   private selectedId: string | undefined;
-  private operationIndex(transfer: SyncActivity): number | undefined {
-    const prefix = `operation:${transfer.operation_id ?? ''}:`;
-    if (!transfer.id.startsWith(prefix)) return undefined;
-    const index = Number(transfer.id.slice(prefix.length));
-    return Number.isInteger(index) && index >= 0 ? index : undefined;
-  }
   async show(transfer: SyncActivity) {
     this.selectedId = transfer.id;
     this.transfer = transfer;
@@ -92,9 +86,9 @@ export class IsmSyncDetail extends IsmPage {
             <dt class="font-medium">Queued</dt><dd>${formatDate(t.queued_at)}</dd>
             <dt class="font-medium">Finished</dt><dd>${formatDate(t.finished_at)}</dd>
           </dl>
-          ${t.error ? html`<p role="alert" class="alert alert-error alert-soft">${t.error}</p>` : nothing}
-          <h3 class="font-semibold">Original & related sidecars</h3>
-          ${this.fileError ? html`<p role="alert" class="my-2 text-sm text-warning">Cannot verify the source folder and related files: ${this.fileError}</p>` : nothing}
+          ${t.error ? html`<details class="my-3 text-xs"><summary class="cursor-pointer">Technical details</summary><p class="mt-1 break-all">${t.error}</p></details>` : nothing}
+          <h3 class="font-semibold">File & related sidecars</h3>
+          ${this.fileError ? html`<details class="my-2 text-xs text-base-content/70"><summary class="cursor-pointer">Preview unavailable</summary><p class="mt-1 break-all">${this.fileError}</p></details>` : nothing}
           ${
             this.files
               ? html`<ul class="my-2 space-y-2">${this.files.files.map(
@@ -107,30 +101,32 @@ export class IsmSyncDetail extends IsmPage {
                 : nothing
           }
           <div class="modal-action flex-wrap">
-            ${t.outgoing ? html`<p class="text-sm text-base-content/70">The receiving instance manages this transfer and its publishing operation.</p>` : nothing}
             ${!t.outgoing && t.operation_id ? html`<button class="btn btn-sm" @click=${() => this.operation.value?.show(t.operation_id ?? '')}>View operation</button>` : nothing}
             ${
-              !t.outgoing && t.operation_id && t.readd_available
+              (t.recovery?.can_fix ?? t.status === 'failed')
                 ? html`<button class="btn btn-primary btn-sm" ?disabled=${!!this.busy}
               @click=${() => {
-                const index = this.operationIndex(t);
-                if (index !== undefined)
-                  void this.act(
-                    'readd',
-                    () => admin.readdSyncOperation(t.operation_id ?? '', index),
-                    'Asset re-added to the sync queue.',
-                  );
-              }}>${this.spin('readd')}Re-add to sync queue</button>`
+                void this.act(
+                  'fix',
+                  () =>
+                    admin.fixIssues({
+                      targets: [
+                        {
+                          kind: t.operation_id ? 'operation' : 'transfer',
+                          id: t.operation_id ?? t.id,
+                          peer_id: t.outgoing ? t.peer_id : null,
+                        },
+                      ],
+                      all: false,
+                      resolution: null,
+                    }),
+                  'Recovery queued on the receiving instance.',
+                );
+              }}>${this.spin('fix')}Fix</button>`
                 : nothing
             }
             ${
-              !t.outgoing && !t.operation_id && ['failed', 'cancelled'].includes(t.status)
-                ? html`<button class="btn btn-primary btn-sm" ?disabled=${!!this.busy}
-              @click=${() => this.act('retry', () => admin.retryTransfer(t.id), 'Transfer queued again.')}>${this.spin('retry')}Retry</button>`
-                : nothing
-            }
-            ${
-              !t.outgoing && !t.operation_id && ['queued', 'running', 'failed'].includes(t.status)
+              !t.outgoing && !t.operation_id && ['queued', 'running'].includes(t.status)
                 ? html`<button class="btn btn-sm" ?disabled=${!!this.busy}
               @click=${() => this.act('cancel', () => admin.cancelTransfer(t.id), 'Transfer cancelled.')}>${this.spin('cancel')}Cancel transfer</button>`
                 : nothing

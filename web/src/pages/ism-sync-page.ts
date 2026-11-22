@@ -26,6 +26,7 @@ import { tabKeydown } from '@/util/tabs';
 import '@/components/ism-pagination';
 import '@/components/ism-sync-thumbnail';
 import '@/components/ism-sync-detail';
+import '@/components/ism-recovery-list';
 
 const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'] as const;
 
@@ -124,7 +125,7 @@ export class IsmSyncPage extends IsmPage {
       admin.overrides(),
       admin.shares(),
       admin.peers(),
-      admin.syncPage(view, limit, offset),
+      admin.syncPage(view === 'attention' ? 'active' : view, limit, offset),
     ]);
     this.status = status;
     this.scheduleInvalid = !schedule;
@@ -245,7 +246,7 @@ export class IsmSyncPage extends IsmPage {
   private renderTransfers() {
     return html`<section class="min-w-0 rounded-box border border-base-300 bg-base-100">
       <div role="tablist" aria-label="Sync view" class="tabs tabs-border" @keydown=${tabKeydown}>
-        ${['active', 'completed'].map(
+        ${['active', 'attention', 'completed'].map(
           (view) => html`<button type="button" role="tab"
           id=${`sync-tab-${view}`} aria-controls="sync-panel" aria-selected=${this.view === view}
           tabindex=${this.view === view ? 0 : -1}
@@ -255,10 +256,14 @@ export class IsmSyncPage extends IsmPage {
             this.offset = 0;
             void this.reload();
           }}>
-          ${view === 'active' ? 'Active & queued' : 'Completed syncs'}</button>`,
+          ${view === 'active' ? 'Active & queued' : view === 'attention' ? 'Needs attention' : 'Completed syncs'}</button>`,
         )}
       </div>
       <div id="sync-panel" role="tabpanel" aria-labelledby=${`sync-tab-${this.view}`}>
+        ${
+          this.view === 'attention'
+            ? html`<ism-recovery-list></ism-recovery-list>`
+            : html`
         ${this.view === 'active' ? html`<p class="px-4 pt-3 text-xs text-base-content/70">Incoming and outgoing transfers, with current runs first, then files in queue order. Files waiting for a peer, retry delay or allowed hours may be skipped until eligible.</p>` : nothing}
         <div class="overflow-x-auto">
           <table class="table table-sm">
@@ -271,7 +276,7 @@ export class IsmSyncPage extends IsmPage {
               <td class="max-w-72 break-all">
                 <button type="button" class="link link-hover text-left font-medium" @click=${() => this.detail.value?.show(t)}>${t.relative_path.split('/').at(-1)}</button>
                 <div class="text-xs text-base-content/70">${t.share_name} / ${t.relative_path}</div>
-                ${t.error ? html`<p class="text-xs text-error">${t.error}</p>` : nothing}
+                ${t.error ? html`<details class="text-xs text-base-content/70"><summary class="cursor-pointer">Technical details</summary><p class="mt-1">${t.error}</p></details>` : nothing}
               </td>
               <td class="text-xs"><div>${t.source}</div><div>→ ${t.destination}</div></td>
               <td class="whitespace-nowrap">${formatBytes(t.size)}</td>
@@ -291,6 +296,8 @@ export class IsmSyncPage extends IsmPage {
             this.offset = e.detail.offset;
             void this.reload();
           }}></ism-pagination>
+        `
+        }
       </div>
     </section>`;
   }

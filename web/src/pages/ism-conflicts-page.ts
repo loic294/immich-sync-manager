@@ -3,10 +3,13 @@ import { admin } from '@/api/admin';
 import type { ConflictResolution } from '@/api/generated/ConflictResolution';
 import type { ConflictSide } from '@/api/generated/ConflictSide';
 import type { ConflictView } from '@/api/generated/ConflictView';
+import type { RecoveryVersions } from '@/api/generated/RecoveryVersions';
 import { IsmPage } from '@/base/ism-page';
 import { confirmAction } from '@/components/confirm';
+import { toast } from '@/components/toast';
 import { formatBytes, formatDate, formatLocation, humanize } from '@/util/format';
 import { statusBadge } from '@/util/status';
+import '@/components/ism-recovery-versions';
 
 const EXPLAIN: Readonly<Record<string, string>> = {
   changed_on_both: 'The file changed on both instances since they last agreed.',
@@ -16,26 +19,18 @@ const EXPLAIN: Readonly<Record<string, string>> = {
   folder_move: 'The peer moved a folder that cannot be moved the same way here.',
 };
 
-const RESOLUTIONS: readonly { value: ConflictResolution; label: string; hint: string }[] = [
+const RESOLUTIONS: readonly { value: ConflictResolution; hint: string }[] = [
   {
     value: 'keep_local',
-    label: 'Keep this instance',
-    hint: 'Record this version as the decision.',
+    hint: 'Synchronize this version and retain replaced content in ISM trash.',
   },
   {
     value: 'keep_remote',
-    label: 'Keep the peer',
     hint: "This instance takes the peer's version; the local copy goes to the trash.",
   },
   {
     value: 'keep_both',
-    label: 'Keep both',
-    hint: "The peer's version is saved next to this one under a new name.",
-  },
-  {
-    value: 'skip',
-    label: 'Skip',
-    hint: 'Dismiss without changing either side; the next change to this path is compared again.',
+    hint: 'Preserve both versions and synchronize the decision.',
   },
 ];
 
@@ -45,16 +40,19 @@ export class IsmConflictsPage extends IsmPage {
     ...IsmPage.properties,
     conflicts: { state: true },
     includeResolved: { state: true },
+    versions: { state: true },
   };
 
   declare conflicts: ConflictView[];
   declare includeResolved: boolean;
+  declare versions: Map<string, RecoveryVersions>;
   protected override reloadOn = ['conflicts_changed'] as const;
 
   constructor() {
     super();
     this.conflicts = [];
     this.includeResolved = false;
+    this.versions = new Map();
   }
 
   protected override async load() {
@@ -62,18 +60,51 @@ export class IsmConflictsPage extends IsmPage {
   }
 
   private async resolve(conflict: ConflictView, resolution: ConflictResolution) {
+    const previous = this.versions.get(conflict.id);
+    if (!(await this.compare(conflict))) return;
+    const current = this.versions.get(conflict.id);
+    if (!current || current.revision !== previous?.revision) {
+      toast.warning('Versions changed. Review the refreshed comparison before choosing again.');
+      return;
+    }
     const choice = RESOLUTIONS.find((r) => r.value === resolution);
+    const label = this.choiceLabel(conflict, resolution);
     const ok = await confirmAction({
-      title: choice?.label ?? 'Resolve',
+      title: label,
       message: `${formatLocation(conflict.location)}\n\n${choice?.hint ?? ''}`,
-      confirmLabel: choice?.label ?? 'Resolve',
+      confirmLabel: label,
     });
     if (ok)
       await this.act(
         `${conflict.id}:${resolution}`,
-        () => admin.resolveConflict(conflict.id, resolution),
-        'Resolution applied.',
+        () =>
+          admin.decideIssues({
+            decisions: [
+              {
+                target: { kind: 'conflict', id: conflict.id, peer_id: null },
+                revision: current.revision,
+              },
+            ],
+            resolution,
+          }),
+        'Version decision queued.',
       );
+  }
+
+  private async compare(conflict: ConflictView) {
+    return this.act('versions', async () => {
+      const current = await admin.recoveryVersions({
+        kind: 'conflict',
+        id: conflict.id,
+        peer_id: null,
+      });
+      this.versions = new Map(this.versions).set(conflict.id, current);
+    });
+  }
+
+  private choiceLabel(conflict: ConflictView, resolution: ConflictResolution) {
+    if (resolution === 'keep_both') return 'Keep both';
+    return `Keep ${resolution === 'keep_local' ? conflict.local.instance : conflict.remote.instance}`;
   }
 
   private side(title: string, side: ConflictSide) {
@@ -95,8 +126,7 @@ export class IsmConflictsPage extends IsmPage {
 
   private card(c: ConflictView) {
     const open = c.status === 'open';
-    const choices =
-      c.kind === 'folder_move' ? RESOLUTIONS.filter((r) => r.value !== 'keep_both') : RESOLUTIONS;
+    const choices = RESOLUTIONS;
     return html`
       <article class="card card-border bg-base-100">
         <div class="card-body gap-3 p-4">
@@ -107,18 +137,28 @@ export class IsmConflictsPage extends IsmPage {
           <p class="text-sm text-base-content/70">
             ${c.share_name} · ${EXPLAIN[c.kind] ?? humanize(c.kind)} · ${formatDate(c.created_at)}
           </p>
-          ${c.detail ? html`<p class="text-sm">${c.detail}</p>` : nothing}
+          ${c.detail ? html`<details class="text-sm text-base-content/70"><summary class="cursor-pointer">Technical details</summary><p class="mt-1">${c.detail}</p></details>` : nothing}
           ${c.moved_from ? html`<p class="text-sm">Moved by the peer from <span class="break-all font-mono text-xs">${formatLocation(c.moved_from)}</span></p>` : nothing}
-          <div class="grid grid-cols-1 gap-3 md:grid-cols-2">
-            ${this.side('This instance', c.local)} ${this.side('Peer', c.remote)}
-          </div>
+          ${
+            this.versions.has(c.id)
+              ? html`<ism-recovery-versions
+            .target=${{ kind: 'conflict', id: c.id, peer_id: null }}
+            .versions=${this.versions.get(c.id)}></ism-recovery-versions>`
+              : !open
+                ? html`<div class="grid grid-cols-1 gap-3 md:grid-cols-2">
+              ${this.side('This instance', c.local)} ${this.side('Peer', c.remote)}
+            </div>`
+                : nothing
+          }
           ${
             open
               ? html`<div class="card-actions">
+                  <button class="btn btn-sm max-sm:min-h-11" ?disabled=${!!this.busy}
+                    @click=${() => this.compare(c)}>Compare versions</button>
                   ${choices.map(
                     (r) => html`<div class="tooltip" data-tip=${r.hint}>
-                      <button type="button" class="btn btn-sm" ?disabled=${this.busy !== undefined} @click=${() => this.resolve(c, r.value)}>
-                        ${this.spin(`${c.id}:${r.value}`)}${r.label}
+                      <button type="button" class="btn btn-sm max-sm:min-h-11" ?disabled=${this.busy !== undefined || !this.versions.has(c.id)} @click=${() => this.resolve(c, r.value)}>
+                        ${this.spin(`${c.id}:${r.value}`)}${this.choiceLabel(c, r.value)}
                       </button>
                     </div>`,
                   )}

@@ -24,6 +24,12 @@ import type { Overview } from '@/api/generated/Overview';
 import type { PeerAcceptInput } from '@/api/generated/PeerAcceptInput';
 import type { PeerInvite } from '@/api/generated/PeerInvite';
 import type { PeerView } from '@/api/generated/PeerView';
+import type { RecoveryBatchInput } from '@/api/generated/RecoveryBatchInput';
+import type { RecoveryBatchResult } from '@/api/generated/RecoveryBatchResult';
+import type { RecoveryDecisionInput } from '@/api/generated/RecoveryDecisionInput';
+import type { RecoveryPage } from '@/api/generated/RecoveryPage';
+import type { RecoveryTarget } from '@/api/generated/RecoveryTarget';
+import type { RecoveryVersions } from '@/api/generated/RecoveryVersions';
 import type { ScheduleView } from '@/api/generated/ScheduleView';
 import type { SettingsInput } from '@/api/generated/SettingsInput';
 import type { SettingsView } from '@/api/generated/SettingsView';
@@ -94,6 +100,28 @@ export const admin = {
     api.get<OperationPage>(`${A}/operations/page`, { query: { status, limit, offset } }),
   operationDetail: (id: string) => api.get<OperationDetail>(`${A}/operations/${enc(id)}/detail`),
   markOperationHandled: (id: string) => api.post<void>(`${A}/operations/${enc(id)}/handled`),
+  recoveryPage: (limit = 250, offset = 0) =>
+    api.get<RecoveryPage>(`${A}/recovery/page`, { query: { limit, offset } }),
+  fixIssues: (body: RecoveryBatchInput) => api.post<RecoveryBatchResult>(`${A}/recovery`, { body }),
+  decideIssues: (body: RecoveryDecisionInput) =>
+    api.post<RecoveryBatchResult>(`${A}/recovery/decisions`, { body }),
+  recoveryVersions: (target: RecoveryTarget) =>
+    api.get<RecoveryVersions>(`${A}/recovery/versions`, {
+      query: {
+        kind: target.kind,
+        id: target.id,
+        ...(target.peer_id ? { peer_id: target.peer_id } : {}),
+      },
+    }),
+  recoveryPreview: (target: RecoveryTarget, revision: string, path: string, source: boolean) =>
+    `${A}/recovery/preview?${new URLSearchParams({
+      kind: target.kind,
+      id: target.id,
+      revision,
+      path,
+      source: String(source),
+      ...(target.peer_id ? { peer_id: target.peer_id } : {}),
+    })}`,
   /** Runs managed actions as the administrator (same endpoint as the client API). */
   submit: (label: string, actions: OperationAction[]) =>
     api.post<OperationAccepted>('/api/v1/operations', {

@@ -36,9 +36,16 @@ the peer had just announced it:
 - files the peer deleted since both sides last agreed go to the ISM trash;
 - files changed on both sides become conflicts.
 
-Paths with an open conflict and hidden paths are skipped. The backfill position is saved with
-each page, so an interrupted backfill resumes where it stopped. A peer's events and backfill wait
-while one of its changes is still being applied.
+Hidden paths are skipped. Conflicting or uncertain entries are retained in a durable inbox
+while independent entries continue. The inventory position is saved atomically with each received
+page, so a restart cannot lose entries deferred behind a folder operation or an unavailable root.
+
+Incoming events likewise have separate **received** and **applied** positions. A page advances
+the receipt position only after its identities and payloads are validated and durably stored.
+The application position advances only past completed effects; failed or unapplied effects are
+not forwarded as successful events. Reception is bounded to 10,000 retained events per peer,
+500 events per page and 64 KiB per event. Deferred work is revisited fairly on subsequent polls,
+including after a restart; unrelated events from the same peer and share can proceed.
 
 ### What is synchronized
 
@@ -59,9 +66,11 @@ while one of its changes is still being applied.
   done through ISM become peer events. A peer applies each one as a managed operation, so on an
   Immich-linked root the asset keeps its ID and only its path changes. An event is acknowledged
   only after the operation and its bookkeeping succeed. Failed or cancelled operations stay in
-  **Sync → Active & queued** and block later peer processing and rescans of the affected library.
-  Administrators inspect the issue and explicitly choose **Re-add to sync queue**; ISM never retries
-  a failed file operation automatically. Recovery-required operations must be resolved first.
+  **Sync → Active & queued** and defer overlapping source/destination paths, descendants, companions
+  and dependent events. Other folders, shares and servers continue. An unresolved maintenance
+  barrier additionally protects the affected Immich server.
+  Failed sync work enters recovery automatically; **Needs attention** offers individual and batch
+  fixes and in-app version decisions when needed.
 - **File contents** (new and modified files) are published as managed uploads, queued for transfer
   during **allowed hours** (Sync → Schedule). An override permits a share or peer outside those
   hours for a set time. Uploads and other writes by ISM schedule a rescan of the affected shares,
@@ -78,12 +87,9 @@ while one of its changes is still being applied.
   that the file's tracked checksum, size and modification time still match the announced version;
   it also freshly rehashes small files to detect same-metadata edits before responding. The
   receiver verifies the SHA-256 of the complete staged file before publication.
-  Sidecars wait for their matching original to finish publishing, so concurrent downloads cannot
-  publish a companion before its original exists. A stem sidecar shared by a JPEG and its RAW or
-  video counterpart, or by an original and a timestamped `.edited`/`-edited-` variant, is
-  published using a deterministic original as its upload anchor; unrelated same-stem files still
-  fail closed as ambiguous. After an upgrade, startup recovery automatically retries transfers
-  that previously failed from a 504 or this paired-companion ambiguity.
+  Authenticated peer transfers can publish sidecars and configured companions independently of an
+  original. Each file retains its role and is verified individually. A later original is imported
+  normally. Deleting one announced file does not delete an unannounced companion.
 - If the saved schedule is invalid, transfers stop rather than defaulting to unrestricted hours.
   An active, explicitly scoped override still applies. The Sync page provides a replacement
   schedule with no allowed days; choose the desired hours and save to resume scheduling.
@@ -91,16 +97,16 @@ while one of its changes is still being applied.
   shared folder rescans that share shortly after it settles, and a full rescan still runs every
   `ISM_SCAN_INTERVAL_SECS` as a safety net. Each scan
   hashes settled files, including files with unchanged size and modification time; this can cause
-  substantial disk reads on large shares. Full safety-net scans wait while a peer transfer backlog
-  or its publication work is active, so restarting or updating ISM does not pause ongoing
-  replication behind a complete library rehash. Native watcher-detected outside changes are still
-  rescanned promptly. To avoid recording half-completed managed operations,
+  substantial disk reads on large shares. Scans exclude queued transfers and uncertain operation
+  or inbox footprints from hashing and deletion inference, while independent paths remain eligible.
+  Unavailable roots never imply deletion. An unreadable subtree is excluded and the incomplete
+  scan is reported explicitly. To avoid recording half-completed managed operations,
   each scan and managed operation runs exclusively of the other within this instance. A long scan
   can therefore delay managed operations and application of incoming events, even though polling
   and scanning run separately. Peer connections are polled independently, so a slow peer does not
-  prevent the others from being contacted. Scans and peer bookkeeping also stop while an operation
-  needs recovery, or while a failed peer operation waits to be re-added, until an administrator
-  resolves it. Managed file trash records deletion events for the original and moved companions
+  prevent the others from being contacted. Recovery and failed peer operations protect their
+  uncertain footprints rather than stopping all scans or peer bookkeeping. Managed file trash
+  records deletion events for the original and moved companions
   immediately, without waiting for the next scan.
   This coordination does not stop external
   programs modifying files.
@@ -113,9 +119,10 @@ while one of its changes is still being applied.
   mismatch stops publication and rolls the managed operation back; none of these checks depend on a
   remote hash result.
 - Invalid event page ordering, cursors or identities, invalid file metadata, unsupported event
-  types, reused event identities with different content, and equal file versions with different
-  contents stop the affected peer's event cursor rather than being silently acknowledged. The Peers
-  page shows the processing error while retaining its connected status when the peer is reachable.
+  types and reused identities with different content reject receipt without advancing its cursor.
+  Equal file versions with different contents retain the affected event unapplied while unrelated
+  work continues. The Peers page shows processing errors while retaining connected status when
+  the peer is reachable. Removing a remote event does not discard an already validated receipt.
 
 ## Shared file settings
 
@@ -150,15 +157,35 @@ Resolutions:
 | Choice | Effect |
 |---|---|
 | **Keep this instance** | Publishes the local version (or deletion) as the decision; the peer applies it. |
-| **Keep the peer** | Downloads the peer's version (the local one goes to the ISM trash), or trashes the local copy if the peer deleted it. For a move, fetches the file at the peer's new path and trashes the local source; for a folder move, moves the local folder the same way. |
-| **Keep both** | Renames the local file to a `… (conflict …)` copy, then downloads the peer's version under the original name. Both instances end up with both files. For a move, the peer's file is fetched at its new path and the local source stays. Not offered for folder moves. |
-| **Skip** | Dismisses the conflict without changing either side. The next change to that path is compared again. |
+| **Keep the peer** | Downloads the peer's version (the local one goes to the ISM trash), or trashes the local copy if the peer deleted it. For file and folder moves, rebuilds the verified peer destination, including nested files and empty folders; displaced local sources and destinations go to ISM trash. |
+| **Keep both** | Renames the local file to a `… (conflict …)` copy, then downloads the peer's version under the original name. Both instances end up with both files. For file and folder moves, keeps the local source, preserves an occupied destination under a conflict-copy name, and fetches the peer's destination. All retained copies are announced to the peer. |
+| **Skip** | Refused while an executable recovery or version choice remains available. |
 
 Keeping the peer or both runs as a managed operation (and transfer). The conflict stays
-`resolving` until it finishes, and the outcome is announced to the peer. If the operation fails,
-the conflict reopens with the error appended to its detail. A choice that cannot be applied safely
-is refused and leaves the conflict open; for example, the destination of a move is taken or the
-peer's version is unknown.
+`resolving` until it finishes, and the outcome is announced to the peer. Move choices persist
+their preparation and publication plan across restarts; a failed step retains its recovery
+footprint instead of settling the conflict. Keeping this instance for a move announces its
+verified layout and contents, rather than merely dismissing the conflict. Peer-only contents
+removed by that choice go to the peer's ISM trash. A choice without authenticated, current
+evidence, or involving symlinks or unverifiable paths, is refused without settling it.
+
+Authenticated committed move lineage also follows a peer folder relocated while a choice is
+waiting. Unchanged bytes retain the chosen decision; changed competing bytes reopen the choice
+instead of silently selecting the new version. If relocation collides with a retained local
+source, keeping local or both requires a refreshed in-app choice; already preserved copies
+remain included in publication. If the current peer folder overlaps the original source, the
+comparison expands to their common ancestor on both instances, including sibling files and empty
+folders. Keeping both preserves the receiving instance's complete ancestor as a conflict copy.
+
+If a failed incoming folder move has lost both local paths, ISM can restore its old source from
+the peer's complete current inventory, then finish the original managed move. Downloads retain
+their verified remote source separately from the receiver target and resume across restarts.
+Restoration uploads execute inside the original operation's maintenance window without
+registering replacement Immich assets. Only the final verified move completes recovery;
+unavailable or changed evidence leaves the original operation outstanding. When source content
+changes, ISM retains the earlier generation and requests a fresh in-app decision. If the peer
+also moved the folder or changed its directory structure, the decision applies to the complete
+current tree. Changes to the receiving tree after review likewise reopen the choice.
 
 If different pending peer versions have concurrent or inconsistent histories, ISM keeps the
 existing transfer and leaves the incoming event unacknowledged. The peer's processing error
@@ -173,8 +200,8 @@ shared; mirrored outgoing activity is never mirrored back. Both peers must be up
 outgoing visibility. An unreachable or older peer leaves the last-known queue visible with a
 warning rather than making it look empty or current. Outgoing transfer controls and publishing
 operations are managed on the receiving instance. Incoming move, rename, trash and folder
-operations appear beside file transfers; failed entries expose **Re-add to sync queue**, and the
-source's mirrored row updates after the receiver handles that action.
+operations appear beside file transfers. Recovery requests for mirrored issues are forwarded to
+the receiver and survive disconnection; the source's mirrored row updates after the receiver acts.
 Activity is polled independently every five seconds, so scans, replication backfills, and the
 operation barrier cannot block status updates. Before the first receiver response, the view
 reports unavailable peer status instead of silently treating the unknown queue as empty.

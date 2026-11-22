@@ -8,8 +8,14 @@
 
 pub mod activity;
 pub mod admin;
+pub mod inbox;
 pub mod net;
+pub mod recovery;
+pub mod retained;
 pub mod transfer;
+pub mod versions;
+
+pub use inbox::{blocked_footprints, require_stable_share};
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -222,21 +228,6 @@ async fn append_local_in(
     Ok(())
 }
 
-async fn log_remote(state: &AppState, e: &PeerEvent) -> AppResult<()> {
-    sqlx::query(
-        "INSERT OR IGNORE INTO event_log (origin, origin_seq, share_name, kind, data_json, at) VALUES (?, ?, ?, ?, ?, ?)",
-    )
-    .bind(&e.origin)
-    .bind(e.origin_seq)
-    .bind(&e.share)
-    .bind(&e.kind)
-    .bind(serde_json::to_string(&e.data)?)
-    .bind(db::now())
-    .execute(&state.db)
-    .await?;
-    Ok(())
-}
-
 /// Events `peer` has not seen: after `after`, in shares it takes part in, not its own.
 pub async fn events_for(
     state: &AppState,
@@ -282,7 +273,7 @@ pub async fn events_for(
 // ---------------------------------------------------------------------------------------------
 // Replica rows
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Row {
     pub size: i64,
     pub mtime_ns: i64,
@@ -512,66 +503,12 @@ async fn register_local(
     Ok(Some(r))
 }
 
-async fn require_recovery_resolved(state: &AppState) -> AppResult<()> {
-    let unresolved: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM operations
-         WHERE recovery_resolved = 0 AND
-               (status = 'recovery_required'
-                OR (status = 'partial' AND CASE
-                    WHEN json_valid(admitted_server_ids_json) THEN
-                        CASE WHEN json_type(admitted_server_ids_json) = 'array'
-                             THEN json_array_length(admitted_server_ids_json) ELSE 1 END
-                    ELSE 1 END > 0)))",
-    )
-    .fetch_one(&state.db)
-    .await?;
-    if unresolved {
-        return Err(AppError::conflict(
-            "recovery_required",
-            "peer bookkeeping waits for unresolved managed operations",
-        ));
-    }
-    Ok(())
-}
-
-async fn require_stable_operations(state: &AppState) -> AppResult<()> {
-    require_recovery_resolved(state).await?;
-    let active: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM operations
-         WHERE status IN ('running', 'waiting_maintenance'))",
-    )
-    .fetch_one(&state.db)
-    .await?;
-    if active {
-        return Err(AppError::conflict(
-            "recovery_required",
-            "peer bookkeeping waits for active managed operations",
-        ));
-    }
-    let pending: bool = sqlx::query_scalar(
-        "SELECT EXISTS(
-             SELECT 1 FROM pending_peer_events p JOIN operations o ON o.id = p.operation_id
-             WHERE o.status IN ('failed','partial','cancelled','recovery_required')
-         ) OR EXISTS(
-             SELECT 1 FROM pending_peer_ops p JOIN operations o ON o.id = p.operation_id
-             WHERE o.status IN ('failed','partial','cancelled','recovery_required')
-         )",
-    )
-    .fetch_one(&state.db)
-    .await?;
-    if pending {
-        return Err(AppError::conflict(
-            "recovery_required",
-            "peer bookkeeping waits for a failed or unresolved peer operation",
-        ));
-    }
-    Ok(())
-}
-
 /// Compares a share with its rows and records local changes as events.
 pub async fn scan_share(state: &AppState, share: &Share) -> AppResult<()> {
     let _operation_guard = state.replication_operation_lock.lock().await;
-    require_stable_operations(state).await?;
+    inbox::require_no_active_operations(state).await?;
+    let mut blocked = blocked_footprints(state, share).await?;
+    blocked.extend(admin::move_decision_footprints(state, share).await?);
     share.root_rel("")?;
     let root = files::root(&state.db, &share.root_id).await?;
     // An unmounted root must never look like "everything was deleted".
@@ -584,14 +521,39 @@ pub async fn scan_share(state: &AppState, share: &Share) -> AppResult<()> {
         )));
     }
     let junk = share.junk.clone();
-    let found: Vec<(String, i64, i64)> = tokio::task::spawn_blocking(move || {
+    let (found, blocked, incomplete) = tokio::task::spawn_blocking(move || {
         let mut found = Vec::new();
+        let mut uncertain = blocked.clone();
         for entry in walkdir::WalkDir::new(&base)
             .min_depth(1)
             .into_iter()
-            .filter_entry(|e| !hidden(&e.file_name().to_string_lossy(), &junk))
+            .filter_entry(|e| {
+                let rel = e
+                    .path()
+                    .strip_prefix(&base)
+                    .ok()
+                    .and_then(|p| p.to_str())
+                    .unwrap_or("");
+                !hidden(&e.file_name().to_string_lossy(), &junk)
+                    && !blocked
+                        .iter()
+                        .any(|p| p.is_empty() || rel == p || rel.starts_with(&format!("{p}/")))
+            })
         {
-            let entry = entry.map_err(std::io::Error::other)?;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    if let Some(rel) = error
+                        .path()
+                        .and_then(|p| p.strip_prefix(&base).ok())
+                        .and_then(|p| p.to_str())
+                    {
+                        uncertain.push(rel.replace('\\', "/"));
+                        continue;
+                    }
+                    return Err(std::io::Error::other(error));
+                }
+            };
             if !entry.file_type().is_file() {
                 continue;
             }
@@ -603,10 +565,17 @@ pub async fn scan_share(state: &AppState, share: &Share) -> AppResult<()> {
                 .to_str()
                 .ok_or_else(|| std::io::Error::other("share contains a non-UTF-8 path"))?
                 .replace('\\', "/");
-            let meta = entry.metadata().map_err(std::io::Error::other)?;
+            let meta = match entry.metadata() {
+                Ok(meta) => meta,
+                Err(_) => {
+                    uncertain.push(rel);
+                    continue;
+                }
+            };
             found.push((rel, meta.len() as i64, files::mtime_ns(&meta)));
         }
-        Ok::<_, std::io::Error>(found)
+        let incomplete = uncertain.len() > blocked.len();
+        Ok::<_, std::io::Error>((found, uncertain, incomplete))
     })
     .await
     .map_err(AppError::internal)??;
@@ -624,7 +593,7 @@ pub async fn scan_share(state: &AppState, share: &Share) -> AppResult<()> {
     let mut seen = HashSet::new();
     for (rel, _size, mtime) in found {
         seen.insert(rel.clone());
-        if mtime > settle_cutoff {
+        if mtime > settle_cutoff || blocked.iter().any(|p| inbox::overlaps(&rel, p)) {
             continue;
         }
         if RelPath::parse(&rel).is_err() {
@@ -634,7 +603,11 @@ pub async fn scan_share(state: &AppState, share: &Share) -> AppResult<()> {
     }
     for (rel, (_, _, deleted)) in known {
         // A newly ignored row is not evidence that the file was deleted.
-        if deleted || seen.contains(&rel) || rel.split('/').any(|name| hidden(name, &share.junk)) {
+        if deleted
+            || seen.contains(&rel)
+            || rel.split('/').any(|name| hidden(name, &share.junk))
+            || blocked.iter().any(|p| inbox::overlaps(&rel, p))
+        {
             continue;
         }
         if let Some(mut r) = row(state, &share.id, &rel).await? {
@@ -660,6 +633,12 @@ pub async fn scan_share(state: &AppState, share: &Share) -> AppResult<()> {
         .bind(&share.id)
         .execute(&state.db)
         .await?;
+    if incomplete {
+        return Err(AppError::conflict(
+            "scan_incomplete",
+            "unreadable share paths were excluded from publication and deletion inference",
+        ));
+    }
     Ok(())
 }
 
@@ -722,20 +701,29 @@ pub async fn operation_finished(
     if !finish_pending_event(state, operation_id).await?
         && !finish_pending(state, operation_id).await?
     {
-        record_local(state, changes).await?;
+        record_local(state, Some(operation_id), changes).await?;
     }
+    let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
+    inbox::finish_operation_in(&mut tx, operation_id).await?;
+    sqlx::query(
+        "UPDATE operations SET status='completed',recovery_resolved=1,finished_at=COALESCE(finished_at,?)
+         WHERE id=? AND status='failed'
+         AND EXISTS(SELECT 1 FROM operation_items WHERE operation_id=? AND status='done' AND json_extract(result_json,'$.recovery_verified')=1)
+         AND NOT EXISTS(SELECT 1 FROM operation_items WHERE operation_id=? AND status!='done')",
+    ).bind(db::now()).bind(operation_id).bind(operation_id).bind(operation_id).execute(&mut *tx).await?;
+    tx.commit().await?;
     state.sync_wake.notify_one();
     Ok(())
 }
 
 async fn finish_pending_event(state: &AppState, operation_id: &str) -> AppResult<bool> {
-    let pending: Option<(String, String, i64, String)> = sqlx::query_as(
-        "SELECT peer_id, share_id, expected_cursor, event_json FROM pending_peer_events WHERE operation_id = ?",
+    let pending: Option<(String, String, String)> = sqlx::query_as(
+        "SELECT peer_id, share_id, event_json FROM pending_peer_events WHERE operation_id = ?",
     )
     .bind(operation_id)
     .fetch_optional(&state.db)
     .await?;
-    let Some((peer_id, share_id, expected_cursor, raw)) = pending else {
+    let Some((peer_id, share_id, raw)) = pending else {
         return Ok(false);
     };
     let (status, recovery_resolved): (String, i64) = sqlx::query_as(
@@ -794,24 +782,11 @@ async fn finish_pending_event(state: &AppState, operation_id: &str) -> AppResult
         .execute(&mut *tx)
         .await?;
     }
-    let updated = sqlx::query(
-        "UPDATE peers SET cursor = ?, events_applied = events_applied + 1 WHERE id = ? AND cursor = ?",
-    )
-    .bind(event.seq)
-    .bind(&peer_id)
-    .bind(expected_cursor)
-    .execute(&mut *tx)
-    .await?;
-    if updated.rows_affected() != 1 {
-        return Err(AppError::conflict(
-            "peer_cursor_changed",
-            "peer cursor changed while a managed event was running",
-        ));
-    }
     sqlx::query("DELETE FROM pending_peer_events WHERE operation_id = ?")
         .bind(operation_id)
         .execute(&mut *tx)
         .await?;
+    inbox::finish_operation_in(&mut tx, operation_id).await?;
     if status == "recovery_required" {
         sqlx::query(
             "UPDATE operation_items SET status = 'done', error_code = NULL, error_message = NULL
@@ -834,7 +809,11 @@ async fn finish_pending_event(state: &AppState, operation_id: &str) -> AppResult
     Ok(true)
 }
 
-async fn record_local(state: &AppState, changes: &[LocalChange]) -> AppResult<()> {
+async fn record_local(
+    state: &AppState,
+    operation_id: Option<&str>,
+    changes: &[LocalChange],
+) -> AppResult<()> {
     let shares = shares(state).await?;
     let written: Vec<&Location> = changes
         .iter()
@@ -845,6 +824,17 @@ async fn record_local(state: &AppState, changes: &[LocalChange]) -> AppResult<()
         .collect();
     rescan_shares_soon(state, &shares, &written);
     let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
+    if let Some(operation_id) = operation_id {
+        let inserted = sqlx::query(
+            "INSERT OR IGNORE INTO completed_peer_bookkeeping(operation_id) VALUES (?)",
+        )
+        .bind(operation_id)
+        .execute(&mut *tx)
+        .await?;
+        if inserted.rows_affected() == 0 {
+            return Ok(());
+        }
+    }
     for change in changes {
         match change {
             LocalChange::FileWritten { .. } => {}
@@ -1175,10 +1165,27 @@ pub async fn queue_transfer(
     size: u64,
     vv: &VersionVector,
 ) -> AppResult<()> {
+    let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
+    queue_transfer_in(&mut tx, peer_id, share, rel, sha256, size, vv).await?;
+    tx.commit().await?;
+    state.sync_wake.notify_one();
+    state.emit(ServerEvent::SyncChanged);
+    Ok(())
+}
+
+pub(super) async fn queue_transfer_in(
+    conn: &mut sqlx::SqliteConnection,
+    peer_id: &str,
+    share: &Share,
+    rel: &str,
+    sha256: &str,
+    size: u64,
+    vv: &VersionVector,
+) -> AppResult<()> {
     share.root_rel(rel)?;
     let size = checked_transfer_size(sha256, size)?;
     let sha256 = sha256.to_ascii_lowercase();
-    let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
+    let tx = conn;
     let queued: Vec<(String, i64, String)> = sqlx::query_as(
         "SELECT sha256, size, vv_json FROM transfers
          WHERE share_id = ? AND rel_path = ? AND status IN ('queued', 'running', 'failed')",
@@ -1211,10 +1218,15 @@ pub async fn queue_transfer(
         }
     }
     if stale {
-        tx.commit().await?;
         return Ok(());
     }
-    let run_id = activity::ensure_run(&mut tx, peer_id).await?;
+    let run_id = activity::ensure_run(tx, peer_id).await?;
+    let transfer_id = crate::crypto::new_id("tr");
+    sqlx::query(
+        "INSERT OR IGNORE INTO sync_recovery_links (recovery_id,kind,target_id)
+         SELECT r.id,'transfer',? FROM sync_recovery r JOIN transfers t ON r.kind='transfer' AND r.target_id=t.id
+         WHERE t.share_id=? AND t.rel_path=? AND t.status IN ('queued','failed')",
+    ).bind(&transfer_id).bind(&share.id).bind(rel).execute(&mut *tx).await?;
     sqlx::query("DELETE FROM transfers WHERE share_id = ? AND rel_path = ? AND status IN ('queued', 'failed')")
         .bind(&share.id)
         .bind(rel)
@@ -1225,7 +1237,7 @@ pub async fn queue_transfer(
         "INSERT INTO transfers (id, peer_id, share_id, rel_path, sha256, size, vv_json, status, queued_at, updated_at, run_id)
          VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)",
     )
-    .bind(crate::crypto::new_id("tr"))
+    .bind(&transfer_id)
     .bind(peer_id)
     .bind(&share.id)
     .bind(rel)
@@ -1237,9 +1249,6 @@ pub async fn queue_transfer(
     .bind(run_id)
     .execute(&mut *tx)
     .await?;
-    tx.commit().await?;
-    state.sync_wake.notify_one();
-    state.emit(ServerEvent::SyncChanged);
     Ok(())
 }
 
@@ -1267,7 +1276,6 @@ async fn queue_folder_event(
     share: &Share,
     event: &PeerEvent,
     cursor: i64,
-    applied: usize,
 ) -> AppResult<()> {
     let principal = Principal::Peer {
         peer_id: peer.id.clone(),
@@ -1309,21 +1317,14 @@ async fn queue_folder_event(
     .bind(serde_json::to_string(event)?)
     .execute(&mut *tx)
     .await?;
-    let updated = sqlx::query(
-        "UPDATE peers SET cursor = ?, events_applied = events_applied + ? WHERE id = ? AND cursor = ?",
+    sqlx::query(
+        "UPDATE peer_inbox SET status = 'applying', operation_id = ?, error = NULL WHERE peer_id = ? AND seq = ?",
     )
-    .bind(cursor)
-    .bind(applied as i64)
+    .bind(&accepted.operation_id)
     .bind(&peer.id)
-    .bind(peer.cursor)
+    .bind(event.seq)
     .execute(&mut *tx)
     .await?;
-    if updated.rows_affected() != 1 {
-        return Err(AppError::conflict(
-            "peer_cursor_changed",
-            "peer cursor changed while queueing an event",
-        ));
-    }
     tx.commit().await?;
     crate::ops::announce_queued(state, &accepted);
     state.emit(ServerEvent::SyncChanged);
@@ -1339,6 +1340,21 @@ async fn apply_event(
     batch: &mut Batch,
 ) -> AppResult<Applied> {
     let d = &e.data;
+    let decided_move = admin::move_decision_footprints(state, share)
+        .await?
+        .iter()
+        .any(|path| {
+            inbox::overlaps(path, &d.path)
+                || d.from
+                    .as_ref()
+                    .is_some_and(|from| inbox::overlaps(path, from))
+        });
+    if decided_move {
+        return Err(AppError::conflict(
+            "move_decision_pending",
+            "move waits for verified conflict publication",
+        ));
+    }
     let rel = d.path.as_str();
     if RelPath::parse(rel).is_err()
         || d.from
@@ -1630,275 +1646,7 @@ async fn move_conflict(
 
 /// Pulls and applies new events from one peer. Returns the number applied.
 pub async fn pull(state: &AppState, peer: &net::Peer) -> Result<usize, String> {
-    let Some(instance) = peer.instance_id.clone() else {
-        return Ok(0);
-    };
-    let pending_event: Option<(String, String)> = sqlx::query_as(
-        "SELECT p.operation_id, o.status
-         FROM pending_peer_events p JOIN operations o ON o.id = p.operation_id WHERE p.peer_id = ?",
-    )
-    .bind(&peer.id)
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| e.to_string())?;
-    if let Some((id, status)) = pending_event {
-        if matches!(
-            status.as_str(),
-            "failed" | "cancelled" | "partial" | "recovery_required" | "completed"
-        ) {
-            return Err(format!(
-                "peer folder operation {id} needs attention ({status})"
-            ));
-        } else {
-            return Ok(0);
-        }
-    }
-    let pending: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM pending_peer_ops WHERE peer_id = ?")
-            .bind(&peer.id)
-            .fetch_one(&state.db)
-            .await
-            .map_err(|e| e.to_string())?;
-    if pending > 0 {
-        return Ok(0);
-    }
-    let page: EventPage = net::get_json(
-        state,
-        peer,
-        &format!("/api/peer/v1/events?after={}", peer.cursor),
-    )
-    .await?;
-    page.validate(peer.cursor)?;
-    let _operation_guard = state.replication_operation_lock.lock().await;
-    require_stable_operations(state)
-        .await
-        .map_err(|e| e.message().to_owned())?;
-    let shares = shares(state).await.map_err(|e| e.message().to_owned())?;
-    let mut batch = Batch {
-        actions: Vec::new(),
-        pending: Vec::new(),
-        paths: HashSet::new(),
-    };
-    let mut cursor = peer.cursor;
-    let mut applied = 0;
-    let mut stopped = false;
-    let mut first_key: Option<String> = None;
-    let mut deferred: Vec<&PeerEvent> = Vec::new();
-    for e in &page.events {
-        let known: Option<(String, String, String)> = sqlx::query_as(
-            "SELECT share_name, kind, data_json FROM event_log WHERE origin = ? AND origin_seq = ?",
-        )
-        .bind(&e.origin)
-        .bind(e.origin_seq)
-        .fetch_optional(&state.db)
-        .await
-        .map_err(|e| e.to_string())?;
-        if let Some((share, kind, data)) = known {
-            let data: EventData = serde_json::from_str(&data).map_err(|e| e.to_string())?;
-            if share != e.share || kind != e.kind || data != e.data {
-                return Err("peer event identity was reused for different content".into());
-            }
-            cursor = e.seq;
-            continue;
-        }
-        if e.origin == state.instance_id {
-            return Err("peer event claims an unknown local event identity".into());
-        }
-        let Some(share) = shares
-            .iter()
-            .find(|s| s.name == e.share && s.includes(&peer.id))
-        else {
-            cursor = e.seq;
-            continue;
-        };
-        let root = match files::root(&state.db, &share.root_id).await {
-            Ok(r) if r.available() => r,
-            // Retry from this event once the root is back.
-            _ => {
-                stopped = true;
-                break;
-            }
-        };
-        if e.kind == SHARE_ENABLED {
-            let mut tx = state
-                .db
-                .begin_with("BEGIN IMMEDIATE")
-                .await
-                .map_err(|e| e.to_string())?;
-            mark_backfill_in(&mut tx, &share.id, &peer.id)
-                .await
-                .map_err(|e| e.message().to_owned())?;
-            tx.commit().await.map_err(|e| e.to_string())?;
-            log_remote(state, e)
-                .await
-                .map_err(|e| e.message().to_owned())?;
-            cursor = e.seq;
-            applied += 1;
-            continue;
-        }
-        if e.kind == "folder_created" {
-            let path =
-                RelPath::parse(&e.data.path).map_err(|_| "invalid peer folder path".to_owned())?;
-            if path.is_root()
-                || path.segments().any(reserved)
-                || e.data.from.is_some()
-                || e.seq <= cursor
-            {
-                return Err("invalid peer folder event".into());
-            }
-            if e.data.excluded(&share.junk) {
-                cursor = e.seq;
-                continue;
-            }
-            let abs = root
-                .abs(
-                    &share
-                        .root_rel(&e.data.path)
-                        .map_err(|e| e.message().to_owned())?,
-                )
-                .map_err(|e| e.message().to_owned())?;
-            match abs.symlink_metadata() {
-                Ok(meta) if meta.is_dir() => {
-                    log_remote(state, e)
-                        .await
-                        .map_err(|e| e.message().to_owned())?;
-                    cursor = e.seq;
-                    applied += 1;
-                    continue;
-                }
-                Ok(_) => return Err("peer folder destination is not a directory".into()),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.to_string()),
-            }
-            queue_folder_event(state, peer, share, e, cursor, applied)
-                .await
-                .map_err(|e| e.message().to_owned())?;
-            return Ok(applied);
-        }
-        match e.kind.as_str() {
-            "file_changed" => {
-                file_event_metadata(&e.data).map_err(|error| error.message().to_owned())?;
-            }
-            "file_deleted" | "file_moved" | "folder_moved" | "folder_trashed" => {
-                management_event_valid(&e.kind, &e.data)?;
-            }
-            other => return Err(format!("unsupported peer event kind '{other}'")),
-        }
-        // Validate legacy metadata events, then acknowledge without applying or forwarding
-        // them, including moves whose source is now excluded.
-        if e.data.excluded(&share.junk) {
-            tracing::debug!(path = %e.data.path, "skipping excluded peer metadata event");
-            cursor = e.seq;
-            continue;
-        }
-        if has_open_conflict(state, &share.id, &e.data.path)
-            .await
-            .map_err(|e| e.message().to_owned())?
-        {
-            // Newer remote state for a conflicting path refreshes the conflict instead.
-            let deleted = e.kind == "file_deleted";
-            if e.kind.starts_with("file_") {
-                conflict(
-                    state,
-                    ConflictInput {
-                        share,
-                        rel: &e.data.path,
-                        kind: "changed_on_both",
-                        detail: format!("{} changed {} again", peer.name, e.data.path),
-                        remote: remote_side(&peer.name, &e.data, deleted),
-                        remote_vv: &e.data.vv,
-                        peer_id: &peer.id,
-                        from: None,
-                    },
-                )
-                .await
-                .map_err(|e| e.message().to_owned())?;
-            }
-            log_remote(state, e)
-                .await
-                .map_err(|e| e.message().to_owned())?;
-            cursor = e.seq;
-            continue;
-        }
-        let before = batch.actions.len();
-        match apply_event(state, peer, share, &root, e, &mut batch).await {
-            Ok(Applied::Done) => {
-                if batch.actions.len() > before {
-                    if first_key.is_none() {
-                        first_key = Some(format!("{}:{}", e.origin, e.origin_seq));
-                    }
-                    // Logged together with the operation that applies it, so a crash cannot
-                    // record the event as known while losing its effect.
-                    deferred.push(e);
-                } else {
-                    log_remote(state, e)
-                        .await
-                        .map_err(|e| e.message().to_owned())?;
-                }
-                cursor = e.seq;
-                applied += 1;
-            }
-            Ok(Applied::Stop) => {
-                stopped = true;
-                break;
-            }
-            Err(err) => {
-                tracing::warn!(peer = %peer.name, "applying {} {}: {}", e.kind, e.data.path, err.message());
-                return Err(err.message().to_owned());
-            }
-        }
-    }
-    if !stopped {
-        cursor = cursor.max(page.next);
-    }
-    let mut tx = state
-        .db
-        .begin_with("BEGIN IMMEDIATE")
-        .await
-        .map_err(|e| e.to_string())?;
-    let accepted = insert_batch_in(
-        &mut tx,
-        peer,
-        format!("peer:{}:{}", instance, first_key.unwrap_or_default()),
-        batch,
-    )
-    .await
-    .map_err(|e| e.message().to_owned())?;
-    for e in deferred {
-        sqlx::query(
-            "INSERT OR IGNORE INTO event_log (origin, origin_seq, share_name, kind, data_json, at) VALUES (?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&e.origin)
-        .bind(e.origin_seq)
-        .bind(&e.share)
-        .bind(&e.kind)
-        .bind(serde_json::to_string(&e.data).map_err(|e| e.to_string())?)
-        .bind(db::now())
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| e.to_string())?;
-    }
-    let moved = sqlx::query(
-        "UPDATE peers SET cursor = ?, events_applied = events_applied + ? WHERE id = ? AND cursor = ?",
-    )
-    .bind(cursor)
-    .bind(applied as i64)
-    .bind(&peer.id)
-    .bind(peer.cursor)
-    .execute(&mut *tx)
-    .await
-    .map_err(|e| e.to_string())?;
-    if moved.rows_affected() != 1 {
-        return Err("peer cursor changed while applying events; retrying".into());
-    }
-    tx.commit().await.map_err(|e| e.to_string())?;
-    if let Some(accepted) = &accepted {
-        crate::ops::announce_queued(state, accepted);
-    }
-    if applied > 0 {
-        state.emit(ServerEvent::SyncChanged);
-    }
-    Ok(applied)
+    inbox::pull(state, peer).await
 }
 
 /// Turns the managed actions collected from a peer into one operation, recording what each
@@ -2104,156 +1852,7 @@ impl InventoryPage {
 /// handled like the event that produced it, so newer versions are fetched, remote deletions
 /// go to the ISM trash, and concurrent changes become conflicts. Returns the rows applied.
 pub async fn backfill(state: &AppState, peer: &net::Peer) -> Result<usize, String> {
-    let busy: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM pending_peer_ops WHERE peer_id = ?1)
-             OR EXISTS(SELECT 1 FROM pending_peer_events WHERE peer_id = ?1)",
-    )
-    .bind(&peer.id)
-    .fetch_one(&state.db)
-    .await
-    .map_err(|e| e.to_string())?;
-    if busy {
-        return Ok(0);
-    }
-    let pending: Option<(String, String)> = sqlx::query_as(
-        "SELECT share_id, after_path FROM share_backfills WHERE peer_id = ? ORDER BY requested_at, share_id LIMIT 1",
-    )
-    .bind(&peer.id)
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| e.to_string())?;
-    let Some((share_id, after)) = pending else {
-        return Ok(0);
-    };
-    let all = shares(state).await.map_err(|e| e.message().to_owned())?;
-    let Some(share) = all
-        .into_iter()
-        .find(|s| s.id == share_id && s.includes(&peer.id))
-    else {
-        // Disabled again: a later enable requests a fresh backfill.
-        sqlx::query("DELETE FROM share_backfills WHERE share_id = ? AND peer_id = ?")
-            .bind(&share_id)
-            .bind(&peer.id)
-            .execute(&state.db)
-            .await
-            .map_err(|e| e.to_string())?;
-        return Ok(0);
-    };
-    let page: InventoryPage = net::get_json(
-        state,
-        peer,
-        &format!(
-            "/api/peer/v1/inventory?share={}&after={}",
-            transfer::encode(&share.name),
-            transfer::encode(&after)
-        ),
-    )
-    .await?;
-    page.validate(&after)?;
-    let _operation_guard = state.replication_operation_lock.lock().await;
-    require_stable_operations(state)
-        .await
-        .map_err(|e| e.message().to_owned())?;
-    let root = match files::root(&state.db, &share.root_id).await {
-        Ok(r) if r.available() => r,
-        _ => return Ok(0),
-    };
-    let mut batch = Batch {
-        actions: Vec::new(),
-        pending: Vec::new(),
-        paths: HashSet::new(),
-    };
-    let origin = peer.instance_id.clone().unwrap_or_default();
-    let mut last = after.clone();
-    let mut applied = 0;
-    let mut stopped = false;
-    for entry in &page.entries {
-        let hidden_path = RelPath::parse(&entry.path)
-            .map(|p| p.segments().any(|name| hidden(name, &share.junk)))
-            .unwrap_or(true);
-        if !hidden_path
-            && !has_open_conflict(state, &share.id, &entry.path)
-                .await
-                .map_err(|e| e.message().to_owned())?
-        {
-            let event = PeerEvent {
-                seq: 0,
-                origin: origin.clone(),
-                origin_seq: 0,
-                share: share.name.clone(),
-                kind: if entry.deleted {
-                    "file_deleted"
-                } else {
-                    "file_changed"
-                }
-                .into(),
-                data: EventData {
-                    path: entry.path.clone(),
-                    from: None,
-                    sha256: entry.sha256.clone(),
-                    size: Some(entry.size),
-                    mtime_ns: Some(entry.mtime_ns),
-                    vv: entry.vv.clone(),
-                },
-            };
-            match apply_event(state, peer, &share, &root, &event, &mut batch).await {
-                Ok(Applied::Done) => applied += 1,
-                Ok(Applied::Stop) => {
-                    stopped = true;
-                    break;
-                }
-                Err(err) => {
-                    tracing::warn!(peer = %peer.name, "backfilling {}: {}", entry.path, err.message());
-                    return Err(err.message().to_owned());
-                }
-            }
-        }
-        last = entry.path.clone();
-    }
-    let done = !stopped && page.next.is_none();
-    let mut tx = state
-        .db
-        .begin_with("BEGIN IMMEDIATE")
-        .await
-        .map_err(|e| e.to_string())?;
-    let accepted = insert_batch_in(
-        &mut tx,
-        peer,
-        format!("peer-backfill:{}:{}:{}", share.id, origin, last),
-        batch,
-    )
-    .await
-    .map_err(|e| e.message().to_owned())?;
-    let progressed = if done {
-        sqlx::query("DELETE FROM share_backfills WHERE share_id = ? AND peer_id = ? AND after_path = ?")
-            .bind(&share.id)
-            .bind(&peer.id)
-            .bind(&after)
-            .execute(&mut *tx)
-            .await
-    } else {
-        sqlx::query(
-            "UPDATE share_backfills SET after_path = ? WHERE share_id = ? AND peer_id = ? AND after_path = ?",
-        )
-        .bind(&last)
-        .bind(&share.id)
-        .bind(&peer.id)
-        .bind(&after)
-        .execute(&mut *tx)
-        .await
-    }
-    .map_err(|e| e.to_string())?;
-    if progressed.rows_affected() != 1 {
-        return Err("share backfill restarted while applying a page; retrying".into());
-    }
-    tx.commit().await.map_err(|e| e.to_string())?;
-    if let Some(accepted) = &accepted {
-        crate::ops::announce_queued(state, accepted);
-    }
-    if applied > 0 || done {
-        state.emit(ServerEvent::SyncChanged);
-    }
-    Ok(applied)
+    inbox::backfill(state, peer).await
 }
 
 /// Finishes the replica bookkeeping of an operation that applied peer events or resolved a
@@ -2283,7 +1882,6 @@ async fn finish_pending(state: &AppState, operation_id: &str) -> AppResult<bool>
         let Some(share) = shares.iter().find(|s| s.id == share_id) else {
             continue;
         };
-        let vv: VersionVector = serde_json::from_str(&vv_json)?;
         let (status, code, message): (String, Option<String>, Option<String>) = sqlx::query_as(
             "SELECT status, error_code, error_message FROM operation_items WHERE operation_id = ? AND idx = ?",
         )
@@ -2292,6 +1890,20 @@ async fn finish_pending(state: &AppState, operation_id: &str) -> AppResult<bool>
         .fetch_one(&state.db)
         .await?;
         let ok = status == "done";
+        if kind == "move_decision_step" {
+            admin::finish_step(
+                state,
+                operation_id,
+                conflict_id
+                    .as_deref()
+                    .ok_or_else(|| AppError::internal("move choice has no conflict"))?,
+                &vv_json,
+                ok,
+            )
+            .await?;
+            continue;
+        }
+        let vv: VersionVector = serde_json::from_str(&vv_json)?;
         let to = to.unwrap_or_default();
         let delete_pending = ok;
         match (kind.as_str(), ok) {
@@ -2371,22 +1983,68 @@ async fn finish_pending(state: &AppState, operation_id: &str) -> AppResult<bool>
                     .map(|r| r.vv)
                     .unwrap_or_default();
                 merged.merge(&vv);
-                put_row(
-                    state,
+                let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
+                put_row_in(
+                    &mut tx,
                     &share.id,
                     &to,
                     &Row {
                         size: meta.len() as i64,
                         mtime_ns: files::mtime_ns(&meta),
-                        sha256: Some(sha256),
+                        sha256: Some(sha256.clone()),
                         deleted: false,
-                        vv: merged,
+                        vv: merged.clone(),
                     },
                 )
                 .await?;
+                let move_choice: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM pending_peer_ops WHERE kind='move_decision_wait'
+                     AND share_id=? AND peer_id=? AND
+                     EXISTS(SELECT 1 FROM json_each(vv_json,'$.files') WHERE json_extract(value,'$.path')=?))",
+                ).bind(&share.id).bind(&_peer_id).bind(&to).fetch_one(&mut *tx).await?;
+                if move_choice {
+                    sqlx::query(
+                        "INSERT OR IGNORE INTO completed_peer_bookkeeping(operation_id) VALUES (?)",
+                    )
+                    .bind(operation_id)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+                if let Some(cid) = &conflict_id
+                    && !move_choice
+                {
+                    admin::resolved_in(&mut tx, cid, "keep_remote").await?;
+                    append_local_in(
+                        &mut tx,
+                        &state.instance_id,
+                        &share.name,
+                        "file_changed",
+                        &EventData {
+                            path: to.clone(),
+                            sha256: Some(sha256),
+                            size: Some(meta.len()),
+                            vv: merged,
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
+                    state.emit(ServerEvent::ConflictsChanged);
+                }
+                sqlx::query("DELETE FROM pending_peer_ops WHERE operation_id=? AND idx=?")
+                    .bind(operation_id)
+                    .bind(idx)
+                    .execute(&mut *tx)
+                    .await?;
+                tx.commit().await?;
             }
             (_, true) => {}
             (_, false) if conflict_id.is_some() => {
+                let move_choice: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM pending_peer_ops WHERE kind='move_decision_wait' AND conflict_id=?)",
+                ).bind(conflict_id.as_deref()).fetch_one(&state.db).await?;
+                if move_choice {
+                    continue;
+                }
                 // The resolution did not apply: the conflict needs another decision.
                 sqlx::query(
                     "UPDATE conflicts SET status = 'open', resolution = NULL,
@@ -2450,14 +2108,20 @@ async fn poll_peer(state: &AppState, peer: &net::Peer) {
         Ok(h) if peer.instance_id.as_deref() == Some(h.instance_id.as_str()) => {
             net::mark(state, &peer.id, Ok(())).await;
             sync_settings(state, peer).await;
-            let mut outcome = pull(state, peer).await;
-            if outcome.is_ok() {
-                outcome = backfill(state, peer).await;
-            }
+            let pulled = pull(state, peer).await;
+            let filled = backfill(state, peer).await;
+            let outcome = pulled.and(filled);
+            let retained_error = inbox::processing_error(state, &peer.id)
+                .await
+                .unwrap_or_else(|error| Some(error.message().to_owned()));
             net::mark_processing_result(
                 state,
                 &peer.id,
-                outcome.as_ref().err().map(String::as_str),
+                outcome
+                    .as_ref()
+                    .err()
+                    .map(String::as_str)
+                    .or(retained_error.as_deref()),
             )
             .await;
         }
@@ -2472,6 +2136,11 @@ async fn poll_peer(state: &AppState, peer: &net::Peer) {
         Err(e) => {
             net::mark(state, &peer.id, Err(e)).await;
         }
+    }
+    // Peer futures share the polling task. Awaiting this lock in the outer scheduler can
+    // prevent it from polling a peer future that already owns the lock.
+    if let Err(error) = admin::process_move_decisions(state).await {
+        tracing::warn!("move decision verification deferred: {}", error.message());
     }
 }
 
@@ -2610,17 +2279,9 @@ pub async fn scan_worker(state: AppState) {
 }
 
 async fn full_scan_allowed(state: &AppState) -> AppResult<bool> {
-    let pending: bool = sqlx::query_scalar(
-        "SELECT EXISTS(
-             SELECT 1 FROM transfers WHERE status IN ('queued','running')
-         ) OR EXISTS(
-             SELECT 1 FROM transfer_history h JOIN operations o ON o.id = h.operation_id
-             WHERE o.status IN ('queued','waiting_maintenance','running')
-         )",
-    )
-    .fetch_one(&state.db)
-    .await?;
-    Ok(!pending)
+    // Each share scan excludes uncertain footprints, including queued transfers.
+    inbox::require_no_active_operations(state).await?;
+    Ok(true)
 }
 
 /// Paths relative to a share, for the admin UI.

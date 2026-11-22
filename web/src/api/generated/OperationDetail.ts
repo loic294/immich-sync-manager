@@ -2,5 +2,6 @@
 import type { Operation } from "./Operation";
 import type { OperationActivity } from "./OperationActivity";
 import type { OperationTaskProgress } from "./OperationTaskProgress";
+import type { RecoveryView } from "./RecoveryView";
 
-export type OperationDetail = { operation: Operation, activity: OperationActivity, tasks: Array<OperationTaskProgress>, };
+export type OperationDetail = { operation: Operation, activity: OperationActivity, tasks: Array<OperationTaskProgress>, recovery?: RecoveryView, };

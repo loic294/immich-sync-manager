@@ -4,6 +4,10 @@ import type { ConflictView } from '@/api/generated/ConflictView';
 import { mount } from '@/test/helpers';
 import '@/pages/ism-conflicts-page';
 
+vi.mock('@/components/confirm', () => ({
+  confirmAction: vi.fn(async () => true),
+}));
+
 const side = {
   instance: 'Example',
   sha256: null,
@@ -17,18 +21,25 @@ const conflict: ConflictView = {
   location: { root_id: 'photos', path: 'a.jpg' },
   kind: 'changed_on_both',
   detail: '',
-  local: side,
-  remote: side,
+  local: { ...side, instance: 'Alpha' },
+  remote: { ...side, instance: 'Beta' },
   peer_id: 'peer-1',
   status: 'open',
   created_at: '2024-01-01T00:00:00Z',
   moved_from: null,
 };
 
+const versions = {
+  share: 'Photos',
+  revision: 'a'.repeat(64),
+  receiving: [{ instance: 'Alpha', path: 'old', state: 'folder', files: [], directories: ['old'] }],
+  source: { instance: 'Beta', path: 'new', state: 'folder', files: [], directories: ['new'] },
+};
+
 describe('ism-conflicts-page', () => {
   afterEach(() => vi.restoreAllMocks());
 
-  it('offers every resolution and shows where a moved file came from', async () => {
+  it('offers named recoveries including keeping both folders, without dismissal', async () => {
     vi.spyOn(api, 'get').mockResolvedValue([
       conflict,
       {
@@ -48,12 +59,46 @@ describe('ism-conflicts-page', () => {
         button.disabled,
       ]);
     expect(labels(fileCard)).toEqual([
-      ['Keep this instance', false],
-      ['Keep the peer', false],
-      ['Keep both', false],
-      ['Skip', false],
+      ['Compare versions', false],
+      ['Keep Alpha', true],
+      ['Keep Beta', true],
+      ['Keep both', true],
     ]);
-    expect(labels(folderCard).map(([label]) => label)).not.toContain('Keep both');
+    expect(labels(folderCard)).toEqual(labels(fileCard));
     expect(folderCard.textContent).toContain('Moved by the peer from');
+  });
+
+  it('queues a folder version decision through shared recovery and collapses diagnostics', async () => {
+    vi.spyOn(api, 'get').mockImplementation(async (path) =>
+      path.endsWith('/versions')
+        ? (versions as never)
+        : ([{ ...conflict, kind: 'folder_move', detail: 'Destination content differs.' }] as never),
+    );
+    const post = vi.spyOn(api, 'post').mockResolvedValue({ items: [] } as never);
+    const page = await mount('ism-conflicts-page');
+    await page.reload();
+    await page.updateComplete;
+    expect(page.querySelector('details')?.hasAttribute('open')).toBe(false);
+    [...page.querySelectorAll<HTMLButtonElement>('button')]
+      .find((button) => button.textContent?.trim() === 'Compare versions')
+      ?.click();
+    await vi.waitFor(() => expect(page.querySelector('ism-recovery-versions')).not.toBeNull());
+    await vi.waitFor(() => expect(page.busy).toBeUndefined());
+    [...page.querySelectorAll<HTMLButtonElement>('button')]
+      .find((button) => button.textContent?.trim() === 'Keep Beta')
+      ?.click();
+    await vi.waitFor(() =>
+      expect(post).toHaveBeenCalledWith('/api/admin/recovery/decisions', {
+        body: {
+          decisions: [
+            {
+              target: { kind: 'conflict', id: conflict.id, peer_id: null },
+              revision: versions.revision,
+            },
+          ],
+          resolution: 'keep_remote',
+        },
+      }),
+    );
   });
 });

@@ -266,6 +266,17 @@ pub async fn report_recovery(state: &AppState, server_id: &str, reason: &str) ->
 
 /// Admin action: all recoveries were handled.
 pub async fn resolve_recovery(state: &AppState, server_id: &str) -> AppResult<()> {
+    let sync_recovery:bool=sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM operations o,json_each(o.admitted_server_ids_json) s
+         WHERE s.value=? AND o.recovery_resolved=0 AND o.status IN ('recovery_required','partial')
+         AND (o.principal LIKE 'peer:%' OR EXISTS(SELECT 1 FROM operation_items i WHERE i.operation_id=o.id AND i.error_code='peer_bookkeeping_failed')))",
+    ).bind(server_id).fetch_one(&state.db).await?;
+    if sync_recovery {
+        return Err(AppError::conflict(
+            "recovery_not_verified",
+            "sync recovery must be verified before releasing this maintenance barrier",
+        ));
+    }
     update(state, server_id, MaintenanceState::resolve_one).await?;
     state.maintenance_wake.notify_waiters();
     Ok(())
@@ -275,6 +286,19 @@ pub async fn resolve_recovery(state: &AppState, server_id: &str) -> AppResult<()
 pub async fn resolve_operation_recovery(state: &AppState, id: &str) -> AppResult<()> {
     let _guard = state.maintenance_lock.lock().await;
     let mut tx = state.db.begin().await?;
+    let servers = resolve_operation_recovery_in(&mut tx, id).await?;
+    tx.commit().await?;
+    for server_id in servers {
+        state.emit(ServerEvent::MaintenanceChanged { server_id });
+    }
+    state.maintenance_wake.notify_waiters();
+    Ok(())
+}
+
+pub(crate) async fn resolve_operation_recovery_in(
+    tx: &mut sqlx::SqliteConnection,
+    id: &str,
+) -> AppResult<std::collections::BTreeSet<String>> {
     let row: Option<(String, String, i64)> = sqlx::query_as(
         "SELECT status, admitted_server_ids_json, recovery_resolved FROM operations WHERE id = ?",
     )
@@ -294,7 +318,7 @@ pub async fn resolve_operation_recovery(state: &AppState, id: &str) -> AppResult
         ));
     }
     if resolved != 0 {
-        return Ok(());
+        return Ok(Default::default());
     }
     let servers: std::collections::BTreeSet<_> = servers.into_iter().collect();
     for server_id in &servers {
@@ -316,12 +340,7 @@ pub async fn resolve_operation_recovery(state: &AppState, id: &str) -> AppResult
         .bind(id)
         .execute(&mut *tx)
         .await?;
-    tx.commit().await?;
-    for server_id in servers {
-        state.emit(ServerEvent::MaintenanceChanged { server_id });
-    }
-    state.maintenance_wake.notify_waiters();
-    Ok(())
+    Ok(servers)
 }
 
 /// Admin action after a blocked barrier: resume a queue ISM still holds, then allow work.

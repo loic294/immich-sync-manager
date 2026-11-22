@@ -24,10 +24,163 @@ pub fn router() -> Router<AppState> {
         .route("/events", get(events))
         .route("/inventory", get(inventory))
         .route("/content", get(content))
+        .route("/recovery/retained", get(retained_discovery))
+        .route("/recovery/retained/check", get(retained_check))
+        .route("/recovery/retained/content", get(retained_content))
         .route("/file-info", get(file_info))
         .route("/thumbnail", get(thumbnail))
         .route("/settings", get(settings))
         .route("/sync-activity", get(sync_activity))
+        .route("/recovery", get(recovery_page).post(recovery))
+        .route("/recovery/file", get(recovery_file))
+        .route("/recovery/versions", get(recovery_versions))
+        .route("/recovery/preview", get(recovery_preview))
+        .route("/recovery/decisions", post(recovery_decisions))
+}
+
+async fn recovery_versions(
+    State(state): State<AppState>,
+    PeerAuth(peer): PeerAuth,
+    Query(query): Query<peers::versions::Query>,
+) -> AppResult<Json<ism_core::dto::RecoveryVersions>> {
+    let target = query.target();
+    peers::recovery::authorize_peer(
+        &state,
+        &peer,
+        &ism_core::dto::RecoveryBatchInput {
+            targets: vec![target.clone()],
+            all: false,
+            resolution: None,
+        },
+    )
+    .await?;
+    Ok(Json(peers::versions::get(&state, &target).await?))
+}
+
+async fn recovery_preview(
+    State(state): State<AppState>,
+    PeerAuth(peer): PeerAuth,
+    Query(query): Query<peers::versions::PreviewQuery>,
+) -> AppResult<Response> {
+    peers::recovery::authorize_peer(
+        &state,
+        &peer,
+        &ism_core::dto::RecoveryBatchInput {
+            targets: vec![query.target.target()],
+            all: false,
+            resolution: None,
+        },
+    )
+    .await?;
+    peers::versions::preview(&state, &query).await
+}
+
+async fn recovery_decisions(
+    State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> AppResult<Json<ism_core::dto::RecoveryBatchResult>> {
+    let sender = headers
+        .get(PEER_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| AppError::unauthorized("missing peer id"))?;
+    let peer = net::peers(&state)
+        .await?
+        .into_iter()
+        .find(|peer| peer.instance_id.as_deref() == Some(sender))
+        .ok_or_else(|| AppError::unauthorized("unknown peer"))?;
+    verify_peer_signature(
+        &peer.secret,
+        "POST",
+        uri.path_and_query().map_or(uri.path(), |pq| pq.as_str()),
+        &headers,
+        &body,
+    )?;
+    let input: ism_core::dto::RecoveryDecisionInput = serde_json::from_slice(&body)?;
+    peers::recovery::authorize_peer(
+        &state,
+        &peer,
+        &ism_core::dto::RecoveryBatchInput {
+            targets: input
+                .decisions
+                .iter()
+                .map(|decision| decision.target.clone())
+                .collect(),
+            all: false,
+            resolution: Some(input.resolution),
+        },
+    )
+    .await?;
+    Ok(Json(
+        peers::recovery::submit_decisions(&state, input).await?,
+    ))
+}
+
+async fn recovery_page(
+    State(state): State<AppState>,
+    PeerAuth(peer): PeerAuth,
+) -> AppResult<Json<ism_core::dto::RecoveryPage>> {
+    Ok(Json(peers::recovery::peer_page(&state, &peer).await?))
+}
+
+#[derive(Deserialize)]
+struct RecoveryFileQuery {
+    share: String,
+    path: String,
+    vv: String,
+    origin: Option<String>,
+    origin_seq: Option<i64>,
+}
+
+async fn recovery_file(
+    State(state): State<AppState>,
+    PeerAuth(peer): PeerAuth,
+    Query(q): Query<RecoveryFileQuery>,
+) -> AppResult<Json<peers::recovery::FileEvidence>> {
+    let vv = serde_json::from_str(&q.vv)?;
+    let event = match (&q.origin, q.origin_seq) {
+        (Some(origin), Some(seq)) => Some((origin.as_str(), seq)),
+        (None, None) => None,
+        _ => {
+            return Err(AppError::bad_request(
+                "invalid_recovery_evidence",
+                "event identity must include origin and sequence",
+            ));
+        }
+    };
+    let _guard = state.replication_operation_lock.lock().await;
+    Ok(Json(
+        peers::recovery::evidence_at_event(&state, Some(&peer.id), &q.share, &q.path, &vv, event)
+            .await?,
+    ))
+}
+
+async fn recovery(
+    State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> AppResult<Json<ism_core::dto::RecoveryBatchResult>> {
+    let sender = headers
+        .get(PEER_HEADER)
+        .and_then(|h| h.to_str().ok())
+        .ok_or_else(|| AppError::unauthorized("missing peer id"))?;
+    let peer = net::peers(&state)
+        .await?
+        .into_iter()
+        .find(|peer| peer.instance_id.as_deref() == Some(sender))
+        .ok_or_else(|| AppError::unauthorized("unknown peer"))?;
+    verify_peer_signature(
+        &peer.secret,
+        "POST",
+        uri.path_and_query().map_or(uri.path(), |pq| pq.as_str()),
+        &headers,
+        &body,
+    )?;
+    let input: ism_core::dto::RecoveryBatchInput = serde_json::from_slice(&body)?;
+    peers::recovery::authorize_peer(&state, &peer, &input).await?;
+    Ok(Json(peers::recovery::submit(&state, input).await?))
 }
 
 #[derive(Deserialize)]
@@ -68,6 +221,50 @@ async fn thumbnail(
 
 /// A paired peer whose GET request carries a valid signature.
 pub struct PeerAuth(pub net::Peer);
+
+async fn retained_discovery(
+    State(state): State<AppState>,
+    PeerAuth(peer): PeerAuth,
+    Query(wanted): Query<peers::retained::Wanted>,
+) -> AppResult<Json<peers::retained::Discovery>> {
+    let _guard = state.replication_operation_lock.lock().await;
+    Ok(Json(
+        peers::retained::discover(&state, Some(&peer.id), &wanted).await?,
+    ))
+}
+
+#[derive(Deserialize)]
+struct RetainedToken {
+    token: String,
+}
+
+async fn retained_check(
+    State(state): State<AppState>,
+    PeerAuth(peer): PeerAuth,
+    Query(query): Query<RetainedToken>,
+) -> AppResult<Json<peers::retained::Wanted>> {
+    let _guard = state.replication_operation_lock.lock().await;
+    let (_, wanted) = peers::retained::resolve(&state, Some(&peer.id), &query.token).await?;
+    Ok(Json(wanted))
+}
+
+async fn retained_content(
+    State(state): State<AppState>,
+    PeerAuth(peer): PeerAuth,
+    Query(query): Query<RetainedToken>,
+    headers: HeaderMap,
+) -> AppResult<Response> {
+    let _guard = state.replication_operation_lock.lock().await;
+    let (path, wanted) = peers::retained::resolve(&state, Some(&peer.id), &query.token).await?;
+    let meta = tokio::fs::metadata(&path).await?;
+    serve_file(
+        &path,
+        &headers,
+        &wanted.sha256,
+        &[("x-ism-mtime-ns", files::mtime_ns(&meta).to_string())],
+    )
+    .await
+}
 
 impl FromRequestParts<AppState> for PeerAuth {
     type Rejection = AppError;

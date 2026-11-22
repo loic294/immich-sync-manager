@@ -445,6 +445,126 @@ pub struct OperationDetail {
     pub operation: Operation,
     pub activity: OperationActivity,
     pub tasks: Vec<OperationTaskProgress>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub recovery: Option<RecoveryView>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum RecoveryKind {
+    Operation,
+    Transfer,
+    Conflict,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct RecoveryTarget {
+    pub kind: RecoveryKind,
+    pub id: String,
+    #[serde(default)]
+    pub peer_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum RecoveryState {
+    Queued,
+    Fixing,
+    Waiting,
+    NeedsDecision,
+    Fixed,
+    NotRetryable,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct RecoveryView {
+    pub target: RecoveryTarget,
+    pub title: String,
+    pub state: RecoveryState,
+    pub code: Option<String>,
+    pub detail: Option<String>,
+    pub can_fix: bool,
+    pub can_dismiss: bool,
+    pub replacement_operation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub local_instance: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub peer_instance: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct RecoveryBatchInput {
+    #[serde(default)]
+    pub targets: Vec<RecoveryTarget>,
+    #[serde(default)]
+    pub all: bool,
+    #[serde(default)]
+    pub resolution: Option<ConflictResolution>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct RecoveryBatchResult {
+    pub items: Vec<RecoveryView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct RecoveryPage {
+    pub rows: Vec<RecoveryView>,
+    pub total: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct RecoveryFileVersion {
+    pub path: String,
+    pub role: String,
+    pub sha256: String,
+    pub size: Option<u64>,
+    pub modified_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct RecoveryVersion {
+    pub instance: String,
+    pub path: String,
+    pub state: String,
+    pub files: Vec<RecoveryFileVersion>,
+    #[serde(default)]
+    pub directories: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct RecoveryVersions {
+    pub share: String,
+    pub revision: String,
+    pub receiving: Vec<RecoveryVersion>,
+    pub source: RecoveryVersion,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct RecoveryDecision {
+    pub target: RecoveryTarget,
+    pub revision: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct RecoveryDecisionInput {
+    pub decisions: Vec<RecoveryDecision>,
+    pub resolution: ConflictResolution,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -468,6 +588,9 @@ pub struct SyncActivity {
     pub operation_id: Option<String>,
     #[serde(default)]
     pub readd_available: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub recovery: Option<RecoveryView>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]

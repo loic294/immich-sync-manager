@@ -931,7 +931,12 @@ async fn queued_opm_operations_run_before_sync_and_keep_arrival_order() {
                     .fetch_one(&h.state.db)
                     .await
                     .unwrap();
-            if completed == 5 {
+            let finished: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM operation_events WHERE event='finished'")
+                    .fetch_one(&h.state.db)
+                    .await
+                    .unwrap();
+            if completed == 5 && finished == 5 {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;

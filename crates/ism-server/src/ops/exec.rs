@@ -132,6 +132,9 @@ async fn set_status(state: &AppState, id: &str, status: OperationStatus) -> AppR
         .await?;
     }
     tx.commit().await?;
+    if status.is_terminal() {
+        state.sync_wake.notify_waiters();
+    }
     let (op, _) = super::load(state, id).await?;
     let event = if status.is_terminal() {
         "finished"
@@ -214,10 +217,17 @@ pub async fn run_operation(state: &AppState, id: &str) -> AppResult<()> {
             return Ok(());
         }
     };
-    let ctx = plan::Ctx::new(state, &principal, allow_owner_transfer).await?;
+    let ctx = plan::Ctx::for_operation(state, &principal, allow_owner_transfer, id).await?;
 
-    // Maintenance admission is limited to servers whose current plan can need legacy DB or
-    // queue-scan behavior. API-native external-library plans stay independent of unrelated scans.
+    // Peer and conflict-recovery mutations must use the library barrier, including API-native
+    // plans. Other operations retain their existing queue-scan admission policy.
+    let sync_managed = matches!(principal, Principal::Peer { .. })
+        || sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM pending_peer_ops WHERE operation_id=?)",
+        )
+        .bind(id)
+        .fetch_one(&state.db)
+        .await?;
     let mut servers: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for (index, action) in actions.iter().enumerate() {
         if rejected.contains(&(index as i64)) {
@@ -226,10 +236,11 @@ pub async fn run_operation(state: &AppState, id: &str) -> AppResult<()> {
         let touched = ctx.touched_servers(action).await?;
         let preliminary_plan = plan::plan(&ctx, action).await;
         for (server_id, library) in touched {
-            let requires_barrier = match &preliminary_plan {
-                Ok(plan) => plan_requires_queue_barrier(state, &server_id, plan).await?,
-                Err(_) => true,
-            };
+            let requires_barrier = sync_managed
+                || match &preliminary_plan {
+                    Ok(plan) => plan_requires_queue_barrier(state, &server_id, plan).await?,
+                    Err(_) => true,
+                };
             if !requires_barrier {
                 continue;
             }
@@ -263,7 +274,7 @@ pub async fn run_operation(state: &AppState, id: &str) -> AppResult<()> {
         .await?;
     set_status(state, id, OperationStatus::Running).await?;
     // Re-read roots and servers now that the window is open.
-    let ctx = plan::Ctx::new(state, &principal, allow_owner_transfer).await?;
+    let ctx = plan::Ctx::for_operation(state, &principal, allow_owner_transfer, id).await?;
 
     let mut changes: Vec<Change> = Vec::new();
     let mut local_changes: Vec<LocalChange> = Vec::new();
@@ -307,7 +318,7 @@ pub async fn run_operation(state: &AppState, id: &str) -> AppResult<()> {
         let mut barrier_failed = false;
         for (server_id, _) in ctx.touched_servers(action).await? {
             if admitted.contains(&server_id)
-                || !plan_requires_queue_barrier(state, &server_id, &plan).await?
+                || !sync_managed && !plan_requires_queue_barrier(state, &server_id, &plan).await?
             {
                 continue;
             }
@@ -516,6 +527,42 @@ async fn fail_all(state: &AppState, id: &str, code: &str, message: &str) -> AppR
 }
 
 async fn journal(state: &AppState, id: &str, index: i64, plan: &Plan) -> AppResult<()> {
+    let mut verification = Vec::new();
+    for file in &plan.files {
+        let Some(to) = &file.to else { continue };
+        let root = files::root(&state.db, &to.root_id).await?;
+        root.ensure_available()?;
+        let destination = root.abs(&files::parse_rel(&to.path)?)?;
+        let path = if let Some(from) = &file.from {
+            let source = files::root(&state.db, &from.root_id).await?;
+            source.ensure_available()?;
+            source.abs(&files::parse_rel(&from.path)?)?
+        } else if let Some(source) = plan.steps.iter().find_map(|step| match step {
+            Step::Fs(m) if m.to == destination => Some(m.from.clone()),
+            _ => None,
+        }) {
+            source
+        } else {
+            continue;
+        };
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.is_file() {
+            verification.push(json!({
+                "location": to,
+                "size": metadata.len(),
+                "sha256": files::sha256_file(&path)?,
+            }));
+        } else if metadata.is_dir() {
+            verification.push(json!({
+                "location": to,
+                "inventory": plan::folder_inventory(&path)?,
+            }));
+        } else {
+            return Err(AppError::invalid_location(
+                "cannot journal an unsafe file type",
+            ));
+        }
+    }
     let steps: Vec<String> = plan
         .steps
         .iter()
@@ -540,12 +587,31 @@ async fn journal(state: &AppState, id: &str, index: i64, plan: &Plan) -> AppResu
         .flatten()
         .map(|d| format!("{d:?}"))
         .collect();
-    sqlx::query("UPDATE operation_items SET journal_json = ? WHERE operation_id = ? AND idx = ?")
-        .bind(json!({ "steps": steps, "database": db_steps }).to_string())
-        .bind(id)
-        .bind(index)
-        .execute(&state.db)
-        .await?;
+    sqlx::query(
+        "UPDATE operation_items SET journal_json = json_patch(?,json_object(
+            'folder_restore_manifest',json(json_extract(journal_json,'$.folder_restore_manifest')),
+            'folder_prerequisites',json(json_extract(journal_json,'$.folder_prerequisites')),
+            'recovery_execution',json(json_extract(journal_json,'$.recovery_execution'))))
+         WHERE operation_id = ? AND idx = ?",
+    )
+    .bind(
+        json!({
+            "steps": steps, "database": db_steps, "verification": verification,
+            "api_effects": plan.steps.iter().enumerate().filter_map(|(index,step)| {
+                if let Step::Api(api)=step {Some((index,api))} else {None}
+            }).collect::<Vec<_>>(),
+            "db_effects": plan.db.iter().enumerate().map(|(index,(server,steps))|
+                (plan.steps.len()+index,server,steps)).collect::<Vec<_>>(),
+            "trash_new":plan.trash_new,"trash_done":plan.trash_done,
+            "upload_done":plan.upload_done,"asset_id":plan.asset_id,
+            "execution_steps": plan.steps,
+        })
+        .to_string(),
+    )
+    .bind(id)
+    .bind(index)
+    .execute(&state.db)
+    .await?;
     let progress = ism_core::dto::OperationTaskProgress {
         files: plan.files.clone(),
         steps: steps
@@ -569,6 +635,2516 @@ async fn journal(state: &AppState, id: &str, index: i64, plan: &Plan) -> AppResu
         .execute(&state.db)
         .await?;
     Ok(())
+}
+
+/// Finishes the original operation using retained content evidence, without re-planning it.
+pub async fn recover_bookkeeping(state: &AppState, id: &str) -> AppResult<bool> {
+    let _guard = state.replication_operation_lock.lock().await;
+    recover_bookkeeping_locked(state, id).await
+}
+
+async fn recover_bookkeeping_locked(state: &AppState, id: &str) -> AppResult<bool> {
+    let (operation, _) = super::load(state, id).await?;
+    if operation.status == OperationStatus::Completed {
+        return Ok(true);
+    }
+    if operation.status != OperationStatus::RecoveryRequired {
+        return Err(AppError::conflict(
+            "recovery_changed",
+            "operation no longer needs recovery",
+        ));
+    }
+    type RecoveryItem = (i64, String, String, Option<String>, Option<String>);
+    let rows: Vec<RecoveryItem> = sqlx::query_as(
+        "SELECT idx,action_json,status,journal_json,progress_json FROM operation_items
+         WHERE operation_id=? ORDER BY idx",
+    )
+    .bind(id)
+    .fetch_all(&state.db)
+    .await?;
+    let mut changes = Vec::new();
+    for (item, action, status, journal, progress) in rows {
+        if !matches!(status.as_str(), "done" | "recovery_required") {
+            return Err(AppError::conflict(
+                "recovery_evidence_missing",
+                "an item did not complete",
+            ));
+        }
+        let progress: ism_core::dto::OperationTaskProgress =
+            serde_json::from_str(progress.as_deref().ok_or_else(|| {
+                AppError::conflict(
+                    "recovery_evidence_missing",
+                    "completed-step evidence is missing",
+                )
+            })?)?;
+        let journal: serde_json::Value =
+            serde_json::from_str(journal.as_deref().ok_or_else(|| {
+                AppError::conflict(
+                    "recovery_evidence_missing",
+                    "verification journal is missing",
+                )
+            })?)?;
+        let api_effects: Vec<(usize, ApiStep)> = journal
+            .get("api_effects")
+            .map(|value| serde_json::from_value(value.clone()))
+            .transpose()?
+            .unwrap_or_default();
+        let db_effects: Vec<(usize, String, Vec<DbStep>)> = journal
+            .get("db_effects")
+            .map(|value| serde_json::from_value(value.clone()))
+            .transpose()?
+            .unwrap_or_default();
+        let action = parse_action(&action)?;
+        if journal.get("api_effects").is_none()
+            && (journal["database"]
+                .as_array()
+                .is_none_or(|steps| !steps.is_empty())
+                || journal["steps"].as_array().is_none_or(|steps| {
+                    steps
+                        .iter()
+                        .any(|step| step.as_str().is_none_or(|step| step.starts_with("immich ")))
+                }))
+        {
+            return Err(AppError::conflict(
+                "recovery_immich_verification",
+                "Immich effects must be verified before completing recovery",
+            ));
+        }
+        let checks = journal["verification"].as_array().ok_or_else(|| {
+            AppError::conflict(
+                "recovery_evidence_missing",
+                "trusted file inventory is missing",
+            )
+        })?;
+        if checks.is_empty() {
+            match &action {
+                OperationAction::CreateFolder { target } => {
+                    let (root, rel, _) = files::locate(&state.db, target).await?;
+                    if !fs::symlink_metadata(root.abs(&rel)?)?.is_dir() {
+                        return Err(AppError::conflict(
+                            "recovery_changed",
+                            "folder is not verified",
+                        ));
+                    }
+                }
+                _ => {
+                    return Err(AppError::conflict(
+                        "recovery_evidence_missing",
+                        "no completed content inventory was retained",
+                    ));
+                }
+            }
+        }
+        verify_folder_prerequisites(state, id, &journal, false).await?;
+        let recovered_steps = recover_moves(state, id, item, &action, &journal, &progress).await?;
+        if progress.steps.is_empty()
+            || progress.steps[..progress.steps.len() - 1]
+                .iter()
+                .enumerate()
+                .any(|(index, step)| {
+                    step.status != "done"
+                        && !api_effects.iter().any(|(i, _)| *i == index)
+                        && !db_effects.iter().any(|(i, ..)| *i == index)
+                        && !recovered_steps.contains(&index)
+                })
+        {
+            return Err(AppError::conflict(
+                "recovery_evidence_missing",
+                "interrupted execution requires more than bookkeeping recovery",
+            ));
+        }
+        for check in checks {
+            let location: ism_core::dto::Location =
+                serde_json::from_value(check["location"].clone())?;
+            let root = files::root(&state.db, &location.root_id).await?;
+            root.ensure_available()?;
+            let path = root.abs(&files::parse_rel(&location.path)?)?;
+            if let Some(expected) = check.get("inventory") {
+                let expected: Vec<plan::TrashEntry> = serde_json::from_value(expected.clone())?;
+                if plan::folder_inventory(&path)? != expected {
+                    return Err(AppError::conflict(
+                        "recovery_changed",
+                        "folder inventory changed",
+                    ));
+                }
+            } else {
+                let fingerprint = files::replacement_fingerprint(&path)?;
+                let metadata = fs::symlink_metadata(&path)?;
+                if !metadata.is_file()
+                    || Some(metadata.len()) != check["size"].as_u64()
+                    || fingerprint.as_ref().map(|(_, sha)| sha.as_str()) != check["sha256"].as_str()
+                {
+                    return Err(AppError::conflict(
+                        "recovery_changed",
+                        "file content changed",
+                    ));
+                }
+            }
+        }
+        for (index, step) in &api_effects {
+            if !verify_api_effect(state, step).await? {
+                call_api(state, step).await?;
+                if !verify_api_effect(state, step).await? {
+                    return Err(AppError::conflict(
+                        "recovery_immich_verification",
+                        "Immich is still applying the recovered change",
+                    ));
+                }
+            }
+            step_progress(state, id, item, *index, "done").await;
+        }
+        for (index, server, steps) in &db_effects {
+            if !verify_db_effects(state, server, steps).await? {
+                apply_db(state, server, steps).await.map_err(|e| {
+                    AppError::conflict(
+                        "recovery_immich_failed",
+                        format!("{}: {}", e.code, e.message),
+                    )
+                })?;
+                if !verify_db_effects(state, server, steps).await? {
+                    return Err(AppError::conflict(
+                        "recovery_immich_verification",
+                        "Immich database effects are not verified",
+                    ));
+                }
+            }
+            step_progress(state, id, item, *index, "done").await;
+        }
+        let trash_done: Option<(String, String)> = journal
+            .get("trash_done")
+            .map(|value| serde_json::from_value(value.clone()))
+            .transpose()?
+            .flatten();
+        let trash_done = trash_done
+            .map(|(id, kind)| match kind.as_str() {
+                "restored" => Ok((id, "restored")),
+                "purged" => Ok((id, "purged")),
+                _ => Err(AppError::internal("invalid journal trash outcome")),
+            })
+            .transpose()?;
+        let publication = if let OperationAction::PublishUpload { upload_id } = &action {
+            Some(authenticated_publish(state, id, item, upload_id, &journal, &progress).await?)
+        } else {
+            None
+        };
+        let mut plan = Plan {
+            files: progress.files,
+            trash_new: journal
+                .get("trash_new")
+                .map(|value| serde_json::from_value(value.clone()))
+                .transpose()?
+                .flatten(),
+            trash_done,
+            upload_done: journal
+                .get("upload_done")
+                .map(|value| serde_json::from_value(value.clone()))
+                .transpose()?
+                .flatten(),
+            asset_id: journal
+                .get("asset_id")
+                .map(|value| serde_json::from_value(value.clone()))
+                .transpose()?
+                .flatten(),
+            ..Default::default()
+        };
+        if publication.is_some() {
+            plan.upload_done = None;
+        }
+        bookkeeping(state, id, &plan).await?;
+        if let Some(publication) = &publication {
+            finalize_recovered_publish(state, id, item, publication).await?;
+        }
+        step_progress(state, id, item, progress.steps.len() - 1, "done").await;
+        changes.extend(local_changes_of(&action, &plan));
+    }
+    verify_recovery_completion(state, id).await?;
+    // Replays are idempotent at the peer-bookkeeping transaction boundary.
+    sqlx::query("UPDATE operation_items SET status='done' WHERE operation_id=? AND status='recovery_required'")
+        .bind(id).execute(&state.db).await?;
+    if let Err(e) = crate::peers::operation_finished(state, id, &changes).await {
+        sqlx::query("UPDATE operation_items SET status='recovery_required' WHERE operation_id=? AND error_code='peer_bookkeeping_failed'")
+            .bind(id).execute(&state.db).await?;
+        return Err(e);
+    }
+    verify_recovery_completion(state, id).await?;
+    crate::maintenance::resolve_operation_recovery(state, id).await?;
+    sqlx::query(
+        "UPDATE operation_items SET error_code=NULL,error_message=NULL WHERE operation_id=?",
+    )
+    .bind(id)
+    .execute(&state.db)
+    .await?;
+    set_status(state, id, OperationStatus::Completed).await?;
+    Ok(true)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+enum RecoveryContent {
+    File { size: u64, sha256: String },
+    Folder(Vec<plan::TrashEntry>),
+}
+
+impl RecoveryContent {
+    fn read(path: &std::path::Path) -> AppResult<Option<Self>> {
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        if metadata.is_dir() {
+            return Ok(Some(Self::Folder(plan::folder_inventory(path)?)));
+        }
+        if !metadata.is_file() {
+            return Err(recovery_changed(
+                "symlinks and special files are not recoverable",
+            ));
+        }
+        let (revision, sha256) = files::replacement_fingerprint(path)?
+            .ok_or_else(|| recovery_changed("file disappeared during recovery"))?;
+        if revision != files::revision(&metadata)
+            || files::revision(&fs::symlink_metadata(path)?) != revision
+        {
+            return Err(recovery_changed(
+                "file changed during recovery verification",
+            ));
+        }
+        Ok(Some(Self::File {
+            size: metadata.len(),
+            sha256,
+        }))
+    }
+
+    fn from_check(check: &serde_json::Value) -> AppResult<Self> {
+        if let Some(inventory) = check.get("inventory") {
+            return Ok(Self::Folder(serde_json::from_value(inventory.clone())?));
+        }
+        Ok(Self::File {
+            size: check["size"]
+                .as_u64()
+                .ok_or_else(|| recovery_changed("journal file size is missing"))?,
+            sha256: check["sha256"]
+                .as_str()
+                .ok_or_else(|| recovery_changed("journal checksum is missing"))?
+                .to_owned(),
+        })
+    }
+
+    fn subset_of(&self, complete: &Self) -> bool {
+        match (self, complete) {
+            (Self::Folder(actual), Self::Folder(expected)) => {
+                actual.iter().all(|entry| expected.contains(entry))
+            }
+            _ => self == complete,
+        }
+    }
+
+    fn trash_inventory(&self, name: &str) -> Vec<plan::TrashEntry> {
+        match self {
+            Self::Folder(entries) => entries.clone(),
+            Self::File { sha256, .. } => vec![plan::TrashEntry {
+                name: name.to_owned(),
+                sha256: Some(sha256.clone()),
+            }],
+        }
+    }
+}
+
+fn recovery_changed(message: &str) -> AppError {
+    AppError::conflict("recovery_changed", message)
+}
+
+async fn verify_recovery_completion(state: &AppState, id: &str) -> AppResult<()> {
+    let items: Vec<(i64, String, String, String)> = sqlx::query_as(
+        "SELECT idx,action_json,journal_json,progress_json FROM operation_items WHERE operation_id=?",
+    )
+    .bind(id)
+    .fetch_all(&state.db)
+    .await?;
+    for (item, action, journal, progress) in items {
+        let journal: serde_json::Value = serde_json::from_str(&journal)?;
+        let progress: ism_core::dto::OperationTaskProgress = serde_json::from_str(&progress)?;
+        let action = parse_action(&action)?;
+        verify_folder_prerequisites(state, id, &journal, true).await?;
+        if let OperationAction::PublishUpload { upload_id } = &action {
+            let publication =
+                authenticated_publish(state, id, item, upload_id, &journal, &progress).await?;
+            verify_recovered_publish(state, id, item, &publication).await?;
+        }
+        for check in journal["verification"]
+            .as_array()
+            .ok_or_else(|| recovery_changed("final inventory is missing"))?
+        {
+            let location = serde_json::from_value(check["location"].clone())?;
+            let (_, _, path) = files::locate(&state.db, &location).await?;
+            if RecoveryContent::read(&path)?.as_ref() != Some(&RecoveryContent::from_check(check)?)
+            {
+                return Err(recovery_changed(
+                    "final destination content is not verified",
+                ));
+            }
+        }
+        if matches!(
+            action,
+            OperationAction::Move { .. }
+                | OperationAction::Rename { .. }
+                | OperationAction::MoveFolder { .. }
+        ) {
+            for file in progress.files {
+                if let Some(from) = file.from {
+                    let (_, _, path) = files::locate(&state.db, &from).await?;
+                    let content = RecoveryContent::read(&path)?;
+                    if !file.copy && content.is_some() {
+                        return Err(recovery_changed("final move source is not absent"));
+                    }
+                    if file.copy {
+                        let check = journal["verification"]
+                            .as_array()
+                            .and_then(|checks| {
+                                checks.iter().find(|check| {
+                                    serde_json::from_value::<ism_core::dto::Location>(
+                                        check["location"].clone(),
+                                    )
+                                    .is_ok_and(|location| file.to.as_ref() == Some(&location))
+                                })
+                            })
+                            .ok_or_else(|| recovery_changed("shared companion proof is missing"))?;
+                        if content.as_ref() != Some(&RecoveryContent::from_check(check)?) {
+                            return Err(recovery_changed("shared companion source changed"));
+                        }
+                    }
+                }
+            }
+        }
+        let archives: Vec<RecoveryArchive> = journal
+            .get("recovery_execution")
+            .map(|value| serde_json::from_value(value.clone()))
+            .transpose()?
+            .unwrap_or_default();
+        for archive in archives {
+            if !archive.done {
+                return Err(recovery_changed("recovery trash was not finalized"));
+            }
+            recover_archive(state, id, &archive).await?;
+        }
+        let api_effects: Vec<(usize, ApiStep)> = journal
+            .get("api_effects")
+            .map(|value| serde_json::from_value(value.clone()))
+            .transpose()?
+            .unwrap_or_default();
+        for (_, step) in api_effects {
+            if !verify_api_effect(state, &step).await? {
+                return Err(recovery_changed("final Immich effect is not verified"));
+            }
+        }
+        let db_effects: Vec<(usize, String, Vec<DbStep>)> = journal
+            .get("db_effects")
+            .map(|value| serde_json::from_value(value.clone()))
+            .transpose()?
+            .unwrap_or_default();
+        for (_, server, steps) in db_effects {
+            if !verify_db_effects(state, &server, &steps).await? {
+                return Err(recovery_changed(
+                    "final Immich database effect is not verified",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct RecoveryArchive {
+    movement: plan::FsMove,
+    record: plan::TrashRecord,
+    content: RecoveryContent,
+    #[serde(default)]
+    done: bool,
+    #[serde(default)]
+    source_upload: Option<String>,
+    #[serde(default)]
+    source_folder_prerequisite: bool,
+}
+
+struct RecoveryMove {
+    index: usize,
+    movement: plan::FsMove,
+    expected: RecoveryContent,
+    source: files::Root,
+    destination: files::Root,
+    upload_id: Option<String>,
+}
+
+struct AuthenticatedPublish {
+    upload_id: String,
+    principal: String,
+    root: files::Root,
+    target: ism_core::dto::Location,
+    staged: std::path::PathBuf,
+    expected: RecoveryContent,
+    role: FileRole,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct FrozenFolderRestore {
+    root_id: String,
+    source: String,
+    target: String,
+    directories: Vec<String>,
+    files: Vec<(String, String, u64)>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct FolderPrerequisite {
+    upload_id: String,
+    target: ism_core::dto::Location,
+    staged: std::path::PathBuf,
+    expected: RecoveryContent,
+    role: FileRole,
+    asset_id: Option<String>,
+    done: bool,
+}
+
+async fn folder_parent(
+    state: &AppState,
+    id: &str,
+) -> AppResult<(
+    Principal,
+    OperationAction,
+    OperationStatus,
+    serde_json::Value,
+)> {
+    let (operation, key) = super::load(state, id).await?;
+    if operation.items.len() != 1 || operation.source != "peer" || !key.starts_with("peer:") {
+        return Err(recovery_changed(
+            "folder continuation requires one authenticated peer action",
+        ));
+    }
+    let principal = principal_from_key(state, &key).await?;
+    let Principal::Peer { peer_id } = &principal else {
+        return Err(recovery_changed(
+            "folder continuation has no peer principal",
+        ));
+    };
+    let known_peer: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM peers WHERE id=?)")
+        .bind(peer_id)
+        .fetch_one(&state.db)
+        .await?;
+    if !known_peer {
+        return Err(recovery_changed("folder continuation peer is unavailable"));
+    }
+    let action: String = sqlx::query_scalar(
+        "SELECT action_json FROM operation_items WHERE operation_id=? AND idx=0",
+    )
+    .bind(id)
+    .fetch_one(&state.db)
+    .await?;
+    let action = parse_action(&action)?;
+    if !matches!(action, OperationAction::MoveFolder { .. })
+        || !matches!(
+            operation.status,
+            OperationStatus::Failed
+                | OperationStatus::RecoveryRequired
+                | OperationStatus::Completed
+        )
+    {
+        return Err(recovery_changed(
+            "original folder operation is not recoverable",
+        ));
+    }
+    let raw: Option<String> = sqlx::query_scalar(
+        "SELECT journal_json FROM operation_items WHERE operation_id=? AND idx=0",
+    )
+    .bind(id)
+    .fetch_one(&state.db)
+    .await?;
+    Ok((
+        principal,
+        action,
+        operation.status,
+        raw.map(|raw| serde_json::from_str(&raw))
+            .transpose()?
+            .unwrap_or_else(|| json!({})),
+    ))
+}
+
+impl FrozenFolderRestore {
+    fn inventory(&self) -> AppResult<Vec<plan::TrashEntry>> {
+        let source = files::parse_rel(&self.source)?;
+        let target = files::parse_rel(&self.target)?;
+        if source.is_root() || target.is_root() || target.starts_with(&source) {
+            return Err(recovery_changed(
+                "folder restoration has an unsafe original scope",
+            ));
+        }
+        let mut entries = BTreeMap::from([(String::new(), None)]);
+        for directory in &self.directories {
+            let mut directory = Some(files::parse_rel(directory)?);
+            while let Some(rel) = directory {
+                let name = rel
+                    .rebase(&source, &ism_core::paths::RelPath::root())
+                    .ok_or_else(|| {
+                        recovery_changed("restoration directory is outside the original source")
+                    })?;
+                entries.insert(name.to_string(), None);
+                if rel == source {
+                    break;
+                }
+                directory = rel.parent();
+            }
+        }
+        for (path, hash, _) in &self.files {
+            let rel = files::parse_rel(path)?;
+            let name = rel
+                .rebase(&source, &ism_core::paths::RelPath::root())
+                .filter(|rel| !rel.is_root())
+                .ok_or_else(|| {
+                    recovery_changed("restoration file is outside the original source")
+                })?;
+            if hash.len() != 64
+                || !hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+                || entries
+                    .insert(name.to_string(), Some(hash.to_ascii_lowercase()))
+                    .is_some()
+            {
+                return Err(recovery_changed(
+                    "restoration inventory is ambiguous or lacks a valid checksum",
+                ));
+            }
+            let mut parent = rel.parent();
+            while let Some(directory) = parent {
+                let name = directory
+                    .rebase(&source, &ism_core::paths::RelPath::root())
+                    .ok_or_else(|| {
+                        recovery_changed("restoration parent is outside the original source")
+                    })?;
+                if entries.entry(name.to_string()).or_insert(None).is_some() {
+                    return Err(recovery_changed("restoration file overlaps a directory"));
+                }
+                if directory == source {
+                    break;
+                }
+                parent = directory.parent();
+            }
+        }
+        Ok(entries
+            .into_iter()
+            .map(|(name, sha256)| plan::TrashEntry { name, sha256 })
+            .collect())
+    }
+}
+
+async fn freeze_folder_restore(state: &AppState, id: &str) -> AppResult<FrozenFolderRestore> {
+    let remote: crate::peers::admin::VerifiedFolderRestore =
+        crate::peers::admin::verified_folder_restore(state, id).await?;
+    let mut frozen = FrozenFolderRestore {
+        root_id: remote.root_id,
+        source: remote.source.to_string(),
+        target: remote.target.to_string(),
+        directories: remote.directories.iter().map(ToString::to_string).collect(),
+        files: remote
+            .files
+            .iter()
+            .map(|(path, hash, size)| (path.to_string(), hash.to_ascii_lowercase(), *size))
+            .collect(),
+    };
+    frozen.directories.sort();
+    frozen.files.sort();
+    let (_, action, _, journal) = folder_parent(state, id).await?;
+    let OperationAction::MoveFolder { source, target } = action else {
+        return Err(recovery_changed("original action is not a folder move"));
+    };
+    if source.root_id != frozen.root_id
+        || target.root_id != frozen.root_id
+        || source.path != frozen.source
+        || target.path != frozen.target
+    {
+        return Err(recovery_changed(
+            "authenticated restoration manifest differs from the immutable folder action",
+        ));
+    }
+    let inventory = frozen.inventory()?;
+    if let Some(checks) = journal["verification"].as_array() {
+        let expected = checks
+            .iter()
+            .find(|check| check["location"] == json!(target))
+            .ok_or_else(|| {
+                recovery_changed("original folder journal has no destination inventory")
+            })?;
+        if RecoveryContent::from_check(expected)? != RecoveryContent::Folder(inventory) {
+            return Err(recovery_changed(
+                "authenticated restoration differs from the original folder inventory",
+            ));
+        }
+    }
+    if let Some(previous) = journal.get("folder_restore_manifest") {
+        if previous != &serde_json::to_value(&frozen)? {
+            return Err(recovery_changed("frozen restoration manifest changed"));
+        }
+    } else {
+        sqlx::query(
+            "UPDATE operation_items SET journal_json=json_set(COALESCE(journal_json,'{}'),'$.folder_restore_manifest',json(?))
+             WHERE operation_id=? AND idx=0",
+        ).bind(serde_json::to_string(&frozen)?).bind(id).execute(&state.db).await?;
+    }
+    Ok(frozen)
+}
+
+async fn prepare_folder_recovery(state: &AppState, id: &str, root: &files::Root) -> AppResult<()> {
+    let (_, _, status, _) = folder_parent(state, id).await?;
+    if status == OperationStatus::Failed {
+        let admitted: String =
+            sqlx::query_scalar("SELECT admitted_server_ids_json FROM operations WHERE id=?")
+                .bind(id)
+                .fetch_one(&state.db)
+                .await?;
+        let admitted: Vec<String> = serde_json::from_str(&admitted)?;
+        if !admitted.is_empty() && admitted != root.server_id.iter().cloned().collect::<Vec<_>>() {
+            return Err(recovery_changed(
+                "original folder maintenance mapping changed",
+            ));
+        }
+        let mut tx = state.db.begin().await?;
+        sqlx::query(
+            "UPDATE operations SET status='recovery_required',recovery_resolved=0,admitted_server_ids_json='[]'
+             WHERE id=? AND status='failed'",
+        ).bind(id).execute(&mut *tx).await?;
+        sqlx::query(
+            "UPDATE operation_items SET status='recovery_required' WHERE operation_id=? AND idx=0",
+        )
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        state.sync_wake.notify_waiters();
+    } else if status != OperationStatus::RecoveryRequired {
+        return Err(recovery_changed("folder continuation is no longer waiting"));
+    }
+    recovery_window(state, id, root).await?;
+    verify_publish_hold(state, id, root).await
+}
+
+async fn recorded_folder_prerequisite(
+    state: &AppState,
+    id: &str,
+    upload_id: &str,
+) -> AppResult<FolderPrerequisite> {
+    let (principal, action, _, journal) = folder_parent(state, id).await?;
+    let frozen: FrozenFolderRestore =
+        serde_json::from_value(journal["folder_restore_manifest"].clone())?;
+    let prerequisites: Vec<FolderPrerequisite> =
+        serde_json::from_value(journal["folder_prerequisites"].clone())?;
+    let prerequisite = prerequisites
+        .into_iter()
+        .find(|entry| entry.upload_id == upload_id)
+        .ok_or_else(|| {
+            recovery_changed("folder upload has no authenticated supplemental execution evidence")
+        })?;
+    let OperationAction::MoveFolder { source, target } = action else {
+        return Err(recovery_changed(
+            "folder prerequisite lost its original action",
+        ));
+    };
+    if source.root_id != frozen.root_id
+        || target.root_id != frozen.root_id
+        || source.path != frozen.source
+        || target.path != frozen.target
+    {
+        return Err(recovery_changed(
+            "recorded restoration scope differs from its original action",
+        ));
+    }
+    let (request, owner, status, operation): (String, String, String, Option<String>) =
+        sqlx::query_as("SELECT request_json,principal,status,operation_id FROM uploads WHERE id=?")
+            .bind(upload_id)
+            .fetch_one(&state.db)
+            .await?;
+    let request: ism_core::dto::CreateUpload = serde_json::from_str(&request)?;
+    let (location, expected, role) = folder_upload_spec(&request, &frozen)?;
+    let root = files::root(&state.db, &frozen.root_id).await?;
+    if owner != principal.key()
+        || location != prerequisite.target
+        || expected != prerequisite.expected
+        || role != prerequisite.role
+        || verified_upload_stage(&root, upload_id)? != prerequisite.staged
+        || !(status == "receiving" && operation.is_none()
+            || status == "committed" && operation.as_deref() == Some(id))
+    {
+        return Err(recovery_changed(
+            "recorded folder upload association or staging changed",
+        ));
+    }
+    Ok(prerequisite)
+}
+
+fn folder_upload_spec(
+    request: &ism_core::dto::CreateUpload,
+    frozen: &FrozenFolderRestore,
+) -> AppResult<(ism_core::dto::Location, RecoveryContent, FileRole)> {
+    let [file] = request.files.as_slice() else {
+        return Err(recovery_changed(
+            "folder prerequisite must contain one file",
+        ));
+    };
+    let folder = files::parse_rel(&request.target.path)?;
+    let rel = folder.join(&file.name).map_err(AppError::internal)?;
+    files::parse_rel(rel.as_str())?;
+    if request.target.root_id != frozen.root_id
+        || request.on_conflict != ism_core::dto::OnConflict::Fail
+        || request.provenance.is_some()
+        || request.existing_original.is_some()
+        || file.expected_revision.is_some()
+        || file.expected_sha256.is_some()
+        || !frozen.files.iter().any(|(path, hash, size)| {
+            path == rel.as_str() && hash.eq_ignore_ascii_case(&file.sha256) && *size == file.size
+        })
+    {
+        return Err(recovery_changed(
+            "folder prerequisite differs from the authenticated frozen file",
+        ));
+    }
+    Ok((
+        ism_core::dto::Location {
+            root_id: frozen.root_id.clone(),
+            path: rel.to_string(),
+        },
+        RecoveryContent::File {
+            size: file.size,
+            sha256: file.sha256.to_ascii_lowercase(),
+        },
+        file.role,
+    ))
+}
+
+async fn persist_folder_prerequisites(
+    state: &AppState,
+    id: &str,
+    prerequisites: &[FolderPrerequisite],
+) -> AppResult<()> {
+    sqlx::query(
+        "UPDATE operation_items SET journal_json=json_set(journal_json,'$.folder_prerequisites',json(?))
+         WHERE operation_id=? AND idx=0",
+    ).bind(serde_json::to_string(prerequisites)?).bind(id).execute(&state.db).await?;
+    Ok(())
+}
+
+async fn verify_folder_prerequisites(
+    state: &AppState,
+    id: &str,
+    journal: &serde_json::Value,
+    at_destination: bool,
+) -> AppResult<()> {
+    let Some(manifest) = journal.get("folder_restore_manifest") else {
+        return Ok(());
+    };
+    let frozen: FrozenFolderRestore = serde_json::from_value(manifest.clone())?;
+    frozen.inventory()?;
+    let prerequisites: Vec<FolderPrerequisite> = journal
+        .get("folder_prerequisites")
+        .map(|value| serde_json::from_value(value.clone()))
+        .transpose()?
+        .unwrap_or_default();
+    let root = files::root(&state.db, &frozen.root_id).await?;
+    for entry in prerequisites {
+        let prerequisite = recorded_folder_prerequisite(state, id, &entry.upload_id).await?;
+        let committed: bool = sqlx::query_scalar(
+            "SELECT status='committed' AND operation_id=? FROM uploads WHERE id=?",
+        )
+        .bind(id)
+        .bind(&entry.upload_id)
+        .fetch_one(&state.db)
+        .await?;
+        if !prerequisite.done
+            || !committed
+            || RecoveryContent::read(&prerequisite.staged)?.is_some()
+        {
+            return Err(recovery_changed(
+                "folder prerequisite has not finished safely",
+            ));
+        }
+        let asset = if at_destination {
+            let rel = files::parse_rel(&prerequisite.target.path)?
+                .rebase(
+                    &files::parse_rel(&frozen.source)?,
+                    &files::parse_rel(&frozen.target)?,
+                )
+                .ok_or_else(|| recovery_changed("prerequisite escaped the original folder"))?;
+            if RecoveryContent::read(&root.abs(&rel)?)?.as_ref() != Some(&prerequisite.expected) {
+                return Err(recovery_changed("final prerequisite content changed"));
+            }
+            verified_asset_at_root(state, &root, &rel, prerequisite.role).await?
+        } else {
+            verify_prerequisite_asset(state, id, &root, &prerequisite.target, prerequisite.role)
+                .await?
+        };
+        if asset != prerequisite.asset_id {
+            return Err(recovery_changed("restored asset identity changed"));
+        }
+    }
+    Ok(())
+}
+
+async fn verify_prerequisite_asset(
+    state: &AppState,
+    id: &str,
+    root: &files::Root,
+    target: &ism_core::dto::Location,
+    role: FileRole,
+) -> AppResult<Option<String>> {
+    if root.server_id.is_none() || role != FileRole::Original {
+        return Ok(None);
+    }
+    let rel = files::parse_rel(&target.path)?;
+    let (_, _, _, journal) = folder_parent(state, id).await?;
+    let effects: Vec<(usize, ApiStep)> = journal
+        .get("api_effects")
+        .map(|value| serde_json::from_value(value.clone()))
+        .transpose()?
+        .unwrap_or_default();
+    let original = effects
+        .iter()
+        .find(|(_, effect)| match &effect.kind {
+            ApiKind::SyncMove { source_path, .. } => {
+                Some(source_path) == root.immich_path(&rel).as_ref()
+            }
+            _ => false,
+        })
+        .map(|(_, effect)| effect);
+    if let Some(effect) = original
+        && verify_api_effect(state, effect).await?
+        && let ApiKind::SyncMove {
+            asset_id: Some(id), ..
+        } = &effect.kind
+    {
+        return Ok(Some(id.clone()));
+    }
+    let asset = verified_asset_at_root(state, root, &rel, role).await?;
+    if let Some(ApiStep {
+        kind: ApiKind::SyncMove {
+            asset_id: Some(id), ..
+        },
+        ..
+    }) = original
+        && asset.as_ref() != Some(id)
+    {
+        return Err(recovery_changed(
+            "original folder asset identity changed before restoration",
+        ));
+    }
+    Ok(asset)
+}
+
+fn verify_folder_subset(root: &files::Root, frozen: &FrozenFolderRestore) -> AppResult<()> {
+    let path = root.abs(&files::parse_rel(&frozen.source)?)?;
+    if let Some(content) = RecoveryContent::read(&path)?
+        && !content.subset_of(&RecoveryContent::Folder(frozen.inventory()?))
+    {
+        return Err(recovery_changed(
+            "old folder contains unknown or changed restoration entries",
+        ));
+    }
+    Ok(())
+}
+
+async fn create_folder_restore_directories(
+    state: &AppState,
+    root: &files::Root,
+    frozen: &FrozenFolderRestore,
+) -> AppResult<()> {
+    verify_folder_subset(root, frozen)?;
+    let source = files::parse_rel(&frozen.source)?;
+    let mut steps = Vec::new();
+    for entry in frozen
+        .inventory()?
+        .into_iter()
+        .filter(|entry| entry.sha256.is_none())
+    {
+        let rel = files::parse_rel(&entry.name)?
+            .rebase(&ism_core::paths::RelPath::root(), &source)
+            .ok_or_else(|| recovery_changed("restoration directory cannot be scoped"))?;
+        steps.push(Step::Mkdir(root.abs(&rel)?));
+    }
+    let plan = Plan {
+        steps,
+        ..Default::default()
+    };
+    crate::watch::expect_writes(state, &expected_writes(&plan)).await?;
+    for step in &plan.steps {
+        apply(state, step)
+            .await
+            .map_err(|failure| AppError::conflict("recovery_filesystem", failure.message))?;
+    }
+    Ok(())
+}
+
+/// Restores one authenticated prerequisite inside its original operation's maintenance window.
+pub(crate) async fn recover_folder_prerequisite_upload(
+    state: &AppState,
+    id: &str,
+    upload_id: &str,
+) -> AppResult<bool> {
+    let _replication_guard = state.replication_operation_lock.lock().await;
+    let _upload_guard = state.lock_upload(upload_id).await;
+    if upload_id.is_empty()
+        || !upload_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte))
+    {
+        return Err(recovery_changed("invalid prerequisite upload identity"));
+    }
+    let frozen = freeze_folder_restore(state, id).await?;
+    let root = files::root(&state.db, &frozen.root_id).await?;
+    root.ensure_available()?;
+    let (_, _, _, journal) = folder_parent(state, id).await?;
+    let mut prerequisites: Vec<FolderPrerequisite> = journal
+        .get("folder_prerequisites")
+        .map(|value| serde_json::from_value(value.clone()))
+        .transpose()?
+        .unwrap_or_default();
+    if !prerequisites
+        .iter()
+        .any(|entry| entry.upload_id == upload_id)
+    {
+        let request = crate::peers::admin::verified_restore_upload(state, id, upload_id).await?;
+        let (target, expected, role) = folder_upload_spec(&request, &frozen)?;
+        let (owner, operation, status): (String, Option<String>, String) =
+            sqlx::query_as("SELECT principal,operation_id,status FROM uploads WHERE id=?")
+                .bind(upload_id)
+                .fetch_one(&state.db)
+                .await?;
+        let (principal, _, _, _) = folder_parent(state, id).await?;
+        if owner != principal.key() || operation.is_some() || status != "receiving" {
+            return Err(recovery_changed(
+                "prerequisite upload has a foreign principal or child operation",
+            ));
+        }
+        let staged = verified_upload_stage(&root, upload_id)?;
+        if RecoveryContent::read(&staged)?.as_ref() != Some(&expected) {
+            return Err(recovery_changed(
+                "prerequisite staging lacks the complete authenticated bytes",
+            ));
+        }
+        prepare_folder_recovery(state, id, &root).await?;
+        verify_folder_subset(&root, &frozen)?;
+        let asset_id = verify_prerequisite_asset(state, id, &root, &target, role).await?;
+        prerequisites.push(FolderPrerequisite {
+            upload_id: upload_id.to_owned(),
+            target,
+            staged,
+            expected,
+            role,
+            asset_id,
+            done: false,
+        });
+        persist_folder_prerequisites(state, id, &prerequisites).await?;
+    }
+    let prerequisite = recorded_folder_prerequisite(state, id, upload_id).await?;
+    prepare_folder_recovery(state, id, &root).await?;
+    let asset =
+        verify_prerequisite_asset(state, id, &root, &prerequisite.target, prerequisite.role)
+            .await?;
+    if asset != prerequisite.asset_id {
+        return Err(recovery_changed(
+            "folder prerequisite asset identity changed",
+        ));
+    }
+    verify_publish_hold(state, id, &root).await?;
+    create_folder_restore_directories(state, &root, &frozen).await?;
+    let target = root.abs(&files::parse_rel(&prerequisite.target.path)?)?;
+    let actual = RecoveryContent::read(&target)?;
+    let staged = RecoveryContent::read(&prerequisite.staged)?;
+    if actual
+        .as_ref()
+        .is_some_and(|actual| actual != &prerequisite.expected)
+        || staged
+            .as_ref()
+            .is_some_and(|actual| actual != &prerequisite.expected)
+        || actual.is_none() && staged.is_none()
+    {
+        return Err(recovery_changed(
+            "folder prerequisite endpoints are changed or incomplete",
+        ));
+    }
+    let mut archives: Vec<RecoveryArchive> = journal
+        .get("recovery_execution")
+        .map(|value| serde_json::from_value(value.clone()))
+        .transpose()?
+        .unwrap_or_default();
+    for archive in &mut archives {
+        recover_archive(state, id, archive).await?;
+        archive.done = true;
+    }
+    persist_recovery_archives(state, id, 0, &archives).await?;
+    if RecoveryContent::read(&target)?.as_ref() == Some(&prerequisite.expected) {
+        if let Some(content) = RecoveryContent::read(&prerequisite.staged)? {
+            retain_recovery_copy(
+                state,
+                id,
+                0,
+                RecoveryRetention {
+                    root: &root,
+                    path: &prerequisite.staged,
+                    logical_path: &target,
+                    source_upload: Some(upload_id),
+                    folder_prerequisite: true,
+                },
+                &content,
+                &mut archives,
+            )
+            .await?;
+        }
+    } else {
+        let plan = Plan {
+            steps: vec![Step::Fs(plan::FsMove {
+                from: prerequisite.staged.clone(),
+                to: target.clone(),
+                copy: false,
+            })],
+            ..Default::default()
+        };
+        crate::watch::expect_writes(state, &expected_writes(&plan)).await?;
+        apply(state, &plan.steps[0])
+            .await
+            .map_err(|failure| AppError::conflict("recovery_filesystem", failure.message))?;
+    }
+    if RecoveryContent::read(&target)?.as_ref() != Some(&prerequisite.expected)
+        || RecoveryContent::read(&prerequisite.staged)?.is_some()
+    {
+        return Err(recovery_changed(
+            "restored prerequisite content is not verified",
+        ));
+    }
+    let current = prerequisites
+        .iter_mut()
+        .find(|entry| entry.upload_id == upload_id)
+        .ok_or_else(|| recovery_changed("prerequisite evidence disappeared"))?;
+    current.done = true;
+    let directory = plan::staging_dir(&root, upload_id)?;
+    match fs::remove_dir(directory) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let principal = folder_parent(state, id).await?.0.key();
+    let mut tx = state.db.begin().await?;
+    sqlx::query(
+        "UPDATE operation_items SET journal_json=json_set(journal_json,'$.folder_prerequisites',json(?))
+         WHERE operation_id=? AND idx=0",
+    ).bind(serde_json::to_string(&prerequisites)?).bind(id).execute(&mut *tx).await?;
+    sqlx::query(
+        "UPDATE uploads SET status='committed',operation_id=? WHERE id=? AND principal=?
+         AND (status='receiving' AND operation_id IS NULL OR status='committed' AND operation_id=?)",
+    ).bind(id).bind(upload_id).bind(principal).bind(id)
+        .execute(&mut *tx).await?.rows_affected().eq(&1).then_some(())
+        .ok_or_else(|| recovery_changed("prerequisite upload changed before finalization"))?;
+    tx.commit().await?;
+    Ok(true)
+}
+
+/// Completes the immutable original folder action, never a child borrowing its barrier.
+pub(crate) async fn resume_recovered_folder_operation(
+    state: &AppState,
+    id: &str,
+) -> AppResult<bool> {
+    let _replication_guard = state.replication_operation_lock.lock().await;
+    let (principal, action, status, _) = folder_parent(state, id).await?;
+    if status == OperationStatus::Completed {
+        return Ok(true);
+    }
+    let frozen = freeze_folder_restore(state, id).await?;
+    let root = files::root(&state.db, &frozen.root_id).await?;
+    prepare_folder_recovery(state, id, &root).await?;
+    let (_, _, _, journal) = folder_parent(state, id).await?;
+    verify_folder_prerequisites(state, id, &journal, false).await?;
+    if journal.get("steps").is_some() {
+        // A published original destination is enough; do not recreate an already removed source.
+        let destination = root.abs(&files::parse_rel(&frozen.target)?)?;
+        if RecoveryContent::read(&destination)?.as_ref()
+            == Some(&RecoveryContent::Folder(frozen.inventory()?))
+        {
+            return recover_bookkeeping_locked(state, id).await;
+        }
+    }
+    create_folder_restore_directories(state, &root, &frozen).await?;
+    crate::peers::admin::verify_restored_folder_source(state, id).await?;
+    if journal.get("steps").is_some() {
+        return recover_bookkeeping_locked(state, id).await;
+    }
+    let request: String = sqlx::query_scalar("SELECT request_json FROM operations WHERE id=?")
+        .bind(id)
+        .fetch_one(&state.db)
+        .await?;
+    let request: serde_json::Value = serde_json::from_str(&request)?;
+    let ctx = plan::Ctx::new(
+        state,
+        &principal,
+        request["allow_owner_transfer"].as_bool().unwrap_or(false),
+    )
+    .await?;
+    let plan = plan::plan(&ctx, &action).await?;
+    if let Some(blocker) = plan.blockers.first() {
+        return Err(AppError::conflict(
+            "recovery_plan_blocked",
+            blocker.message.clone(),
+        ));
+    }
+    self::journal(state, id, 0, &plan).await?;
+    execute(state, id, 0, &plan)
+        .await
+        .map_err(|failure| AppError::conflict("recovery_execution", failure.message))?;
+    recover_bookkeeping_locked(state, id).await
+}
+
+async fn authenticated_publish(
+    state: &AppState,
+    id: &str,
+    item: i64,
+    upload_id: &str,
+    journal: &serde_json::Value,
+    progress: &ism_core::dto::OperationTaskProgress,
+) -> AppResult<AuthenticatedPublish> {
+    if upload_id.is_empty()
+        || !upload_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte))
+        || item != 0
+        || journal["upload_done"].as_str() != Some(upload_id)
+        || !journal["trash_new"].is_null()
+        || !journal["trash_done"].is_null()
+    {
+        return Err(recovery_changed(
+            "publication lacks an unambiguous non-replacement upload association",
+        ));
+    }
+    let (principal, source, key, request, resolved): (String, String, String, String, i64) =
+        sqlx::query_as("SELECT principal,source,idempotency_key,request_json,recovery_resolved FROM operations WHERE id=?")
+            .bind(id).fetch_one(&state.db).await?;
+    let peer_id = principal
+        .strip_prefix("peer:")
+        .filter(|peer| !peer.is_empty())
+        .ok_or_else(|| {
+            recovery_changed("publication was not submitted by an authenticated peer")
+        })?;
+    let request: serde_json::Value = serde_json::from_str(&request)?;
+    let actions = request["actions"]
+        .as_array()
+        .ok_or_else(|| recovery_changed("original publication request is missing"))?;
+    if source != "peer"
+        || resolved != 0
+        || key != format!("upload:{upload_id}")
+        || actions.len() != 1
+        || actions[0]["kind"] != "publish_upload"
+        || actions[0]["upload_id"].as_str() != Some(upload_id)
+    {
+        return Err(recovery_changed(
+            "original operation does not authenticate this publication",
+        ));
+    }
+    let peer_exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM peers WHERE id=?)")
+        .bind(peer_id)
+        .fetch_one(&state.db)
+        .await?;
+    let item_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM operation_items WHERE operation_id=?")
+            .bind(id)
+            .fetch_one(&state.db)
+            .await?;
+    let uploads: Vec<(String, String, String, String)> =
+        sqlx::query_as("SELECT id,principal,request_json,status FROM uploads WHERE operation_id=?")
+            .bind(id)
+            .fetch_all(&state.db)
+            .await?;
+    let [(stored_id, owner, request, status)] = uploads.as_slice() else {
+        return Err(recovery_changed(
+            "operation does not own exactly one upload",
+        ));
+    };
+    if !peer_exists
+        || item_count != 1
+        || stored_id != upload_id
+        || owner != &principal
+        || !matches!(status.as_str(), "publishing" | "failed" | "committed")
+    {
+        return Err(recovery_changed(
+            "upload owner, operation association or lifecycle changed",
+        ));
+    }
+    let request: ism_core::dto::CreateUpload = serde_json::from_str(request)?;
+    let [spec] = request.files.as_slice() else {
+        return Err(recovery_changed(
+            "publication recovery requires one authenticated upload file",
+        ));
+    };
+    if request.on_conflict != ism_core::dto::OnConflict::Fail
+        || request.existing_original.is_some()
+        || request.provenance.is_some()
+        || spec.expected_revision.is_some()
+        || spec.expected_sha256.is_some()
+        || spec.name.is_empty()
+        || spec.name == "."
+        || spec.name == ".."
+        || spec.name.contains(['/', '\\', '\0'])
+        || spec.name.starts_with(".ism")
+        || spec.name.len() > 255
+        || spec.sha256.len() != 64
+        || !spec.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || (spec.role != FileRole::Original
+            && !super::uploads::standalone_peer_upload(
+                &Principal::Peer {
+                    peer_id: peer_id.to_owned(),
+                },
+                &request,
+                &state.sidecar_extensions(),
+            ))
+    {
+        return Err(recovery_changed(
+            "replacement, group or uncertain companion publication is not recoverable",
+        ));
+    }
+    let (root, folder, _) = files::locate(&state.db, &request.target).await?;
+    let rel = folder.join(&spec.name).map_err(AppError::internal)?;
+    files::parse_rel(rel.as_str())?;
+    let target = root.location(&rel);
+    let [file] = progress.files.as_slice() else {
+        return Err(recovery_changed(
+            "journal does not describe a single publication",
+        ));
+    };
+    let checks = journal["verification"]
+        .as_array()
+        .ok_or_else(|| recovery_changed("publication content journal is missing"))?;
+    let expected = RecoveryContent::File {
+        size: spec.size,
+        sha256: spec.sha256.to_ascii_lowercase(),
+    };
+    if file.from.is_some()
+        || file.to.as_ref() != Some(&target)
+        || file.copy
+        || file.role != spec.role
+        || checks.len() != 1
+        || serde_json::from_value::<ism_core::dto::Location>(checks[0]["location"].clone())?
+            != target
+        || RecoveryContent::from_check(&checks[0])? != expected
+    {
+        return Err(recovery_changed(
+            "journal destination or content differs from the authenticated upload",
+        ));
+    }
+    let api_effects: Vec<(usize, ApiStep)> =
+        serde_json::from_value(journal["api_effects"].clone())?;
+    let db_effects: Vec<(usize, String, Vec<DbStep>)> =
+        serde_json::from_value(journal["db_effects"].clone())?;
+    if !db_effects.is_empty() {
+        return Err(recovery_changed(
+            "publication contains unexpected database effects",
+        ));
+    }
+    if let Some(server) = &root.server_id
+        && spec.role == FileRole::Original
+    {
+        let library = root
+            .library_id
+            .as_ref()
+            .ok_or_else(|| recovery_changed("publication library is missing"))?;
+        let owner = registry::library_owner(state, library)
+            .await?
+            .ok_or_else(|| recovery_changed("publication library owner is missing"))?;
+        let path = root
+            .immich_path(&rel)
+            .ok_or_else(|| recovery_changed("publication Immich path is missing"))?;
+        if api_effects.len() != 1
+            || api_effects[0].1.server_id != *server
+            || api_effects[0].1.owner != owner
+            || !api_effects[0].1.ids.is_empty()
+            || api_effects[0].1.kind
+                != (ApiKind::SyncAdd {
+                    library_id: library.clone(),
+                    path,
+                })
+        {
+            return Err(recovery_changed(
+                "publication Immich effect differs from the original mapped library",
+            ));
+        }
+    } else if !api_effects.is_empty() {
+        return Err(recovery_changed(
+            "publication contains unexpected Immich effects",
+        ));
+    }
+    let pending: Vec<(i64, String, String, Option<String>, String)> = sqlx::query_as(
+        "SELECT idx,share_id,kind,to_path,peer_id FROM pending_peer_ops WHERE operation_id=?",
+    )
+    .bind(id)
+    .fetch_all(&state.db)
+    .await?;
+    if !pending.is_empty() {
+        let [(index, share_id, kind, to, pending_peer)] = pending.as_slice() else {
+            return Err(recovery_changed(
+                "publication has ambiguous peer bookkeeping",
+            ));
+        };
+        let shares = crate::peers::shares(state).await?;
+        let share = shares
+            .iter()
+            .find(|share| &share.id == share_id)
+            .ok_or_else(|| recovery_changed("publication share is missing"))?;
+        if *index != item
+            || kind != "publish"
+            || pending_peer != peer_id
+            || !share.enabled
+            || !share.peer_ids.iter().any(|peer| peer == peer_id)
+            || share.rel_of(&target).is_none()
+            || share.rel_of(&target).as_ref() != to.as_ref()
+        {
+            return Err(recovery_changed(
+                "publication peer bookkeeping refers to a foreign destination",
+            ));
+        }
+    }
+    verify_publish_hold(state, id, &root).await?;
+    let staged = verified_upload_stage(&root, upload_id)?;
+    Ok(AuthenticatedPublish {
+        upload_id: upload_id.to_owned(),
+        principal,
+        root,
+        target,
+        staged,
+        expected,
+        role: spec.role,
+    })
+}
+
+async fn verify_publish_hold(state: &AppState, id: &str, root: &files::Root) -> AppResult<()> {
+    let (raw, resolved): (String, i64) = sqlx::query_as(
+        "SELECT admitted_server_ids_json,recovery_resolved FROM operations WHERE id=?",
+    )
+    .bind(id)
+    .fetch_one(&state.db)
+    .await?;
+    let admitted: Vec<String> = serde_json::from_str(&raw)?;
+    if resolved != 0 || admitted != root.server_id.iter().cloned().collect::<Vec<_>>() {
+        return Err(recovery_changed(
+            "publication no longer owns its original maintenance hold",
+        ));
+    }
+    if let Some(server) = &root.server_id {
+        let maintenance = registry::server(state, server).await?.maintenance;
+        if maintenance.phase != ism_core::maintenance::Phase::RecoveryRequired
+            || !maintenance.queue_paused_by_ism
+            || maintenance.unresolved_recoveries == 0
+            || maintenance.drift.is_some()
+        {
+            return Err(recovery_changed(
+                "publication maintenance hold is not verified",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn verified_upload_stage(root: &files::Root, upload_id: &str) -> AppResult<std::path::PathBuf> {
+    root.ensure_available()?;
+    let directory = plan::staging_dir(root, upload_id)?;
+    match fs::symlink_metadata(&directory) {
+        Ok(metadata) if metadata.is_dir() => {
+            for entry in fs::read_dir(&directory)? {
+                let entry = entry?;
+                if entry.file_name() != "0" || !fs::symlink_metadata(entry.path())?.is_file() {
+                    return Err(recovery_changed(
+                        "upload staging contains unknown or unsafe entries",
+                    ));
+                }
+            }
+        }
+        Ok(_) => return Err(recovery_changed("upload staging is not a directory")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let rel =
+        ism_core::paths::RelPath::parse(&format!("{}/uploads/{upload_id}/0", files::STAGING_DIR))
+            .map_err(AppError::internal)?;
+    root.abs(&rel)
+}
+
+async fn finalize_recovered_publish(
+    state: &AppState,
+    id: &str,
+    item: i64,
+    publication: &AuthenticatedPublish,
+) -> AppResult<()> {
+    let asset = verify_recovered_publish(state, id, item, publication).await?;
+    // Only remove an empty, authenticated stage directory; never recursively clean recovery bytes.
+    let directory = plan::staging_dir(&publication.root, &publication.upload_id)?;
+    match fs::remove_dir(&directory) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let mut tx = state.db.begin().await?;
+    let changed = sqlx::query(
+        "UPDATE uploads SET status='committed' WHERE id=? AND operation_id=? AND principal=?
+         AND status IN ('publishing','failed','committed')",
+    )
+    .bind(&publication.upload_id)
+    .bind(id)
+    .bind(&publication.principal)
+    .execute(&mut *tx)
+    .await?;
+    if changed.rows_affected() != 1 {
+        return Err(recovery_changed(
+            "upload association changed before finalization",
+        ));
+    }
+    sqlx::query(
+        "UPDATE operation_items SET result_json=json_set(COALESCE(result_json,'{}'),'$.asset_id',?,'$.recovery_verified',json('true'))
+         WHERE operation_id=? AND idx=?",
+    ).bind(&asset).bind(id).bind(item).execute(&mut *tx).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn verify_recovered_publish(
+    state: &AppState,
+    id: &str,
+    item: i64,
+    publication: &AuthenticatedPublish,
+) -> AppResult<Option<String>> {
+    verify_publish_hold(state, id, &publication.root).await?;
+    let staged = verified_upload_stage(&publication.root, &publication.upload_id)?;
+    let rel = files::parse_rel(&publication.target.path)?;
+    let final_path = publication.root.abs(&rel)?;
+    if staged != publication.staged
+        || RecoveryContent::read(&staged)?.is_some()
+        || RecoveryContent::read(&final_path)?.as_ref() != Some(&publication.expected)
+    {
+        return Err(recovery_changed(
+            "publication endpoints are not ready for finalization",
+        ));
+    }
+    let asset = verified_asset_at_root(state, &publication.root, &rel, publication.role).await?;
+    let previous: Option<String> = sqlx::query_scalar(
+        "SELECT json_extract(result_json,'$.asset_id') FROM operation_items WHERE operation_id=? AND idx=?",
+    ).bind(id).bind(item).fetch_one(&state.db).await?;
+    if previous.is_some() && previous != asset {
+        return Err(recovery_changed(
+            "recovered publication asset identity changed",
+        ));
+    }
+    verify_publish_hold(state, id, &publication.root).await?;
+    if verified_upload_stage(&publication.root, &publication.upload_id)? != staged
+        || RecoveryContent::read(&staged)?.is_some()
+        || RecoveryContent::read(&publication.root.abs(&rel)?)?.as_ref()
+            != Some(&publication.expected)
+    {
+        return Err(recovery_changed(
+            "publication changed during Immich verification",
+        ));
+    }
+    Ok(asset)
+}
+
+// A short file is salvageable only when its entire byte sequence matches the trusted full copy.
+fn matching_partial(
+    partial_path: &std::path::Path,
+    partial: &RecoveryContent,
+    full_path: &std::path::Path,
+    full: &RecoveryContent,
+) -> AppResult<bool> {
+    if partial.subset_of(full) {
+        return Ok(true);
+    }
+    if let (RecoveryContent::Folder(actual), RecoveryContent::Folder(expected)) = (partial, full) {
+        for entry in actual {
+            let Some(original) = expected.iter().find(|original| original.name == entry.name)
+            else {
+                return Ok(false);
+            };
+            if entry == original {
+                continue;
+            }
+            if entry.sha256.is_none() || original.sha256.is_none() {
+                return Ok(false);
+            }
+            let short_path = partial_path.join(&entry.name);
+            let long_path = full_path.join(&entry.name);
+            let short = RecoveryContent::read(&short_path)?
+                .ok_or_else(|| recovery_changed("partial folder file disappeared"))?;
+            let long = RecoveryContent::read(&long_path)?
+                .ok_or_else(|| recovery_changed("complete folder file disappeared"))?;
+            if !matching_partial(&short_path, &short, &long_path, &long)? {
+                return Ok(false);
+            }
+        }
+        return Ok(
+            RecoveryContent::read(partial_path)?.as_ref() == Some(partial)
+                && RecoveryContent::read(full_path)?.as_ref() == Some(full),
+        );
+    }
+    if let (RecoveryContent::File { size: short, .. }, RecoveryContent::File { size: long, .. }) =
+        (partial, full)
+        && short < long
+    {
+        use std::io::Read;
+        let mut partial_file = fs::File::open(partial_path)?;
+        let mut full_file = fs::File::open(full_path)?;
+        let mut left = [0_u8; 64 * 1024];
+        let mut right = [0_u8; 64 * 1024];
+        let mut remaining = *short;
+        while remaining > 0 {
+            let count = remaining.min(left.len() as u64) as usize;
+            partial_file.read_exact(&mut left[..count])?;
+            full_file.read_exact(&mut right[..count])?;
+            if left[..count] != right[..count] {
+                return Ok(false);
+            }
+            remaining -= count as u64;
+        }
+        return Ok(
+            RecoveryContent::read(partial_path)?.as_ref() == Some(partial)
+                && RecoveryContent::read(full_path)?.as_ref() == Some(full),
+        );
+    }
+    Ok(false)
+}
+
+async fn recovery_window(state: &AppState, id: &str, root: &files::Root) -> AppResult<()> {
+    let Some(server) = &root.server_id else {
+        return Ok(());
+    };
+    let raw: String =
+        sqlx::query_scalar("SELECT admitted_server_ids_json FROM operations WHERE id=?")
+            .bind(id)
+            .fetch_one(&state.db)
+            .await?;
+    let mut admitted: Vec<String> = serde_json::from_str(&raw)?;
+    if !admitted.contains(server) {
+        crate::maintenance::acquire(state, server).await?;
+        let _maintenance_guard = state.maintenance_lock.lock().await;
+        let mut tx = state.db.begin().await?;
+        let raw: String =
+            sqlx::query_scalar("SELECT maintenance_json FROM immich_servers WHERE id=?")
+                .bind(server)
+                .fetch_one(&mut *tx)
+                .await?;
+        let mut maintenance: ism_core::maintenance::MaintenanceState = serde_json::from_str(&raw)?;
+        if maintenance.phase != ism_core::maintenance::Phase::Active
+            || !maintenance.queue_paused_by_ism
+            || maintenance.drift.is_some()
+        {
+            return Err(recovery_changed(
+                "maintenance changed during recovery admission",
+            ));
+        }
+        maintenance.unresolved_recoveries += 1;
+        maintenance.require_recovery("finishing interrupted filesystem move");
+        maintenance.settle();
+        admitted.push(server.clone());
+        sqlx::query("UPDATE operations SET admitted_server_ids_json=? WHERE id=? AND status='recovery_required' AND recovery_resolved=0")
+            .bind(serde_json::to_string(&admitted)?)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?.rows_affected().eq(&1).then_some(())
+            .ok_or_else(|| recovery_changed("operation changed during recovery admission"))?;
+        sqlx::query("UPDATE immich_servers SET maintenance_json=? WHERE id=?")
+            .bind(serde_json::to_string(&maintenance)?)
+            .bind(server)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        state.emit(ServerEvent::MaintenanceChanged {
+            server_id: server.clone(),
+        });
+        state.maintenance_wake.notify_waiters();
+    }
+    let maintenance = registry::server(state, server).await?.maintenance;
+    if !maintenance.queue_paused_by_ism
+        || maintenance.drift.is_some()
+        || !matches!(
+            maintenance.phase,
+            ism_core::maintenance::Phase::RecoveryRequired
+        )
+    {
+        return Err(AppError::conflict(
+            "recovery_maintenance",
+            "the original operation's maintenance barrier is not held",
+        ));
+    }
+    Ok(())
+}
+
+async fn recover_archive(state: &AppState, id: &str, archive: &RecoveryArchive) -> AppResult<()> {
+    let root = files::root(&state.db, &archive.record.root_id).await?;
+    root.ensure_available()?;
+    let source = if let Some(upload_id) = &archive.source_upload {
+        if archive.source_folder_prerequisite {
+            let prerequisite = recorded_folder_prerequisite(state, id, upload_id).await?;
+            if prerequisite.target.root_id != archive.record.root_id
+                || prerequisite.target.path != archive.record.path
+                || archive.content != prerequisite.expected
+            {
+                return Err(recovery_changed(
+                    "retained stage differs from its authenticated folder prerequisite",
+                ));
+            }
+            prerequisite.staged
+        } else {
+            let (journal, progress): (String, String) = sqlx::query_as(
+            "SELECT journal_json,progress_json FROM operation_items WHERE operation_id=? AND idx=0",
+        ).bind(id).fetch_one(&state.db).await?;
+            let publication = authenticated_publish(
+                state,
+                id,
+                0,
+                upload_id,
+                &serde_json::from_str(&journal)?,
+                &serde_json::from_str(&progress)?,
+            )
+            .await?;
+            if publication.target.root_id != archive.record.root_id
+                || publication.target.path != archive.record.path
+                || archive.content != publication.expected
+            {
+                return Err(recovery_changed(
+                    "retained stage does not belong to the authenticated publication",
+                ));
+            }
+            publication.staged
+        }
+    } else {
+        root.abs(&files::parse_rel(&archive.record.path)?)?
+    };
+    let quarantine = ism_core::paths::RelPath::parse(&format!(
+        "{}/{}",
+        archive.record.quarantine_rel, archive.record.path
+    ))
+    .map_err(AppError::internal)?;
+    if source != archive.movement.from
+        || root.abs(&quarantine)? != archive.movement.to
+        || archive.movement.copy
+        || !archive.record.asset_ids.is_empty()
+        || archive.record.server_id.is_some()
+    {
+        return Err(recovery_changed(
+            "recovery trash evidence differs from its mapped paths",
+        ));
+    }
+    recovery_window(state, id, &root).await?;
+    if archive.done {
+        if RecoveryContent::read(&archive.movement.to)?.as_ref() != Some(&archive.content) {
+            return Err(recovery_changed("retained recovery trash changed"));
+        }
+        return bookkeeping(
+            state,
+            id,
+            &Plan {
+                trash_new: Some(archive.record.clone()),
+                ..Default::default()
+            },
+        )
+        .await;
+    }
+    let source = RecoveryContent::read(&archive.movement.from)?;
+    let destination = RecoveryContent::read(&archive.movement.to)?;
+    match (source, destination) {
+        (Some(source), None) if source == archive.content => {
+            let plan = Plan {
+                steps: vec![Step::Fs(archive.movement.clone())],
+                ..Default::default()
+            };
+            crate::watch::expect_writes(state, &expected_writes(&plan)).await?;
+            apply(state, &plan.steps[0])
+                .await
+                .map_err(|failure| AppError::conflict("recovery_filesystem", failure.message))?;
+        }
+        (None, Some(destination)) if destination == archive.content => {}
+        _ => return Err(recovery_changed("recovery trash paths are not verified")),
+    }
+    if RecoveryContent::read(&archive.movement.from)?.is_some()
+        || RecoveryContent::read(&archive.movement.to)?.as_ref() != Some(&archive.content)
+    {
+        return Err(recovery_changed("retained recovery trash is not verified"));
+    }
+    bookkeeping(
+        state,
+        id,
+        &Plan {
+            trash_new: Some(archive.record.clone()),
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+async fn retain_recovery_copy(
+    state: &AppState,
+    id: &str,
+    item: i64,
+    retention: RecoveryRetention<'_>,
+    content: &RecoveryContent,
+    archives: &mut Vec<RecoveryArchive>,
+) -> AppResult<()> {
+    let RecoveryRetention {
+        root,
+        path,
+        logical_path,
+        source_upload,
+        folder_prerequisite,
+    } = retention;
+    let rel = logical_path
+        .strip_prefix(root.base())
+        .map_err(AppError::internal)?;
+    let rel = rel
+        .to_str()
+        .ok_or_else(|| recovery_changed("non-UTF-8 recovery path"))?;
+    files::parse_rel(rel)?;
+    let trash_id = crate::crypto::new_id("trash");
+    let quarantine_rel = format!("{}/{trash_id}", files::TRASH_DIR);
+    let quarantine = ism_core::paths::RelPath::parse(&format!("{quarantine_rel}/{rel}"))
+        .map_err(AppError::internal)?;
+    let archive = RecoveryArchive {
+        movement: plan::FsMove {
+            from: path.to_owned(),
+            to: root.abs(&quarantine)?,
+            copy: false,
+        },
+        record: plan::TrashRecord {
+            id: trash_id,
+            root_id: root.mapping.root_id.clone(),
+            path: rel.to_owned(),
+            quarantine_rel,
+            is_folder: matches!(content, RecoveryContent::Folder(_)),
+            size: files::tree_size(path),
+            // Redundant bytes are not the canonical Immich asset.
+            asset_ids: Vec::new(),
+            server_id: None,
+            file_inventory: Some(
+                content.trash_inventory(
+                    logical_path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .ok_or_else(|| recovery_changed("recovery file has no name"))?,
+                ),
+            ),
+        },
+        content: content.clone(),
+        done: false,
+        source_upload: source_upload.map(str::to_owned),
+        source_folder_prerequisite: folder_prerequisite,
+    };
+    archives.push(archive.clone());
+    // Persist intent before moving bytes. Original action, plan and checks remain immutable.
+    sqlx::query(
+        "UPDATE operation_items SET journal_json=json_set(journal_json,'$.recovery_execution',json(?))
+         WHERE operation_id=? AND idx=?",
+    ).bind(serde_json::to_string(archives)?).bind(id).bind(item)
+        .execute(&state.db).await?;
+    recover_archive(state, id, &archive).await?;
+    archives
+        .last_mut()
+        .ok_or_else(|| AppError::internal("recovery archive missing"))?
+        .done = true;
+    persist_recovery_archives(state, id, item, archives).await
+}
+
+struct RecoveryRetention<'a> {
+    root: &'a files::Root,
+    path: &'a std::path::Path,
+    logical_path: &'a std::path::Path,
+    source_upload: Option<&'a str>,
+    folder_prerequisite: bool,
+}
+
+async fn persist_recovery_archives(
+    state: &AppState,
+    id: &str,
+    item: i64,
+    archives: &[RecoveryArchive],
+) -> AppResult<()> {
+    sqlx::query(
+        "UPDATE operation_items SET journal_json=json_set(journal_json,'$.recovery_execution',json(?))
+         WHERE operation_id=? AND idx=?",
+    ).bind(serde_json::to_string(archives)?).bind(id).bind(item)
+        .execute(&state.db).await?;
+    Ok(())
+}
+
+async fn recover_moves(
+    state: &AppState,
+    id: &str,
+    item: i64,
+    action: &OperationAction,
+    journal: &serde_json::Value,
+    progress: &ism_core::dto::OperationTaskProgress,
+) -> AppResult<Vec<usize>> {
+    if !matches!(
+        action,
+        OperationAction::Move { .. }
+            | OperationAction::Rename { .. }
+            | OperationAction::MoveFolder { .. }
+            | OperationAction::PublishUpload { .. }
+    ) {
+        return Ok(Vec::new());
+    }
+    let labels = journal["steps"]
+        .as_array()
+        .ok_or_else(|| recovery_changed("journal steps are missing"))?;
+    let checks = journal["verification"]
+        .as_array()
+        .ok_or_else(|| recovery_changed("journal content proof is missing"))?;
+    let typed: Option<Vec<Step>> = journal
+        .get("execution_steps")
+        .map(|value| serde_json::from_value(value.clone()))
+        .transpose()?;
+    let api_effects: Vec<(usize, ApiStep)> = journal
+        .get("api_effects")
+        .map(|value| serde_json::from_value(value.clone()))
+        .transpose()?
+        .unwrap_or_default();
+    let db_effects: Vec<(usize, String, Vec<DbStep>)> = journal
+        .get("db_effects")
+        .map(|value| serde_json::from_value(value.clone()))
+        .transpose()?
+        .unwrap_or_default();
+    if progress.steps.len() != labels.len() + db_effects.len() + 1 {
+        return Err(recovery_changed("journal and progress step counts differ"));
+    }
+    if api_effects
+        .iter()
+        .any(|(_, step)| matches!(&step.kind, ApiKind::SyncMove { asset_id: None, .. }))
+    {
+        return Err(recovery_changed(
+            "original Immich asset identity was not retained",
+        ));
+    }
+    let mut moves = Vec::new();
+    let publication = if let OperationAction::PublishUpload { upload_id } = action {
+        Some(authenticated_publish(state, id, item, upload_id, journal, progress).await?)
+    } else {
+        None
+    };
+    for file in &progress.files {
+        let to = file
+            .to
+            .as_ref()
+            .ok_or_else(|| recovery_changed("filesystem destination lacks recovery proof"))?;
+        let (source, from_path) = if let Some(publication) = &publication {
+            (publication.root.clone(), publication.staged.clone())
+        } else {
+            let from = file
+                .from
+                .as_ref()
+                .ok_or_else(|| recovery_changed("filesystem source lacks recovery proof"))?;
+            let (root, _, path) = files::locate(&state.db, from).await?;
+            (root, path)
+        };
+        let (destination, _, to_path) = files::locate(&state.db, to).await?;
+        let label = format!(
+            "{} {} -> {}",
+            if file.copy { "copy" } else { "move" },
+            from_path.display(),
+            to_path.display()
+        );
+        let indices: Vec<_> = labels
+            .iter()
+            .enumerate()
+            .filter_map(|(index, value)| (value.as_str() == Some(&label)).then_some(index))
+            .collect();
+        if indices.len() != 1 || from_path == to_path {
+            return Err(recovery_changed(
+                "move journal does not uniquely match its mapped paths",
+            ));
+        }
+        let index = indices[0];
+        if let Some(steps) = &typed {
+            match steps.get(index) {
+                Some(Step::Fs(movement))
+                    if movement.from == from_path
+                        && movement.to == to_path
+                        && movement.copy == file.copy => {}
+                _ => {
+                    return Err(recovery_changed(
+                        "serialized filesystem effect differs from its authenticated endpoints",
+                    ));
+                }
+            }
+        }
+        let check = checks
+            .iter()
+            .find(|check| {
+                serde_json::from_value::<ism_core::dto::Location>(check["location"].clone())
+                    .is_ok_and(|location| location == *to)
+            })
+            .ok_or_else(|| recovery_changed("move destination lacks trusted original content"))?;
+        moves.push(RecoveryMove {
+            index,
+            movement: plan::FsMove {
+                from: from_path,
+                to: to_path,
+                copy: file.copy,
+            },
+            expected: RecoveryContent::from_check(check)?,
+            source,
+            destination,
+            upload_id: publication
+                .as_ref()
+                .map(|publication| publication.upload_id.clone()),
+        });
+    }
+    if publication.is_none()
+        && api_effects.is_empty()
+        && db_effects.is_empty()
+        && moves.iter().any(|movement| {
+            (movement.source.server_id.is_some() || movement.destination.server_id.is_some())
+                && match &movement.expected {
+                    RecoveryContent::File { .. } => true,
+                    RecoveryContent::Folder(entries) => {
+                        entries.iter().any(|entry| entry.sha256.is_some())
+                    }
+                }
+        })
+    {
+        return Err(AppError::conflict(
+            "recovery_immich_verification",
+            "journal has no independently verifiable Immich effect for library content",
+        ));
+    }
+    if publication.is_none()
+        && moves
+            .iter()
+            .flat_map(|movement| [&movement.source, &movement.destination])
+            .filter_map(|root| root.server_id.as_ref())
+            .any(|server| {
+                !api_effects
+                    .iter()
+                    .any(|(_, step)| &step.server_id == server)
+                    && !db_effects
+                        .iter()
+                        .any(|(_, planned_server, _)| planned_server == server)
+            })
+        && moves.iter().any(|movement| match &movement.expected {
+            RecoveryContent::File { .. } => true,
+            RecoveryContent::Folder(entries) => entries.iter().any(|entry| entry.sha256.is_some()),
+        })
+    {
+        return Err(recovery_changed(
+            "mapped Immich server differs from the retained effects",
+        ));
+    }
+    if moves.is_empty() {
+        return Err(recovery_changed("no journaled filesystem moves"));
+    }
+    let mut recovered: Vec<_> = moves.iter().map(|movement| movement.index).collect();
+    if let Some(steps) = &typed {
+        if steps.len() != labels.len() {
+            return Err(recovery_changed(
+                "serialized execution and journal step counts differ",
+            ));
+        }
+        for (index, effect) in &api_effects {
+            match steps.get(*index) {
+                Some(Step::Api(original))
+                    if original.kind == effect.kind
+                        && original.server_id == effect.server_id
+                        && original.owner == effect.owner
+                        && original.ids == effect.ids => {}
+                _ => {
+                    return Err(recovery_changed(
+                        "serialized Immich effect differs from its original journal",
+                    ));
+                }
+            }
+        }
+        if let Some(publication) = &publication {
+            for step in steps {
+                if let Step::CheckHash {
+                    expected_size,
+                    expected_sha256,
+                    ..
+                } = step
+                    && (RecoveryContent::File {
+                        size: *expected_size,
+                        sha256: expected_sha256.to_ascii_lowercase(),
+                    }) != publication.expected
+                {
+                    return Err(recovery_changed(
+                        "serialized hash check differs from the authenticated upload",
+                    ));
+                }
+            }
+        }
+    }
+    // Reject extra/intermediate mutations, even if their progress says done.
+    for (index, label) in labels.iter().enumerate() {
+        if recovered.contains(&index) {
+            continue;
+        }
+        if label
+            .as_str()
+            .is_some_and(|label| label.starts_with("immich "))
+        {
+            if !api_effects.iter().any(|(i, _)| *i == index) {
+                return Err(recovery_changed(
+                    "Immich step has no retained executable effect",
+                ));
+            }
+            continue;
+        }
+        let covered_check = typed
+            .as_ref()
+            .and_then(|steps| steps.get(index))
+            .is_some_and(|step| {
+                let path = match step {
+                    Step::CheckTree { path, .. }
+                    | Step::CheckHash { path, .. }
+                    | Step::CheckRevision { path, .. } => path,
+                    Step::Mkdir(path) => {
+                        return publication.is_some()
+                            && moves.iter().any(|movement| {
+                                movement.movement.to.parent() == Some(path.as_path())
+                            });
+                    }
+                    _ => return false,
+                };
+                moves.iter().any(|movement| {
+                    path == &movement.movement.from || path == &movement.movement.to
+                })
+            })
+            || (typed.is_none()
+                && moves.iter().any(|movement| {
+                    [&movement.movement.from, &movement.movement.to]
+                        .iter()
+                        .any(|path| {
+                            ["check revision", "check folder inventory", "check sha256"]
+                                .iter()
+                                .any(|prefix| {
+                                    label.as_str() == Some(&format!("{prefix} {}", path.display()))
+                                })
+                        })
+                }))
+            || (typed.is_none()
+                && publication.is_some()
+                && moves.iter().any(|movement| {
+                    movement.movement.to.parent().is_some_and(|parent| {
+                        label.as_str() == Some(&format!("mkdir {}", parent.display()))
+                    })
+                }));
+        if !covered_check {
+            return Err(recovery_changed(
+                "an intermediate filesystem effect lacks recovery proof",
+            ));
+        }
+        recovered.push(index);
+    }
+    let mut archives: Vec<RecoveryArchive> = journal
+        .get("recovery_execution")
+        .map(|value| serde_json::from_value(value.clone()))
+        .transpose()?
+        .unwrap_or_default();
+    for archive in &mut archives {
+        recover_archive(state, id, archive).await?;
+        archive.done = true;
+    }
+    persist_recovery_archives(state, id, item, &archives).await?;
+    // Preflight the entire file group before moving any of its original bytes.
+    for movement in &moves {
+        verify_recoverable_move(movement)?;
+        if publication.is_some() {
+            verify_publish_hold(state, id, &movement.destination).await?;
+        } else {
+            recovery_window(state, id, &movement.source).await?;
+            recovery_window(state, id, &movement.destination).await?;
+        }
+    }
+    for movement in &moves {
+        verify_recoverable_move(movement)?;
+        let source = RecoveryContent::read(&movement.movement.from)?;
+        let destination = RecoveryContent::read(&movement.movement.to)?;
+        if destination.as_ref() == Some(&movement.expected) {
+            if !movement.movement.copy
+                && let Some(source) = source
+            {
+                retain_recovery_copy(
+                    state,
+                    id,
+                    item,
+                    RecoveryRetention {
+                        root: &movement.source,
+                        path: &movement.movement.from,
+                        logical_path: if publication.is_some() {
+                            &movement.movement.to
+                        } else {
+                            &movement.movement.from
+                        },
+                        source_upload: movement.upload_id.as_deref(),
+                        folder_prerequisite: false,
+                    },
+                    &source,
+                    &mut archives,
+                )
+                .await?;
+            }
+        } else {
+            if let Some(destination) = destination {
+                retain_recovery_copy(
+                    state,
+                    id,
+                    item,
+                    RecoveryRetention {
+                        root: &movement.destination,
+                        path: &movement.movement.to,
+                        logical_path: &movement.movement.to,
+                        source_upload: None,
+                        folder_prerequisite: false,
+                    },
+                    &destination,
+                    &mut archives,
+                )
+                .await?;
+            }
+            let plan = Plan {
+                steps: vec![Step::Fs(movement.movement.clone())],
+                ..Default::default()
+            };
+            crate::watch::expect_writes(state, &expected_writes(&plan)).await?;
+            if RecoveryContent::read(&movement.movement.from)?.as_ref() != Some(&movement.expected)
+            {
+                return Err(recovery_changed("source changed before recovery execution"));
+            }
+            apply(state, &plan.steps[0])
+                .await
+                .map_err(|failure| AppError::conflict("recovery_filesystem", failure.message))?;
+        }
+        if RecoveryContent::read(&movement.movement.to)?.as_ref() != Some(&movement.expected)
+            || (!movement.movement.copy
+                && RecoveryContent::read(&movement.movement.from)?.is_some())
+        {
+            return Err(recovery_changed(
+                "recovered move endpoints are not verified",
+            ));
+        }
+        step_progress(state, id, item, movement.index, "done").await;
+    }
+    for archive in &archives {
+        recover_archive(state, id, archive).await?;
+    }
+    for index in &recovered {
+        step_progress(state, id, item, *index, "done").await;
+    }
+    Ok(recovered)
+}
+
+fn verify_recoverable_move(movement: &RecoveryMove) -> AppResult<()> {
+    for (root, path) in [
+        (&movement.source, &movement.movement.from),
+        (&movement.destination, &movement.movement.to),
+    ] {
+        root.ensure_available()?;
+        let rel = path.strip_prefix(root.base()).map_err(AppError::internal)?;
+        let verified = if movement.upload_id.is_some() && path == &movement.movement.from {
+            verified_upload_stage(root, movement.upload_id.as_deref().unwrap_or_default())?
+        } else {
+            let rel = files::parse_rel(
+                rel.to_str()
+                    .ok_or_else(|| recovery_changed("non-UTF-8 path"))?,
+            )?;
+            root.abs(&rel)?
+        };
+        if verified != *path {
+            return Err(recovery_changed("recovery path changed"));
+        }
+    }
+    let source = RecoveryContent::read(&movement.movement.from)?;
+    let destination = RecoveryContent::read(&movement.movement.to)?;
+    let source_full = source.as_ref() == Some(&movement.expected);
+    let destination_full = destination.as_ref() == Some(&movement.expected);
+    if movement.upload_id.is_some() && source.is_some() && !source_full {
+        return Err(recovery_changed(
+            "authenticated upload staging content changed",
+        ));
+    }
+    if source_full
+        && destination_full
+        && fs::canonicalize(&movement.movement.from)? == fs::canonicalize(&movement.movement.to)?
+    {
+        return Err(recovery_changed(
+            "aliased move endpoints cannot be recovered as redundant copies",
+        ));
+    }
+    if movement.movement.copy && !source_full {
+        return Err(recovery_changed("shared companion source is not complete"));
+    }
+    if !source_full && !destination_full {
+        return Err(recovery_changed(
+            "neither move endpoint proves complete original content",
+        ));
+    }
+    for (path, content, other) in [
+        (
+            &movement.movement.from,
+            source.as_ref(),
+            &movement.movement.to,
+        ),
+        (
+            &movement.movement.to,
+            destination.as_ref(),
+            &movement.movement.from,
+        ),
+    ] {
+        if let Some(content) = content
+            && content != &movement.expected
+            && !matching_partial(path, content, other, &movement.expected)?
+        {
+            return Err(recovery_changed(
+                "move endpoint contains changed or unexpected entries",
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn verify_api_effect(state: &AppState, step: &ApiStep) -> AppResult<bool> {
+    let immich = |error: crate::immich::api::ApiError| {
+        AppError::conflict("recovery_immich_unavailable", error.to_string())
+    };
+    let server = registry::server(state, &step.server_id).await?;
+    let owner = match &step.kind {
+        ApiKind::SyncMove {
+            to_owner: Some(owner),
+            ..
+        } => owner,
+        _ => &step.owner,
+    };
+    let api = registry::api_as_user(state, &server, owner).await?;
+    match &step.kind {
+        ApiKind::SyncAdd { path, .. } => {
+            Ok(api.asset_id_by_path(path).await.map_err(immich)?.is_some())
+        }
+        ApiKind::SyncRemove { path, .. } => {
+            Ok(api.asset_id_by_path(path).await.map_err(immich)?.is_none())
+        }
+        ApiKind::SyncMove {
+            source_library_id,
+            destination_library_id,
+            destination_path,
+            asset_id,
+            to_owner,
+            ..
+        } => {
+            let id = match asset_id {
+                Some(id) => id.clone(),
+                None => match api
+                    .asset_id_by_path(destination_path)
+                    .await
+                    .map_err(immich)?
+                {
+                    Some(id) => id,
+                    None => return Ok(false),
+                },
+            };
+            let asset = match api.asset(&id).await {
+                Ok(asset) => asset,
+                Err(crate::immich::api::ApiError::Status { status: 404, .. }) => return Ok(false),
+                Err(error) => return Err(immich(error)),
+            };
+            Ok(asset["originalPath"].as_str() == Some(destination_path)
+                && asset["libraryId"].as_str()
+                    == Some(
+                        destination_library_id
+                            .as_deref()
+                            .unwrap_or(source_library_id),
+                    )
+                && to_owner
+                    .as_ref()
+                    .is_none_or(|owner| asset["ownerId"].as_str() == Some(owner)))
+        }
+        kind => {
+            for id in &step.ids {
+                match api.asset(id).await {
+                    Ok(asset) => {
+                        let valid = match kind {
+                            ApiKind::Trash => asset["isTrashed"].as_bool() == Some(true),
+                            ApiKind::Restore => asset["isTrashed"].as_bool() == Some(false),
+                            ApiKind::ForceDelete => false,
+                            _ => {
+                                return Err(AppError::internal("unexpected asset recovery effect"));
+                            }
+                        };
+                        if !valid {
+                            return Ok(false);
+                        }
+                    }
+                    Err(crate::immich::api::ApiError::Status { status: 404, .. })
+                        if *kind == ApiKind::ForceDelete => {}
+                    Err(error) => return Err(immich(error)),
+                }
+            }
+            Ok(true)
+        }
+    }
+}
+
+pub(crate) async fn verified_asset_at_root(
+    state: &AppState,
+    root: &files::Root,
+    path: &ism_core::paths::RelPath,
+    role: ism_core::dto::FileRole,
+) -> AppResult<Option<String>> {
+    let Some(server_id) = &root.server_id else {
+        return Ok(None);
+    };
+    if role != ism_core::dto::FileRole::Original {
+        return Ok(None);
+    }
+    let library = root.library_id.as_ref().ok_or_else(|| {
+        AppError::conflict(
+            "recovery_immich_verification",
+            "root has no verified Immich library",
+        )
+    })?;
+    let owner = registry::library_owner(state, library)
+        .await?
+        .ok_or_else(|| {
+            AppError::conflict(
+                "recovery_immich_verification",
+                "library owner is unavailable",
+            )
+        })?;
+    let server = registry::server(state, server_id).await?;
+    let api = registry::api_as_user(state, &server, &owner).await?;
+    let expected = root.immich_path(path).ok_or_else(|| {
+        AppError::conflict(
+            "recovery_immich_verification",
+            "Immich path mapping is unavailable",
+        )
+    })?;
+    let unavailable = |e: crate::immich::api::ApiError| {
+        AppError::conflict("recovery_immich_unavailable", e.to_string())
+    };
+    let id = api
+        .asset_id_by_path(&expected)
+        .await
+        .map_err(unavailable)?
+        .ok_or_else(|| {
+            AppError::conflict(
+                "recovery_immich_verification",
+                "published file is awaiting verified Immich indexing",
+            )
+        })?;
+    let asset = api.asset(&id).await.map_err(unavailable)?;
+    if asset["originalPath"].as_str() != Some(&expected)
+        || asset["libraryId"].as_str() != Some(library)
+        || asset["ownerId"].as_str() != Some(&owner)
+        || asset["isTrashed"].as_bool() != Some(false)
+    {
+        return Err(AppError::conflict(
+            "recovery_immich_verification",
+            "Immich asset does not match the recovered file",
+        ));
+    }
+    Ok(Some(id))
+}
+
+/// Read-only proof of both disk absence and absence of live Immich original/sidecar references.
+pub(crate) async fn verified_file_absence_at_root(
+    state: &AppState,
+    root: &files::Root,
+    rel: &ism_core::paths::RelPath,
+) -> AppResult<()> {
+    root.ensure_available()?;
+    files::parse_rel(rel.as_str())?;
+    let path = root.abs(rel)?;
+    if rel.is_root() || fs::symlink_metadata(&path).is_ok() {
+        return Err(recovery_changed("expected absent file still exists"));
+    }
+    if RecoveryContent::read(&path)?.is_some() {
+        return Err(recovery_changed("file absence is not verified"));
+    }
+    if let Some(server_id) = &root.server_id {
+        let library = root
+            .library_id
+            .as_ref()
+            .ok_or_else(|| recovery_changed("absence verification has no mapped Immich library"))?;
+        let owner = registry::library_owner(state, library)
+            .await?
+            .ok_or_else(|| {
+                recovery_changed("absence verification has no verified library owner")
+            })?;
+        let expected = root
+            .immich_path(rel)
+            .ok_or_else(|| recovery_changed("absence verification has no Immich path mapping"))?;
+        let parent = rel.parent().unwrap_or_else(ism_core::paths::RelPath::root);
+        let folder = root
+            .immich_path(&parent)
+            .ok_or_else(|| recovery_changed("absence verification has no Immich parent mapping"))?;
+        let server = registry::server(state, server_id).await?;
+        // Owner-scoped API search cannot prove absence of foreign-owner or sidecar references.
+        let pool = registry::pg_pool(state, &server).await?;
+        let mut tx = pool.begin().await?;
+        for asset in pg::assets_under(&mut tx, &folder)
+            .await?
+            .into_iter()
+            .filter(|asset| asset.original_path == expected)
+        {
+            verify_absent_asset(&asset, library, &owner)?;
+        }
+        for sidecar in pg::sidecars_under(&mut tx, &folder)
+            .await?
+            .into_iter()
+            .filter(|sidecar| sidecar.path == expected)
+        {
+            let asset = pg::asset_by_id(&mut tx, &sidecar.asset_id)
+                .await?
+                .ok_or_else(|| {
+                    recovery_changed("sidecar reference has no verifiable owning asset")
+                })?;
+            verify_absent_asset(&asset, library, &owner)?;
+        }
+        tx.commit().await?;
+    }
+    root.ensure_available()?;
+    if root.abs(rel)? != path || RecoveryContent::read(&path)?.is_some() {
+        return Err(recovery_changed(
+            "file absence changed during Immich verification",
+        ));
+    }
+    Ok(())
+}
+
+fn verify_absent_asset(asset: &pg::AssetRow, library: &str, owner: &str) -> AppResult<()> {
+    if asset.library_id.as_deref() != Some(library) || asset.owner_id != owner || !asset.trashed {
+        return Err(recovery_changed(
+            "absent file has a live or foreign Immich reference",
+        ));
+    }
+    Ok(())
+}
+
+async fn verify_db_effects(state: &AppState, server_id: &str, steps: &[DbStep]) -> AppResult<bool> {
+    let server = registry::server(state, server_id).await?;
+    let pool = registry::pg_pool(state, &server).await?;
+    let mut tx = pool.begin().await?;
+    for step in steps {
+        match step {
+            DbStep::MoveSidecar { file_id, from, to } => {
+                let destination = pg::sidecar_by_path(&mut tx, to).await?;
+                if destination.is_none_or(|row| row.id != *file_id)
+                    || pg::sidecar_by_path(&mut tx, from).await?.is_some()
+                {
+                    return Ok(false);
+                }
+            }
+            DbStep::RemoveSidecar { sidecar, asset } => {
+                if !pg::sidecars_at_path(&mut tx, &sidecar.path)
+                    .await?
+                    .is_empty()
+                    || pg::asset_by_id(&mut tx, &asset.id).await?.as_ref() != Some(asset)
+                {
+                    return Ok(false);
+                }
+            }
+        }
+    }
+    tx.commit().await?;
+    Ok(true)
 }
 
 async fn step_progress(state: &AppState, id: &str, item: i64, step: usize, status: &str) {
@@ -1389,6 +3965,9 @@ async fn apply_db(state: &AppState, server_id: &str, steps: &[DbStep]) -> Result
             DbStep::MoveSidecar { file_id, from, to } => {
                 pg::move_sidecar(&mut tx, file_id, from, to).await
             }
+            DbStep::RemoveSidecar { sidecar, asset } => {
+                pg::remove_sidecar(&mut tx, sidecar, asset).await
+            }
         }
         .map_err(db_err)?;
     }
@@ -1530,7 +4109,12 @@ async fn bookkeeping(state: &AppState, op_id: &str, plan: &Plan) -> AppResult<()
     if let Some(t) = &plan.trash_new {
         sqlx::query(
             "INSERT INTO trash (id, root_id, path, quarantine_rel, is_folder, size, trashed_at, operation_id, asset_ids_json, server_id, file_inventory_json)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(id) DO UPDATE SET id=excluded.id
+             WHERE root_id=excluded.root_id AND path=excluded.path
+               AND quarantine_rel=excluded.quarantine_rel AND is_folder=excluded.is_folder
+               AND size=excluded.size AND asset_ids_json=excluded.asset_ids_json
+               AND server_id IS excluded.server_id AND file_inventory_json IS excluded.file_inventory_json",
         )
         .bind(&t.id)
         .bind(&t.root_id)
@@ -1549,7 +4133,10 @@ async fn bookkeeping(state: &AppState, op_id: &str, plan: &Plan) -> AppResult<()
                 .transpose()?,
         )
         .execute(&state.db)
-        .await?;
+        .await?
+        .rows_affected().eq(&1).then_some(()).ok_or_else(
+            ||AppError::conflict("recovery_changed","trash bookkeeping differs from the retained plan"),
+        )?;
     }
     if let Some((trash_id, what)) = &plan.trash_done {
         let column = if *what == "restored" {
@@ -1597,6 +4184,10 @@ async fn bookkeeping(state: &AppState, op_id: &str, plan: &Plan) -> AppResult<()
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "recovery_tests.rs"]
+mod recovery_tests;
 
 #[cfg(test)]
 mod tests {

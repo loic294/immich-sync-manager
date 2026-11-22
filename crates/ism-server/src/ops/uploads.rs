@@ -34,6 +34,32 @@ fn valid_name(name: &str) -> bool {
         && name.len() <= 255
 }
 
+pub(super) fn standalone_peer_upload(
+    principal: &Principal,
+    req: &CreateUpload,
+    extensions: &[String],
+) -> bool {
+    matches!(principal, Principal::Peer { .. })
+        && req.existing_original.is_none()
+        && req.provenance.is_none()
+        && !req.files.is_empty()
+        && req.files.iter().all(|file| {
+            matches!(
+                (
+                    file.role,
+                    ism_core::sidecar::companion_role(&file.name, extensions)
+                ),
+                (
+                    FileRole::Sidecar,
+                    Some(ism_core::sidecar::CompanionRole::Sidecar)
+                ) | (
+                    FileRole::Companion,
+                    Some(ism_core::sidecar::CompanionRole::Companion)
+                )
+            )
+        })
+}
+
 async fn load(
     state: &AppState,
     principal: &Principal,
@@ -106,8 +132,15 @@ async fn create_locked(
         .iter()
         .filter(|f| f.role == FileRole::Original)
         .count();
+    let standalone = standalone_peer_upload(principal, &req, &state.sidecar_extensions());
+    if standalone && req.on_conflict == OnConflict::Rename {
+        return Err(AppError::bad_request(
+            "bad_upload",
+            "standalone peer companions must retain their names",
+        ));
+    }
     match &req.existing_original {
-        None if originals != 1 => {
+        None if originals != 1 && !standalone => {
             return Err(AppError::bad_request(
                 "bad_upload",
                 "exactly one file must have role 'original', or name the existing original",
@@ -485,6 +518,7 @@ async fn commit_locked(
                 .find(|f| f.role == FileRole::Original)
                 .map(|f| f.name.as_str())
                 .or(req.existing_original.as_ref().map(|o| o.name.as_str()))
+                .or(req.files.first().map(|f| f.name.as_str()))
                 .unwrap_or("")
         )),
         actions: vec![OperationAction::PublishUpload {
@@ -620,6 +654,9 @@ pub async fn fill_asset_ids(
          JOIN operation_items i ON i.operation_id = u.operation_id
          WHERE i.kind = 'publish_upload' AND i.status = 'done' AND i.result_json IS NOT NULL
            AND json_extract(i.result_json, '$.asset_id') IS NULL AND u.created_at >= ?
+           AND (json_extract(u.request_json, '$.existing_original.name') IS NOT NULL
+                OR EXISTS (SELECT 1 FROM json_each(u.request_json, '$.files') f
+                           WHERE json_extract(f.value, '$.role') = 'original'))
          ORDER BY u.created_at LIMIT 500",
     )
     .bind(&cutoff)

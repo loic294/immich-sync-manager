@@ -41,7 +41,7 @@ pub async fn latest_migration(pool: &PgPool) -> Result<Option<String>, sqlx::Err
         .await
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AssetRow {
     pub id: String,
     pub owner_id: String,
@@ -178,7 +178,7 @@ pub async fn live_assets_page(
     .await
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SidecarRow {
     pub id: String,
     pub asset_id: String,
@@ -226,6 +226,69 @@ pub async fn sidecars_under(
             })
         })
         .collect()
+}
+
+pub async fn sidecars_at_path(
+    conn: &mut PgConnection,
+    path: &str,
+) -> Result<Vec<SidecarRow>, sqlx::Error> {
+    let rows = sqlx::query(
+        r#"SELECT id::text AS id,"assetId"::text AS asset_id,path FROM asset_file
+           WHERE type='sidecar' AND path=$1 ORDER BY id"#,
+    )
+    .bind(path)
+    .fetch_all(&mut *conn)
+    .await?;
+    rows.into_iter()
+        .map(|row| {
+            Ok(SidecarRow {
+                id: row.try_get("id")?,
+                asset_id: row.try_get("asset_id")?,
+                path: row.try_get("path")?,
+            })
+        })
+        .collect()
+}
+
+/// Called inside the operation's database transaction, after guarded filesystem trash.
+pub async fn remove_sidecar(
+    conn: &mut PgConnection,
+    expected: &SidecarRow,
+    asset: &AssetRow,
+) -> Result<(), PgError> {
+    let row = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SELECT {ASSET_COLUMNS} FROM asset WHERE id=$1::uuid FOR UPDATE"
+    )))
+    .bind(&asset.id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    if row.as_ref().map(asset_row).transpose()?.as_ref() != Some(asset) {
+        return Err(PgError::Stale(asset.id.clone()));
+    }
+    let row = sqlx::query(
+        r#"SELECT id::text AS id,"assetId"::text AS asset_id,path FROM asset_file
+           WHERE id=$1::uuid AND type='sidecar' FOR UPDATE"#,
+    )
+    .bind(&expected.id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    let actual = row
+        .map(|row| -> Result<SidecarRow, sqlx::Error> {
+            Ok(SidecarRow {
+                id: row.try_get("id")?,
+                asset_id: row.try_get("asset_id")?,
+                path: row.try_get("path")?,
+            })
+        })
+        .transpose()?;
+    if actual.as_ref() != Some(expected) || expected.asset_id != asset.id {
+        return Err(PgError::Stale(expected.id.clone()));
+    }
+    sqlx::query("DELETE FROM asset_file WHERE id=$1::uuid")
+        .bind(&expected.id)
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
 }
 
 pub fn file_name(path: &str) -> &str {
@@ -473,6 +536,95 @@ mod tests {
             !asset_identity_matches(&mut conn, "/example/a.jpg", id)
                 .await
                 .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a disposable PostgreSQL database named ismtest"]
+    async fn disposable_sidecar_removal_preserves_original_and_refuses_stale_identity() {
+        let url = std::env::var("ISM_DISPOSABLE_IMMICH_DATABASE_URL")
+            .expect("set the disposable proof database URL");
+        assert!(url.ends_with("/ismtest"), "use only the proof database");
+        let pool = connect(&url).await.unwrap();
+        let mut conn = pool.acquire().await.unwrap();
+        sqlx::query(
+            r#"CREATE TEMP TABLE asset (
+                id uuid PRIMARY KEY,"ownerId" uuid NOT NULL,"libraryId" uuid,"originalPath" text NOT NULL,
+                "livePhotoVideoId" uuid,"stackId" uuid,"duplicateId" uuid,"deletedAt" timestamptz
+            )"#,
+        ).execute(&mut *conn).await.unwrap();
+        sqlx::query(
+            r#"CREATE TEMP TABLE asset_file (
+                id uuid PRIMARY KEY,"assetId" uuid NOT NULL REFERENCES asset(id),path text NOT NULL,type text NOT NULL
+            )"#,
+        ).execute(&mut *conn).await.unwrap();
+        sqlx::query(
+            r#"INSERT INTO asset (id,"ownerId","libraryId","originalPath")
+               VALUES ('00000000-0000-0000-0000-000000000001',
+                       '00000000-0000-0000-0000-000000000002',
+                       '00000000-0000-0000-0000-000000000003','/example/photo.jpg')"#,
+        )
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"INSERT INTO asset_file (id,"assetId",path,type) VALUES
+               ('00000000-0000-0000-0000-000000000011','00000000-0000-0000-0000-000000000001','/example/photo.xmp','sidecar'),
+               ('00000000-0000-0000-0000-000000000012','00000000-0000-0000-0000-000000000001','/example/photo.xmp','sidecar'),
+               ('00000000-0000-0000-0000-000000000013','00000000-0000-0000-0000-000000000001','/example/photo.jpg','original')"#,
+        ).execute(&mut *conn).await.unwrap();
+        let mut tx = conn.begin().await.unwrap();
+        let asset = asset_by_id(&mut tx, "00000000-0000-0000-0000-000000000001")
+            .await
+            .unwrap()
+            .unwrap();
+        let sidecars = sidecars_at_path(&mut tx, "/example/photo.xmp")
+            .await
+            .unwrap();
+        assert_eq!(sidecars.len(), 2);
+        let mut stale = asset.clone();
+        stale.owner_id = "00000000-0000-0000-0000-000000000099".into();
+        assert!(matches!(
+            remove_sidecar(&mut tx, &sidecars[0], &stale).await,
+            Err(PgError::Stale(_))
+        ));
+        let mut stale_sidecar = sidecars[0].clone();
+        stale_sidecar.path = "/example/other.xmp".into();
+        assert!(matches!(
+            remove_sidecar(&mut tx, &stale_sidecar, &asset).await,
+            Err(PgError::Stale(_))
+        ));
+        assert_eq!(
+            sidecars_at_path(&mut tx, "/example/photo.xmp")
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        for sidecar in &sidecars {
+            remove_sidecar(&mut tx, sidecar, &asset).await.unwrap();
+        }
+        assert!(
+            sidecars_at_path(&mut tx, "/example/photo.xmp")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(asset_by_id(&mut tx, &asset.id).await.unwrap(), Some(asset));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM asset_file WHERE type='original'")
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap(),
+            1
+        );
+        tx.rollback().await.unwrap();
+        assert_eq!(
+            sidecars_at_path(&mut conn, "/example/photo.xmp")
+                .await
+                .unwrap()
+                .len(),
+            2
         );
     }
 

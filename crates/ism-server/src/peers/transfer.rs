@@ -32,13 +32,21 @@ fn existing_original_for_companion(
     folder: &std::path::Path,
     name: &str,
     companion_extensions: &[String],
-) -> AppResult<ExistingOriginal> {
-    let mut names = std::fs::read_dir(folder)
-        .map_err(AppError::internal)?
-        .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().is_ok_and(|file_type| file_type.is_file()))
-        .filter_map(|entry| entry.file_name().into_string().ok())
-        .collect::<Vec<_>>();
+) -> AppResult<Option<ExistingOriginal>> {
+    let entries = match std::fs::read_dir(folder) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(AppError::internal(error)),
+    };
+    let mut names = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(AppError::internal)?;
+        if entry.file_type().map_err(AppError::internal)?.is_file()
+            && let Ok(name) = entry.file_name().into_string()
+        {
+            names.push(name);
+        }
+    }
     if !names.iter().any(|candidate| candidate == name) {
         names.push(name.to_owned());
     }
@@ -58,29 +66,16 @@ fn existing_original_for_companion(
             .collect::<Vec<_>>(),
     );
     let Some(original) = selected else {
-        return Err(if owners.is_empty() {
-            AppError::conflict(
-                "companion_original_missing",
-                format!("no original matches companion '{name}'"),
-            )
-        } else {
-            AppError::conflict(
-                "companion_original_ambiguous",
-                format!("companion '{name}' belongs to multiple originals"),
-            )
-        });
+        return Ok(None);
     };
     let Some((expected_revision, _)) = files::replacement_fingerprint(&folder.join(original))?
     else {
-        return Err(AppError::conflict(
-            "companion_original_missing",
-            format!("original '{original}' disappeared"),
-        ));
+        return Ok(None);
     };
-    Ok(ExistingOriginal {
+    Ok(Some(ExistingOriginal {
         name: original.to_owned(),
         expected_revision,
-    })
+    }))
 }
 
 fn peer_upload_file(
@@ -91,19 +86,11 @@ fn peer_upload_file(
     match companion_role(name, companion_extensions) {
         Some(CompanionRole::Sidecar) => Ok((
             FileRole::Sidecar,
-            Some(existing_original_for_companion(
-                folder,
-                name,
-                companion_extensions,
-            )?),
+            existing_original_for_companion(folder, name, companion_extensions)?,
         )),
         Some(CompanionRole::Companion) => Ok((
             FileRole::Companion,
-            Some(existing_original_for_companion(
-                folder,
-                name,
-                companion_extensions,
-            )?),
+            existing_original_for_companion(folder, name, companion_extensions)?,
         )),
         None => Ok((FileRole::Original, None)),
     }
@@ -137,12 +124,7 @@ fn recovery_check_failed(message: impl Into<String>) -> AppError {
 /// This never moves, replaces or deletes a library file. It only verifies the final content and
 /// finishes the persisted peer bookkeeping when every expected file still matches exactly.
 pub async fn recheck_publish_recovery(state: &AppState, operation_id: &str) -> AppResult<()> {
-    let _operation_guard = state.replication_operation_lock.try_lock().map_err(|_| {
-        AppError::conflict(
-            "recovery_busy",
-            "peer replication is busy finishing another scan or operation; retry in a moment",
-        )
-    })?;
+    let _operation_guard = state.replication_operation_lock.lock().await;
     let operation: Option<(String, String, i64)> = sqlx::query_as(
         "SELECT status, admitted_server_ids_json, recovery_resolved
          FROM operations WHERE id = ?",
@@ -159,11 +141,6 @@ pub async fn recheck_publish_recovery(state: &AppState, operation_id: &str) -> A
         ));
     }
     let admitted: Vec<String> = serde_json::from_str(&admitted)?;
-    if !admitted.is_empty() {
-        return Err(recovery_check_failed(
-            "this recovery includes Immich maintenance work; inspect it manually instead",
-        ));
-    }
 
     let pending: Vec<(i64, String, String, String, String, String)> = sqlx::query_as(
         "SELECT idx, share_id, kind, to_path, vv_json, peer_id
@@ -249,7 +226,7 @@ pub async fn recheck_publish_recovery(state: &AppState, operation_id: &str) -> A
     let request: CreateUpload = serde_json::from_str(&request_json)?;
     let [spec] = request.files.as_slice() else {
         return Err(recovery_check_failed(
-            "this action published more than one file; inspect it manually",
+            "this publication requires group verification",
         ));
     };
     let share = super::shares(state)
@@ -264,20 +241,35 @@ pub async fn recheck_publish_recovery(state: &AppState, operation_id: &str) -> A
     }
     let target_folder = RelPath::parse(&request.target.path)
         .map_err(|e| AppError::invalid_location(e.to_string()))?;
-    let target_rel = target_folder
+    let uploaded_rel = target_folder
         .join(&spec.name)
         .map_err(|e| AppError::invalid_location(e.to_string()))?;
-    if share.rel_of(&Location {
-        root_id: request.target.root_id.clone(),
-        path: target_rel.as_str().to_owned(),
-    }) != Some(to_path.clone())
+    let vv: VersionVector = serde_json::from_str(vv_json)?;
+    let uploaded_share_path = share
+        .rel_of(&Location {
+            root_id: request.target.root_id.clone(),
+            path: uploaded_rel.as_str().to_owned(),
+        })
+        .ok_or_else(|| recovery_check_failed("upload destination is outside the share"))?;
+    let current_path = super::recovery::current_path(state, &share, to_path, &vv).await?;
+    if super::recovery::current_path(state, &share, &uploaded_share_path, &vv).await?
+        != current_path
     {
         return Err(recovery_check_failed(
             "the final file path does not match the interrupted peer publication",
         ));
     }
+    let target_rel = share.root_rel(&current_path)?;
     let root = files::root(&state.db, &share.root_id).await?;
     root.ensure_available()?;
+    if admitted
+        .iter()
+        .any(|server| root.server_id.as_ref() != Some(server))
+    {
+        return Err(recovery_check_failed(
+            "this publication includes unverified Immich effects",
+        ));
+    }
     let path = root.abs(&target_rel)?;
     let checked_path = path.clone();
     let fingerprint =
@@ -302,10 +294,11 @@ pub async fn recheck_publish_recovery(state: &AppState, operation_id: &str) -> A
             "the destination file no longer matches the upload size and checksum",
         ));
     }
+    let asset_id =
+        crate::ops::exec::verified_asset_at_root(state, &root, &target_rel, spec.role).await?;
 
-    let vv: VersionVector = serde_json::from_str(vv_json)?;
     let result = serde_json::json!({
-        "asset_id": null,
+        "asset_id": asset_id,
         "files": [PlannedFile {
             from: None,
             to: Some(Location {
@@ -326,6 +319,7 @@ pub async fn recheck_publish_recovery(state: &AppState, operation_id: &str) -> A
         last["status"] = "done".into();
     }
 
+    let _maintenance_guard = state.maintenance_lock.lock().await;
     let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
     let unchanged: Option<String> =
         sqlx::query_scalar("SELECT status FROM operations WHERE id = ?")
@@ -355,7 +349,7 @@ pub async fn recheck_publish_recovery(state: &AppState, operation_id: &str) -> A
             "the destination file changed while it was being rechecked",
         ));
     }
-    let mut row = super::row_in(&mut tx, &share.id, to_path)
+    let mut row = super::row_in(&mut tx, &share.id, &current_path)
         .await?
         .unwrap_or(Row {
             size: 0,
@@ -369,7 +363,7 @@ pub async fn recheck_publish_recovery(state: &AppState, operation_id: &str) -> A
     row.mtime_ns = files::mtime_ns(&meta);
     row.sha256 = Some(sha256);
     row.deleted = false;
-    super::put_row_in(&mut tx, &share.id, to_path, &row).await?;
+    super::put_row_in(&mut tx, &share.id, &current_path, &row).await?;
     sqlx::query("DELETE FROM pending_peer_ops WHERE operation_id = ? AND idx = ?")
         .bind(operation_id)
         .bind(idx)
@@ -403,6 +397,7 @@ pub async fn recheck_publish_recovery(state: &AppState, operation_id: &str) -> A
             "the upload record changed while it was being rechecked",
         ));
     }
+    let resumed = crate::maintenance::resolve_operation_recovery_in(&mut tx, operation_id).await?;
     let updated_operation = sqlx::query(
         "UPDATE operations
          SET status = 'completed', recovery_resolved = 1, finished_at = COALESCE(finished_at, ?)
@@ -418,6 +413,12 @@ pub async fn recheck_publish_recovery(state: &AppState, operation_id: &str) -> A
         ));
     }
     tx.commit().await?;
+    for server_id in resumed {
+        state.emit(ServerEvent::MaintenanceChanged { server_id });
+    }
+    if !admitted.is_empty() {
+        state.maintenance_wake.notify_waiters();
+    }
 
     let (operation, _) = crate::ops::load(state, operation_id).await?;
     crate::ops::record(
@@ -488,6 +489,10 @@ struct Transfer {
     sha256: String,
     size: i64,
     vv: VersionVector,
+    source_rel: Option<String>,
+    source_vv: Option<VersionVector>,
+    retained_token: Option<String>,
+    restore_parent: Option<String>,
 }
 
 async fn original_pending(state: &AppState, share_id: &str, rel: &str) -> AppResult<bool> {
@@ -517,6 +522,7 @@ async fn original_pending(state: &AppState, share_id: &str, rel: &str) -> AppRes
 }
 
 async fn next(state: &AppState) -> AppResult<Option<(Transfer, Option<String>)>> {
+    let shares = super::shares(state).await?;
     type R = (
         String,
         String,
@@ -527,12 +533,17 @@ async fn next(state: &AppState) -> AppResult<Option<(Transfer, Option<String>)>>
         String,
         i64,
         String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
     );
     let now = chrono::Utc::now();
     let mut offset = 0_i64;
     loop {
         let rows: Vec<R> = sqlx::query_as(
-            "SELECT t.id, t.peer_id, t.share_id, t.rel_path, t.sha256, t.size, t.vv_json, t.attempts, t.updated_at
+            "SELECT t.id, t.peer_id, t.share_id, t.rel_path, t.sha256, t.size, t.vv_json, t.attempts, t.updated_at,
+                    t.source_rel_path,t.source_vv_json,t.restore_parent_operation_id,t.source_retained_token
              FROM transfers t JOIN peers p ON p.id = t.peer_id
              WHERE t.status = 'queued' AND p.status = 'online' ORDER BY t.queued_at, t.id LIMIT 200 OFFSET ?",
         )
@@ -543,7 +554,30 @@ async fn next(state: &AppState) -> AppResult<Option<(Transfer, Option<String>)>>
             return Ok(None);
         }
         offset += rows.len() as i64;
-        for (id, peer_id, share_id, rel, sha256, size, vv, attempts, updated) in rows {
+        for (
+            id,
+            peer_id,
+            share_id,
+            rel,
+            sha256,
+            size,
+            vv,
+            attempts,
+            updated,
+            source_rel,
+            source_vv,
+            restore_parent,
+            retained_token,
+        ) in rows
+        {
+            let Some(share) = shares.iter().find(|share| share.id == share_id) else {
+                continue;
+            };
+            match super::inbox::require_stable_transfer(state, share, &[&rel], &id).await {
+                Ok(()) => {}
+                Err(e) if matches!(e.code(), "recovery_required" | "root_unavailable") => continue,
+                Err(e) => return Err(e),
+            }
             // Back off after failures: one minute per attempt.
             if attempts > 0
                 && db::parse_ts(&updated)
@@ -562,6 +596,12 @@ async fn next(state: &AppState) -> AppResult<Option<(Transfer, Option<String>)>>
                         sha256,
                         size,
                         vv: serde_json::from_str(&vv)?,
+                        source_rel,
+                        source_vv: source_vv
+                            .map(|raw| serde_json::from_str(&raw))
+                            .transpose()?,
+                        restore_parent,
+                        retained_token,
                     },
                     ov,
                 )));
@@ -575,34 +615,28 @@ pub async fn run(state: AppState) {
     let mut tasks = tokio::task::JoinSet::new();
     loop {
         if tasks.len() < state.config.peer_transfer_concurrency {
-            match super::require_recovery_resolved(&state).await {
-                Ok(()) => match next(&state).await {
-                    Ok(Some((t, ov))) => {
-                        match claim(&state, &t.id, ov.as_deref()).await {
-                            Ok(true) => {}
-                            Ok(false) => continue,
-                            Err(e) => {
-                                tracing::error!(transfer = %t.id, "claim transfer: {}", e.message());
-                                tokio::time::sleep(tick).await;
-                                continue;
-                            }
+            match next(&state).await {
+                Ok(Some((t, ov))) => {
+                    match claim(&state, &t.id, ov.as_deref()).await {
+                        Ok(true) => {}
+                        Ok(false) => continue,
+                        Err(e) => {
+                            tracing::error!(transfer = %t.id, "claim transfer: {}", e.message());
+                            tokio::time::sleep(tick).await;
+                            continue;
                         }
-                        state.emit(ServerEvent::SyncChanged);
-                        let state = state.clone();
-                        tasks.spawn(async move {
-                            run_claimed(&state, &t).await;
-                        });
-                        continue;
                     }
-                    Ok(None) => {}
-                    Err(e) => {
-                        tracing::error!("transfer queue: {}", e.message());
-                    }
-                },
-                Err(e) if e.code() != "recovery_required" => {
-                    tracing::error!("transfer recovery check: {}", e.message());
+                    state.emit(ServerEvent::SyncChanged);
+                    let state = state.clone();
+                    tasks.spawn(async move {
+                        run_claimed(&state, &t).await;
+                    });
+                    continue;
                 }
-                Err(_) => {}
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::error!("transfer queue: {}", e.message());
+                }
             }
         }
         tokio::select! {
@@ -704,14 +738,6 @@ async fn run_one(state: &AppState, t: &Transfer) -> Result<Outcome, String> {
             "NAS metadata and ignored names are excluded from peer replication",
         ));
     }
-    let operation_guard = state.replication_operation_lock.lock().await;
-    if let Err(e) = super::require_stable_operations(state).await {
-        return if e.code() == "recovery_required" {
-            Ok(Outcome::Deferred)
-        } else {
-            Err(e.message().to_owned())
-        };
-    }
     let m = |e: AppError| e.message().to_owned();
     let peer = net::peer(state, &t.peer_id).await.map_err(m)?;
     let shares = super::shares(state).await.map_err(m)?;
@@ -720,6 +746,62 @@ async fn run_one(state: &AppState, t: &Transfer) -> Result<Outcome, String> {
     };
     if !share.includes(&peer.id) {
         return Ok(Outcome::Dropped);
+    }
+    if let Some(parent) = &t.restore_parent {
+        match super::admin::validate_folder_restore(state, parent).await {
+            Ok(()) => {}
+            Err(error) if error.code() == "choose_version" => {
+                return Ok(Outcome::Blocked(
+                    "peer source tree changed; a new choice is required",
+                ));
+            }
+            Err(_) => return Ok(Outcome::Deferred),
+        }
+    }
+    // Remote-source adapters authenticate fresh version/hash evidence before local locking.
+    if let Some(token) = &t.retained_token {
+        let wanted = super::retained::Wanted {
+            share: share.name.clone(),
+            path: t.source_rel.clone().unwrap_or_else(|| t.rel.clone()),
+            sha256: t.sha256.clone(),
+            size: t.size as u64,
+        };
+        if super::retained::remote_check(state, &peer, token, &wanted)
+            .await
+            .is_err()
+        {
+            return Ok(Outcome::Deferred);
+        }
+    } else if let Some(source) = &t.source_rel {
+        share.root_rel(source).map_err(m)?;
+        let version = t
+            .source_vv
+            .as_ref()
+            .ok_or("verified source version is missing")?;
+        let evidence =
+            match super::recovery::remote_evidence(state, &peer, &share, source, version).await {
+                Ok(evidence) => evidence,
+                Err(_) => return Ok(Outcome::Deferred),
+            };
+        if evidence.path != *source
+            || evidence.deleted
+            || evidence.sha256.as_deref() != Some(&t.sha256)
+            || evidence.size != Some(t.size as u64)
+            || !matches!(
+                evidence.vv.compare(version),
+                Causality::Equal | Causality::Dominates
+            )
+        {
+            return Ok(Outcome::Deferred);
+        }
+    }
+    let operation_guard = state.replication_operation_lock.lock().await;
+    if let Err(e) = super::inbox::require_stable_transfer(state, &share, &[&t.rel], &t.id).await {
+        return if matches!(e.code(), "recovery_required" | "root_unavailable") {
+            Ok(Outcome::Deferred)
+        } else {
+            Err(e.message().to_owned())
+        };
     }
     let root = files::root(&state.db, &share.root_id).await.map_err(m)?;
     root.ensure_available().map_err(m)?;
@@ -733,9 +815,10 @@ async fn run_one(state: &AppState, t: &Transfer) -> Result<Outcome, String> {
             .await
             .map_err(|e| e.to_string())?
             .map_err(|e| e.to_string())?;
-    if fingerprint
-        .as_ref()
-        .is_some_and(|(_, hash)| hash == &t.sha256)
+    if t.restore_parent.is_none()
+        && fingerprint
+            .as_ref()
+            .is_some_and(|(_, hash)| hash == &t.sha256)
     {
         let meta = std::fs::metadata(&target).map_err(|e| e.to_string())?;
         if i64::try_from(meta.len()).ok() != Some(t.size) {
@@ -817,17 +900,28 @@ async fn run_one(state: &AppState, t: &Transfer) -> Result<Outcome, String> {
         .unwrap_or(0);
     let expected_size = t.size as u64;
     if offset > expected_size {
-        tokio::fs::remove_file(&staging)
-            .await
-            .map_err(|e| e.to_string())?;
+        if t.retained_token.is_some() {
+            super::retained::preserve_staging(&root, &t.id).map_err(m)?;
+        } else {
+            tokio::fs::remove_file(&staging)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
         offset = 0;
     }
-    let path = format!(
-        "/api/peer/v1/content?share={}&path={}&sha256={}",
-        encode(&share.name),
-        encode(&t.rel),
-        t.sha256
-    );
+    let path = if let Some(token) = &t.retained_token {
+        format!(
+            "/api/peer/v1/recovery/retained/content?token={}",
+            encode(token)
+        )
+    } else {
+        format!(
+            "/api/peer/v1/content?share={}&path={}&sha256={}",
+            encode(&share.name),
+            encode(t.source_rel.as_deref().unwrap_or(&t.rel)),
+            t.sha256
+        )
+    };
     let mut file = BufWriter::with_capacity(
         STAGING_WRITE_BUFFER,
         tokio::fs::OpenOptions::new()
@@ -855,8 +949,21 @@ async fn run_one(state: &AppState, t: &Transfer) -> Result<Outcome, String> {
         let status = resp.status().as_u16();
         if status == 404 || status == 409 || status == 410 {
             drop(file);
-            let _ = tokio::fs::remove_file(&staging).await;
-            return Ok(Outcome::Dropped);
+            if t.source_rel.is_some() || t.retained_token.is_some() {
+                return Ok(Outcome::Deferred);
+            }
+            let current: Option<String> =
+                sqlx::query_scalar("SELECT rel_path FROM transfers WHERE id=?")
+                    .bind(&t.id)
+                    .fetch_optional(&state.db)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            if current.as_deref() != Some(&t.rel) {
+                return Ok(Outcome::Deferred);
+            }
+            return Ok(Outcome::Blocked(
+                "source version is no longer at the queued path; recovery will reconcile its current location",
+            ));
         }
         if status != 206 {
             return Err(format!("HTTP {status} from {}", peer.name));
@@ -907,7 +1014,11 @@ async fn run_one(state: &AppState, t: &Transfer) -> Result<Outcome, String> {
                 .map_err(m)?
                 {
                     drop(file);
-                    let _ = tokio::fs::remove_file(&staging).await;
+                    if t.retained_token.is_some() {
+                        super::retained::preserve_staging(&root, &t.id).map_err(m)?;
+                    } else {
+                        let _ = tokio::fs::remove_file(&staging).await;
+                    }
                     return Ok(Outcome::Dropped);
                 }
                 reported = done;
@@ -924,7 +1035,12 @@ async fn run_one(state: &AppState, t: &Transfer) -> Result<Outcome, String> {
         .await
         .map_err(m)?
     {
-        let _ = tokio::fs::remove_file(&staging).await;
+        drop(file);
+        if t.retained_token.is_some() {
+            super::retained::preserve_staging(&root, &t.id).map_err(m)?;
+        } else {
+            let _ = tokio::fs::remove_file(&staging).await;
+        }
         return Ok(Outcome::Dropped);
     }
     file.flush().await.map_err(|e| e.to_string())?;
@@ -937,13 +1053,17 @@ async fn run_one(state: &AppState, t: &Transfer) -> Result<Outcome, String> {
         .map_err(|e| e.to_string())?
         .map_err(|e| e.to_string())?;
     if hash != t.sha256 {
-        let _ = tokio::fs::remove_file(&staging).await;
+        if t.retained_token.is_some() {
+            super::retained::preserve_staging(&root, &t.id).map_err(m)?;
+        } else {
+            let _ = tokio::fs::remove_file(&staging).await;
+        }
         return Err("downloaded data does not match its checksum".into());
     }
 
     let _operation_guard = state.replication_operation_lock.lock().await;
-    if let Err(e) = super::require_stable_operations(state).await {
-        return if e.code() == "recovery_required" {
+    if let Err(e) = super::inbox::require_stable_transfer(state, &share, &[&t.rel], &t.id).await {
+        return if matches!(e.code(), "recovery_required" | "root_unavailable") {
             Ok(Outcome::Deferred)
         } else {
             Err(e.message().to_owned())
@@ -956,6 +1076,20 @@ async fn run_one(state: &AppState, t: &Transfer) -> Result<Outcome, String> {
         .map_err(|e| e.to_string())?;
     if status.as_deref() != Some("running") {
         return Ok(Outcome::Dropped);
+    }
+    let source: (Option<String>, Option<String>, String, Option<String>) = sqlx::query_as(
+        "SELECT source_rel_path,restore_parent_operation_id,rel_path,source_retained_token FROM transfers WHERE id=?",
+    )
+    .bind(&t.id)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|e| e.to_string())?;
+    if source.0 != t.source_rel
+        || source.1 != t.restore_parent
+        || source.2 != t.rel
+        || source.3 != t.retained_token
+    {
+        return Ok(Outcome::Deferred);
     }
     let Some(current_share) = super::shares(state)
         .await
@@ -990,11 +1124,12 @@ async fn run_one(state: &AppState, t: &Transfer) -> Result<Outcome, String> {
     let newer = local
         .as_ref()
         .is_none_or(|r| matches!(t.vv.compare(&r.vv), Causality::Dominates | Causality::Equal));
-    if !consistent
-        || !newer
-        || super::has_open_conflict(state, &share.id, &t.rel)
-            .await
-            .map_err(m)?
+    if t.restore_parent.is_none()
+        && (!consistent
+            || !newer
+            || super::has_open_conflict(state, &share.id, &t.rel)
+                .await
+                .map_err(m)?)
     {
         let _ = tokio::fs::remove_file(&staging).await;
         conflict_here(state, &peer, &share, t).await.map_err(m)?;
@@ -1047,7 +1182,24 @@ async fn publish(
             .map_err(AppError::internal)??
     };
     let companion_extensions = state.sidecar_extensions();
-    let (role, existing_original) = peer_upload_file(&folder_path, &name, &companion_extensions)?;
+    let (role, existing_original) = if t.restore_parent.is_some() {
+        (
+            match companion_role(&name, &companion_extensions) {
+                Some(CompanionRole::Sidecar) => FileRole::Sidecar,
+                Some(CompanionRole::Companion) => FileRole::Companion,
+                None => FileRole::Original,
+            },
+            None,
+        )
+    } else {
+        peer_upload_file(&folder_path, &name, &companion_extensions)?
+    };
+    if t.restore_parent.is_some() && current.is_some() {
+        return Err(AppError::conflict(
+            "peer_versions_diverged",
+            "restoration target contains a valid competing file",
+        ));
+    }
     let upload_id = crate::crypto::new_id("upl");
     let principal = Principal::Peer {
         peer_id: peer.id.clone(),
@@ -1104,15 +1256,31 @@ async fn publish(
         .bind(&request.idempotency_key)
         .execute(&mut *tx)
         .await?;
+    if let Some(parent) = &t.restore_parent {
+        super::admin::record_restore_upload_in(&mut tx, parent, &t.rel, &upload_id).await?;
+        archive_transfer(&mut tx, &t.id, Some(parent)).await?;
+        sqlx::query("DELETE FROM transfers WHERE id=? AND status='running'")
+            .bind(&t.id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        state.sync_wake.notify_waiters();
+        state.emit(ServerEvent::SyncChanged);
+        return Ok(());
+    }
     let accepted = crate::ops::insert_in(&mut tx, &principal, &op, Some(&upload_id)).await?;
     sqlx::query(
-        "INSERT INTO pending_peer_ops (operation_id, idx, share_id, kind, from_path, to_path, vv_json, peer_id)
-         VALUES (?, 0, ?, 'publish', NULL, ?, ?, ?)",
+        "INSERT INTO pending_peer_ops (operation_id, idx, share_id, kind, from_path, to_path, vv_json, peer_id, conflict_id)
+         VALUES (?, 0, ?, 'publish', NULL, ?, ?, ?,
+            (SELECT id FROM conflicts WHERE share_id=? AND rel_path=? AND peer_id=? AND status='resolving' LIMIT 1))",
     )
     .bind(&accepted.operation_id)
     .bind(&share.id)
     .bind(&t.rel)
     .bind(serde_json::to_string(&t.vv)?)
+    .bind(&peer.id)
+    .bind(&share.id)
+    .bind(&t.rel)
     .bind(&peer.id)
     .execute(&mut *tx)
     .await?;
@@ -1127,7 +1295,7 @@ async fn publish(
     Ok(())
 }
 
-async fn archive_transfer(
+pub(super) async fn archive_transfer(
     conn: &mut sqlx::SqliteConnection,
     id: &str,
     operation_id: Option<&str>,
@@ -1188,8 +1356,9 @@ mod tests {
             .map(|extension| extension.to_string())
             .collect::<Vec<_>>();
 
-        let existing =
-            existing_original_for_companion(dir.path(), "retry-move.xmp", &extensions).unwrap();
+        let existing = existing_original_for_companion(dir.path(), "retry-move.xmp", &extensions)
+            .unwrap()
+            .unwrap();
         assert_eq!(existing.name, "retry-move.png");
         assert!(!existing.expected_revision.is_empty());
 
@@ -1207,7 +1376,7 @@ mod tests {
     }
 
     #[test]
-    fn refuses_ambiguous_shared_peer_sidecar() {
+    fn leaves_ambiguous_shared_peer_sidecar_unanchored() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("retry.jpg"), b"jpg").unwrap();
         std::fs::write(dir.path().join("retry.png"), b"png").unwrap();
@@ -1217,9 +1386,9 @@ mod tests {
             .map(|extension| extension.to_string())
             .collect::<Vec<_>>();
 
-        let error =
-            existing_original_for_companion(dir.path(), "retry.xmp", &extensions).unwrap_err();
-        assert_eq!(error.code(), "companion_original_ambiguous");
+        let (role, existing) = peer_upload_file(dir.path(), "retry.xmp", &extensions).unwrap();
+        assert_eq!(role, FileRole::Sidecar);
+        assert!(existing.is_none());
     }
 
     #[test]
@@ -1240,8 +1409,9 @@ mod tests {
             }
             std::fs::write(dir.path().join("retry.xmp"), b"metadata").unwrap();
 
-            let existing =
-                existing_original_for_companion(dir.path(), "retry.xmp", &extensions).unwrap();
+            let existing = existing_original_for_companion(dir.path(), "retry.xmp", &extensions)
+                .unwrap()
+                .unwrap();
             assert_eq!(existing.name, expected);
         }
     }

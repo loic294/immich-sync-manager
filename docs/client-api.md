@@ -72,7 +72,7 @@ blocked). `direct_writes` is one of:
 | `unknown_server` | The root points to an Immich server that is no longer registered | `direct_writes_unavailable` |
 | `drift` | Immich's watcher or scheduled scan was turned back on | `maintenance_blocked` |
 | `maintenance` | The library queue could not be paused or resumed | `maintenance_blocked` |
-| `recovery_required` | A change could not be completed or verified; an admin must resolve it | `maintenance_blocked` |
+| `recovery_required` | A change could not be verified; ISM recovery must verify it before releasing this server's barrier | `maintenance_blocked` |
 
 ## Logical locations
 
@@ -209,6 +209,9 @@ Immich library. `503 immich_unavailable` means the Immich database cannot be rea
    need to poll the manifest for the new asset id.
 
 ### Sidecar-only uploads
+
+Authenticated peer replication can publish standalone sidecars without an original. This internal
+mode does not relax the client upload rules below or create an artificial Immich asset.
 
 To sync an edited sidecar without re-uploading an unchanged original, name the original that
 stays in place instead of sending it:

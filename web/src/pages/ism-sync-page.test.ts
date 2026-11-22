@@ -129,7 +129,7 @@ describe('ism-sync-page', () => {
     );
     expect(buttons).not.toContain('View publishing operation');
     expect(buttons).not.toContain('Cancel transfer');
-    expect(page.textContent).toContain('The receiving instance manages this transfer');
+    expect(page.textContent).not.toContain('Cannot verify the source folder');
   });
 
   it('shows current-run file and byte totals, a byte-based progress bar, speed and ETA', async () => {
@@ -218,12 +218,20 @@ describe('ism-sync-page', () => {
     const page = await mount('ism-sync-page');
     await vi.waitFor(() => expect(page.textContent).toContain('target already exists'));
     page.querySelector<HTMLButtonElement>('tbody button')?.click();
-    await vi.waitFor(() => expect(page.textContent).toContain('Re-add to sync queue'));
+    await vi.waitFor(() =>
+      expect(page.querySelector('ism-sync-detail')?.textContent).toContain('Fix'),
+    );
     [...page.querySelectorAll<HTMLButtonElement>('ism-sync-detail button')]
-      .find((button) => button.textContent?.includes('Re-add to sync queue'))
+      .find((button) => button.textContent?.trim() === 'Fix')
       ?.click();
     await vi.waitFor(() =>
-      expect(post).toHaveBeenCalledWith('/api/admin/sync/operations/op-peer/0/readd'),
+      expect(post).toHaveBeenCalledWith('/api/admin/recovery', {
+        body: {
+          targets: [{ kind: 'operation', id: 'op-peer', peer_id: null }],
+          all: false,
+          resolution: null,
+        },
+      }),
     );
   });
 

@@ -2,6 +2,12 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "isolation_tests.rs"]
+mod isolation;
+
+#[path = "folder_decision_tests.rs"]
+mod folder_decisions;
+
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -173,6 +179,1273 @@ async fn stop_workers(instance: &mut Instance) {
         task.abort();
         let _ = task.await;
     }
+}
+
+#[tokio::test]
+async fn recovery_automatically_finishes_local_bookkeeping_once() {
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    sqlx::query(
+        "CREATE TRIGGER reject_recovery_event BEFORE INSERT ON event_log
+         WHEN json_extract(NEW.data_json,'$.path')='recoverable'
+         BEGIN SELECT RAISE(FAIL,'injected'); END",
+    )
+    .execute(&b.state.db)
+    .await
+    .unwrap();
+    let accepted = crate::ops::submit(
+        &b.state,
+        &Principal::Admin {
+            username: "test".into(),
+        },
+        OperationRequest {
+            idempotency_key: "recover-local-bookkeeping".into(),
+            label: Some("Create recoverable folder".into()),
+            actions: vec![OperationAction::CreateFolder {
+                target: Location {
+                    root_id: "photos".into(),
+                    path: "shared/recoverable".into(),
+                },
+            }],
+            allow_owner_transfer: false,
+            allow_partial: false,
+        },
+    )
+    .await
+    .unwrap();
+    crate::ops::exec::run_operation(&b.state, &accepted.operation_id)
+        .await
+        .unwrap();
+    sqlx::query("DROP TRIGGER reject_recovery_event")
+        .execute(&b.state.db)
+        .await
+        .unwrap();
+    super::recovery::tick(&b.state).await.unwrap();
+    assert_eq!(
+        crate::ops::load(&b.state, &accepted.operation_id)
+            .await
+            .unwrap()
+            .0
+            .status,
+        ism_core::dto::OperationStatus::Completed,
+    );
+    let count = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM event_log WHERE json_extract(data_json,'$.path')='recoverable'",
+    )
+    .fetch_one(&b.state.db)
+    .await
+    .unwrap();
+    assert_eq!(count, 1);
+    let batch = ism_core::dto::RecoveryBatchInput {
+        targets: vec![ism_core::dto::RecoveryTarget {
+            kind: ism_core::dto::RecoveryKind::Operation,
+            id: accepted.operation_id.clone(),
+            peer_id: None,
+        }],
+        all: false,
+        resolution: None,
+    };
+    let response = super::recovery::submit(&b.state, batch.clone())
+        .await
+        .unwrap();
+    assert_eq!(response.items[0].state, ism_core::dto::RecoveryState::Fixed);
+    super::recovery::submit(&b.state, batch).await.unwrap();
+    super::recovery::tick(&b.state).await.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM event_log WHERE json_extract(data_json,'$.path')='recoverable'",
+        )
+        .fetch_one(&b.state.db)
+        .await
+        .unwrap(),
+        count,
+    );
+}
+
+#[tokio::test]
+async fn recovery_batch_preserves_decisions_and_never_dismisses_unverified_work() {
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    write_old(&a.shared.join("photo.jpg"), b"alpha");
+    write_old(&b.shared.join("photo.jpg"), b"beta");
+    scan(&a).await;
+    scan(&b).await;
+    let peer = super::net::peers(&b.state).await.unwrap().remove(0);
+    assert!(
+        super::pull(&b.state, &peer)
+            .await
+            .unwrap_err()
+            .contains("conflict resolution")
+    );
+    let conflicts = admin::list_conflicts(&b.state, false).await.unwrap();
+    assert_eq!(conflicts.len(), 1);
+    let result = super::recovery::submit(
+        &b.state,
+        ism_core::dto::RecoveryBatchInput {
+            targets: Vec::new(),
+            all: true,
+            resolution: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.items.len(), 1);
+    super::recovery::tick(&b.state).await.unwrap();
+    let recovery = super::recovery::get(
+        &b.state,
+        ism_core::dto::RecoveryKind::Conflict,
+        &conflicts[0].id,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(recovery.state, ism_core::dto::RecoveryState::NeedsDecision);
+    assert!(!recovery.can_dismiss);
+    assert_eq!(std::fs::read(b.shared.join("photo.jpg")).unwrap(), b"beta");
+    let error = super::recovery::submit(
+        &b.state,
+        ism_core::dto::RecoveryBatchInput {
+            targets: vec![recovery.target],
+            all: false,
+            resolution: Some(ConflictResolution::Skip),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code(), "recovery_not_exhausted");
+}
+
+#[tokio::test]
+async fn peer_original_deletion_preserves_the_surviving_orphan_sidecar() {
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    write_old(&a.shared.join("photo.jpg"), b"original");
+    write_old(&a.shared.join("photo.xmp"), b"surviving metadata");
+    scan(&a).await;
+    let peer = super::net::peers(&b.state).await.unwrap().remove(0);
+    super::pull(&b.state, &peer).await.unwrap();
+    b.tasks
+        .push(tokio::spawn(crate::ops::exec::run(b.state.clone())));
+    b.tasks
+        .push(tokio::spawn(super::transfer::run(b.state.clone())));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let pending: i64 = sqlx::query_scalar(
+                "SELECT (SELECT COUNT(*) FROM transfers)
+                 + (SELECT COUNT(*) FROM operations WHERE status IN ('queued','running','waiting_maintenance'))",
+            )
+            .fetch_one(&b.state.db)
+            .await
+            .unwrap();
+            if pending == 0 {
+                break;
+            }
+            b.state.sync_wake.notify_waiters();
+            b.state.ops_wake.notify_one();
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("both initial files must finish publication");
+    stop_workers(&mut b).await;
+    super::pull(&b.state, &peer).await.unwrap();
+    assert_eq!(
+        std::fs::read(b.shared.join("photo.xmp")).unwrap(),
+        b"surviving metadata"
+    );
+    std::fs::remove_file(a.shared.join("photo.jpg")).unwrap();
+    scan(&a).await;
+    let peer = super::net::peers(&b.state).await.unwrap().remove(0);
+    super::pull(&b.state, &peer).await.unwrap();
+    let deletion: String = sqlx::query_scalar(
+        "SELECT operation_id FROM pending_peer_ops WHERE kind='delete' AND to_path='photo.jpg'",
+    )
+    .fetch_one(&b.state.db)
+    .await
+    .unwrap();
+    crate::ops::exec::run_operation(&b.state, &deletion)
+        .await
+        .unwrap();
+    assert!(!b.shared.join("photo.jpg").exists());
+    assert_eq!(
+        std::fs::read(b.shared.join("photo.xmp")).unwrap(),
+        b"surviving metadata",
+        "an original-only peer deletion must not remove an unannounced sidecar",
+    );
+    let share = super::shares(&b.state).await.unwrap().remove(0);
+    assert!(
+        !super::row(&b.state, &share.id, "photo.xmp")
+            .await
+            .unwrap()
+            .unwrap()
+            .deleted
+    );
+}
+
+#[tokio::test]
+async fn peer_and_reviewed_conflict_sidecar_deletions_preserve_the_original() {
+    for diverged in [false, true] {
+        let (mut a, mut b) = pair().await;
+        stop_workers(&mut a).await;
+        stop_workers(&mut b).await;
+        write_old(&a.shared.join("photo.jpg"), b"original");
+        write_old(&a.shared.join("photo.xmp"), b"metadata");
+        scan(&a).await;
+        let peer = super::net::peers(&b.state).await.unwrap().remove(0);
+        super::pull(&b.state, &peer).await.unwrap();
+        b.tasks
+            .push(tokio::spawn(crate::ops::exec::run(b.state.clone())));
+        b.tasks
+            .push(tokio::spawn(super::transfer::run(b.state.clone())));
+        tokio::time::timeout(Duration::from_secs(5),async {
+            loop {
+                let pending:i64=sqlx::query_scalar(
+                    "SELECT (SELECT COUNT(*) FROM transfers)
+                     + (SELECT COUNT(*) FROM operations WHERE status IN ('queued','running','waiting_maintenance'))",
+                ).fetch_one(&b.state.db).await.unwrap();
+                if pending==0 { break; }
+                b.state.sync_wake.notify_waiters();
+                b.state.ops_wake.notify_one();
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }).await.expect("initial publication must settle");
+        stop_workers(&mut b).await;
+        super::pull(&b.state, &peer).await.unwrap();
+        if diverged {
+            write_old(&b.shared.join("photo.xmp"), b"changed metadata");
+            scan(&b).await;
+        }
+        std::fs::remove_file(a.shared.join("photo.xmp")).unwrap();
+        scan(&a).await;
+        if diverged {
+            super::pull(&b.state, &peer).await.unwrap_err();
+            let id: String = sqlx::query_scalar(
+                "SELECT id FROM conflicts WHERE rel_path='photo.xmp' AND status='open'",
+            )
+            .fetch_one(&b.state.db)
+            .await
+            .unwrap();
+            let reviewed = super::versions::get(
+                &b.state,
+                &ism_core::dto::RecoveryTarget {
+                    kind: ism_core::dto::RecoveryKind::Conflict,
+                    id: id.clone(),
+                    peer_id: None,
+                },
+            )
+            .await
+            .unwrap();
+            admin::resolve_reviewed(
+                &b.state,
+                "test",
+                &id,
+                ConflictResolution::KeepRemote,
+                Some(&reviewed.revision),
+            )
+            .await
+            .unwrap();
+        } else {
+            super::pull(&b.state, &peer).await.unwrap();
+        }
+        let operation: String = sqlx::query_scalar(
+            "SELECT operation_id FROM pending_peer_ops WHERE kind='delete' AND to_path='photo.xmp'",
+        )
+        .fetch_one(&b.state.db)
+        .await
+        .unwrap();
+        crate::ops::exec::run_operation(&b.state, &operation)
+            .await
+            .unwrap();
+        assert!(!b.shared.join("photo.xmp").exists());
+        assert_eq!(
+            std::fs::read(b.shared.join("photo.jpg")).unwrap(),
+            b"original"
+        );
+        let progress: String = sqlx::query_scalar(
+            "SELECT progress_json FROM operation_items WHERE operation_id=? AND idx=0",
+        )
+        .bind(&operation)
+        .fetch_one(&b.state.db)
+        .await
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&progress).unwrap()["files"][0]["role"],
+            "sidecar"
+        );
+    }
+}
+
+#[tokio::test]
+async fn recovery_fetches_exact_peer_trash_content_without_restoring_ancestor_collateral() {
+    use ism_core::dto::{RecoveryBatchInput, RecoveryKind, RecoveryTarget};
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    write_old(&a.shared.join("lost/orphan.xmp"), b"retained metadata");
+    write_old(&a.shared.join("lost/unrelated.jpg"), b"unrelated photo");
+    let source = super::net::peers(&b.state).await.unwrap().remove(0);
+    let share = super::shares(&b.state).await.unwrap().remove(0);
+    let trashed = crate::ops::submit(
+        &a.state,
+        &Principal::Admin {
+            username: "test".into(),
+        },
+        OperationRequest {
+            idempotency_key: "retain-folder-for-exact-repair".into(),
+            label: None,
+            actions: vec![OperationAction::TrashFolder {
+                source: loc("shared/lost"),
+                expected_entries: None,
+            }],
+            allow_owner_transfer: false,
+            allow_partial: false,
+        },
+    )
+    .await
+    .unwrap();
+    crate::ops::exec::run_operation(&a.state, &trashed.operation_id)
+        .await
+        .unwrap();
+    assert!(!a.shared.join("lost").exists());
+    sqlx::query(
+        "INSERT INTO transfers (id,peer_id,share_id,rel_path,sha256,size,vv_json,status,queued_at,updated_at,error)
+         VALUES ('retained-repair',?,?, 'lost/orphan.xmp',?,?,?,'failed',?,?,'source file missing')",
+    ).bind(&source.id).bind(&share.id).bind(crate::crypto::sha256_hex(b"retained metadata")).bind(17_i64)
+    .bind("{}").bind(crate::db::now()).bind(crate::db::now())
+    .execute(&b.state.db).await.unwrap();
+    super::recovery::submit(
+        &b.state,
+        RecoveryBatchInput {
+            targets: vec![RecoveryTarget {
+                kind: RecoveryKind::Transfer,
+                id: "retained-repair".into(),
+                peer_id: None,
+            }],
+            all: false,
+            resolution: None,
+        },
+    )
+    .await
+    .unwrap();
+    super::recovery::tick(&b.state).await.unwrap();
+    let queued: (String, Option<String>) = sqlx::query_as(
+        "SELECT status,source_retained_token FROM transfers WHERE id='retained-repair'",
+    )
+    .fetch_one(&b.state.db)
+    .await
+    .unwrap();
+    assert_eq!(queued.0, "queued");
+    assert!(queued.1.is_some());
+    b.tasks
+        .push(tokio::spawn(crate::ops::exec::run(b.state.clone())));
+    b.tasks
+        .push(tokio::spawn(super::transfer::run(b.state.clone())));
+    eventually("exact retained sidecar publication", &[&b], || {
+        b.shared.join("lost/orphan.xmp").exists()
+    })
+    .await;
+    assert_eq!(
+        std::fs::read(b.shared.join("lost/orphan.xmp")).unwrap(),
+        b"retained metadata"
+    );
+    assert!(!b.shared.join("lost/unrelated.jpg").exists());
+    assert!(!a.shared.join("lost").exists());
+    let retained: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM trash WHERE restored_at IS NULL AND purged_at IS NULL",
+    )
+    .fetch_one(&a.state.db)
+    .await
+    .unwrap();
+    assert_eq!(retained, 1);
+}
+
+#[tokio::test]
+async fn recovery_previews_are_owner_scoped_current_and_independent_of_immich_indexing() {
+    use ism_core::dto::{RecoveryKind, RecoveryTarget};
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    write_old(&a.shared.join("preview.jpg"), b"source preview");
+    write_old(&b.shared.join("preview.jpg"), b"receiving preview");
+    scan(&a).await;
+    scan(&b).await;
+    let source_peer = super::net::peers(&b.state).await.unwrap().remove(0);
+    super::pull(&b.state, &source_peer).await.unwrap_err();
+    let id: String = sqlx::query_scalar("SELECT id FROM conflicts WHERE rel_path='preview.jpg'")
+        .fetch_one(&b.state.db)
+        .await
+        .unwrap();
+    let target = RecoveryTarget {
+        kind: RecoveryKind::Conflict,
+        id,
+        peer_id: None,
+    };
+    let reviewed = super::versions::get(&b.state, &target).await.unwrap();
+    let receiver = super::net::peers(&a.state).await.unwrap().remove(0);
+    for (source, expected) in [
+        (false, b"receiving preview".as_slice()),
+        (true, b"source preview".as_slice()),
+    ] {
+        let query = reqwest::Url::parse_with_params(
+            "http://ism.example",
+            [
+                ("kind", "conflict"),
+                ("id", target.id.as_str()),
+                ("revision", reviewed.revision.as_str()),
+                ("path", "preview.jpg"),
+                ("source", if source { "true" } else { "false" }),
+            ],
+        )
+        .unwrap();
+        let response = super::net::request(
+            &a.state,
+            &receiver.url,
+            &receiver.secret,
+            reqwest::Method::GET,
+            &format!("/api/peer/v1/recovery/preview?{}", query.query().unwrap()),
+            None,
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            response.headers().get("cache-control").unwrap(),
+            "private, no-store"
+        );
+        assert_eq!(response.bytes().await.unwrap().as_ref(), expected);
+    }
+    super::recovery::refresh(&a.state, &receiver).await.unwrap();
+    let mut query = super::versions::PreviewQuery {
+        target: super::versions::Query {
+            kind: target.kind,
+            id: target.id.clone(),
+            peer_id: Some(receiver.id),
+        },
+        revision: reviewed.revision.clone(),
+        path: "preview.jpg".into(),
+        source: false,
+    };
+    let response = super::versions::preview(&a.state, &query).await.unwrap();
+    assert_eq!(
+        axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap()
+            .as_ref(),
+        b"receiving preview"
+    );
+    query.target.peer_id = None;
+    query.path = "../outside.jpg".into();
+    assert_eq!(
+        super::versions::preview(&b.state, &query)
+            .await
+            .unwrap_err()
+            .status(),
+        axum::http::StatusCode::NOT_FOUND
+    );
+    query.path = "preview.jpg".into();
+    write_old(&b.shared.join("preview.jpg"), b"changed after review");
+    assert_eq!(
+        super::versions::preview(&b.state, &query)
+            .await
+            .unwrap_err()
+            .code(),
+        "preview_changed"
+    );
+    assert_eq!(
+        admin::resolve_reviewed(
+            &b.state,
+            "test",
+            &target.id,
+            ConflictResolution::KeepRemote,
+            Some(&reviewed.revision)
+        )
+        .await
+        .unwrap_err()
+        .code(),
+        "version_conflict"
+    );
+    assert_eq!(
+        std::fs::read(b.shared.join("preview.jpg")).unwrap(),
+        b"changed after review"
+    );
+    sqlx::query(
+        "UPDATE recovery_version_snapshots SET created_at='2000-01-01T00:00:00Z' WHERE target_id=?",
+    )
+    .bind(&target.id)
+    .execute(&b.state.db)
+    .await
+    .unwrap();
+    assert_eq!(
+        super::versions::preview(&b.state, &query)
+            .await
+            .unwrap_err()
+            .code(),
+        "preview_expired"
+    );
+}
+
+#[tokio::test]
+async fn recovery_outgoing_fix_is_persisted_offline_and_replayed_after_restart() {
+    use ism_core::dto::{RecoveryBatchInput, RecoveryKind, RecoveryState, RecoveryTarget};
+
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    let owner_peer = super::net::peers(&b.state).await.unwrap().remove(0);
+    let share = super::shares(&b.state).await.unwrap().remove(0);
+    sqlx::query(
+        "INSERT INTO transfers (id,peer_id,share_id,rel_path,sha256,size,vv_json,status,queued_at,updated_at,error)
+         VALUES ('offline-repair',?,?, 'photo.xmp',?,3,'{}','failed',?,?, 'peer unavailable')",
+    )
+    .bind(&owner_peer.id)
+    .bind(&share.id)
+    .bind(crate::crypto::sha256_hex(b"xmp"))
+    .bind(crate::db::now())
+    .bind(crate::db::now())
+    .execute(&b.state.db)
+    .await
+    .unwrap();
+    let receiver = super::net::peers(&a.state).await.unwrap().remove(0);
+    super::recovery::refresh(&a.state, &receiver).await.unwrap();
+    sqlx::query("UPDATE peers SET url='http://127.0.0.1:1' WHERE id=?")
+        .bind(&receiver.id)
+        .execute(&a.state.db)
+        .await
+        .unwrap();
+    let request = RecoveryBatchInput {
+        targets: vec![RecoveryTarget {
+            kind: RecoveryKind::Transfer,
+            id: "offline-repair".into(),
+            peer_id: Some(receiver.id.clone()),
+        }],
+        all: false,
+        resolution: None,
+    };
+    for _ in 0..2 {
+        let result = super::recovery::submit(&a.state, request.clone())
+            .await
+            .unwrap();
+        assert_eq!(result.items[0].state, RecoveryState::Queued);
+    }
+    let pending: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM outgoing_recovery_requests WHERE state!='accepted'",
+    )
+    .fetch_one(&a.state.db)
+    .await
+    .unwrap();
+    assert_eq!(
+        pending, 1,
+        "repeated Fix must coalesce while the owner is offline"
+    );
+    let restarted = AppState::new(
+        Config::for_tests(a._dir.path()),
+        a.state.db.clone(),
+        SecretBox::open_or_create(a._dir.path()).unwrap(),
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE peers SET url=? WHERE id=?")
+        .bind(&b.url)
+        .bind(&receiver.id)
+        .execute(&a.state.db)
+        .await
+        .unwrap();
+    let worker = tokio::spawn(super::recovery::run(restarted));
+    a.tasks.push(worker);
+    for _ in 0..200 {
+        let pending: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM outgoing_recovery_requests WHERE state!='accepted'",
+        )
+        .fetch_one(&a.state.db)
+        .await
+        .unwrap();
+        if pending == 0 {
+            let accepted: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM sync_recovery WHERE target_id='offline-repair' AND state='queued'",
+            )
+            .fetch_one(&b.state.db)
+            .await
+            .unwrap();
+            assert_eq!(
+                accepted, 1,
+                "only the receiving owner may execute the persisted Fix"
+            );
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("the persisted outgoing Fix was not delivered after restart");
+}
+
+#[tokio::test]
+async fn recovery_versions_are_current_owner_scoped_and_stale_decisions_do_not_execute() {
+    use ism_core::dto::{
+        RecoveryDecision, RecoveryDecisionInput, RecoveryKind, RecoveryState, RecoveryTarget,
+    };
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    write_old(&a.shared.join("orphan.xmp"), b"old source metadata");
+    write_old(&b.shared.join("orphan.xmp"), b"receiver metadata");
+    scan(&a).await;
+    scan(&b).await;
+    let share = super::shares(&b.state).await.unwrap().remove(0);
+    let source_share = super::shares(&a.state).await.unwrap().remove(0);
+    let peer = super::net::peers(&b.state).await.unwrap().remove(0);
+    let version = super::row(&a.state, &source_share.id, "orphan.xmp")
+        .await
+        .unwrap()
+        .unwrap()
+        .vv;
+    super::conflict(
+        &b.state,
+        super::ConflictInput {
+            share: &share,
+            rel: "orphan.xmp",
+            kind: "changed_on_both",
+            detail: "Choose a version".into(),
+            remote: ConflictSide {
+                instance: "Alpha".into(),
+                sha256: Some(crate::crypto::sha256_hex(b"old source metadata")),
+                size: Some(19),
+                modified_at: None,
+                deleted: false,
+            },
+            remote_vv: &version,
+            peer_id: &peer.id,
+            from: None,
+        },
+    )
+    .await
+    .unwrap();
+    let id: String = sqlx::query_scalar("SELECT id FROM conflicts WHERE rel_path='orphan.xmp'")
+        .fetch_one(&b.state.db)
+        .await
+        .unwrap();
+    write_old(&a.shared.join("orphan.xmp"), b"current source metadata");
+    scan(&a).await;
+    let target = RecoveryTarget {
+        kind: RecoveryKind::Conflict,
+        id,
+        peer_id: None,
+    };
+    let current = super::versions::get(&b.state, &target).await.unwrap();
+    assert_eq!(
+        current.source.files[0].sha256,
+        crate::crypto::sha256_hex(b"current source metadata")
+    );
+    assert_eq!(current.source.files[0].role, "sidecar");
+    assert_eq!(
+        current.receiving[0].files[0].sha256,
+        crate::crypto::sha256_hex(b"receiver metadata")
+    );
+    let receiver = super::net::peers(&a.state).await.unwrap().remove(0);
+    super::recovery::refresh(&a.state, &receiver).await.unwrap();
+    let forwarded = super::versions::get(
+        &a.state,
+        &RecoveryTarget {
+            peer_id: Some(receiver.id),
+            ..target.clone()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(forwarded.revision, current.revision);
+    assert_eq!(forwarded.receiving[0].instance, "Beta");
+    assert_eq!(forwarded.source.instance, "Alpha");
+    write_old(&b.shared.join("orphan.xmp"), b"new receiver metadata");
+    let result = super::recovery::submit_decisions(
+        &b.state,
+        RecoveryDecisionInput {
+            decisions: vec![RecoveryDecision {
+                target: target.clone(),
+                revision: current.revision,
+            }],
+            resolution: ConflictResolution::KeepRemote,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.items[0].state, RecoveryState::NeedsDecision);
+    let pending: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM pending_peer_ops WHERE conflict_id=?")
+            .bind(&target.id)
+            .fetch_one(&b.state.db)
+            .await
+            .unwrap();
+    assert_eq!(pending, 0);
+    assert_eq!(
+        std::fs::read(b.shared.join("orphan.xmp")).unwrap(),
+        b"new receiver metadata"
+    );
+    let current = super::versions::get(&b.state, &target).await.unwrap();
+    super::recovery::submit_decisions(
+        &b.state,
+        RecoveryDecisionInput {
+            decisions: vec![RecoveryDecision {
+                target: target.clone(),
+                revision: current.revision,
+            }],
+            resolution: ConflictResolution::KeepRemote,
+        },
+    )
+    .await
+    .unwrap();
+    super::recovery::tick(&b.state).await.unwrap();
+    b.tasks
+        .push(tokio::spawn(crate::ops::exec::run(b.state.clone())));
+    b.tasks
+        .push(tokio::spawn(super::transfer::run(b.state.clone())));
+    eventually(
+        "the reviewed current source sidecar publishes",
+        &[&b],
+        || {
+            std::fs::read(b.shared.join("orphan.xmp")).ok().as_deref()
+                == Some(b"current source metadata")
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn recovery_accepts_a_verified_causal_deletion_without_resurrecting_content() {
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    write_old(&a.shared.join("obsolete.jpg"), b"obsolete source version");
+    scan(&a).await;
+    let peer = super::net::peers(&b.state).await.unwrap().remove(0);
+    super::pull(&b.state, &peer).await.unwrap();
+    let transfer_id: String =
+        sqlx::query_scalar("SELECT id FROM transfers WHERE rel_path='obsolete.jpg'")
+            .fetch_one(&b.state.db)
+            .await
+            .unwrap();
+    let deleted = crate::ops::submit(
+        &a.state,
+        &Principal::Admin {
+            username: "test".into(),
+        },
+        OperationRequest {
+            idempotency_key: "delete-before-recovery-download".into(),
+            label: None,
+            actions: vec![OperationAction::Trash {
+                source: Location {
+                    root_id: "photos".into(),
+                    path: "shared/obsolete.jpg".into(),
+                },
+                expected_revision: None,
+            }],
+            allow_owner_transfer: false,
+            allow_partial: false,
+        },
+    )
+    .await
+    .unwrap();
+    crate::ops::exec::run_operation(&a.state, &deleted.operation_id)
+        .await
+        .unwrap();
+    b.tasks
+        .push(tokio::spawn(super::transfer::run(b.state.clone())));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let status: String = sqlx::query_scalar("SELECT status FROM transfers WHERE id=?")
+                .bind(&transfer_id)
+                .fetch_one(&b.state.db)
+                .await
+                .unwrap();
+            if status == "failed" {
+                break;
+            }
+            b.state.sync_wake.notify_one();
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("missing source must enter recovery");
+    stop_workers(&mut b).await;
+    let staging = b
+        .shared
+        .parent()
+        .unwrap()
+        .join(".ism-staging/peer")
+        .join(&transfer_id);
+    write_old(&staging, b"obsolete source version");
+    super::recovery::tick(&b.state).await.unwrap();
+    let recovered = super::recovery::get(
+        &b.state,
+        ism_core::dto::RecoveryKind::Transfer,
+        &transfer_id,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        recovered.state,
+        ism_core::dto::RecoveryState::Fixed,
+        "{recovered:?}"
+    );
+    assert!(!b.shared.join("obsolete.jpg").exists());
+    assert_eq!(std::fs::read(staging).unwrap(), b"obsolete source version");
+    let queued: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM transfers WHERE id=?")
+        .bind(&transfer_id)
+        .fetch_one(&b.state.db)
+        .await
+        .unwrap();
+    assert_eq!(queued, 0);
+    super::pull(&b.state, &peer).await.unwrap();
+    let share = super::shares(&b.state).await.unwrap().remove(0);
+    let local = super::row(&b.state, &share.id, "obsolete.jpg")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(local.deleted);
+    let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM peer_inbox WHERE status!='done'")
+        .fetch_one(&b.state.db)
+        .await
+        .unwrap();
+    assert_eq!(
+        pending, 0,
+        "the original change and its superseding deletion must apply"
+    );
+    let applied: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM event_log WHERE origin=? AND kind='file_deleted'
+         AND json_extract(data_json,'$.path')='obsolete.jpg'",
+    )
+    .bind(&a.state.instance_id)
+    .fetch_one(&b.state.db)
+    .await
+    .unwrap();
+    assert_eq!(applied, 1);
+    let obsolete: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM event_log WHERE origin=? AND kind='file_changed'
+         AND json_extract(data_json,'$.path')='obsolete.jpg'",
+    )
+    .bind(&a.state.instance_id)
+    .fetch_one(&b.state.db)
+    .await
+    .unwrap();
+    assert_eq!(
+        obsolete, 0,
+        "superseded bytes must not be advertised as applied"
+    );
+    let retained: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM trash WHERE restored_at IS NULL AND purged_at IS NULL",
+    )
+    .fetch_one(&a.state.db)
+    .await
+    .unwrap();
+    assert_eq!(
+        retained, 1,
+        "recovery must not restore deliberately deleted bytes"
+    );
+}
+
+#[tokio::test]
+async fn recovery_follows_committed_folder_moves_before_retrying_content() {
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    write_old(&a.shared.join("old/photo.jpg"), b"moved content");
+    scan(&a).await;
+    let peer = super::net::peers(&b.state).await.unwrap().remove(0);
+    super::pull(&b.state, &peer).await.unwrap();
+    let transfer_id: String =
+        sqlx::query_scalar("SELECT id FROM transfers WHERE rel_path='old/photo.jpg'")
+            .fetch_one(&b.state.db)
+            .await
+            .unwrap();
+    let accepted = crate::ops::submit(
+        &a.state,
+        &Principal::Admin {
+            username: "test".into(),
+        },
+        OperationRequest {
+            idempotency_key: "recovery-folder-move".into(),
+            label: Some("Move source folder".into()),
+            actions: vec![OperationAction::MoveFolder {
+                source: Location {
+                    root_id: "photos".into(),
+                    path: "shared/old".into(),
+                },
+                target: Location {
+                    root_id: "photos".into(),
+                    path: "shared/current".into(),
+                },
+            }],
+            allow_owner_transfer: false,
+            allow_partial: false,
+        },
+    )
+    .await
+    .unwrap();
+    crate::ops::exec::run_operation(&a.state, &accepted.operation_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        crate::ops::load(&a.state, &accepted.operation_id)
+            .await
+            .unwrap()
+            .0
+            .status,
+        ism_core::dto::OperationStatus::Completed
+    );
+    b.tasks
+        .push(tokio::spawn(super::transfer::run(b.state.clone())));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let status: String = sqlx::query_scalar("SELECT status FROM transfers WHERE id=?")
+                .bind(&transfer_id)
+                .fetch_one(&b.state.db)
+                .await
+                .unwrap();
+            if status == "failed" {
+                break;
+            }
+            b.state.sync_wake.notify_waiters();
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("missing queued source must be retained for recovery");
+    stop_workers(&mut b).await;
+    super::recovery::tick(&b.state).await.unwrap();
+    let (path, status): (String, String) =
+        sqlx::query_as("SELECT rel_path,status FROM transfers WHERE id=?")
+            .bind(&transfer_id)
+            .fetch_one(&b.state.db)
+            .await
+            .unwrap();
+    assert_eq!(
+        path,
+        "current/photo.jpg",
+        "recovery={:?}; moves={:?}",
+        super::recovery::get(
+            &b.state,
+            ism_core::dto::RecoveryKind::Transfer,
+            &transfer_id
+        )
+        .await
+        .unwrap(),
+        sqlx::query_as::<_, (String, String)>(
+            "SELECT kind,data_json FROM event_log WHERE kind='folder_moved'",
+        )
+        .fetch_all(&a.state.db)
+        .await
+        .unwrap(),
+    );
+    assert_eq!(status, "queued");
+    b.tasks
+        .push(tokio::spawn(crate::ops::exec::run(b.state.clone())));
+    b.tasks
+        .push(tokio::spawn(super::transfer::run(b.state.clone())));
+    eventually("publication at recovered path", &[&a, &b], || {
+        std::fs::read(b.shared.join("current/photo.jpg"))
+            .ok()
+            .as_deref()
+            == Some(b"moved content")
+    })
+    .await;
+    assert!(!b.shared.join("old/photo.jpg").exists());
+    tokio::time::timeout(Duration::from_secs(5),async {
+        loop {
+            let completed:bool=sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM transfer_history h JOIN operations o ON o.id=h.operation_id
+                 WHERE h.id=? AND o.status='completed')",
+            ).bind(&transfer_id).fetch_one(&b.state.db).await.unwrap();
+            if completed {break;}
+            b.state.ops_wake.notify_one();
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }).await.expect("publication must commit its bookkeeping");
+    super::pull(&b.state, &peer).await.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM event_log WHERE kind='folder_moved'")
+            .fetch_one(&b.state.db)
+            .await
+            .unwrap(),
+        1,
+        "the original folder event must complete after its recovered content",
+    );
+    let source_cursor: i64 = sqlx::query_scalar("SELECT MAX(seq) FROM event_log")
+        .fetch_one(&a.state.db)
+        .await
+        .unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT cursor FROM peers WHERE id=?")
+            .bind(&peer.id)
+            .fetch_one(&b.state.db)
+            .await
+            .unwrap(),
+        source_cursor,
+    );
+    let admission = super::recovery::submit(
+        &b.state,
+        ism_core::dto::RecoveryBatchInput {
+            targets: vec![ism_core::dto::RecoveryTarget {
+                kind: ism_core::dto::RecoveryKind::Transfer,
+                id: transfer_id.clone(),
+                peer_id: None,
+            }],
+            all: false,
+            resolution: None,
+        },
+    )
+    .await
+    .unwrap();
+    super::recovery::tick(&b.state).await.unwrap();
+    assert_eq!(
+        super::recovery::get(
+            &b.state,
+            ism_core::dto::RecoveryKind::Transfer,
+            &transfer_id
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .state,
+        ism_core::dto::RecoveryState::Fixed,
+        "admission={admission:?}",
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM pending_peer_events")
+            .fetch_one(&b.state.db)
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn recovery_replacement_transfer_does_not_wait_on_its_failed_parent() {
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    write_old(&a.shared.join("photo.jpg"), b"recover publication");
+    scan(&a).await;
+    let peer = super::net::peers(&b.state).await.unwrap().remove(0);
+    super::pull(&b.state, &peer).await.unwrap();
+    b.tasks
+        .push(tokio::spawn(super::transfer::run(b.state.clone())));
+    let operation = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let id: Option<String> = sqlx::query_scalar(
+                "SELECT operation_id FROM transfer_history WHERE rel_path='photo.jpg'",
+            )
+            .fetch_optional(&b.state.db)
+            .await
+            .unwrap();
+            if let Some(id) = id {
+                break id;
+            }
+            b.state.sync_wake.notify_waiters();
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    stop_workers(&mut b).await;
+    std::fs::create_dir(b.shared.join("photo.jpg")).unwrap();
+    crate::ops::exec::run_operation(&b.state, &operation)
+        .await
+        .unwrap();
+    assert_eq!(
+        crate::ops::load(&b.state, &operation)
+            .await
+            .unwrap()
+            .0
+            .status,
+        ism_core::dto::OperationStatus::Failed
+    );
+    std::fs::remove_dir(b.shared.join("photo.jpg")).unwrap();
+    let upload: String = sqlx::query_scalar("SELECT id FROM uploads WHERE operation_id=?")
+        .bind(&operation)
+        .fetch_one(&b.state.db)
+        .await
+        .unwrap();
+    let root = crate::files::root(&b.state.db, "photos").await.unwrap();
+    std::fs::remove_file(
+        crate::ops::plan::staging_dir(&root, &upload)
+            .unwrap()
+            .join("0"),
+    )
+    .unwrap();
+    super::recovery::tick(&b.state).await.unwrap();
+    let transfer: String = sqlx::query_scalar(
+        "SELECT target_id FROM sync_recovery_links WHERE recovery_id=? AND kind='transfer'",
+    )
+    .bind(format!("operation:{operation}"))
+    .fetch_one(&b.state.db)
+    .await
+    .unwrap();
+    let share = super::shares(&b.state).await.unwrap().remove(0);
+    super::inbox::require_stable_transfer(&b.state, &share, &["photo.jpg"], &transfer)
+        .await
+        .unwrap();
+    assert_eq!(
+        super::inbox::require_stable_transfer(
+            &b.state,
+            &share,
+            &["photo.jpg"],
+            "unrelated-transfer"
+        )
+        .await
+        .unwrap_err()
+        .code(),
+        "recovery_required",
+        "ordinary transfers must still respect the parent's footprint",
+    );
+    b.tasks
+        .push(tokio::spawn(crate::ops::exec::run(b.state.clone())));
+    b.tasks
+        .push(tokio::spawn(super::transfer::run(b.state.clone())));
+    tokio::time::timeout(Duration::from_secs(5),async {
+        loop {
+            let completed:bool=sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM transfer_history h JOIN operations o ON o.id=h.operation_id
+                 WHERE h.id=? AND o.status='completed')",
+            ).bind(&transfer).fetch_one(&b.state.db).await.unwrap();
+            if completed {break;}
+            b.state.sync_wake.notify_waiters();
+            b.state.ops_wake.notify_waiters();
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }).await.expect("the authorized recovery must make progress");
+    super::recovery::submit(
+        &b.state,
+        ism_core::dto::RecoveryBatchInput {
+            targets: vec![ism_core::dto::RecoveryTarget {
+                kind: ism_core::dto::RecoveryKind::Operation,
+                id: operation.clone(),
+                peer_id: None,
+            }],
+            all: false,
+            resolution: None,
+        },
+    )
+    .await
+    .unwrap();
+    super::recovery::tick(&b.state).await.unwrap();
+    assert_eq!(
+        std::fs::read(b.shared.join("photo.jpg")).unwrap(),
+        b"recover publication"
+    );
+    assert_eq!(
+        crate::ops::load(&b.state, &operation)
+            .await
+            .unwrap()
+            .0
+            .status,
+        ism_core::dto::OperationStatus::Completed
+    );
+}
+
+#[tokio::test]
+async fn recovery_waiting_for_a_mount_keeps_its_retry_budget_and_resumes() {
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    let created = crate::ops::submit(
+        &a.state,
+        &Principal::Admin {
+            username: "test".into(),
+        },
+        OperationRequest {
+            idempotency_key: "recovery-mount".into(),
+            label: None,
+            actions: vec![OperationAction::CreateFolder {
+                target: loc("shared/recovered"),
+            }],
+            allow_owner_transfer: false,
+            allow_partial: false,
+        },
+    )
+    .await
+    .unwrap();
+    crate::ops::exec::run_operation(&a.state, &created.operation_id)
+        .await
+        .unwrap();
+    let peer = super::net::peers(&b.state).await.unwrap().remove(0);
+    super::pull(&b.state, &peer).await.unwrap();
+    let operation: String = sqlx::query_scalar("SELECT operation_id FROM pending_peer_events")
+        .fetch_one(&b.state.db)
+        .await
+        .unwrap();
+    let root = crate::files::root(&b.state.db, "photos").await.unwrap();
+    let marker = root.base().join(".ism-root");
+    std::fs::remove_file(&marker).unwrap();
+    crate::ops::exec::run_operation(&b.state, &operation)
+        .await
+        .unwrap();
+    let batch = ism_core::dto::RecoveryBatchInput {
+        targets: vec![ism_core::dto::RecoveryTarget {
+            kind: ism_core::dto::RecoveryKind::Operation,
+            id: operation.clone(),
+            peer_id: None,
+        }],
+        all: false,
+        resolution: None,
+    };
+    for _ in 0..3 {
+        super::recovery::submit(&b.state, batch.clone())
+            .await
+            .unwrap();
+        super::recovery::tick(&b.state).await.unwrap();
+    }
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT attempts FROM sync_recovery WHERE target_id=?")
+            .bind(&operation)
+            .fetch_one(&b.state.db)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM operations")
+            .fetch_one(&b.state.db)
+            .await
+            .unwrap(),
+        1,
+        "waiting must not create doomed replacement operations"
+    );
+    assert_eq!(
+        super::recovery::get(&b.state, ism_core::dto::RecoveryKind::Operation, &operation)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        ism_core::dto::RecoveryState::Waiting
+    );
+    std::fs::write(marker, "photos\n").unwrap();
+    super::recovery::submit(&b.state, batch.clone())
+        .await
+        .unwrap();
+    super::recovery::tick(&b.state).await.unwrap();
+    let replacement: String = sqlx::query_scalar(
+        "SELECT target_id FROM sync_recovery_links WHERE recovery_id=? AND kind='operation'",
+    )
+    .bind(format!("operation:{operation}"))
+    .fetch_one(&b.state.db)
+    .await
+    .unwrap();
+    crate::ops::exec::run_operation(&b.state, &replacement)
+        .await
+        .unwrap();
+    super::recovery::submit(&b.state, batch).await.unwrap();
+    super::recovery::tick(&b.state).await.unwrap();
+    assert!(b.shared.join("recovered").is_dir());
+    assert_eq!(
+        crate::ops::load(&b.state, &operation)
+            .await
+            .unwrap()
+            .0
+            .status,
+        ism_core::dto::OperationStatus::Completed
+    );
 }
 
 async fn gate_peer_content(
@@ -1026,6 +2299,7 @@ async fn tracked_synology_metadata_is_not_deleted_advertised_or_served() {
     scan(&a).await;
     super::record_local(
         &a.state,
+        None,
         &[
             super::LocalChange::FileTrashed {
                 at: loc(&format!("shared/{metadata}")),
@@ -1158,9 +2432,14 @@ async fn legacy_synology_events_and_backfill_do_not_apply_metadata_or_stall_the_
         .await;
     super::pull(&b.state, &peer).await.unwrap();
     assert_eq!(
-        super::net::peer(&b.state, &peer.id).await.unwrap().cursor,
+        sqlx::query_scalar::<_, i64>("SELECT received_cursor FROM peers WHERE id = ?")
+            .bind(&peer.id)
+            .fetch_one(&b.state.db)
+            .await
+            .unwrap(),
         last
     );
+    assert!(super::net::peer(&b.state, &peer.id).await.unwrap().cursor < last);
     let mut tx = b.state.db.begin().await.unwrap();
     super::mark_backfill_in(&mut tx, &share.id, &peer.id)
         .await
@@ -1229,7 +2508,7 @@ async fn legacy_synology_events_and_backfill_do_not_apply_metadata_or_stall_the_
         0
     );
     server.reset().await;
-    peer.cursor = last;
+    peer.cursor = super::net::peer(&b.state, &peer.id).await.unwrap().cursor;
     Mock::given(matchers::path("/api/peer/v1/events"))
         .respond_with(ResponseTemplate::new(200).set_body_json(super::EventPage {
             events: vec![super::PeerEvent {
@@ -1250,8 +2529,16 @@ async fn legacy_synology_events_and_backfill_do_not_apply_metadata_or_stall_the_
     assert!(super::pull(&b.state, &peer).await.is_err());
     assert_eq!(
         super::net::peer(&b.state, &peer.id).await.unwrap().cursor,
-        last,
+        peer.cursor,
         "exclusion must not bypass event validation"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT received_cursor FROM peers WHERE id = ?")
+            .bind(&peer.id)
+            .fetch_one(&b.state.db)
+            .await
+            .unwrap(),
+        last
     );
 }
 
@@ -1745,6 +3032,20 @@ async fn content_and_management_events_replicate_through_managed_operations() {
         !b.shared.join("2024").exists()
     })
     .await;
+    let observer = super::net::peers(&b.state).await.unwrap().remove(0);
+    for _ in 0..100 {
+        if super::events_for(&b.state, &observer.id, "observer-instance", 0)
+            .await
+            .unwrap()
+            .events
+            .iter()
+            .any(|event| event.kind == "folder_trashed")
+        {
+            break;
+        }
+        b.state.sync_wake.notify_waiters();
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
     let applied: Vec<String> =
         sqlx::query_scalar("SELECT kind FROM event_log WHERE origin != ? ORDER BY seq")
             .bind(&b.state.instance_id)
@@ -1874,6 +3175,11 @@ async fn conflict_resolutions_skip_or_apply_the_peer_side() {
     b.tasks[2].abort();
     let share = super::shares(&b.state).await.unwrap().remove(0);
     let peer = super::net::peers(&b.state).await.unwrap().remove(0);
+    write_old(&a.shared.join("photo.jpg"), b"remote");
+    write_old(&a.shared.join("gone.jpg"), b"prior");
+    scan(&a).await;
+    std::fs::remove_file(a.shared.join("gone.jpg")).unwrap();
+    scan(&a).await;
     write_old(&b.shared.join("photo.jpg"), b"local");
     write_old(&b.shared.join("gone.jpg"), b"local-gone");
     scan(&b).await;
@@ -1913,16 +3219,24 @@ async fn conflict_resolutions_skip_or_apply_the_peer_side() {
             .clone()
     };
 
-    // Skip dismisses the conflict and touches nothing.
-    admin::resolve(
+    let error = admin::resolve(
         &b.state,
         "test",
         &id_of("photo.jpg"),
         ConflictResolution::Skip,
     )
     .await
-    .unwrap();
+    .unwrap_err();
+    assert_eq!(error.code(), "recovery_not_exhausted");
     assert_eq!(std::fs::read(b.shared.join("photo.jpg")).unwrap(), b"local");
+    admin::resolve(
+        &b.state,
+        "test",
+        &id_of("photo.jpg"),
+        ConflictResolution::KeepLocal,
+    )
+    .await
+    .unwrap();
 
     // Keeping the peer's deletion trashes the local copy and announces it afterwards.
     let trashed = trash_count(&b);
@@ -1966,6 +3280,10 @@ async fn conflict_resolutions_skip_or_apply_the_peer_side() {
 
     // A move on the peer of a file edited here: keeping theirs fetches their copy at the new
     // path and sends the local edit to the ISM trash.
+    let (a, b) = pair().await;
+    a.tasks[2].abort();
+    b.tasks[2].abort();
+    let peer = super::net::peers(&b.state).await.unwrap().remove(0);
     write_old(&a.shared.join("src.jpg"), b"original");
     scan(&a).await;
     super::pull(&b.state, &peer).await.unwrap();
@@ -2015,21 +3333,12 @@ async fn conflict_resolutions_skip_or_apply_the_peer_side() {
 
 #[tokio::test]
 async fn keep_local_resolution_and_event_are_atomic() {
-    let b = instance("Beta").await;
-    for task in &b.tasks {
-        task.abort();
-    }
-    admin::create_share(
-        &b.state,
-        ShareInput {
-            name: "Family".into(),
-            location: loc("shared"),
-            peer_ids: vec![],
-            enabled: true,
-        },
-    )
-    .await
-    .unwrap();
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    write_old(&a.shared.join("photo.jpg"), b"remote");
+    scan(&a).await;
+    let peer = super::net::peers(&b.state).await.unwrap().remove(0);
     let share = super::shares(&b.state).await.unwrap().remove(0);
     write_old(&b.shared.join("photo.jpg"), b"local");
     super::scan_share(&b.state, &share).await.unwrap();
@@ -2046,13 +3355,13 @@ async fn keep_local_resolution_and_event_are_atomic() {
             detail: "conflict".into(),
             remote: ConflictSide {
                 instance: "Alpha".into(),
-                sha256: Some("remote".into()),
-                size: Some(5),
+                sha256: Some(crate::crypto::sha256_hex(b"remote")),
+                size: Some(6),
                 modified_at: None,
                 deleted: false,
             },
             remote_vv: &ism_core::version::VersionVector::default(),
-            peer_id: "peer",
+            peer_id: &peer.id,
             from: None,
         },
     )
@@ -2116,28 +3425,27 @@ async fn incomplete_scan_does_not_record_deletions() {
     use std::os::unix::fs::PermissionsExt;
 
     let (_a, b) = pair().await;
-    let path = b.shared.join("known.jpg");
+    let path = b.shared.join("inaccessible/known.jpg");
     write_old(&path, b"photo");
     scan(&b).await;
     let share = super::shares(&b.state).await.unwrap().remove(0);
-    let before = super::row(&b.state, &share.id, "known.jpg")
+    let before = super::row(&b.state, &share.id, "inaccessible/known.jpg")
         .await
         .unwrap()
         .unwrap();
     assert!(!before.deleted);
 
     let inaccessible = b.shared.join("inaccessible");
-    std::fs::create_dir(&inaccessible).unwrap();
+    std::fs::remove_file(path).unwrap();
     std::fs::set_permissions(&inaccessible, std::fs::Permissions::from_mode(0o000)).unwrap();
     if std::fs::read_dir(&inaccessible).is_ok() {
         std::fs::set_permissions(&inaccessible, std::fs::Permissions::from_mode(0o700)).unwrap();
         return;
     }
-    std::fs::remove_file(path).unwrap();
     let result = super::scan_share(&b.state, &share).await;
     std::fs::set_permissions(&inaccessible, std::fs::Permissions::from_mode(0o700)).unwrap();
     assert!(result.is_err());
-    let after = super::row(&b.state, &share.id, "known.jpg")
+    let after = super::row(&b.state, &share.id, "inaccessible/known.jpg")
         .await
         .unwrap()
         .unwrap();
@@ -2284,8 +3592,19 @@ async fn operation_requires_recovery_if_peer_bookkeeping_fails() {
             .await
             .unwrap();
     assert_eq!(event_count, 0);
-    let error = super::scan_share(&b.state, &share).await.unwrap_err();
-    assert_eq!(error.code(), "recovery_required");
+    super::scan_share(&b.state, &share).await.unwrap();
+    for path in ["first", "second"] {
+        assert_eq!(
+            super::require_stable_share(&b.state, &share, &[path])
+                .await
+                .unwrap_err()
+                .code(),
+            "recovery_required"
+        );
+    }
+    super::require_stable_share(&b.state, &share, &["independent.jpg"])
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -2373,14 +3692,18 @@ async fn recheck_finishes_only_verified_interrupted_peer_publication() {
         .unwrap();
 
     let lock = b.state.replication_operation_lock.lock().await;
-    let error = tokio::time::timeout(
-        Duration::from_millis(250),
-        super::transfer::recheck_publish_recovery(&b.state, &operation_id),
-    )
-    .await
-    .expect("a busy recheck must return instead of waiting on the lock")
-    .unwrap_err();
-    assert_eq!(error.code(), "recovery_busy");
+    let waiting_state = b.state.clone();
+    let waiting_id = operation_id.clone();
+    let waiting = tokio::spawn(async move {
+        super::transfer::recheck_publish_recovery(&waiting_state, &waiting_id).await
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !waiting.is_finished(),
+        "recovery must wait for busy replication instead of failing"
+    );
+    waiting.abort();
+    let _ = waiting.await;
     drop(lock);
 
     write_old(&b.shared.join("photo.jpg"), b"wrong photo");
@@ -2853,7 +4176,7 @@ async fn scans_wait_for_operation_recovery_before_recording_deletions() {
         idempotency_key: "scan-recovery".into(),
         label: None,
         actions: vec![OperationAction::CreateFolder {
-            target: loc("shared/new"),
+            target: loc("shared/photo.xmp"),
         }],
         allow_owner_transfer: false,
         allow_partial: false,
@@ -2873,7 +4196,10 @@ async fn scans_wait_for_operation_recovery_before_recording_deletions() {
         .await
         .unwrap();
     std::fs::remove_file(file).unwrap();
-    let error = super::scan_share(&b.state, &share).await.unwrap_err();
+    super::scan_share(&b.state, &share).await.unwrap();
+    let error = super::require_stable_share(&b.state, &share, &["photo.jpg"])
+        .await
+        .unwrap_err();
     assert_eq!(error.code(), "recovery_required");
     assert!(
         !super::row(&b.state, &share.id, "photo.jpg")
@@ -2932,7 +4258,7 @@ async fn peer_events_wait_for_operation_recovery_without_advancing_cursor() {
         idempotency_key: "peer-recovery".into(),
         label: None,
         actions: vec![OperationAction::CreateFolder {
-            target: loc("shared/new"),
+            target: loc("shared/photo.jpg"),
         }],
         allow_owner_transfer: false,
         allow_partial: false,
@@ -3489,9 +4815,7 @@ async fn peer_folder_bookkeeping_failure_requires_recovery_before_acknowledgemen
     crate::ops::resolve_recovery(&b.state, &operation_id)
         .await
         .unwrap();
-    admin::readd_sync_operation(&b.state, &operation_id, 0)
-        .await
-        .unwrap();
+    super::recovery::tick(&b.state).await.unwrap();
     assert_eq!(
         crate::ops::load(&b.state, &operation_id)
             .await
@@ -3657,8 +4981,9 @@ async fn failed_peer_file_move_blocks_later_sync_until_readded() {
     assert_eq!(page.rows[0].relative_path, "new.jpg");
     assert_eq!(page.progress.failed, 1);
     assert_eq!(super::pull(&b.state, &peer).await.unwrap(), 0);
+    super::scan_share(&b.state, &share).await.unwrap();
     assert_eq!(
-        super::scan_share(&b.state, &share)
+        super::require_stable_share(&b.state, &share, &["new.jpg"])
             .await
             .unwrap_err()
             .code(),
@@ -3735,7 +5060,7 @@ async fn cancelled_peer_folder_creation_can_be_explicitly_retried() {
 }
 
 #[tokio::test]
-async fn incoming_empty_folder_uses_a_managed_operation_without_queue_access() {
+async fn incoming_empty_folder_is_not_created_without_queue_access() {
     let (_a, b, peer, _) = pending_folder_fixture().await;
     sqlx::query(
         "INSERT INTO immich_servers (id, name, url, database_url_enc, direct_writes_enabled, version, compatible, maintenance_json, created_at)
@@ -3755,15 +5080,23 @@ async fn incoming_empty_folder_uses_a_managed_operation_without_queue_access() {
         .fetch_one(&b.state.db)
         .await
         .unwrap();
-    // Creating an empty folder does not change any existing Immich assets.
     crate::ops::exec::run_operation(&b.state, &operation_id)
         .await
         .unwrap();
     let (operation, _) = crate::ops::load(&b.state, &operation_id).await.unwrap();
-    assert_eq!(operation.status, ism_core::dto::OperationStatus::Completed);
-    assert!(operation.items[0].error.is_none());
-    assert!(b.shared.join("new-folder").is_dir());
-    assert!(super::net::peer(&b.state, &peer.id).await.unwrap().cursor > peer.cursor);
+    assert_eq!(operation.status, ism_core::dto::OperationStatus::Failed);
+    assert_eq!(
+        operation.items[0]
+            .error
+            .as_ref()
+            .map(|error| error.code.as_str()),
+        Some("maintenance_blocked")
+    );
+    assert!(!b.shared.join("new-folder").exists());
+    assert_eq!(
+        super::net::peer(&b.state, &peer.id).await.unwrap().cursor,
+        peer.cursor
+    );
 }
 
 #[tokio::test]
@@ -4420,11 +5753,11 @@ async fn competing_peer_event_stays_unacknowledged_and_reports_the_error() {
         .fetch_one(&b.state.db)
         .await
         .unwrap();
-    assert!(error.is_none());
-    assert!(matches!(
-        updates.try_recv().unwrap(),
-        crate::state::ServerEvent::SyncChanged
-    ));
+    assert!(error.is_some_and(|error| error.contains("conflicting contents")));
+    assert!(
+        updates.try_recv().is_err(),
+        "durable input is not discarded when the peer removes its log"
+    );
 }
 
 #[tokio::test]
@@ -4455,7 +5788,7 @@ async fn transfers_are_deferred_without_consuming_retries_during_recovery() {
         idempotency_key: "transfer-recovery".into(),
         label: None,
         actions: vec![OperationAction::CreateFolder {
-            target: loc("shared/new"),
+            target: loc("shared/photo.jpg"),
         }],
         allow_owner_transfer: false,
         allow_partial: false,
@@ -4495,7 +5828,7 @@ async fn transfers_are_deferred_without_consuming_retries_during_recovery() {
     assert!(
         page.warnings
             .iter()
-            .any(|warning| warning.contains("paused by unresolved operation recovery"))
+            .any(|warning| warning.contains("Independent sync continues"))
     );
     crate::ops::resolve_recovery(&b.state, &accepted.operation_id)
         .await
@@ -4537,9 +5870,26 @@ async fn full_scans_wait_for_a_peer_transfer_backlog() {
     .await
     .unwrap();
 
+    assert!(super::full_scan_allowed(&b.state).await.unwrap());
     assert!(
-        !super::full_scan_allowed(&b.state).await.unwrap(),
-        "a full rehash must not pause an active peer backlog"
+        super::blocked_footprints(&b.state, &share)
+            .await
+            .unwrap()
+            .contains(&"photo.jpg".to_owned())
+    );
+    write_old(&b.shared.join("independent.jpg"), b"independent");
+    super::scan_share(&b.state, &share).await.unwrap();
+    assert!(
+        super::row(&b.state, &share.id, "independent.jpg")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        super::row(&b.state, &share.id, "photo.jpg")
+            .await
+            .unwrap()
+            .is_none()
     );
     sqlx::query("DELETE FROM transfers")
         .execute(&b.state.db)
@@ -4641,6 +5991,204 @@ async fn peer_content_rechecks_hash_with_unchanged_metadata() {
     .await
     .unwrap();
     assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn replicates_orphan_sidecars_and_replaces_their_own_revision() {
+    let (a, b) = pair().await;
+    let rel = "orphan/nested/photo.xmp";
+    assert!(!b.shared.join("orphan").exists());
+    write_old(&a.shared.join(rel), b"<xmp>first</xmp>");
+    write_old(
+        &a.shared.join("orphan/nested/photo.dop"),
+        b"editor settings",
+    );
+    scan(&a).await;
+    eventually("orphan XMP reaches an absent folder", &[&a, &b], || {
+        std::fs::read(b.shared.join(rel)).ok().as_deref() == Some(b"<xmp>first</xmp>")
+            && std::fs::read(b.shared.join("orphan/nested/photo.dop"))
+                .ok()
+                .as_deref()
+                == Some(b"editor settings")
+    })
+    .await;
+
+    write_old(&a.shared.join(rel), b"<xmp>replacement</xmp>");
+    scan(&a).await;
+    eventually("orphan XMP replacement reaches B", &[&a, &b], || {
+        std::fs::read(b.shared.join(rel)).ok().as_deref() == Some(b"<xmp>replacement</xmp>")
+    })
+    .await;
+
+    // Shared-stem originals must not prevent independent sidecar replication.
+    for instance in [&a, &b] {
+        write_old(&instance.shared.join("ambiguous/photo.jpg"), b"jpeg");
+        write_old(&instance.shared.join("ambiguous/photo.png"), b"png");
+    }
+    write_old(&a.shared.join("ambiguous/photo.xmp"), b"<xmp>shared</xmp>");
+    scan(&a).await;
+    eventually("ambiguous XMP reaches B", &[&a, &b], || {
+        std::fs::read(b.shared.join("ambiguous/photo.xmp"))
+            .ok()
+            .as_deref()
+            == Some(b"<xmp>shared</xmp>")
+    })
+    .await;
+
+    for _ in 0..100 {
+        let committed: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM uploads u
+             JOIN operation_items i ON i.operation_id = u.operation_id
+             WHERE u.status = 'committed' AND i.status = 'done' AND json_valid(i.result_json)
+               AND json_extract(u.request_json, '$.files[0].role') IN ('sidecar', 'companion')",
+        )
+        .fetch_one(&b.state.db)
+        .await
+        .unwrap();
+        if committed == 4 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let uploads: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT u.id, u.request_json, i.result_json FROM uploads u
+         JOIN operation_items i ON i.operation_id = u.operation_id
+         WHERE u.status = 'committed' AND i.status = 'done' AND json_valid(i.result_json)
+           AND json_extract(u.request_json, '$.files[0].role') IN ('sidecar', 'companion')",
+    )
+    .fetch_all(&b.state.db)
+    .await
+    .unwrap();
+    assert_eq!(uploads.len(), 4);
+    let peer = admin::list_peers(&b.state).await.unwrap().remove(0);
+    let principal = Principal::Peer { peer_id: peer.id };
+    for (id, request, result) in uploads {
+        let request: ism_core::dto::CreateUpload = serde_json::from_str(&request).unwrap();
+        assert!(request.existing_original.is_none());
+        let (role, serialized_role) = if request.files[0].name == "photo.dop" {
+            (ism_core::dto::FileRole::Companion, "companion")
+        } else {
+            (ism_core::dto::FileRole::Sidecar, "sidecar")
+        };
+        assert_eq!(request.files[0].role, role);
+        if request.files[0].sha256 == crate::crypto::sha256_hex(b"<xmp>replacement</xmp>") {
+            assert!(request.files[0].expected_revision.is_some());
+            assert_eq!(
+                request.files[0].expected_sha256.as_deref(),
+                Some(crate::crypto::sha256_hex(b"<xmp>first</xmp>").as_str())
+            );
+            assert_eq!(
+                request.on_conflict,
+                ism_core::dto::OnConflict::ReplaceIfExpected
+            );
+        }
+        let result: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert!(result["asset_id"].is_null());
+        assert_eq!(result["files"][0]["role"], serialized_role);
+        assert_eq!(
+            crate::ops::uploads::get(&b.state, &principal, &id)
+                .await
+                .unwrap()
+                .status,
+            "committed"
+        );
+    }
+    assert!(!b.shared.join("orphan/nested/photo.jpg").exists());
+    // Independent content has no Immich asset to wait for, even on a scan callback.
+    assert_eq!(
+        crate::ops::uploads::fill_asset_ids(&b.state, "unconfigured", "unconfigured")
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn standalone_peer_companions_keep_upload_validation_and_revision_guards() {
+    use ism_core::dto::{CreateUpload, FileRole, OnConflict, UploadFileSpec};
+
+    let i = instance("Receiver").await;
+    let principal = Principal::Peer {
+        peer_id: "synthetic-peer".into(),
+    };
+    write_old(&i.shared.join("photo.dop"), b"old editor settings");
+    let (revision, hash) = crate::files::replacement_fingerprint(&i.shared.join("photo.dop"))
+        .unwrap()
+        .unwrap();
+    let req = CreateUpload {
+        idempotency_key: None,
+        target: loc("shared"),
+        provenance: None,
+        existing_original: None,
+        files: vec![UploadFileSpec {
+            name: "photo.dop".into(),
+            role: FileRole::Companion,
+            size: 3,
+            sha256: crate::crypto::sha256_hex(b"new"),
+            expected_revision: Some(revision),
+            expected_sha256: Some(hash),
+        }],
+        on_conflict: OnConflict::ReplaceIfExpected,
+    };
+    let client = Principal::Client(crate::auth::ClientGrant {
+        token_id: "synthetic-client".into(),
+        kind: "ila".into(),
+        roots: vec!["photos".into()],
+        actions: vec![ism_core::dto::ClientAction::Upload],
+    });
+    assert_eq!(
+        crate::ops::uploads::create(&i.state, &client, req.clone())
+            .await
+            .unwrap_err()
+            .code(),
+        "bad_upload"
+    );
+    let mut invalid = req.clone();
+    invalid.files[0].role = FileRole::Sidecar;
+    assert_eq!(
+        crate::ops::uploads::create(&i.state, &principal, invalid)
+            .await
+            .unwrap_err()
+            .code(),
+        "bad_upload"
+    );
+    let upload = crate::ops::uploads::create(&i.state, &principal, req)
+        .await
+        .unwrap();
+    crate::ops::uploads::put_chunk(
+        &i.state,
+        &principal,
+        &upload.upload_id,
+        0,
+        &axum::http::HeaderMap::new(),
+        bytes::Bytes::from_static(b"new"),
+    )
+    .await
+    .unwrap();
+    // Change only bytes, leaving the metadata revision unchanged.
+    let target = i.shared.join("photo.dop");
+    let modified = std::fs::metadata(&target).unwrap().modified().unwrap();
+    std::fs::write(&target, b"bad editor settings").unwrap();
+    std::fs::File::open(&target)
+        .unwrap()
+        .set_modified(modified)
+        .unwrap();
+    let accepted = crate::ops::uploads::commit(&i.state, &principal, &upload.upload_id)
+        .await
+        .unwrap();
+    for _ in 0..200 {
+        let (op, _) = crate::ops::load(&i.state, &accepted.operation_id)
+            .await
+            .unwrap();
+        if matches!(op.status, ism_core::dto::OperationStatus::Failed) {
+            assert_eq!(op.items[0].error.as_ref().unwrap().code, "revision_changed");
+            assert_eq!(std::fs::read(&target).unwrap(), b"bad editor settings");
+            return;
+        }
+        i.state.ops_wake.notify_waiters();
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("changed standalone companion must fail without replacement");
 }
 
 #[tokio::test]

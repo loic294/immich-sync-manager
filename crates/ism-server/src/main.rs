@@ -52,6 +52,7 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(peers::run(state.clone()));
     tokio::spawn(peers::scan_worker(state.clone()));
     tokio::spawn(peers::transfer::run(state.clone()));
+    tokio::spawn(peers::recovery::run(state.clone()));
     tokio::spawn(watch::run(state.clone()));
     tokio::spawn(watch::scheduler::run(state.clone()));
     let janitor = state.clone();

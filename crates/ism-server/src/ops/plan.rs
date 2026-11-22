@@ -24,7 +24,7 @@ use crate::immich::pg::{self, AssetRow};
 use crate::immich::registry::{self, Server};
 use crate::state::AppState;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FsMove {
     pub from: PathBuf,
     pub to: PathBuf,
@@ -32,16 +32,20 @@ pub struct FsMove {
     pub copy: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum DbStep {
     MoveSidecar {
         file_id: String,
         from: String,
         to: String,
     },
+    RemoveSidecar {
+        sidecar: pg::SidecarRow,
+        asset: pg::AssetRow,
+    },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ApiKind {
     Trash,
     Restore,
@@ -65,7 +69,7 @@ pub enum ApiKind {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ApiStep {
     pub kind: ApiKind,
     pub server_id: String,
@@ -73,7 +77,7 @@ pub struct ApiStep {
     pub ids: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum Step {
     Mkdir(PathBuf),
     CheckRevision {
@@ -96,7 +100,7 @@ pub enum Step {
     Remove(PathBuf),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TrashRecord {
     pub id: String,
     pub root_id: String,
@@ -112,9 +116,9 @@ pub struct TrashRecord {
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TrashEntry {
-    name: String,
+    pub(crate) name: String,
     /// None denotes a directory, including empty directories.
-    sha256: Option<String>,
+    pub(crate) sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -170,6 +174,7 @@ pub struct Ctx<'a> {
     pub roots: Vec<Root>,
     pub companions: Vec<String>,
     pub servers: Vec<Server>,
+    peer_deletions: HashSet<(String, String)>,
 }
 
 impl<'a> Ctx<'a> {
@@ -185,7 +190,53 @@ impl<'a> Ctx<'a> {
             roots: files::load_roots(&state.db).await?,
             companions: state.sidecar_extensions(),
             servers: registry::servers(state).await?,
+            peer_deletions: HashSet::new(),
         })
+    }
+
+    pub async fn for_operation(
+        state: &'a AppState,
+        principal: &'a Principal,
+        allow_owner_transfer: bool,
+        operation_id: &str,
+    ) -> AppResult<Self> {
+        let mut ctx = Self::new(state, principal, allow_owner_transfer).await?;
+        if matches!(principal, Principal::Peer { .. } | Principal::Admin { .. }) {
+            let peer_id = match principal {
+                Principal::Peer { peer_id } => Some(peer_id.as_str()),
+                _ => None,
+            };
+            let deletions: Vec<(String, String, String)> = sqlx::query_as(
+                "SELECT p.share_id,p.to_path,i.action_json FROM pending_peer_ops p
+                 JOIN operation_items i ON i.operation_id=p.operation_id AND i.idx=p.idx
+                 WHERE p.operation_id=? AND p.kind='delete'
+                 AND (p.peer_id=? OR (? AND EXISTS(SELECT 1 FROM conflicts c WHERE
+                    c.id=p.conflict_id AND c.peer_id=p.peer_id AND c.status='resolving'
+                    AND json_extract(c.remote_json,'$.deleted')=1)))",
+            )
+            .bind(operation_id)
+            .bind(peer_id)
+            .bind(matches!(principal, Principal::Admin { .. }))
+            .fetch_all(&state.db)
+            .await?;
+            let shares = crate::peers::shares(state).await?;
+            for (share_id, path, action) in deletions {
+                let share = shares.iter().find(|s| s.id == share_id).ok_or_else(|| {
+                    AppError::conflict("share_disabled", "the deletion share is unavailable")
+                })?;
+                let source = share.location(&path)?;
+                let action: OperationAction = serde_json::from_str(&action)?;
+                if !matches!(action, OperationAction::Trash { source: ref actual, .. } if *actual == source)
+                {
+                    return Err(AppError::conflict(
+                        "peer_deletion_changed",
+                        "the announced deletion does not match its managed action",
+                    ));
+                }
+                ctx.peer_deletions.insert((source.root_id, source.path));
+            }
+        }
+        Ok(ctx)
     }
 
     fn root(&self, root_id: &str) -> AppResult<&Root> {
@@ -466,7 +517,9 @@ async fn plan_move_file(
     }
     let src_name = src_rel.name().unwrap_or_default().to_owned();
     let dst_name = dst_rel.name().unwrap_or_default().to_owned();
-    if is_companion_name(&src_name, &ctx.companions) {
+    if is_companion_name(&src_name, &ctx.companions)
+        && !matches!(ctx.principal, Principal::Peer { .. })
+    {
         plan.block(
             "not_an_original",
             "move the original file; its sidecars follow automatically",
@@ -486,7 +539,8 @@ async fn plan_move_file(
     let mut group: Vec<(String, String, FileRole, bool)> = vec![(
         src_name.clone(),
         dst_name.clone(),
-        FileRole::Original,
+        ism_core::sidecar::companion_role(&src_name, &ctx.companions)
+            .map_or(FileRole::Original, |role| role_of(&role)),
         false,
     )];
     for c in companions_of(&src_name, &sibling_names(&src_dir), &ctx.companions) {
@@ -883,7 +937,7 @@ async fn trash_fingerprint(path: PathBuf) -> AppResult<(String, String)> {
         .ok_or_else(|| AppError::conflict("revision_changed", "a trash file disappeared"))
 }
 
-pub(super) fn folder_inventory(path: &Path) -> io::Result<Vec<TrashEntry>> {
+pub(crate) fn folder_inventory(path: &Path) -> io::Result<Vec<TrashEntry>> {
     let mut inventory = Vec::new();
     for entry in walkdir::WalkDir::new(path).follow_links(false) {
         let entry = entry.map_err(io::Error::other)?;
@@ -1046,8 +1100,21 @@ async fn plan_trash(
     }
     let trash_id = crate::crypto::new_id("trash");
     let quarantine = |r: &RelPath| format!("{TRASH_DIR}/{trash_id}/{r}");
-    let mut moved: Vec<(RelPath, FileRole)> = vec![(rel.clone(), FileRole::Original)];
-    if !folder {
+    let announced_only = ctx
+        .peer_deletions
+        .contains(&(source.root_id.clone(), source.path.clone()));
+    let role = if announced_only {
+        ism_core::sidecar::companion_role(rel.name().unwrap_or_default(), &ctx.companions)
+            .map_or(FileRole::Original, |role| role_of(&role))
+    } else {
+        FileRole::Original
+    };
+    let mut moved: Vec<(RelPath, FileRole)> = vec![(rel.clone(), role)];
+    if !folder
+        && !ctx
+            .peer_deletions
+            .contains(&(source.root_id.clone(), source.path.clone()))
+    {
         let name = rel.name().unwrap_or_default();
         if is_companion_name(name, &ctx.companions) {
             plan.block(
@@ -1136,6 +1203,53 @@ async fn plan_trash(
                 path: to,
                 expected: inventory.clone(),
             });
+        }
+    }
+    if announced_only
+        && role == FileRole::Sidecar
+        && let Some(server) = immich_side(ctx, root, plan)
+        && let Some(path) = root.immich_path(&rel)
+    {
+        let library = root
+            .library_id
+            .as_deref()
+            .ok_or_else(|| AppError::invalid_location("sidecar has no mapped library"))?;
+        let owner = registry::library_owner(ctx.state, library)
+            .await?
+            .ok_or_else(|| {
+                AppError::conflict(
+                    "sidecar_owner_unverified",
+                    "sidecar library owner is unavailable",
+                )
+            })?;
+        let prefix = root
+            .immich_path(&RelPath::root())
+            .ok_or_else(|| AppError::invalid_location("sidecar has no mapped root"))?;
+        let mut conn = ctx.conn(server).await?;
+        for sidecar in pg::sidecars_at_path(&mut conn, &path).await? {
+            let asset = pg::asset_by_id(&mut conn, &sidecar.asset_id)
+                .await?
+                .ok_or_else(|| {
+                    AppError::conflict(
+                        "sidecar_owner_unverified",
+                        "sidecar owning asset is missing",
+                    )
+                })?;
+            if asset.library_id.as_deref() != Some(library)
+                || asset.owner_id != owner
+                || !asset
+                    .original_path
+                    .starts_with(&format!("{}/", prefix.trim_end_matches('/')))
+            {
+                return Err(AppError::conflict(
+                    "sidecar_owner_unverified",
+                    "sidecar association is outside the admitted library root",
+                ));
+            }
+            plan.db
+                .entry(server.id.clone())
+                .or_default()
+                .push(DbStep::RemoveSidecar { sidecar, asset });
         }
     }
     let mut asset_ids = Vec::new();
@@ -1615,6 +1729,21 @@ async fn plan_publish(ctx: &Ctx<'_>, plan: &mut Plan, upload_id: &str) -> AppRes
     let staging = staging_dir(root, upload_id)?;
     let names: Vec<String> = req.files.iter().map(|f| f.name.clone()).collect();
     let sidecar_only = req.existing_original.as_ref();
+    let standalone = super::uploads::standalone_peer_upload(ctx.principal, &req, &ctx.companions);
+    if sidecar_only.is_none()
+        && !req.files.iter().any(|file| file.role == FileRole::Original)
+        && !standalone
+    {
+        plan.block("bad_upload", "an upload requires an original");
+        return Ok(());
+    }
+    if standalone && req.on_conflict == OnConflict::Rename {
+        plan.block(
+            "bad_upload",
+            "standalone peer companions must retain their names",
+        );
+        return Ok(());
+    }
     let original = req
         .files
         .iter()
@@ -1657,7 +1786,7 @@ async fn plan_publish(ctx: &Ctx<'_>, plan: &mut Plan, upload_id: &str) -> AppRes
                         "conflicting expected revisions for the original",
                     );
                 }
-                if spec_revision.or(original_revision).is_none() {
+                if !standalone && spec_revision.or(original_revision).is_none() {
                     plan.block(
                         "revision_changed",
                         "original revision is required for replacement",
@@ -1710,7 +1839,7 @@ async fn plan_publish(ctx: &Ctx<'_>, plan: &mut Plan, upload_id: &str) -> AppRes
                 if plan.blockers.is_empty() && !existing_files.is_empty() {
                     // The replaced versions are kept as a recoverable trash item; a sidecar-only
                     // upload keeps only the replaced sidecars, never the untouched original.
-                    let trashed_name = if sidecar_only.is_some() {
+                    let trashed_name = if sidecar_only.is_some() || standalone {
                         existing_files[0].0.to_owned()
                     } else {
                         original.clone()
@@ -1791,7 +1920,7 @@ async fn plan_publish(ctx: &Ctx<'_>, plan: &mut Plan, upload_id: &str) -> AppRes
         if upload_file_needs_sync_add(f.role) {
             published_original_path = Some(r.clone());
         }
-        if f.name == original {
+        if f.name == original || standalone {
             plan.changes.push(Change::Created {
                 location: root.location(&r),
             });

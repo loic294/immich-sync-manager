@@ -63,7 +63,7 @@ describe('operations activity', () => {
     await vi.waitFor(() => expect(page.textContent).toContain('2/2'));
   });
 
-  it('shows live subtasks and marks attention handled without resolving recovery', async () => {
+  it('shows live subtasks and queues recovery instead of manual acknowledgment', async () => {
     let handled = false;
     vi.spyOn(api, 'get').mockImplementation(async (path) => {
       if (path === '/api/admin/operations/op1/detail')
@@ -100,15 +100,22 @@ describe('operations activity', () => {
     page.querySelector<HTMLButtonElement>('ism-operation-table button')?.click();
     await vi.waitFor(() => expect(page.textContent).toContain('Move original.jpg'));
     expect(page.querySelector('dialog[open]')).not.toBeNull();
-    [...page.querySelectorAll('button')]
-      .find((b) => b.textContent?.includes('Mark handled'))
-      ?.click();
-    await vi.waitFor(() => expect(post).toHaveBeenCalledWith('/api/admin/operations/op1/handled'));
+    [...page.querySelectorAll('button')].find((b) => b.textContent?.trim() === 'Fix')?.click();
+    await vi.waitFor(() =>
+      expect(post).toHaveBeenCalledWith('/api/admin/recovery', {
+        body: {
+          targets: [{ kind: 'operation', id: 'op1', peer_id: null }],
+          all: false,
+          resolution: null,
+        },
+      }),
+    );
+    expect(post).not.toHaveBeenCalledWith('/api/admin/operations/op1/handled');
     expect(post).not.toHaveBeenCalledWith('/api/admin/operations/op1/resolve');
     await vi.waitFor(() => expect(page.textContent).toContain('Handled'));
   });
 
-  it('offers a file recheck for interrupted recovery', async () => {
+  it('uses the shared recovery workflow for interrupted publication', async () => {
     vi.spyOn(api, 'get').mockImplementation(async (path) => {
       if (path === '/api/admin/operations/op1/detail')
         return {
@@ -145,12 +152,20 @@ describe('operations activity', () => {
     page.querySelector<HTMLButtonElement>('ism-operation-table button')?.click();
     await vi.waitFor(() => expect(page.textContent).toContain('Record changes'));
     [...page.querySelectorAll('button')]
-      .find((button) => button.textContent?.includes('Recheck files'))
+      .find((button) => button.textContent?.trim() === 'Fix')
       ?.click();
-    await vi.waitFor(() => expect(post).toHaveBeenCalledWith('/api/admin/operations/op1/recheck'));
+    await vi.waitFor(() =>
+      expect(post).toHaveBeenCalledWith('/api/admin/recovery', {
+        body: {
+          targets: [{ kind: 'operation', id: 'op1', peer_id: null }],
+          all: false,
+          resolution: null,
+        },
+      }),
+    );
   });
 
-  it('offers a verified publication retry for a failed pending upload', async () => {
+  it('queues a failed pending upload without promising it has been fixed', async () => {
     vi.spyOn(api, 'get').mockImplementation(async (path) => {
       if (path === '/api/admin/operations/op1/detail')
         return {
@@ -177,12 +192,18 @@ describe('operations activity', () => {
     const page = await mount('ism-operations-page');
     await vi.waitFor(() => expect(page.textContent).toContain('OPM: editor'));
     page.querySelector<HTMLButtonElement>('ism-operation-table button')?.click();
-    await vi.waitFor(() => expect(page.textContent).toContain('Retry publication'));
+    await vi.waitFor(() => expect(page.textContent).toContain('Fix'));
     [...page.querySelectorAll('button')]
-      .find((button) => button.textContent?.includes('Retry publication'))
+      .find((button) => button.textContent?.trim() === 'Fix')
       ?.click();
     await vi.waitFor(() =>
-      expect(post).toHaveBeenCalledWith('/api/admin/operations/op1/retry-publication'),
+      expect(post).toHaveBeenCalledWith('/api/admin/recovery', {
+        body: {
+          targets: [{ kind: 'operation', id: 'op1', peer_id: null }],
+          all: false,
+          resolution: null,
+        },
+      }),
     );
   });
 });

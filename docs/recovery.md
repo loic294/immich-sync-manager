@@ -1,66 +1,89 @@
 # Recovery
 
-ISM fails closed: when it cannot prove a step worked, it stops changing that Immich server and says why.
+ISM fails closed: sync recovery completes only after ISM verifies the filesystem, replica
+bookkeeping, and any required Immich effects. Failed sync work enters a durable recovery queue
+automatically; the **Needs attention** tab also provides **Fix selected** and **Fix all**.
 
-| State (Servers page) | Meaning | What to do |
-| --- | --- | --- |
-| **Blocked** | Immich's `library` queue could not be paused, confirmed idle or resumed. Nothing was modified. | Check Immich's jobs page (a long-running library job must finish), then **Retry**. |
-| **Settings drift** | Immich's file watcher or scheduled library scan was turned back on. Writes are refused. | Click **Turn them off again** on the Servers or Overview page. |
-| **Recovery required** | An item failed and undoing it also failed. Immich's `library` queue stays paused. | Open the operation, fix the listed files (each item says what it expected), click **Resolve** on the operation, then **Mark recovery as done** on the server. |
-| **Partial** operation | Some items succeeded and some were rolled back. | Read the item errors; resubmit what is still wanted. |
+| Recovery state | Meaning |
+| --- | --- |
+| **Queued / Fixing** | Recovery is admitted or running, not yet complete. |
+| **Waiting** | A dependency, unavailable mount or peer, or incomplete evidence prevents verified progress. |
+| **Needs a decision** | Valid versions disagree; select an instance's version or preserve both in ISM. |
+| **Fixed** | The original work or its linked replacements completed with verified effects. |
+| **Not retryable** | Recovery verified that no complete copy remains in available peers, staging, or applicable ISM trash. |
 
-After recovery is marked done, the `library` queue is resumed and due library scans run.
+Batch admission returns an outcome for each target. A queued request is not reported as fixed.
+Selections persist across pages, and **Fix all** snapshots the outstanding local and mirrored
+receiver-owned issues, up to 5000 per batch. Outgoing actions are authenticated and forwarded
+to the receiver; each peer can act only on its own work. Requests survive receiver
+unavailability and restart. Version choices use current, owner-scoped comparisons and are
+rechecked before admission and again before publication. Folder comparisons include empty
+directories; changed content or directory structure requires a refreshed decision. Preview
+availability does not determine whether repair can proceed.
 
-If an item reports `peer_bookkeeping_failed`, its filesystem changes may already be complete, but
-replica rows and events may be only partly updated. Inspect and reconcile both before resolving the
-operation; peer scans and event processing remain paused while recovery is unresolved.
+Independent paths, shares, and servers continue syncing. Overlapping paths and causally dependent
+events wait, and an unresolved Immich maintenance barrier still protects that server. A replacement
+transfer may pass its own failed parent's path gate, but never that parent's unresolved maintenance
+barrier or another operation's gate. Waiting for busy work, unavailable mounts, or unavailable peer
+evidence does not consume the recovery attempt counter.
 
-For an interrupted peer publication, **Recheck files** repeats the saved upload's final file-size
-and SHA-256 checks. If every expected file still matches, ISM finishes the interrupted replica
-bookkeeping and completes the operation; it does not move, replace or delete library files. A
-missing or changed file, a non-peer action, or a recovery involving Immich maintenance work is
-refused and remains for manual inspection.
+Recovery checks retained complete staging, upload staging, local copies, and authenticated share
+peers' applicable trash inventories. It can transfer the exact verified file without restoring
+the rest of a trashed folder. It also follows authenticated committed move history. A duplicate
+hash alone is not proof of a move. Missing old paths and HTTP errors alone
+never justify successful completion or discarding work. Saved actions are previewed against current
+state before replacement operations are admitted.
 
-If a peer publication failed before its first action started, **Retry publication** is available
-when the staged upload still exists. ISM verifies every staged file against its recorded size and
-SHA-256 before requeueing the normal managed publication. If staging is missing or changed, retry
-is refused rather than recreating an operation from uncertain data.
+An unchanged verified plan has a bounded execution budget shared with its replacements and
+preserved across restart. Once used, recovery waits for changed evidence instead of creating
+another identical failing operation. Fresh hashes are checked even when file size and modification
+time are unchanged; waiting does not prove that data is permanently unrecoverable.
 
-If the container is restarted mid-operation, unfinished items are marked for recovery on start and the
-server keeps Immich's `library` queue paused until an admin confirms. If ISM had paused the queue
-and no operation was running, it resumes the queue on start. Corrupt maintenance state or a failed restart recovery
-prevents the server from starting rather than assuming it is safe.
+For `peer_bookkeeping_failed` and interrupted publications, recovery verifies recorded sizes,
+hashes, folder inventories, and journaled Immich effects before replaying bookkeeping. Repeated
+Fix requests coalesce, and verified completion is idempotent. Sync **Resolve** admits this same
+workflow instead of accepting an administrator's filesystem attestation; server recovery cannot
+be acknowledged while sync maintenance remains unresolved.
+
+On restart, interrupted recovery jobs are requeued. An untouched peer upload can resume only when
+its staging still matches the saved request; other interrupted work retains its evidence and any
+maintenance barrier. Corrupt maintenance state or failed restart bookkeeping prevents startup
+rather than assuming it is safe. If ISM paused a queue and no operation holds it, restart recovery
+resumes it.
 
 Cross-filesystem moves retain the source until a complete destination copy has passed content
 and metadata verification and has been published. If verification or source removal fails after
 publication, the item requires recovery: the source may be complete or partly removed, while the
-destination copy is retained. Inspect both paths listed in the operation journal and reconcile
-Immich's paths before resolving the operation; do not blindly retry against an existing destination.
+destination copy is retained. Journal recovery can finish a move using a complete verified source
+or destination. Matching partial copies are retained in ISM trash before completion; changed or
+unexpected entries are refused. File groups, nested folders, and shared companions retain their
+original operation and content identities.
 Rollback also uses verified cross-filesystem moves and never replaces an existing source path.
 After an interruption, a hidden `.ism-move-*` directory beside the destination may contain an
-unpublished `payload`. Preserve it until the source and destination have been checked against a
-trusted inventory or backup, then remove only the confirmed redundant staging directory.
+unpublished `payload`. ISM must retain uncertain staging rather than deleting a potentially
+recoverable copy.
 
 An interrupted peer upload is requeued automatically only when every staging file is still present
 and exactly matches the recorded size and checksum, no execution step has been recorded, and the
 operation does not hold an Immich maintenance barrier. Any missing, changed, partially executed,
-or otherwise uncertain upload remains in **Recovery required** for an administrator to inspect.
+or otherwise uncertain upload remains in recovery until ISM can verify a safe plan.
 
 Interrupted peer transfers return to the queue on restart while peer publication is disabled.
-Failed and cancelled transfers are left unchanged.
+Failed transfers enter the shared recovery workflow. Healthy user-cancelled transfers are not
+automatically restarted.
 
-If a mapped root is unavailable, verify that the intended volume is mounted before repairing its
-`.ism-root` marker. The marker must be a regular file containing that mapping's root ID; an empty,
-different, missing, or symlinked marker is refused. Older empty markers need manual verification and
-repair. Matching root IDs alone do not prove that the correct physical volume is mounted.
+An unavailable mapped root puts recovery in **Waiting**. Its `.ism-root` marker must be a regular
+file containing that mapping's root ID; an empty,
+different, missing, or symlinked marker is refused. ISM does not recreate a missing marker as a
+recovery shortcut. Matching root IDs alone do not prove that the correct physical volume is mounted.
 When two independent source mappings share the exact same folder, the additional mapping uses
 `.ism-root-<root-id>` instead. Each marker contains its own root ID; removing one mapping leaves
 the other's marker intact. These markers are hidden from listings and cannot be accessed by clients.
 
 Trash created before the corresponding file-group or recursive folder inventories were introduced
 cannot be restored automatically: ISM cannot determine which entries were originally quarantined.
-Preserve the quarantine and inspect it against a trusted backup; do not invent an inventory to
-bypass this check. New inventories check names, types and hashes, including empty directories.
+ISM preserves such quarantine entries rather than inventing an inventory to bypass this check.
+New inventories check names, types and hashes, including empty directories.
 Folder trash rejects symlinks and special files. Other processes can still change files concurrently;
 coordinate external writers before deleting or restoring a folder.
 

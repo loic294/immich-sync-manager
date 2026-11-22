@@ -728,8 +728,12 @@ async fn awaiting_asset_id(state: &AppState, id: &str) -> bool {
     let cutoff = crate::db::ts(chrono::Utc::now() - chrono::Duration::seconds(wait));
     sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM operation_items i JOIN operations o ON o.id = i.operation_id
+         JOIN uploads u ON u.operation_id = o.id
          WHERE i.operation_id = ? AND i.kind = 'publish_upload' AND i.status = 'done'
            AND i.result_json IS NOT NULL AND json_extract(i.result_json, '$.asset_id') IS NULL
+           AND (json_extract(u.request_json, '$.existing_original.name') IS NOT NULL
+                OR EXISTS (SELECT 1 FROM json_each(u.request_json, '$.files') f
+                           WHERE json_extract(f.value, '$.role') = 'original'))
            AND (o.finished_at IS NULL OR o.finished_at >= ?))",
     )
     .bind(id)

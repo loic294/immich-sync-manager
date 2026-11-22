@@ -29,6 +29,12 @@ pub async fn run(state: AppState) {
                             if running.insert(peer.id.clone()) {
                                 let state = state.clone();
                                 active.push(async move {
+                                    if let Err(error)=super::recovery::refresh(&state,&peer).await {
+                                        tracing::warn!(peer=%peer.id,"cannot refresh recovery: {}",error.message());
+                                        if let Err(error)=super::recovery::unavailable(&state,&peer.id,&error).await {
+                                            tracing::error!("cannot persist recovery availability: {}",error.message());
+                                        }
+                                    }
                                     if let Err(error) = refresh(&state, &peer).await {
                                         unavailable(&state, &peer.id, &error).await;
                                     }
@@ -154,6 +160,7 @@ async fn select(
             let outgoing: bool = r.try_get("outgoing")?;
             let peer: String = r.try_get("peer_name")?;
             Ok(SyncActivity {
+                recovery: None,
                 id: r.try_get("id")?,
                 outgoing,
                 peer_id: r.try_get("peer_id")?,
@@ -253,10 +260,11 @@ pub async fn page(
     offset: i64,
     id: Option<&str>,
 ) -> AppResult<SyncPage> {
+    super::recovery::discover(state).await?;
     let name = state.instance_name().await;
     let ids = id.map(|id| serde_json::to_string(&[id])).transpose()?;
     let mut tx = state.db.begin().await?;
-    let (rows, total) = select(
+    let (mut rows, total) = select(
         &mut tx,
         &name,
         Selection {
@@ -306,12 +314,15 @@ pub async fn page(
             ));
         }
     }
-    match super::require_recovery_resolved(state).await {
-        Ok(()) => {}
-        Err(error) if error.code() == "recovery_required" => warnings.push(
-            "File transfers are paused by unresolved operation recovery. Open Operations and check the interrupted operation.".into(),
-        ),
-        Err(error) => return Err(error),
+    let recovering: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM operations WHERE status='recovery_required' AND recovery_resolved=0",
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+    if recovering > 0 {
+        warnings.push(format!(
+            "{recovering} sync issues are awaiting recovery. Independent sync continues."
+        ));
     }
     if warnings.is_empty() {
         estimate(&mut progress);
@@ -319,6 +330,17 @@ pub async fn page(
         progress.eta_seconds = None;
     }
     tx.commit().await?;
+    for row in &mut rows {
+        let (kind, id) = row.operation_id.as_ref().map_or(
+            (ism_core::dto::RecoveryKind::Transfer, row.id.as_str()),
+            |id| (ism_core::dto::RecoveryKind::Operation, id.as_str()),
+        );
+        row.recovery = if row.outgoing {
+            super::recovery::outgoing(state, &row.peer_id, kind, id).await?
+        } else {
+            super::recovery::get(state, kind, id).await?
+        };
+    }
     Ok(SyncPage {
         rows,
         total,
@@ -421,6 +443,7 @@ pub async fn changes(state: &AppState, peer: &str, after: i64) -> AppResult<Chan
             "cursor must be nonnegative",
         ));
     }
+    super::recovery::discover(state).await?;
     let name = state.instance_name().await;
     let mut tx = state.db.begin().await?;
     let events: Vec<(i64, String)> = sqlx::query_as(
@@ -445,9 +468,21 @@ pub async fn changes(state: &AppState, peer: &str, after: i64) -> AppResult<Chan
         },
     )
     .await?;
-    let mut rows: HashMap<_, _> = rows.into_iter().map(|row| (row.id.clone(), row)).collect();
     let progress = progress(&mut tx, Some(peer)).await?;
     tx.commit().await?;
+    let mut decorated = Vec::new();
+    for mut row in rows {
+        let (kind, id) = row.operation_id.as_ref().map_or(
+            (ism_core::dto::RecoveryKind::Transfer, row.id.as_str()),
+            |id| (ism_core::dto::RecoveryKind::Operation, id.as_str()),
+        );
+        row.recovery = super::recovery::get(state, kind, id).await?;
+        decorated.push(row);
+    }
+    let mut rows: HashMap<_, _> = decorated
+        .into_iter()
+        .map(|row| (row.id.clone(), row))
+        .collect();
     Ok(Changes {
         cursor: events.last().map_or(after, |(seq, _)| *seq),
         more: events.len() == CHANGE_LIMIT as usize,

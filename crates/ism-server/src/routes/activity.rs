@@ -33,6 +33,11 @@ pub fn router() -> Router<AppState> {
         .route("/sync/page", get(sync))
         .route("/sync/files", get(sync_files))
         .route("/sync/thumbnail", get(sync_thumbnail))
+        .route("/recovery/page", get(recovery_page))
+        .route("/recovery/versions", get(recovery_versions))
+        .route("/recovery/preview", get(recovery_preview))
+        .route("/recovery/decisions", post(recovery_decisions))
+        .route("/recovery", post(recover))
 }
 
 #[derive(Default, Deserialize)]
@@ -205,18 +210,76 @@ async fn operation_detail(
         })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Json(OperationDetail {
+        recovery: crate::peers::recovery::get(&state, ism_core::dto::RecoveryKind::Operation, &id)
+            .await?,
         operation,
         activity,
         tasks,
     }))
 }
 
+async fn recovery_page(
+    State(state): State<AppState>,
+    Admin(_): Admin,
+    Query(q): Query<PageQuery>,
+) -> AppResult<Json<ism_core::dto::RecoveryPage>> {
+    let (limit, offset) = q.bounds()?;
+    Ok(Json(
+        crate::peers::recovery::page(&state, limit, offset).await?,
+    ))
+}
+
+async fn recover(
+    State(state): State<AppState>,
+    Admin(_): Admin,
+    Json(input): Json<ism_core::dto::RecoveryBatchInput>,
+) -> AppResult<Json<ism_core::dto::RecoveryBatchResult>> {
+    Ok(Json(crate::peers::recovery::submit(&state, input).await?))
+}
+
+async fn recovery_versions(
+    State(state): State<AppState>,
+    Admin(_): Admin,
+    Query(query): Query<crate::peers::versions::Query>,
+) -> AppResult<Json<ism_core::dto::RecoveryVersions>> {
+    Ok(Json(
+        crate::peers::versions::get(&state, &query.target()).await?,
+    ))
+}
+
+async fn recovery_preview(
+    State(state): State<AppState>,
+    Admin(_): Admin,
+    Query(query): Query<crate::peers::versions::PreviewQuery>,
+) -> AppResult<Response> {
+    crate::peers::versions::preview(&state, &query).await
+}
+
+async fn recovery_decisions(
+    State(state): State<AppState>,
+    Admin(_): Admin,
+    Json(input): Json<ism_core::dto::RecoveryDecisionInput>,
+) -> AppResult<Json<ism_core::dto::RecoveryBatchResult>> {
+    Ok(Json(
+        crate::peers::recovery::submit_decisions(&state, input).await?,
+    ))
+}
 async fn mark_handled(
     State(state): State<AppState>,
     Admin(_): Admin,
     Path(id): Path<String>,
 ) -> AppResult<Response> {
     let op = ops::load(&state, &id).await?.0;
+    crate::peers::recovery::discover(&state).await?;
+    if crate::peers::recovery::get(&state, ism_core::dto::RecoveryKind::Operation, &id)
+        .await?
+        .is_some_and(|recovery| !recovery.can_dismiss)
+    {
+        return Err(AppError::conflict(
+            "recovery_not_exhausted",
+            "recovery must finish before this issue can be dismissed",
+        ));
+    }
     if !matches!(
         op.status,
         OperationStatus::Failed | OperationStatus::Partial | OperationStatus::RecoveryRequired
@@ -393,7 +456,7 @@ pub async fn thumbnail(state: &AppState, location: &Location) -> AppResult<Respo
     image_response(response).await
 }
 
-async fn image_response(mut response: reqwest::Response) -> AppResult<Response> {
+pub(crate) async fn image_response(mut response: reqwest::Response) -> AppResult<Response> {
     let content_type = response
         .headers()
         .get(header::CONTENT_TYPE)
@@ -452,11 +515,18 @@ async fn remote_file(
     .await
     .map_err(|e| AppError::conflict("peer_unreachable", net::net_error(&e)))?;
     if !response.status().is_success() {
+        let status = response.status();
+        let error: serde_json::Value = response.json().await.map_err(AppError::internal)?;
+        if status == reqwest::StatusCode::NOT_FOUND && error["error"]["code"] == "not_found" {
+            return Err(AppError::not_found(
+                "this file is no longer at its recorded path",
+            ));
+        }
         return Err(AppError::conflict(
             "peer_preview_unavailable",
             format!(
-                "The peer could not provide {endpoint} (HTTP {}). Both peers must support activity previews.",
-                response.status().as_u16()
+                "The peer preview is unavailable (HTTP {}).",
+                status.as_u16()
             ),
         ));
     }
