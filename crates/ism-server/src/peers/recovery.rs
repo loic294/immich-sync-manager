@@ -871,6 +871,9 @@ pub struct FileEvidence {
     pub last_move_seq: Option<i64>,
     #[serde(default)]
     pub inventory: Option<Vec<crate::ops::plan::TrashEntry>>,
+    /// RFC 3339 modification time of the file; older peers omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modified_at: Option<String>,
 }
 
 /// Follows committed move lineage only. Content similarity alone is not a file identity.
@@ -1004,6 +1007,7 @@ pub async fn evidence_at_event(
                 deleted: false,
                 last_move_seq,
                 inventory: Some(inventory),
+                modified_at: None,
             });
         }
         Ok(_) => {}
@@ -1026,7 +1030,7 @@ pub async fn evidence_at_event(
             "file content has not yet been committed by the share scan",
         ));
     }
-    let size = if let Some((revision, _)) = &fingerprint {
+    let (size, modified_at) = if let Some((revision, _)) = &fingerprint {
         let metadata = std::fs::metadata(&abs)?;
         if files::revision(&metadata) != *revision {
             return Err(AppError::conflict(
@@ -1034,9 +1038,12 @@ pub async fn evidence_at_event(
                 "recovery evidence changed while being verified",
             ));
         }
-        Some(metadata.len())
+        (
+            Some(metadata.len()),
+            Some(chrono::DateTime::from_timestamp_nanos(files::mtime_ns(&metadata)).to_rfc3339()),
+        )
     } else {
-        None
+        (None, None)
     };
     Ok(FileEvidence {
         path,
@@ -1046,6 +1053,7 @@ pub async fn evidence_at_event(
         deleted: row.is_some_and(|r| r.deleted),
         last_move_seq,
         inventory: None,
+        modified_at,
     })
 }
 

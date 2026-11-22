@@ -1180,7 +1180,7 @@ pub(super) async fn version_context(
                 evidence
                     .files
                     .into_iter()
-                    .map(|file| (file.path, file.sha256, file.size))
+                    .map(|file| (file.path, file.sha256, file.size, file.modified_at))
                     .collect(),
                 evidence.directories,
             )
@@ -1192,7 +1192,7 @@ pub(super) async fn version_context(
             let files = evidence
                 .sha256
                 .zip(evidence.size)
-                .map(|(hash, size)| vec![(evidence.path.clone(), hash, size)])
+                .map(|(hash, size)| vec![(evidence.path.clone(), hash, size, evidence.modified_at)])
                 .unwrap_or_default();
             let status = if evidence.deleted {
                 "deleted"

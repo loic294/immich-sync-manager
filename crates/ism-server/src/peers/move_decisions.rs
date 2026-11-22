@@ -37,6 +37,8 @@ pub(super) struct Content {
     pub(super) size: u64,
     pub(super) vv: VersionVector,
     pub(super) download: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) modified_at: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -339,6 +341,7 @@ pub(super) async fn evidence_at(
                     size,
                     vv: file.vv,
                     download: true,
+                    modified_at: file.modified_at,
                 });
             } else {
                 result.directories.push(path);
@@ -358,6 +361,7 @@ pub(super) async fn evidence_at(
             size,
             vv: remote.vv,
             download: true,
+            modified_at: remote.modified_at,
         });
     }
     Ok(result)
@@ -417,6 +421,9 @@ async fn local_content(
             size: meta.len(),
             vv,
             download: false,
+            modified_at: Some(
+                chrono::DateTime::from_timestamp_nanos(files::mtime_ns(&meta)).to_rfc3339(),
+            ),
         });
     }
     Ok((files, directories))

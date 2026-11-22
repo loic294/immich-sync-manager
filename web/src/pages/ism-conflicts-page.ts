@@ -153,6 +153,32 @@ export class IsmConflictsPage extends IsmPage {
     `;
   }
 
+  /** When each side last changed, so the newer version is visible before comparing. */
+  private modified(c: ConflictView) {
+    const times = [c.local, c.remote].map((side) =>
+      side.deleted || !side.modified_at ? undefined : Date.parse(side.modified_at),
+    );
+    const [local, remote] = times;
+    const newest =
+      local !== undefined &&
+      remote !== undefined &&
+      !Number.isNaN(local + remote) &&
+      local !== remote
+        ? Math.max(local, remote)
+        : undefined;
+    const entry = (fallback: string, side: ConflictSide, time: number | undefined) => html`
+      <div class="rounded-box border border-base-300 px-3 py-2">
+        <dt class="text-base-content/60">${side.instance || fallback} · last modified</dt>
+        <dd class="flex flex-wrap items-center gap-2">
+          ${side.deleted ? 'Deleted' : side.modified_at ? formatDate(side.modified_at) : 'Unknown'}
+          ${time !== undefined && time === newest ? html`<span class="badge badge-info badge-soft badge-sm">Newer</span>` : nothing}
+        </dd>
+      </div>`;
+    return html`<dl class="grid grid-cols-1 gap-2 text-sm sm:grid-cols-2">
+      ${entry('This instance', c.local, local)}${entry('Peer', c.remote, remote)}
+    </dl>`;
+  }
+
   private card(c: ConflictView) {
     const open = c.status === 'open';
     const choices = RESOLUTIONS;
@@ -178,7 +204,7 @@ export class IsmConflictsPage extends IsmPage {
           ${c.moved_from ? html`<p class="text-sm">Moved by the peer from <span class="break-all font-mono text-xs">${formatLocation(c.moved_from)}</span></p>` : nothing}
           ${
             open
-              ? this.review.render(target(c))
+              ? html`${this.modified(c)}${this.review.render(target(c))}`
               : html`<div class="grid grid-cols-1 gap-3 md:grid-cols-2">
               ${this.side('This instance', c.local)} ${this.side('Peer', c.remote)}
             </div>`

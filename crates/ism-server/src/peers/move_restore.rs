@@ -1442,7 +1442,7 @@ pub(super) async fn version_context(
         remote_files: current
             .files
             .into_iter()
-            .map(|file| (file.path, file.sha256, file.size))
+            .map(|file| (file.path, file.sha256, file.size, file.modified_at))
             .collect(),
         remote_directories: current.directories,
     })

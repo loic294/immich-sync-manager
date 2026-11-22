@@ -39,6 +39,29 @@ const versions = {
 describe('ism-conflicts-page', () => {
   afterEach(() => vi.restoreAllMocks());
 
+  it('shows when each side was last modified and marks the newer one before comparing', async () => {
+    vi.spyOn(api, 'get').mockResolvedValue([
+      {
+        ...conflict,
+        local: { ...conflict.local, modified_at: '2024-01-01T00:00:00Z' },
+        remote: { ...conflict.remote, modified_at: '2024-02-01T00:00:00Z' },
+      },
+      { ...conflict, id: 'conflict-2', remote: { ...conflict.remote, deleted: true } },
+    ] as never);
+    const page = await mount('ism-conflicts-page');
+    await vi.waitFor(() => expect(page.querySelectorAll('article')).toHaveLength(2));
+    const [changed, deleted] = [...page.querySelectorAll('article')].map((card) =>
+      [...card.querySelectorAll('dl > div')].map((entry) =>
+        entry.textContent?.replace(/\s+/g, ' ').trim(),
+      ),
+    );
+    expect(changed).toEqual([
+      `Alpha · last modified ${new Date('2024-01-01T00:00:00Z').toLocaleString()}`,
+      `Beta · last modified ${new Date('2024-02-01T00:00:00Z').toLocaleString()} Newer`,
+    ]);
+    expect(deleted).toEqual(['Alpha · last modified Unknown', 'Beta · last modified Deleted']);
+  });
+
   it('offers named recoveries including keeping both folders, without dismissal', async () => {
     vi.spyOn(api, 'get').mockResolvedValue([
       conflict,

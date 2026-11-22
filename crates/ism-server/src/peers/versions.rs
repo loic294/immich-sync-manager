@@ -106,7 +106,8 @@ pub(super) struct Context {
     pub local_paths: Vec<String>,
     pub remote_path: String,
     pub remote_state: String,
-    pub remote_files: Vec<(String, String, u64)>,
+    /// Path, checksum, size and modification time of each source file.
+    pub remote_files: Vec<(String, String, u64, Option<String>)>,
     pub remote_directories: Vec<String>,
 }
 
@@ -270,12 +271,12 @@ pub async fn get(state: &AppState, target: &RecoveryTarget) -> AppResult<Recover
         files: context
             .remote_files
             .into_iter()
-            .map(|(path, sha256, size)| RecoveryFileVersion {
+            .map(|(path, sha256, size, modified_at)| RecoveryFileVersion {
                 role: role(state, &path),
                 path,
                 sha256,
                 size: Some(size),
-                modified_at: None,
+                modified_at,
             })
             .collect(),
         directories,

@@ -584,6 +584,7 @@ async fn recovery_previews_are_owner_scoped_current_and_independent_of_immich_in
         peer_id: None,
     };
     let reviewed = super::versions::get(&b.state, &target).await.unwrap();
+    assert!(reviewed.source.files[0].modified_at.is_some());
     let receiver = super::net::peers(&a.state).await.unwrap().remove(0);
     for (source, expected) in [
         (false, b"receiving preview".as_slice()),

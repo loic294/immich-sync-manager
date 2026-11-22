@@ -1022,6 +1022,7 @@ async fn changed_version_choice(
     assert_eq!(versions.receiving[0].state, "folder");
     assert_eq!(versions.receiving[0].files[0].path, "old/nested/photo.jpg");
     assert_eq!(versions.source.files[0].path, "new/nested/photo.jpg");
+    assert!(versions.source.files[0].modified_at.is_some());
     assert_ne!(
         versions.source.files[0].sha256,
         versions.receiving[0].files[0].sha256

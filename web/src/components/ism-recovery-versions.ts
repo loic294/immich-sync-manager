@@ -35,7 +35,8 @@ export class IsmRecoveryVersions extends IsmElement {
         version.state === 'absent' || version.state === 'deleted'
           ? html`<p class="mt-2">${version.state === 'deleted' ? 'Deleted' : 'No file at this location'}</p>`
           : html`<p class="mt-2 text-sm">${version.files.length} ${version.files.length === 1 ? 'file' : 'files'} ·
-            ${formatBytes(version.files.reduce((sum, file) => sum + (file.size ?? 0), 0))}</p>
+            ${formatBytes(version.files.reduce((sum, file) => sum + (file.size ?? 0), 0))}
+            ${latest(version) ? html` · Last modified ${formatDate(latest(version))}` : nothing}</p>
           <ul class="mt-3 space-y-4">${version.files.slice(0, this.limit).map((file) => {
             const image = /\.(jpe?g|png|webp|avif)$/i.test(file.path);
             const id = `${source}:${file.path}:${file.sha256}`;
@@ -59,7 +60,7 @@ export class IsmRecoveryVersions extends IsmElement {
               }
               <p class="mt-1 text-sm text-base-content/70">${file.role} ·
                 ${file.size === null ? 'Size unavailable' : formatBytes(file.size)}
-                ${file.modified_at ? html` · ${formatDate(file.modified_at)}` : nothing}</p>
+                ${file.modified_at ? html` · Modified ${formatDate(file.modified_at)}` : nothing}</p>
               <p class="text-sm">${same ? 'Same bytes on both instances' : 'Different version or only on this instance'}</p>
               <details class="mt-1 text-xs text-base-content/70"><summary class="cursor-pointer">Checksum</summary>
                 <p class="break-all">${file.sha256}</p></details>
@@ -102,6 +103,14 @@ export class IsmRecoveryVersions extends IsmElement {
 }
 
 customElements.define('ism-recovery-versions', IsmRecoveryVersions);
+
+/** The most recent modification time among a version's files. */
+function latest(version: RecoveryVersion) {
+  return version.files.reduce<string | undefined>((newest, file) => {
+    if (!file.modified_at) return newest;
+    return !newest || Date.parse(file.modified_at) > Date.parse(newest) ? file.modified_at : newest;
+  }, undefined);
+}
 
 declare global {
   interface HTMLElementTagNameMap {
