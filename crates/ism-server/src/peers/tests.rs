@@ -563,6 +563,47 @@ async fn recovery_fetches_exact_peer_trash_content_without_restoring_ancestor_co
 }
 
 #[tokio::test]
+async fn recovery_comparison_does_not_wait_for_unrelated_peer_operations() {
+    use ism_core::dto::{RecoveryKind, RecoveryTarget};
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    write_old(&a.shared.join("compare.jpg"), b"source version");
+    write_old(&b.shared.join("compare.jpg"), b"receiving version");
+    scan(&a).await;
+    scan(&b).await;
+    let peer = super::net::peers(&b.state).await.unwrap().remove(0);
+    super::pull(&b.state, &peer).await.unwrap_err();
+    let id: String = sqlx::query_scalar("SELECT id FROM conflicts WHERE rel_path='compare.jpg'")
+        .fetch_one(&b.state.db)
+        .await
+        .unwrap();
+    let target = RecoveryTarget {
+        kind: RecoveryKind::Conflict,
+        id,
+        peer_id: None,
+    };
+    let _source_operation = a.state.replication_operation_lock.lock().await;
+    let _receiving_operation = b.state.replication_operation_lock.lock().await;
+    let reviewed = tokio::time::timeout(
+        Duration::from_secs(2),
+        super::versions::get(&b.state, &target),
+    )
+    .await
+    .expect("comparison waited for an unrelated operation and would hit the proxy timeout")
+    .unwrap();
+    assert_eq!(
+        reviewed.source.files[0].sha256,
+        crate::crypto::sha256_hex(b"source version")
+    );
+    assert_eq!(
+        reviewed.receiving[0].files[0].sha256,
+        crate::crypto::sha256_hex(b"receiving version")
+    );
+    assert!(reviewed.source.files[0].modified_at.is_some());
+}
+
+#[tokio::test]
 async fn recovery_previews_are_owner_scoped_current_and_independent_of_immich_indexing() {
     use ism_core::dto::{RecoveryKind, RecoveryTarget};
     let (mut a, mut b) = pair().await;

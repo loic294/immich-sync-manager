@@ -149,7 +149,8 @@ async fn recovery_file(
             ));
         }
     };
-    let _guard = state.replication_operation_lock.lock().await;
+    // Evidence is observational and checks file revisions. Taking the mutation lock here
+    // blocks comparisons behind entire scans; decisions revalidate under that lock later.
     Ok(Json(
         peers::recovery::evidence_at_event(&state, Some(&peer.id), &q.share, &q.path, &vv, event)
             .await?,
