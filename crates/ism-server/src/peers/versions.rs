@@ -219,6 +219,29 @@ pub(super) async fn local(
     })
 }
 
+/// The comparison must answer before a reverse proxy in front of this instance times out.
+const COMPARISON_DEADLINE: std::time::Duration = std::time::Duration::from_secs(50);
+
+/// [`get`] bounded by a deadline; a slow peer becomes a retryable error instead of a proxy 504.
+pub async fn get_bounded(state: &AppState, target: &RecoveryTarget) -> AppResult<RecoveryVersions> {
+    within(COMPARISON_DEADLINE, get(state, target)).await
+}
+
+async fn within<T>(
+    deadline: std::time::Duration,
+    work: impl std::future::Future<Output = AppResult<T>>,
+) -> AppResult<T> {
+    tokio::time::timeout(deadline, work)
+        .await
+        .unwrap_or_else(|_| {
+            Err(AppError::new(
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "peer_busy",
+                "The other instance is busy. Try again in a moment.",
+            ))
+        })
+}
+
 pub async fn get(state: &AppState, target: &RecoveryTarget) -> AppResult<RecoveryVersions> {
     if let Some(peer_id) = &target.peer_id {
         // Only known work owned by this receiver can be forwarded.
@@ -539,4 +562,19 @@ pub async fn preview(state: &AppState, query: &PreviewQuery) -> AppResult<Respon
         bytes,
     )
         .into_response())
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    #[tokio::test]
+    async fn slow_comparison_becomes_retryable_instead_of_hanging() {
+        let error = super::within(
+            std::time::Duration::from_millis(20),
+            std::future::pending::<crate::error::AppResult<()>>(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error.code(), "peer_busy");
+    }
 }

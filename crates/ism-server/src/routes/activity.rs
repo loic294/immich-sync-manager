@@ -243,7 +243,7 @@ async fn recovery_versions(
     Query(query): Query<crate::peers::versions::Query>,
 ) -> AppResult<Json<ism_core::dto::RecoveryVersions>> {
     Ok(Json(
-        crate::peers::versions::get(&state, &query.target()).await?,
+        crate::peers::versions::get_bounded(&state, &query.target()).await?,
     ))
 }
 

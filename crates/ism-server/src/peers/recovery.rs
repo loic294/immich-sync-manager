@@ -1057,6 +1057,9 @@ pub async fn evidence_at_event(
     })
 }
 
+/// Peers usually sit behind a proxy that gives up after about a minute; answer well before it.
+const EVIDENCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(40);
+
 pub async fn remote_evidence(
     state: &AppState,
     peer: &net::Peer,
@@ -1090,7 +1093,7 @@ async fn remote_event_evidence(
         "/api/peer/v1/recovery/file?{}",
         query.query().unwrap_or_default()
     );
-    let evidence: FileEvidence = net::get_json(state, peer, &path)
+    let evidence: FileEvidence = net::get_json_within(state, peer, &path, Some(EVIDENCE_TIMEOUT))
         .await
         .map_err(|e| AppError::conflict("peer_evidence_unavailable", e))?;
     RelPath::parse(&evidence.path).map_err(|e| AppError::invalid_location(e.to_string()))?;

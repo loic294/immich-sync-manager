@@ -101,20 +101,41 @@ pub async fn get_json<T: serde::de::DeserializeOwned>(
     peer: &Peer,
     path: &str,
 ) -> Result<T, String> {
-    let resp = request(state, &peer.url, &peer.secret, Method::GET, path, None)
-        .send()
-        .await
-        .map_err(|e| net_error(&e))?;
+    get_json_within(state, peer, path, None).await
+}
+
+/// Like [`get_json`], but gives up after `timeout` so callers can answer before a proxy does.
+pub async fn get_json_within<T: serde::de::DeserializeOwned>(
+    state: &AppState,
+    peer: &Peer,
+    path: &str,
+    timeout: Option<std::time::Duration>,
+) -> Result<T, String> {
+    let mut req = request(state, &peer.url, &peer.secret, Method::GET, path, None);
+    if let Some(timeout) = timeout {
+        req = req.timeout(timeout);
+    }
+    let resp = req.send().await.map_err(|e| net_error(&e))?;
     let status = resp.status();
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
-        return Err(format!(
-            "HTTP {}: {}",
-            status.as_u16(),
-            crate::error::redact(&body.chars().take(300).collect::<String>())
-        ));
+        return Err(http_failure(status, &body));
     }
     resp.json().await.map_err(|e| net_error(&e))
+}
+
+/// A proxy's HTML error page (or an empty body) is reduced to its status reason.
+fn http_failure(status: reqwest::StatusCode, body: &str) -> String {
+    let detail: String = if body.trim_start().starts_with('<') || body.trim().is_empty() {
+        status.canonical_reason().unwrap_or("error").to_owned()
+    } else {
+        body.chars().take(300).collect()
+    };
+    format!(
+        "HTTP {}: {}",
+        status.as_u16(),
+        crate::error::redact(&detail)
+    )
 }
 
 pub async fn mark(state: &AppState, peer_id: &str, result: Result<(), String>) {
@@ -178,5 +199,21 @@ pub async fn mark_processing_result(state: &AppState, peer_id: &str, error: Opti
         Err(error) => {
             tracing::error!(peer = %peer_id, "could not record peer processing status: {error}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn proxy_html_errors_are_reduced_to_their_status() {
+        let status = reqwest::StatusCode::GATEWAY_TIMEOUT;
+        assert_eq!(
+            super::http_failure(status, "<html><center>openresty</center></html>"),
+            "HTTP 504: Gateway Timeout"
+        );
+        assert_eq!(
+            super::http_failure(status, r#"{"error":{"code":"x","message":"y"}}"#),
+            r#"HTTP 504: {"error":{"code":"x","message":"y"}}"#
+        );
     }
 }
