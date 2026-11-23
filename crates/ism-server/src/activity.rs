@@ -2,12 +2,13 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
 use ism_core::dto::{BackgroundActivity, BackgroundActivityPage, BackgroundStatus};
 
 use crate::db;
-use crate::error::{AppError, AppResult, redact};
+use crate::error::{AppResult, redact};
 use crate::state::{AppState, ServerEvent};
 
 #[derive(Clone)]
@@ -18,7 +19,18 @@ struct Pending {
 }
 
 #[derive(Default)]
-pub struct Registry(Mutex<HashMap<String, Pending>>, Mutex<Option<String>>);
+pub struct Registry(
+    Mutex<HashMap<String, Pending>>,
+    Mutex<Option<String>>,
+    tokio::sync::Mutex<()>,
+    AtomicI64,
+);
+
+impl Registry {
+    fn revision(&self) -> i64 {
+        self.3.fetch_add(1, Ordering::Relaxed) + 1
+    }
+}
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     match mutex.lock() {
@@ -81,21 +93,12 @@ impl Task {
             examples: Vec::new(),
         };
         let id = activity.id.clone();
-        persist(
-            state,
-            &Pending {
-                activity: activity.clone(),
-                revision: 0,
-                saved_revision: 0,
-            },
-        )
-        .await?;
         lock(&state.activity.0).insert(
             id.clone(),
             Pending {
                 activity,
-                revision: 0,
-                saved_revision: 0,
+                revision: state.activity.revision(),
+                saved_revision: -1,
             },
         );
         state.emit(ServerEvent::ActivityChanged);
@@ -132,20 +135,6 @@ impl Task {
             }
         });
         self.finished = true;
-        let pending = lock(&self.state.activity.0)
-            .get(&self.id)
-            .cloned()
-            .ok_or_else(|| AppError::internal("active background task missing"))?;
-        persist(&self.state, &pending).await?;
-        {
-            let mut registry = lock(&self.state.activity.0);
-            if registry
-                .get(&self.id)
-                .is_some_and(|p| p.revision == pending.revision)
-            {
-                registry.remove(&self.id);
-            }
-        }
         self.state.emit(ServerEvent::ActivityChanged);
         Ok(())
     }
@@ -155,11 +144,14 @@ impl Reporter {
     fn update(&self, f: impl FnOnce(&mut BackgroundActivity)) {
         let mut registry = lock(&self.state.activity.0);
         if let Some(pending) = registry.get_mut(&self.id) {
+            if pending.activity.finished_at.is_some() {
+                return;
+            }
             let before = pending.activity.clone();
             f(&mut pending.activity);
             if pending.activity != before {
                 pending.activity.updated_at = db::now();
-                pending.revision += 1;
+                pending.revision = self.state.activity.revision();
             }
         }
     }
@@ -199,7 +191,6 @@ pub async fn observe<T, F: std::future::Future<Output = AppResult<T>>>(
     let result = work(task.reporter.clone()).await;
     if let Err(error) = task.finish(&result).await {
         tracing::error!("cannot record background outcome: {}", error.message());
-        return Err(error);
     }
     result
 }
@@ -231,7 +222,7 @@ fn status(a: &BackgroundActivity) -> &'static str {
 async fn persist(state: &AppState, pending: &Pending) -> AppResult<()> {
     let a = &pending.activity;
     let mut tx = state.db.begin().await?;
-    sqlx::query(
+    let written = sqlx::query(
         "INSERT INTO background_activity(id,task_key,status,revision,updated_at,finished_at,activity_json)
          VALUES (?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET status=excluded.status,
          revision=excluded.revision,updated_at=excluded.updated_at,finished_at=excluded.finished_at,
@@ -239,16 +230,33 @@ async fn persist(state: &AppState, pending: &Pending) -> AppResult<()> {
     )
     .bind(&a.id).bind(&a.task_key).bind(status(a)).bind(pending.revision)
     .bind(&a.updated_at).bind(&a.finished_at).bind(serde_json::to_string(a)?)
-    .execute(&mut *tx).await?;
-    if a.finished_at.is_some() {
-        // A newer failure replaces the scoped issue; a successful run resolves it.
+    .execute(&mut *tx).await?.rows_affected();
+    if a.finished_at.is_some() && written != 0 {
+        // Resolve in both directions so delayed/retried writes cannot reopen an older issue.
+        // Registry revisions order outcomes even when finish timestamps share a millisecond.
         sqlx::query(
             "UPDATE background_activity SET resolved=1 WHERE task_key=? AND id!=?
-             AND status IN ('failed','interrupted') AND updated_at <= ?",
+             AND status IN ('failed','interrupted')
+             AND (finished_at < ? OR (finished_at = ? AND revision < ?))",
         )
         .bind(&a.task_key)
         .bind(&a.id)
-        .bind(&a.updated_at)
+        .bind(&a.finished_at)
+        .bind(&a.finished_at)
+        .bind(pending.revision)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE background_activity SET resolved=1 WHERE id=?
+             AND status IN ('failed','interrupted') AND EXISTS (
+                 SELECT 1 FROM background_activity newer WHERE newer.task_key=?
+                 AND (newer.finished_at > ? OR (newer.finished_at = ? AND newer.revision > ?)))",
+        )
+        .bind(&a.id)
+        .bind(&a.task_key)
+        .bind(&a.finished_at)
+        .bind(&a.finished_at)
+        .bind(pending.revision)
         .execute(&mut *tx)
         .await?;
     }
@@ -257,6 +265,11 @@ async fn persist(state: &AppState, pending: &Pending) -> AppResult<()> {
 }
 
 pub async fn recover(state: &AppState) -> AppResult<()> {
+    let revision: i64 =
+        sqlx::query_scalar("SELECT COALESCE(MAX(revision),0) FROM background_activity")
+            .fetch_one(&state.db)
+            .await?;
+    state.activity.3.fetch_max(revision, Ordering::Relaxed);
     let rows: Vec<(String, i64)> = sqlx::query_as(
         "SELECT activity_json,revision FROM background_activity WHERE status IN ('running','waiting')",
     ).fetch_all(&state.db).await?;
@@ -270,7 +283,7 @@ pub async fn recover(state: &AppState) -> AppResult<()> {
             state,
             &Pending {
                 activity,
-                revision: revision + 1,
+                revision: state.activity.revision(),
                 saved_revision: revision,
             },
         )
@@ -280,17 +293,29 @@ pub async fn recover(state: &AppState) -> AppResult<()> {
 }
 
 async fn flush(state: &AppState) -> AppResult<()> {
+    let _flush = state.activity.2.lock().await;
     let pending: Vec<_> = lock(&state.activity.0)
         .values()
         .filter(|p| p.revision != p.saved_revision || p.activity.finished_at.is_some())
         .cloned()
         .collect();
     for item in &pending {
-        persist(state, item).await?;
+        if let Err(error) = persist(state, item).await {
+            tracing::error!(
+                "background activity persistence failed: {}",
+                error.message()
+            );
+            *lock(&state.activity.1) = Some(
+                "Background activity persistence failed; unsaved evidence is only in memory and will be retried."
+                    .into(),
+            );
+            state.emit(ServerEvent::ActivityChanged);
+            return Err(error);
+        }
         {
             let mut registry = lock(&state.activity.0);
             if let Some(p) = registry.get_mut(&item.activity.id) {
-                p.saved_revision = item.revision;
+                p.saved_revision = p.saved_revision.max(item.revision);
             }
         }
         if item.activity.finished_at.is_some() {
@@ -303,6 +328,7 @@ async fn flush(state: &AppState) -> AppResult<()> {
             }
         }
     }
+    *lock(&state.activity.1) = None;
     if !pending.is_empty() {
         state.emit(ServerEvent::ActivityChanged);
     }
@@ -315,7 +341,7 @@ pub async fn prune(state: &AppState) -> AppResult<()> {
         "DELETE FROM background_activity WHERE (status='completed' OR resolved=1) AND
          (finished_at < ? OR id IN (
             SELECT id FROM background_activity WHERE status='completed' OR resolved=1
-            ORDER BY finished_at DESC,id DESC LIMIT -1 OFFSET 1000))",
+            ORDER BY finished_at DESC,revision DESC,id DESC LIMIT -1 OFFSET 1000))",
     )
     .bind(cutoff)
     .execute(&state.db)
@@ -328,15 +354,7 @@ pub async fn run(state: AppState) {
     let mut retention = 0;
     loop {
         tick.tick().await;
-        if let Err(e) = flush(&state).await {
-            tracing::error!("background activity persistence failed: {}", e.message());
-            *lock(&state.activity.1) = Some(
-                "Background activity could not be persisted; progress/history may be stale.".into(),
-            );
-            state.emit(ServerEvent::ActivityChanged);
-        } else {
-            *lock(&state.activity.1) = None;
-        }
+        let _ = flush(&state).await; // flush reports failures and retains evidence for retry.
         retention += 1;
         if retention >= 60 {
             retention = 0;
@@ -359,10 +377,16 @@ pub async fn page(state: &AppState, limit: i64, offset: i64) -> AppResult<Backgr
         .into_iter()
         .map(|j| serde_json::from_str::<BackgroundActivity>(&j).map(|a| (a.id.clone(), a)))
         .collect::<Result<_, _>>()?;
-    for pending in lock(&state.activity.0).values() {
-        if pending.activity.status == BackgroundStatus::Completed {
-            current.remove(&pending.activity.id);
-        } else {
+    let mut warnings: Vec<_> = lock(&state.activity.1).iter().cloned().collect();
+    {
+        let registry = lock(&state.activity.0);
+        if registry.values().any(|p| p.revision != p.saved_revision) {
+            warnings.push(
+                "Some background activity updates are not yet persisted; in-memory evidence can be lost if ISM stops."
+                    .into(),
+            );
+        }
+        for pending in registry.values() {
             current.insert(pending.activity.id.clone(), pending.activity.clone());
         }
     }
@@ -373,7 +397,7 @@ pub async fn page(state: &AppState, limit: i64, offset: i64) -> AppResult<Backgr
     .await?;
     let history: Vec<String> = sqlx::query_scalar(
         "SELECT activity_json FROM background_activity WHERE status='completed' OR resolved=1
-         ORDER BY finished_at DESC,id DESC LIMIT ? OFFSET ?",
+         ORDER BY finished_at DESC,revision DESC,id DESC LIMIT ? OFFSET ?",
     )
     .bind(limit)
     .bind(offset)
@@ -401,7 +425,7 @@ pub async fn page(state: &AppState, limit: i64, offset: i64) -> AppResult<Backgr
             .collect::<Result<_, _>>()?,
         total,
         observed_at: db::now(),
-        warnings: lock(&state.activity.1).iter().cloned().collect(),
+        warnings,
     })
 }
 
@@ -445,6 +469,7 @@ pub fn spawn(
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+    use crate::error::AppError;
     use crate::{config::Config, crypto::SecretBox};
 
     async fn harness() -> (tempfile::TempDir, AppState) {
@@ -458,6 +483,140 @@ mod tests {
         .await
         .unwrap();
         (dir, state)
+    }
+
+    #[tokio::test]
+    async fn observed_work_and_outcomes_do_not_wait_for_another_sqlite_writer() {
+        let (_dir, state) = harness().await;
+        let mut writer = state.db.begin().await.unwrap();
+        sqlx::query("INSERT INTO settings(key,value) VALUES ('writer-lock','held')")
+            .execute(&mut *writer)
+            .await
+            .unwrap();
+        let mut reporter = None;
+        let observed_state = &state;
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(250),
+            observe(&state, "contention", "Scan", "Archive", None, |r| {
+                reporter = Some(r.clone());
+                async move {
+                    r.progress(3, Some(3), "files");
+                    let snapshot = page(observed_state, 25, 0).await.unwrap();
+                    assert_eq!(snapshot.current[0].status, BackgroundStatus::Running);
+                    assert_eq!(snapshot.current[0].done, 3);
+                    Err::<(), _>(AppError::conflict("actual_failure", "Actual work failed"))
+                }
+            }),
+        )
+        .await
+        .expect("activity recording must not wait for the SQLite writer");
+        assert_eq!(outcome.unwrap_err().message(), "Actual work failed");
+        let snapshot = page(&state, 25, 0).await.unwrap();
+        assert_eq!(snapshot.current[0].status, BackgroundStatus::Failed);
+        assert_eq!(snapshot.current[0].done, 3);
+        assert!(!snapshot.warnings.is_empty());
+        let reporter = reporter.unwrap();
+        reporter.phase("Late callback");
+        reporter.progress(0, None, "files");
+        assert_eq!(
+            page(&state, 25, 0).await.unwrap().current[0].status,
+            BackgroundStatus::Failed
+        );
+        let completed = Task::start(&state, "completed", "Scan", "Archive", None)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_millis(250), completed.finish(&Ok(())))
+            .await
+            .expect("finishing must not wait for the SQLite writer")
+            .unwrap();
+        assert!(
+            page(&state, 25, 0)
+                .await
+                .unwrap()
+                .current
+                .iter()
+                .any(|a| a.status == BackgroundStatus::Completed)
+        );
+        writer.rollback().await.unwrap();
+        flush(&state).await.unwrap();
+        let snapshot = page(&state, 25, 0).await.unwrap();
+        assert_eq!(snapshot.current[0].done, 3);
+        assert!(snapshot.warnings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_persistence_keeps_terminal_evidence_visible_until_retry() {
+        let (_dir, state) = harness().await;
+        sqlx::query(
+            "CREATE TRIGGER reject_activity BEFORE INSERT ON background_activity
+             BEGIN SELECT RAISE(ABORT, 'synthetic recording failure'); END",
+        )
+        .execute(&state.db)
+        .await
+        .unwrap();
+        assert_eq!(
+            observe(&state, "retry", "Scan", "Archive", None, |_| async {
+                Ok(42)
+            })
+            .await
+            .unwrap(),
+            42
+        );
+        assert!(flush(&state).await.is_err());
+        let snapshot = page(&state, 25, 0).await.unwrap();
+        assert_eq!(snapshot.current[0].status, BackgroundStatus::Completed);
+        assert_eq!(snapshot.total, 0);
+        assert!(!snapshot.warnings.is_empty());
+        sqlx::query("DROP TRIGGER reject_activity")
+            .execute(&state.db)
+            .await
+            .unwrap();
+        flush(&state).await.unwrap();
+        let snapshot = page(&state, 25, 0).await.unwrap();
+        assert!(snapshot.current.is_empty());
+        assert_eq!(snapshot.history[0].status, BackgroundStatus::Completed);
+        assert_eq!(snapshot.total, 1);
+        assert!(snapshot.warnings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn delayed_outcomes_resolve_by_finish_order_not_flush_order() {
+        let (_dir, state) = harness().await;
+        let failed = Task::start(&state, "scan", "Scan", "Archive", None)
+            .await
+            .unwrap();
+        let id = failed.id.clone();
+        failed
+            .finish(&Err::<(), _>(AppError::conflict("failed", "Scan failed")))
+            .await
+            .unwrap();
+        let success = Task::start(&state, "scan", "Scan", "Archive", None)
+            .await
+            .unwrap();
+        let success_id = success.id.clone();
+        success.finish(&Ok(())).await.unwrap();
+        let (older, newer) = {
+            let mut registry = lock(&state.activity.0);
+            for p in registry.values_mut() {
+                p.activity.finished_at = Some("2024-01-01T00:00:00.000Z".into());
+            }
+            (registry[&id].clone(), registry[&success_id].clone())
+        };
+        persist(&state, &newer).await.unwrap();
+        persist(&state, &older).await.unwrap();
+        flush(&state).await.unwrap();
+        let snapshot = page(&state, 25, 0).await.unwrap();
+        assert!(snapshot.current.is_empty());
+        assert_eq!(snapshot.history[0].id, success_id);
+        assert_eq!(snapshot.total, 2);
+
+        let revision: i64 = sqlx::query_scalar("SELECT MAX(revision) FROM background_activity")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+        state.activity.3.store(0, Ordering::Relaxed);
+        recover(&state).await.unwrap();
+        assert!(state.activity.revision() > revision);
     }
 
     #[tokio::test]
@@ -687,6 +846,7 @@ mod tests {
         assert!(p.current.iter().any(|a| a.done == 12 && a.total.is_none()));
         second.progress(20, Some(30), "files checked");
         second.finish(&Ok(())).await.unwrap();
+        flush(&state).await.unwrap();
         let snapshot = page(&state, 1, 0).await.unwrap();
         assert_eq!(snapshot.current.len(), 1);
         assert_eq!(snapshot.history[0].done, 20);
@@ -694,6 +854,7 @@ mod tests {
             .finish_with_phase(&Ok(()), "Attempt deferred; work remains queued")
             .await
             .unwrap();
+        flush(&state).await.unwrap();
         assert!(
             page(&state, 25, 0)
                 .await
@@ -717,6 +878,7 @@ mod tests {
             )))
             .await
             .unwrap();
+            flush(&state).await.unwrap();
         }
         let p = page(&state, 25, 0).await.unwrap();
         assert_eq!(p.current.len(), 1);
@@ -727,6 +889,7 @@ mod tests {
             .unwrap();
         assert_eq!(page(&state, 25, 0).await.unwrap().current.len(), 2);
         retry.finish(&Ok(())).await.unwrap();
+        flush(&state).await.unwrap();
         let p = page(&state, 25, 0).await.unwrap();
         assert!(p.current.is_empty());
         assert_eq!(p.total, 3);
@@ -741,6 +904,7 @@ mod tests {
         task.phase("Walking files");
         let stale = lock(&state.activity.0).get(&task.id).cloned().unwrap();
         task.finish(&Ok(())).await.unwrap();
+        flush(&state).await.unwrap();
         persist(&state, &stale).await.unwrap();
         assert!(page(&state, 25, 0).await.unwrap().current.is_empty());
 
@@ -756,6 +920,7 @@ mod tests {
         let task = Task::start(&state, "restart", "Scan", "Archive", None)
             .await
             .unwrap();
+        flush(&state).await.unwrap();
         // Lose the in-memory update as a process restart would, retaining the durable start.
         drop(task);
         lock(&state.activity.0).clear();
@@ -767,6 +932,13 @@ mod tests {
                 .iter()
                 .all(|a| a.status == BackgroundStatus::Interrupted)
         );
+        let task = Task::start(&state, "never-saved", "Scan", "Archive", None)
+            .await
+            .unwrap();
+        drop(task);
+        lock(&state.activity.0).clear();
+        recover(&state).await.unwrap();
+        assert_eq!(page(&state, 25, 0).await.unwrap().current.len(), 2);
     }
 
     #[tokio::test]
@@ -785,6 +957,7 @@ mod tests {
             )))
             .await
             .unwrap();
+        flush(&state).await.unwrap();
         let base = page(&state, 25, 0)
             .await
             .unwrap()
