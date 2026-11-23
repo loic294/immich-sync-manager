@@ -64,9 +64,18 @@ the displayed phase (for example bytes hashed versus files reconciled); progress
 notifications are coalesced to a one-second cadence. No progress update is not proof of a hang.
 Unexpected worker exits and interrupted runs remain visible rather than appearing healthy.
 
+Activity starts, progress, and outcomes are recorded in memory immediately, then persisted by a
+retrying background reporter. SQLite contention or recording failures do not delay the observed
+work or replace its actual result. Unsaved outcomes stay in the live section until committed;
+warnings distinguish in-memory evidence from durable history and report persistence failures.
+If ISM stops before a start is saved, that run cannot be recovered. If only its start/progress was
+saved, restart marks it interrupted, not successful, even if the work actually finished.
+
 Recent completed background history is kept for seven days, capped at 1,000 runs; older resolved
 issues share that bound. Active runs and unresolved failures are not evicted by retention.
-Repeated failures update the scoped issue, and a successful subsequent run resolves it. On restart,
+Repeated failures update the scoped issue, and a successful subsequent run resolves it after
+persistence. Outcomes are ordered by finish time, with recording revision breaking millisecond
+ties, regardless of retry/write order. On restart,
 unfinished runs are marked interrupted; actual queued work is recovered by the existing workers,
 not by the reporting system. Managed file-operation history is unchanged.
 
