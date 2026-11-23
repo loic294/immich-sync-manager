@@ -72,8 +72,9 @@ async fn background_activity_requires_admin_and_keeps_current_work_outside_histo
         get("/api/admin/operations/background?limit=1", &auth),
     )
     .await;
-    assert_eq!(reply.json()["current"].as_array().unwrap().len(), 0);
-    assert_eq!(reply.json()["history"][0]["status"], "completed");
+    assert_eq!(reply.json()["current"][0]["status"], "completed");
+    assert_eq!(reply.json()["history"].as_array().unwrap().len(), 0);
+    assert!(!reply.json()["warnings"].as_array().unwrap().is_empty());
 }
 
 impl Reply {
