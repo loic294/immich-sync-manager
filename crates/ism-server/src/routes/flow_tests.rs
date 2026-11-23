@@ -175,6 +175,77 @@ impl Harness {
 }
 
 #[tokio::test]
+async fn repeated_client_requests_do_not_write_token_usage_each_time() {
+    let h = harness().await;
+    h.map_root().await;
+    let bearer = h.token(&["read"]).await;
+    sqlx::query("CREATE TABLE token_usage_writes (id INTEGER PRIMARY KEY)")
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER count_token_usage AFTER UPDATE OF last_used_at ON client_tokens
+         BEGIN INSERT INTO token_usage_writes VALUES (NULL); END",
+    )
+    .execute(&h.state.db)
+    .await
+    .unwrap();
+    for _ in 0..25 {
+        let response = send(
+            &h.app,
+            get("/api/v1/client/info", &[("authorization", &bearer)]),
+        )
+        .await;
+        assert_eq!(response.status, StatusCode::OK);
+    }
+    let writes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM token_usage_writes")
+        .fetch_one(&h.state.db)
+        .await
+        .unwrap();
+    assert_eq!(writes, 1, "recent requests share one usage update");
+
+    sqlx::query("UPDATE client_tokens SET last_used_at = '2024-01-01T00:00:00Z'")
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM token_usage_writes")
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    let responses = futures_util::future::join_all((0..12).map(|_| {
+        send(
+            &h.app,
+            get("/api/v1/client/info", &[("authorization", &bearer)]),
+        )
+    }))
+    .await;
+    assert!(
+        responses
+            .iter()
+            .all(|response| response.status == StatusCode::OK)
+    );
+    let writes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM token_usage_writes")
+        .fetch_one(&h.state.db)
+        .await
+        .unwrap();
+    assert_eq!(
+        writes, 1,
+        "concurrent requests refresh an old timestamp once"
+    );
+    sqlx::query("UPDATE client_tokens SET revoked_at = ?")
+        .bind(crate::db::now())
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    let response = send(
+        &h.app,
+        get("/api/v1/client/info", &[("authorization", &bearer)]),
+    )
+    .await;
+    assert_eq!(response.status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
 async fn activity_websocket_requires_a_session_and_same_origin_and_streams_changes() {
     use futures_util::StreamExt;
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
