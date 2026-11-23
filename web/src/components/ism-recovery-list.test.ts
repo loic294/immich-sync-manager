@@ -56,6 +56,14 @@ describe('sync recovery', () => {
       },
       {
         ...ISSUE,
+        title: 'Version choice',
+        target: { kind: 'conflict', id: 'conflict-2', peer_id: null },
+        state: 'needs_decision',
+        code: 'choose_version',
+        can_fix: false,
+      },
+      {
+        ...ISSUE,
         title: 'Missing file',
         state: 'not_retryable',
         code: 'recovery_exhausted',
@@ -80,13 +88,16 @@ describe('sync recovery', () => {
     expect(rendered[1]?.querySelector('td:nth-child(2) > p')?.textContent).toContain(
       "can't read this saved issue",
     );
-    expect(rendered[2]?.textContent).toContain('Compare the versions again on the Conflicts page');
+    expect(rendered[2]?.textContent).toContain('Review them again on the Conflicts page');
     expect(rendered[3]?.textContent).toContain('Find it on the Conflicts page');
-    expect(rendered[4]?.textContent).toContain('Restore this file from a backup');
-    expect(rendered[5]?.textContent).toContain('choose Fix selected to try again');
+    expect(rendered[4]?.textContent).toContain(
+      'Choose which version to keep on the Conflicts page',
+    );
+    expect(rendered[5]?.textContent).toContain('Restore this file from a backup');
+    expect(rendered[6]?.textContent).toContain('choose Fix selected to try again');
     expect(rendered[1]?.querySelector('details')?.open).toBe(false);
-    expect(rendered[4]?.querySelector('button')).toBeNull();
-    for (const row of [rendered[2], rendered[3]]) {
+    expect(rendered[5]?.querySelector('button')).toBeNull();
+    for (const row of [rendered[2], rendered[3], rendered[4]]) {
       expect(row?.querySelector('a')?.getAttribute('href')).toBe('/conflicts');
       expect(row?.querySelector('a')?.textContent).toContain('Go to Conflicts');
     }

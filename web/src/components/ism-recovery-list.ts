@@ -34,8 +34,8 @@ function issueGuidance(row: RecoveryView): string {
       return 'A related file needs a version choice. Find it on the Conflicts page.';
     }
     return row.code === 'version_conflict'
-      ? 'The files changed. Compare the versions again on the Conflicts page.'
-      : 'Compare the versions and choose which to keep on the Conflicts page.';
+      ? 'The files changed. Review them again on the Conflicts page.'
+      : 'Choose which version to keep on the Conflicts page.';
   }
   switch (row.code) {
     case 'peer_unreachable':
