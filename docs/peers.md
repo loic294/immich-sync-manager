@@ -110,7 +110,11 @@ including after a restart; unrelated events from the same peer and share can pro
   each scan and managed operation runs exclusively of the other within this instance. A long scan
   can therefore delay managed operations and application of incoming events, even though polling
   and scanning run separately. Peer connections are polled independently, so a slow peer does not
-  prevent the others from being contacted. Recovery and failed peer operations protect their
+  prevent the others from being contacted. Each peer has at most one synchronization worker and
+  one activity-refresh worker; admitted workers keep progressing while their schedulers query
+  the peer list. Worker failures are logged and release the peer's admission slot for retry.
+  Stopping a scheduler cancels its admitted workers rather than leaving them detached.
+  Recovery and failed peer operations protect their
   uncertain footprints rather than stopping all scans or peer bookkeeping. Managed file trash
   records deletion events for the original and moved companions
   immediately, without waiting for the next scan.
