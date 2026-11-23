@@ -695,6 +695,10 @@ async fn run_inner(state: AppState, #[cfg(test)] mut pause: Option<EligibilityPa
     let tick = Duration::from_secs(state.config.tick_secs.max(1));
     let mut tasks = tokio::task::JoinSet::new();
     loop {
+        // A managed operation can finish while eligibility is being checked.
+        let wake = state.sync_wake.notified();
+        tokio::pin!(wake);
+        wake.as_mut().enable();
         if tasks.len() < state.config.peer_transfer_concurrency {
             match next(&state, #[cfg(test)] &mut pause).await {
                 Ok(Some((t, ov))) => {
@@ -727,7 +731,7 @@ async fn run_inner(state: AppState, #[cfg(test)] mut pause: Option<EligibilityPa
                 }
             }
             () = tokio::time::sleep(tick * 6) => {}
-            () = state.sync_wake.notified() => {}
+            () = &mut wake => {}
         }
     }
 }
