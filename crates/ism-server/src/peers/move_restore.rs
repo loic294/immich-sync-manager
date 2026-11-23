@@ -1240,6 +1240,7 @@ async fn finish_tree_generation(
             generation.resolution,
             label,
             current,
+            None,
         )
         .await?;
         return Ok(false);

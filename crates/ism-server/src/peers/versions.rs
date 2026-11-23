@@ -152,7 +152,7 @@ pub(super) async fn local(
                 directories.extend(
                     entries
                         .iter()
-                        .filter(|entry| entry.sha256.is_none())
+                        .filter(|entry| entry.sha256.is_none() && !entry.name.is_empty())
                         .map(|entry| format!("{base}/{}", entry.name)),
                 );
                 directories.sort();
@@ -329,7 +329,7 @@ pub(super) async fn validate_reviewed(
     revision: &str,
     remote: Option<&super::recovery::FileEvidence>,
     moved: Option<MovedVersion<'_>>,
-) -> AppResult<()> {
+) -> AppResult<Vec<RecoveryVersion>> {
     let Snapshot {
         share_id,
         peer_id,
@@ -401,7 +401,7 @@ pub(super) async fn validate_reviewed(
             ));
         }
     }
-    Ok(())
+    Ok(view.receiving)
 }
 
 pub async fn preview(state: &AppState, query: &PreviewQuery) -> AppResult<Response> {

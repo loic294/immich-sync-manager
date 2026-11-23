@@ -175,6 +175,7 @@ pub struct Ctx<'a> {
     pub companions: Vec<String>,
     pub servers: Vec<Server>,
     peer_deletions: HashSet<(String, String)>,
+    operation_id: Option<String>,
 }
 
 impl<'a> Ctx<'a> {
@@ -191,6 +192,7 @@ impl<'a> Ctx<'a> {
             companions: state.sidecar_extensions(),
             servers: registry::servers(state).await?,
             peer_deletions: HashSet::new(),
+            operation_id: None,
         })
     }
 
@@ -201,6 +203,7 @@ impl<'a> Ctx<'a> {
         operation_id: &str,
     ) -> AppResult<Self> {
         let mut ctx = Self::new(state, principal, allow_owner_transfer).await?;
+        ctx.operation_id = Some(operation_id.to_owned());
         if matches!(principal, Principal::Peer { .. } | Principal::Admin { .. }) {
             let peer_id = match principal {
                 Principal::Peer { peer_id } => Some(peer_id.as_str()),
@@ -1146,6 +1149,19 @@ async fn plan_trash(
         let to = root.abs(&to_rel)?;
         if folder {
             inventory = load_folder_inventory(from.clone()).await?;
+            if let Some(operation_id) = &ctx.operation_id
+                && let Some(reviewed) =
+                    crate::peers::admin::reviewed_trash_inventory(ctx.state, operation_id, source)
+                        .await?
+            {
+                if inventory != reviewed {
+                    plan.block(
+                        "revision_changed",
+                        "folder contents changed after review; review the conflict again",
+                    );
+                }
+                inventory = reviewed;
+            }
             if let TrashExpect::Entries(Some(expected)) = &expect {
                 let path = from.clone();
                 let actual = tokio::task::spawn_blocking(move || folder_revisions(&path))
