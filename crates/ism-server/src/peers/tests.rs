@@ -6023,6 +6023,14 @@ async fn transfer_wakes_when_operation_finishes_during_eligibility_scan() {
         .await
         .expect("transfer never encountered the blocking operation")
         .unwrap();
+    let before: (String, i64) = sqlx::query_as(
+        "SELECT status, attempts FROM transfers WHERE share_id = ? AND rel_path = 'album/photo.jpg'",
+    )
+    .bind(&share.id)
+    .fetch_one(&b.state.db)
+    .await
+    .unwrap();
+    assert_eq!((before.0.as_str(), before.1), ("queued", 0));
     crate::ops::exec::complete_for_test(&b.state, &accepted.operation_id)
         .await
         .unwrap();
@@ -6035,12 +6043,13 @@ async fn transfer_wakes_when_operation_finishes_during_eligibility_scan() {
     resume.send(()).unwrap();
     let result = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            let status: Option<String> =
-                sqlx::query_scalar("SELECT status FROM transfers WHERE share_id = ?")
-                    .bind(&share.id)
-                    .fetch_optional(&b.state.db)
-                    .await
-                    .unwrap();
+            let status: Option<String> = sqlx::query_scalar(
+                "SELECT status FROM transfers WHERE share_id = ? AND rel_path = 'album/photo.jpg'",
+            )
+            .bind(&share.id)
+            .fetch_optional(&b.state.db)
+            .await
+            .unwrap();
             if status.as_deref() != Some("queued") {
                 break;
             }

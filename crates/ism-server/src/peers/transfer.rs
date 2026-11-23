@@ -650,7 +650,8 @@ async fn next(
             let Some(share) = shares.iter().find(|share| share.id == share_id) else {
                 continue;
             };
-            let eligible = eligibility(state, share, &peer_id, &id, &rel, attempts, &updated).await?;
+            let eligible =
+                eligibility(state, share, &peer_id, &id, &rel, attempts, &updated).await?;
             #[cfg(test)]
             if matches!(eligible, Eligibility::Waiting { blocked: true, .. })
                 && let Some(pause) = pause.take()
@@ -683,7 +684,12 @@ async fn next(
 }
 
 pub async fn run(state: AppState) {
-    run_inner(state, #[cfg(test)] None).await;
+    run_inner(
+        state,
+        #[cfg(test)]
+        None,
+    )
+    .await;
 }
 
 #[cfg(test)]
@@ -700,7 +706,13 @@ async fn run_inner(state: AppState, #[cfg(test)] mut pause: Option<EligibilityPa
         tokio::pin!(wake);
         wake.as_mut().enable();
         if tasks.len() < state.config.peer_transfer_concurrency {
-            match next(&state, #[cfg(test)] &mut pause).await {
+            match next(
+                &state,
+                #[cfg(test)]
+                &mut pause,
+            )
+            .await
+            {
                 Ok(Some((t, ov))) => {
                     match claim(&state, &t.id, ov.as_deref()).await {
                         Ok(true) => {}
