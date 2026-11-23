@@ -15,10 +15,12 @@ use serde::{Deserialize, Serialize};
 
 use super::selfwrite::now_ms;
 use crate::error::{AppError, AppResult};
+use crate::files;
 use crate::immich::registry;
 use crate::state::{AppState, ServerEvent};
 
 const MAX_REASONS: usize = 10;
+const REMOVED_FILE_EXISTS: &str = "Removed file still exists";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) enum WorkKind {
@@ -146,6 +148,71 @@ pub(crate) async fn recover(state: &AppState) -> AppResult<()> {
     .bind(now_ms())
     .execute(&state.db)
     .await?;
+    let restored = sqlx::query(
+        "UPDATE scan_schedule SET due_at = ?
+         WHERE running = 0 AND due_at IS NULL AND last_error = ?
+           AND EXISTS (SELECT 1 FROM scan_work WHERE scan_work.library_id = scan_schedule.library_id)",
+    )
+    .bind(now_ms())
+    .bind(format!("Immich answered 400: {REMOVED_FILE_EXISTS}"))
+    .execute(&state.db)
+    .await?
+    .rows_affected();
+    if restored > 0 {
+        tracing::info!(
+            libraries = restored,
+            "rescheduled retained stale-removal work"
+        );
+    }
+    Ok(())
+}
+
+async fn recreated_file_exists(
+    state: &AppState,
+    server_id: &str,
+    library_id: &str,
+    path: &str,
+) -> AppResult<bool> {
+    let roots: Vec<_> = files::load_roots(&state.db)
+        .await?
+        .into_iter()
+        .filter(|root| {
+            root.server_id.as_deref() == Some(server_id)
+                && root.library_id.as_deref() == Some(library_id)
+        })
+        .collect();
+    let (root, rel) = files::resolve_immich_path(&roots, path).ok_or_else(|| {
+        AppError::conflict(
+            "unverified_removal",
+            "Cannot verify the file against an available library mapping; synchronization remains queued",
+        )
+    })?;
+    root.ensure_available()?;
+    let path = root.abs(&files::parse_rel(rel.as_str())?)?;
+    match std::fs::metadata(path) {
+        Ok(metadata) => Ok(metadata.is_file()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+async fn verify_recreated_files(
+    state: &AppState,
+    server_id: &str,
+    library_id: &str,
+    paths: &[String],
+) -> AppResult<()> {
+    for path in paths {
+        if !recreated_file_exists(state, server_id, library_id, path).await? {
+            return Err(AppError::conflict(
+                "unverified_removal",
+                "A file changed during synchronization; its removal remains queued",
+            ));
+        }
+    }
+    if !paths.is_empty() {
+        tracing::info!(library = %library_id, files = paths.len(), "synchronized files that reappeared after removal");
+    }
     Ok(())
 }
 
@@ -250,6 +317,7 @@ async fn scan_reporting(
     }
     let mut files = BTreeMap::new();
     let mut folders = BTreeSet::new();
+    let mut recreated = Vec::new();
     for row in rows {
         let work: Work = serde_json::from_str(&row)?;
         if work.kind == WorkKind::Folder {
@@ -288,6 +356,19 @@ async fn scan_reporting(
         match result {
             Some(Ok(())) => continue,
             Some(Err(error)) => {
+                let stale_removal = kind == WorkKind::Removed
+                    && matches!(&error, crate::immich::api::ApiError::Status {
+                        status: 400, message
+                    } if message == REMOVED_FILE_EXISTS);
+                if stale_removal
+                    && recreated_file_exists(state, server_id, library_id, &path).await?
+                {
+                    api.sync_library_file_add(library_id, &path)
+                        .await
+                        .map_err(immich)?;
+                    recreated.push(path);
+                    continue;
+                }
                 let unavailable = error.is_external_library_api_unavailable()
                     && server.external_library_move_mode == ImmichMoveMode::ApiWithDbFallback
                     && server.external_library_api_capable != Some(true);
@@ -334,6 +415,7 @@ async fn scan_reporting(
     }
     drop(guard);
     if scanned.is_empty() {
+        verify_recreated_files(state, server_id, library_id, &recreated).await?;
         return Ok(true);
     }
     let timing = &state.config.timing;
@@ -359,6 +441,7 @@ async fn scan_reporting(
             "Waiting for Immich library queue idle confirmation"
         });
         if idle.observe(library.is_some_and(crate::immich::api::Queue::is_idle)) {
+            verify_recreated_files(state, server_id, library_id, &recreated).await?;
             return Ok(true);
         }
         if library.is_some_and(|q| q.is_paused) {

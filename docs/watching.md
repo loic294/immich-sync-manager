@@ -59,10 +59,14 @@ Explicit full scans requested manually in Immich are unchanged.
 
 Authentication errors, known-library errors and failures of an API previously confirmed available
 remain errors, following the existing capability rules. Failed work is retained and its error
-appears in the Overview queue; a later request retries it. The fork's folder scan discovers new
-files but does not reconcile existing-asset metadata or removals. In particular, a failed outside
-removal is reported rather than pretending a folder scan repaired it. Refreshing existing metadata
-remains an Immich API limitation; ISM does not work around it with a full scan.
+appears in the Overview queue; a later request retries it. If Immich rejects a removal because the
+file exists, ISM checks the mapped root and, only when it can verify a regular file, uses the file
+add API to synchronize the reappeared file. It checks again before completing the batch. If the
+file or mapping cannot be verified, the work remains queued. On startup, previously retained
+work with this specific rejection is retried once. The fork's folder scan discovers new files but
+does not reconcile existing-asset metadata or removals. Other failed removals remain errors rather
+than pretending a folder scan repaired them. Refreshing existing metadata remains an Immich API
+limitation; ISM does not work around it with a full scan.
 
 After a successful batch, including one handled entirely by file APIs, ISM emits the existing
 `library_scanned` event and looks up imported upload asset IDs. For queued folder scans it first
