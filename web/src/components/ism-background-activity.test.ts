@@ -54,7 +54,7 @@ describe('background activity', () => {
       .querySelector('ism-pagination')
       ?.dispatchEvent(new CustomEvent('page-change', { detail: { limit: 25, offset: 25 } }));
     await vi.waitFor(() => expect(get).toHaveBeenCalledWith(25, 25));
-    expect(page.textContent).toContain('Share inventory scan');
+    expect(page.textContent).toContain('Checking shared files');
     expect(page.querySelector('a')?.getAttribute('href')).toBe('/peers');
   });
 
@@ -85,7 +85,9 @@ describe('background activity', () => {
     await vi.waitFor(() => expect(page.textContent).toContain('3,162 files'));
     expect(page.querySelectorAll('#activity-panel li > details')).toHaveLength(1);
     expect(page.querySelector('#activity-panel progress')).toBeNull();
-    expect(page.textContent).toContain('receiver disk full');
+    expect(page.textContent).toContain('The receiving instance has run out of storage');
+    expect(page.textContent).toContain('The file changed on the other instance');
+    expect(page.textContent).not.toContain('receiver disk full');
     expect(page.textContent).toContain('2,000');
     expect(page.textContent).toContain('Examples (1 of 3,162)');
     expect(page.textContent).toContain('Trip/a.example.jpg');
@@ -93,8 +95,165 @@ describe('background activity', () => {
       .find((b) => b.textContent?.includes('Running'))
       ?.click();
     await page.updateComplete;
-    expect(page.textContent).toContain('Share inventory scan');
+    expect(page.textContent).toContain('Checking shared files');
     expect(page.textContent).not.toContain('Peer B / Archive');
+  });
+
+  it('explains dependent work and version conflicts without internal jargon', async () => {
+    vi.spyOn(admin, 'backgroundActivity').mockResolvedValue(
+      snapshot([
+        {
+          ...task,
+          id: 'state:transfer-queue:peer:share',
+          title: 'Peer file transfer queue',
+          resource: 'Peer B / Archive',
+          status: 'blocked',
+          phase:
+            'Next files in the queue are waiting: peer publication waits for a dependent inbox effect',
+          count: 100,
+          reasons: [{ reason: 'peer publication waits for a dependent inbox effect', count: 6 }],
+          examples: [
+            {
+              resource: 'trip/photo.example.jpg',
+              detail: 'peer publication waits for a dependent inbox effect',
+            },
+          ],
+          page: '/sync',
+        },
+        {
+          ...task,
+          id: 'state:inbox:peer:share',
+          title: 'Peer event application',
+          resource: 'Peer B / Archive',
+          status: 'blocked',
+          phase: 'peer effect waits for conflict resolution',
+          page: '/sync',
+        },
+      ]),
+    );
+    const page = await mount('ism-background-activity');
+    await vi.waitFor(() =>
+      expect(page.textContent).toContain('An earlier change to this file must finish first'),
+    );
+    expect(page.textContent).toContain('Check Sync issues if it needs attention.');
+    expect(page.textContent).not.toContain('ISM will continue automatically.');
+    expect(page.textContent).toContain('Reasons (6 of 100)');
+    expect(page.textContent).toContain('Files have different versions');
+    expect(page.textContent).not.toContain('dependent inbox');
+    expect(page.textContent).not.toContain('peer publication');
+    expect(page.textContent).not.toContain('peer effect');
+    expect(page.querySelector('a[href="/sync?view=attention"]')?.textContent).toContain('sync');
+  });
+
+  it('explains saved transfer failures while preserving unknown details', async () => {
+    vi.spyOn(admin, 'backgroundActivity').mockResolvedValue(
+      snapshot([
+        {
+          ...task,
+          status: 'blocked',
+          page: '/sync',
+          error: 'downloaded data does not match its checksum',
+          reasons: [
+            { reason: 'peer file changed during the transfer', count: 1 },
+            { reason: 'peer returned unexpected Content-Range (0, 4, 10)', count: 1 },
+            { reason: 'peer returned 3 of 10 requested bytes', count: 1 },
+            { reason: 'A specific server error', count: 1 },
+          ],
+        },
+      ]),
+    );
+    const page = await mount('ism-background-activity');
+    await vi.waitFor(() =>
+      expect(page.textContent).toContain('The downloaded file did not match the original'),
+    );
+    expect(page.textContent).toContain('The file changed on the other instance during download');
+    expect(page.textContent).toContain('The other instance sent an unexpected part of the file');
+    expect(page.textContent).toContain('The other instance sent an incomplete file');
+    expect(page.textContent).toContain('A specific server error');
+    expect(page.textContent).not.toContain('Content-Range');
+    expect(page.textContent).not.toContain('checksum');
+  });
+
+  it('uses plain language for current activity and older saved runs', async () => {
+    const data = snapshot([
+      {
+        ...task,
+        title: 'Peer inventory backfill',
+        phase: 'Fetching inventory pages and saving durable receipts',
+        unit: 'inventory entries checked',
+      },
+      {
+        ...task,
+        id: 'legacy-check',
+        title: 'Prepare Immich write barrier',
+        phase: 'Verifying checksum for trip/photo.example.jpg',
+        unit: 'bytes hashed',
+        total: 100,
+      },
+    ]);
+    data.history = [
+      {
+        ...task,
+        id: 'legacy-history',
+        status: 'completed',
+        phase: 'Inventory pagination will continue after trip/photo.example.jpg',
+        reasons: [{ reason: '<item> changed on the receiver', count: 1 }],
+      },
+    ];
+    vi.spyOn(admin, 'backgroundActivity').mockResolvedValue(data);
+    const page = await mount('ism-background-activity');
+    await vi.waitFor(() => expect(page.textContent).toContain('Getting the list of files'));
+    expect(page.textContent).toContain('Checking the contents of trip/photo.example.jpg');
+    expect(page.textContent).toContain('Continuing to check files after trip/photo.example.jpg');
+    expect(page.textContent).toContain('The file changed on the other instance');
+    expect(page.textContent).toContain('files checked');
+    expect(page.textContent).not.toContain('write barrier');
+    expect(page.textContent).not.toContain('durable receipts');
+    expect(page.textContent).not.toContain('checksum');
+    expect(page.textContent).not.toContain('pagination');
+    expect(page.textContent).not.toContain('<item>');
+  });
+
+  it('explains an Immich safety wait without internal terminology', async () => {
+    vi.spyOn(admin, 'backgroundActivity').mockResolvedValue(
+      snapshot([
+        {
+          ...task,
+          status: 'waiting',
+          title: 'Library synchronization',
+          phase: 'Immich library queue is paused by a write barrier; waiting for release',
+        },
+      ]),
+    );
+    const page = await mount('ism-background-activity');
+    await vi.waitFor(() =>
+      expect(page.textContent).toContain('Waiting for Immich to finish another file change'),
+    );
+    expect(page.textContent).not.toContain('write barrier');
+    expect(page.textContent).not.toContain('queue');
+  });
+
+  it('keeps interrupted work visible until a later outcome is known', async () => {
+    vi.spyOn(admin, 'backgroundActivity').mockResolvedValue(
+      snapshot([
+        {
+          ...task,
+          id: 'restarted',
+          title: 'Peer file transfer',
+          status: 'interrupted',
+          phase:
+            'ISM restarted before this run reported an outcome; queued work is recovered separately',
+          finished_at: '2026-01-01T00:01:00Z',
+        },
+        task,
+      ]),
+    );
+    const page = await mount('ism-background-activity');
+    await vi.waitFor(() =>
+      expect(page.querySelector('#activity-panel')?.textContent).toContain('File transfer'),
+    );
+    expect(page.querySelector('[aria-selected="true"]')?.textContent).toContain('Needs attention');
+    expect(page.textContent).toContain('ISM restarted before this finished');
   });
 
   it('explains waiting and failed work, and opens related operations without unsupported actions', async () => {
@@ -131,8 +290,8 @@ describe('background activity', () => {
       .find((b) => b.textContent?.includes('Waiting'))
       ?.click();
     await page.updateComplete;
-    expect(page.textContent).toContain('Waiting for allowed file-transfer hours');
-    expect(page.textContent).toContain('Next eligible:');
+    expect(page.textContent).toContain('Waiting for the scheduled sync hours');
+    expect(page.textContent).toContain('Scheduled for:');
   });
 
   it('preserves the last snapshot on errors and never presents a failed fetch as idle', async () => {

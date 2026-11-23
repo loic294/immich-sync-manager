@@ -30,6 +30,72 @@ const VERSIONS: RecoveryVersions = {
 describe('sync recovery', () => {
   afterEach(() => vi.restoreAllMocks());
 
+  it('starts with a manageable page when many files need attention', async () => {
+    const get = vi.spyOn(api, 'get').mockResolvedValue({ rows: [ISSUE], total: 700 } as never);
+    const page = await mount('ism-recovery-list');
+    await page.reload();
+    await page.updateComplete;
+    expect(get).toHaveBeenCalledWith('/api/admin/recovery/page', {
+      query: { limit: 25, offset: 0 },
+    });
+    expect(page.querySelector('ism-pagination')?.limit).toBe(25);
+  });
+
+  it('shows what each issue needs without making technical details the main explanation', async () => {
+    const rows: RecoveryView[] = [
+      ISSUE,
+      {
+        ...ISSUE,
+        title: 'Unreadable issue',
+        code: 'invalid_saved_recovery',
+        detail: 'saved recovery request has an invalid version decision',
+        can_fix: false,
+      },
+      {
+        ...ISSUE,
+        title: 'Different versions',
+        target: { kind: 'conflict', id: 'conflict-1', peer_id: null },
+        state: 'needs_decision',
+        code: 'choose_version',
+        can_fix: false,
+      },
+      {
+        ...ISSUE,
+        title: 'Missing file',
+        state: 'not_retryable',
+        code: 'recovery_exhausted',
+        can_fix: false,
+      },
+      {
+        ...ISSUE,
+        title: 'Stopped fix',
+        code: 'recovery_worker_failed',
+        detail: 'Recovery stopped unexpectedly.',
+      },
+    ];
+    vi.spyOn(api, 'get').mockResolvedValue({ rows, total: rows.length } as never);
+    const page = await mount('ism-recovery-list');
+    await page.reload();
+    await page.updateComplete;
+    const rendered = [...page.querySelectorAll('tbody tr')];
+    expect(rendered[0]?.querySelector('td:nth-child(2) > p')?.textContent).toContain(
+      'Check that it is running and connected',
+    );
+    expect(rendered[1]?.querySelector('td:nth-child(2) > p')?.textContent).toContain(
+      "can't read this saved issue",
+    );
+    expect(rendered[2]?.querySelector('td:nth-child(2) > p')?.textContent).toContain(
+      'Compare the versions',
+    );
+    expect(rendered[3]?.querySelector('td:nth-child(2) > p')?.textContent).toContain(
+      'Restore this file from a backup',
+    );
+    expect(rendered[4]?.querySelector('td:nth-child(2) > p')?.textContent).toContain(
+      'choose Fix selected to try again',
+    );
+    expect(rendered[1]?.querySelector('details')?.open).toBe(false);
+  });
+
   it('keeps selection across pages and submits exact targets without claiming completion', async () => {
     vi.spyOn(api, 'get').mockImplementation(async (_path, options) => {
       const offset = Number(options?.query?.offset ?? 0);
@@ -87,7 +153,7 @@ describe('sync recovery', () => {
         body: { targets: [], all: true, resolution: null },
       }),
     );
-    expect(page.textContent).toContain('Independent sync continues');
+    expect(page.textContent).toContain('Issues are handled per file');
   });
 
   it('exposes selected version comparisons from other pages before a batch decision', async () => {
@@ -148,7 +214,7 @@ describe('sync recovery', () => {
     const page = await mount('ism-recovery-list');
     await page.reload();
     await page.updateComplete;
-    expect(page.textContent).toContain('Not retryable');
+    expect(page.textContent).toContain("Can't fix automatically");
     expect(page.querySelectorAll('tbody tr')[1]?.querySelectorAll('button')).toHaveLength(0);
     page.querySelector<HTMLInputElement>('tbody input')?.click();
     await page.updateComplete;

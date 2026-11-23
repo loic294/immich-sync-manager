@@ -137,18 +137,20 @@ are the next two menu entries; their tables and open progress dialogs refresh ov
 WebSocket. Reverse proxies must forward WebSocket upgrades for `/api/admin/live`. The existing SSE
 endpoints remain available to API clients.
 
-Sync has **Active & queued** and **Completed syncs** tabs. Downloads currently running and managed
-publication operations come first, followed by queued files in FIFO order; offline peers, retry
-delays and transfer-hour restrictions can defer individual files. Completed history starts with this
-version and is retained in ISM's database. Thumbnails come from Immich, including video thumbnails;
-unindexed or unavailable previews display a file-type icon. Source-folder and sidecar inspection
+Sync has **Active & queued**, **Sync issues**, and **Completed syncs** tabs. Downloads currently
+running and managed publication operations come first, followed by queued files in FIFO order;
+offline peers, retry delays and transfer-hour restrictions can defer individual files. Completed
+history starts with this version and is retained in ISM's database. Thumbnails come from Immich,
+including video thumbnails; unindexed or unavailable previews display a file-type icon. Source-folder and sidecar inspection
 requires both peers to run a version supporting activity previews. Configure allowed hours and
 temporary overrides under **Hours & overrides**.
 
-Operations have status tabs, app/instance endpoints and live per-action file and Immich steps.
+Operations show background work, grouped blockers, and live per-action file and Immich steps.
+Expand an activity for details and use **Review sync issues** to see available next steps.
 **Mark handled** acknowledges an attention item without changing its outcome or releasing a recovery
-barrier; **Resolve recovery** remains a separate, explicit action after checking the files. Both
-activity tables use server-side pagination, defaulting to 250 rows with sizes from 25 to 5,000.
+barrier; **Resolve recovery** remains a separate, explicit action after checking the files. Managed
+operations and sync activity default to 250 rows per page; recent background runs and sync issues
+default to 25. Available page sizes range from 25 to 5,000.
 
 ## Development
 
