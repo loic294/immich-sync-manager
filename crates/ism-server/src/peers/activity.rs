@@ -610,7 +610,7 @@ pub async fn refresh(state: &AppState, peer: &net::Peer) -> Result<(), String> {
         .execute(&mut *tx).await.map_err(|e| e.to_string())?;
         tx.commit().await.map_err(|e| e.to_string())?;
         if changed {
-            state.emit(ServerEvent::SyncChanged);
+            state.emit_ui(ServerEvent::SyncChanged);
         }
         cursor = batch.cursor;
         if !batch.more {
@@ -630,7 +630,7 @@ pub async fn unavailable(state: &AppState, peer: &str, error: &str) {
     .execute(&state.db)
     .await;
     match updated {
-        Ok(result) if result.rows_affected() > 0 => state.emit(ServerEvent::SyncChanged),
+        Ok(result) if result.rows_affected() > 0 => state.emit_ui(ServerEvent::SyncChanged),
         Ok(_) => {}
         Err(e) => tracing::error!(peer, "record sync activity error: {e}"),
     }

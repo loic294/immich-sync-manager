@@ -147,6 +147,7 @@ async fn insert_peer(
     .bind(db::now())
     .execute(&state.db)
     .await?;
+    state.peer_configuration_changed();
     state.sync_wake.notify_one();
     Ok(id)
 }
@@ -348,6 +349,7 @@ pub async fn delete_peer(state: &AppState, id: &str) -> AppResult<()> {
             .await?;
     }
     tx.commit().await?;
+    state.peer_configuration_changed();
     db::audit(&state.db, "admin", "peer.removed", &peer.name).await;
     state.emit(ServerEvent::SyncChanged);
     Ok(())
@@ -470,6 +472,7 @@ pub async fn create_share(state: &AppState, input: ShareInput) -> AppResult<Shar
             .await?;
     }
     tx.commit().await?;
+    state.peer_configuration_changed();
     db::audit(&state.db, "admin", "share.created", &name).await;
     state.sync_wake.notify_one();
     share_view(state, &id).await
@@ -526,6 +529,7 @@ pub async fn update_share(state: &AppState, id: &str, input: ShareInput) -> AppR
         .await?;
     super::request_backfill_in(&mut tx, &state.instance_id, id, &current.name, &activated).await?;
     tx.commit().await?;
+    state.peer_configuration_changed();
     db::audit(&state.db, "admin", "share.updated", &current.name).await;
     state.sync_wake.notify_one();
     share_view(state, id).await
@@ -545,6 +549,7 @@ pub async fn delete_share(state: &AppState, id: &str) -> AppResult<()> {
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
+    state.peer_configuration_changed();
     db::audit(&state.db, "admin", "share.removed", &share.name).await;
     state.emit(ServerEvent::SyncChanged);
     Ok(())

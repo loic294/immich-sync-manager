@@ -22,6 +22,7 @@ pub fn router() -> Router<AppState> {
         .route("/pair", post(pair))
         .route("/hello", get(hello))
         .route("/events", get(events))
+        .route("/notifications", get(super::peer_events::notifications))
         .route("/inventory", get(inventory))
         .route("/content", get(content))
         .route("/recovery/retained", get(retained_discovery))
