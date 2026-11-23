@@ -28,6 +28,7 @@ const SCHEDULE_KEY: &str = "sync_schedule";
 mod move_decisions;
 #[path = "move_restore.rs"]
 mod move_restore;
+pub(crate) use move_decisions::reviewed_trash_inventory;
 pub(super) use move_decisions::{
     content_decision, event_decision, finish_step, footprints as move_decision_footprints,
     process as process_move_decisions,
@@ -1533,7 +1534,7 @@ pub(super) async fn resolve_reviewed(
     };
     let _operation_guard = state.replication_operation_lock.lock().await;
     let mut c = load_conflict(state, id).await?;
-    if let Some(revision) = revision {
+    let reviewed_local = if let Some(revision) = revision {
         let moved_files: Vec<_> = evidence
             .as_ref()
             .map(|value| {
@@ -1544,26 +1545,30 @@ pub(super) async fn resolve_reviewed(
                     .collect()
             })
             .unwrap_or_default();
-        super::versions::validate_reviewed(
-            state,
-            id,
-            revision,
-            current_remote.as_ref(),
-            evidence.as_ref().map(|value| {
-                (
-                    value.location.as_str(),
-                    if c.kind == "folder_move" {
-                        "folder"
-                    } else {
-                        "file"
-                    },
-                    moved_files.as_slice(),
-                    value.directories.as_slice(),
-                )
-            }),
+        Some(
+            super::versions::validate_reviewed(
+                state,
+                id,
+                revision,
+                current_remote.as_ref(),
+                evidence.as_ref().map(|value| {
+                    (
+                        value.location.as_str(),
+                        if c.kind == "folder_move" {
+                            "folder"
+                        } else {
+                            "file"
+                        },
+                        moved_files.as_slice(),
+                        value.directories.as_slice(),
+                    )
+                }),
+            )
+            .await?,
         )
-        .await?;
-    }
+    } else {
+        None
+    };
     let paths = [c.rel.as_str(), c.remote_from.as_deref().unwrap_or(&c.rel)];
     super::inbox::require_move_choice_stable(state, &c.share, &paths, &c.id).await?;
     if c.status != "open" {
@@ -1648,6 +1653,7 @@ pub(super) async fn resolve_reviewed(
             resolution,
             label,
             evidence.ok_or_else(|| AppError::internal("missing move evidence"))?,
+            reviewed_local,
         )
         .await;
     }

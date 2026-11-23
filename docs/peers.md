@@ -192,6 +192,13 @@ verified layout and contents, rather than merely dismissing the conflict. Peer-o
 removed by that choice go to the peer's ISM trash. A choice without authenticated, current
 evidence, or involving symlinks or unverifiable paths, is refused without settling it.
 
+Folder trash preparations retain the complete reviewed tree, including empty directories, across
+queuing and restarts. Added, removed, or changed contents cannot become authorized merely because
+planning starts later. If that tree changes, the failed preparation leaves the contents in place
+(or rolls the move back), and reopens the conflict for a fresh review. Legacy preparations without
+complete reviewed inventories also require a new choice. A step needing filesystem recovery keeps
+its recovery barrier instead of automatically reopening.
+
 Authenticated committed move lineage also follows a peer folder relocated while a choice is
 waiting. Unchanged bytes retain the chosen decision; changed competing bytes reopen the choice
 instead of silently selecting the new version. If relocation collides with a retained local
