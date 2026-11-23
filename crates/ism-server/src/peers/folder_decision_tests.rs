@@ -1624,6 +1624,13 @@ async fn preserves_addition(directory: bool, destination: bool) {
         "unreviewed addition moved to trash: {directory}"
     );
     assert_eq!(status(&a, &id).await, "open");
+    assert!(
+        sqlx::query_scalar::<_, bool>("SELECT recovery_resolved FROM operations WHERE id=?")
+            .bind(&operation)
+            .fetch_one(&a.state.db)
+            .await
+            .unwrap()
+    );
     if destination {
         assert!(a.shared.join("new/occupied.jpg").is_file());
         assert!(contains_bytes(&a, b"local source"));

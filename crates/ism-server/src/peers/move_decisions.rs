@@ -1067,12 +1067,7 @@ pub(in crate::peers) async fn finish_step(
         {
             let c = super::load_conflict(state, conflict_id).await?;
             let decision: Decision = serde_json::from_str(raw)?;
-            reopen_choice(state, &c, &decision).await?;
-            // Failed (not recovery_required) means nothing committed, or all effects rolled back.
-            sqlx::query("UPDATE operations SET recovery_resolved=1 WHERE id=?")
-                .bind(operation_id)
-                .execute(&state.db)
-                .await?;
+            reopen_choice(state, &c, &decision, Some(operation_id)).await?;
         }
         // Other failures keep their footprint; partially applied choices still need recovery.
         return Ok(());
@@ -1336,8 +1331,24 @@ fn previously_displaced(decision: &Decision, previous: &Evidence, fresh: &Eviden
     true
 }
 
-async fn reopen_choice(state: &AppState, c: &Conflict, decision: &Decision) -> AppResult<()> {
+async fn reopen_choice(
+    state: &AppState,
+    c: &Conflict,
+    decision: &Decision,
+    failed_operation: Option<&str>,
+) -> AppResult<()> {
     let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
+    if let Some(operation_id) = failed_operation {
+        // Failed (not recovery_required) means nothing committed, or all effects rolled back.
+        let released = sqlx::query(
+            "UPDATE operations SET recovery_resolved=1 WHERE id=?
+             AND EXISTS(SELECT 1 FROM operation_items WHERE operation_id=? AND status='failed')
+             AND NOT EXISTS(SELECT 1 FROM operation_items WHERE operation_id=? AND status='recovery_required')",
+        ).bind(operation_id).bind(operation_id).bind(operation_id).execute(&mut *tx).await?;
+        if released.rows_affected() != 1 {
+            return Err(invalid("failed preparation still requires recovery"));
+        }
+    }
     sqlx::query(
         "UPDATE conflicts SET status='open',resolution=NULL WHERE id=? AND status='resolving'",
     )
@@ -1386,7 +1397,7 @@ async fn refresh_choice(
         return Ok(false);
     };
     if contents(previous) != contents(&fresh) && !previously_displaced(decision, previous, &fresh) {
-        reopen_choice(state, c, decision).await?;
+        reopen_choice(state, c, decision, None).await?;
         return Ok(true);
     }
     if previous.location == fresh.location {
@@ -1402,7 +1413,7 @@ async fn refresh_choice(
         && peers::inbox::overlaps(&new, from)
     {
         if new != *from || resolution != "keep_remote" {
-            reopen_choice(state, c, decision).await?;
+            reopen_choice(state, c, decision, None).await?;
             return Ok(true);
         }
         decision
@@ -1450,7 +1461,7 @@ async fn refresh_choice(
                             format!("/{}", entry.name)
                         };
                         if allowed.get(&name).map(|(sha, _)| sha) != Some(&entry.sha256) {
-                            reopen_choice(state, c, decision).await?;
+                            reopen_choice(state, c, decision, None).await?;
                             return Ok(true);
                         }
                     }
@@ -1458,7 +1469,7 @@ async fn refresh_choice(
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(e.into()),
                 _ => {
-                    reopen_choice(state, c, decision).await?;
+                    reopen_choice(state, c, decision, None).await?;
                     return Ok(true);
                 }
             }
@@ -1475,7 +1486,7 @@ async fn refresh_choice(
                     };
                     allowed.get(&name).map(|(sha, _)| sha) != Some(&entry.sha256)
                 }) {
-                    reopen_choice(state, c, decision).await?;
+                    reopen_choice(state, c, decision, None).await?;
                     return Ok(true);
                 }
                 decision
