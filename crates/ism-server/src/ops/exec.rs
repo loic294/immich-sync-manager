@@ -4765,13 +4765,24 @@ mod tests {
 
     #[tokio::test]
     async fn folder_inventory_failure_rolls_back_the_move() {
+        for change in ["modified-file", "added-file", "added-directory"] {
+            folder_inventory_change_is_preserved(change).await;
+        }
+    }
+
+    async fn folder_inventory_change_is_preserved(change: &str) {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("source");
         let target = dir.path().join("quarantine");
         fs::create_dir(&source).unwrap();
         fs::write(source.join("photo.jpg"), b"original").unwrap();
         let expected = plan::folder_inventory(&source).unwrap();
-        fs::write(source.join("photo.jpg"), b"changed").unwrap();
+        match change {
+            "modified-file" => fs::write(source.join("photo.jpg"), b"changed").unwrap(),
+            "added-file" => fs::write(source.join("added.jpg"), b"unreviewed").unwrap(),
+            "added-directory" => fs::create_dir(source.join("added-empty")).unwrap(),
+            _ => unreachable!(),
+        }
         let state = AppState::new(
             crate::config::Config::for_tests(dir.path()),
             crate::db::connect(dir.path()).await.unwrap(),
@@ -4798,7 +4809,19 @@ mod tests {
         };
         assert_eq!(failure.code, "revision_changed");
         assert!(!failure.recovery);
-        assert_eq!(fs::read(source.join("photo.jpg")).unwrap(), b"changed");
+        assert_eq!(
+            fs::read(source.join("photo.jpg")).unwrap(),
+            if change == "modified-file" {
+                b"changed".as_slice()
+            } else {
+                b"original".as_slice()
+            },
+        );
+        if change == "added-file" {
+            assert_eq!(fs::read(source.join("added.jpg")).unwrap(), b"unreviewed");
+        } else if change == "added-directory" {
+            assert!(source.join("added-empty").is_dir());
+        }
         assert!(!target.exists());
     }
 }

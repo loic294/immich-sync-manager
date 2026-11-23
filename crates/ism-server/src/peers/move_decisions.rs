@@ -11,6 +11,7 @@ use super::{Conflict, conflict_name};
 use crate::auth::Principal;
 use crate::error::{AppError, AppResult};
 use crate::files;
+use crate::ops::plan::TrashEntry;
 use crate::peers::{self, EventData, Row, recovery};
 use crate::state::{AppState, ServerEvent};
 
@@ -44,6 +45,8 @@ pub(super) struct Content {
 #[derive(Serialize, Deserialize)]
 struct Decision {
     #[serde(default)]
+    reviewed_trees: Option<BTreeMap<String, Vec<TrashEntry>>>,
+    #[serde(default)]
     recovery_ids: Vec<String>,
     #[serde(default)]
     retained_transfers: Vec<String>,
@@ -62,6 +65,67 @@ struct Decision {
     displaced_files: Vec<Content>,
     #[serde(default)]
     displaced_directories: Vec<String>,
+}
+
+fn reviewed_tree(version: &ism_core::dto::RecoveryVersion) -> AppResult<Vec<TrashEntry>> {
+    let mut entries = BTreeMap::new();
+    for (path, hash) in version.directories.iter().map(|path| (path, None)).chain(
+        version
+            .files
+            .iter()
+            .map(|file| (&file.path, Some(file.sha256.clone()))),
+    ) {
+        let name = if path == &version.path {
+            String::new()
+        } else {
+            path.strip_prefix(&format!("{}/", version.path))
+                .ok_or_else(|| invalid("reviewed tree escaped its folder"))?
+                .to_owned()
+        };
+        if entries.insert(name, hash).is_some() {
+            return Err(invalid("reviewed tree contains duplicate paths"));
+        }
+    }
+    if entries.get("") != Some(&None) {
+        return Err(invalid("reviewed tree has no root directory"));
+    }
+    Ok(entries
+        .into_iter()
+        .map(|(name, sha256)| TrashEntry { name, sha256 })
+        .collect())
+}
+
+pub(crate) async fn reviewed_trash_inventory(
+    state: &AppState,
+    operation_id: &str,
+    source: &ism_core::dto::Location,
+) -> AppResult<Option<Vec<TrashEntry>>> {
+    let raw: Option<String> = sqlx::query_scalar(
+        "SELECT vv_json FROM pending_peer_ops WHERE operation_id=? AND kind='move_decision_step'",
+    )
+    .bind(operation_id)
+    .fetch_optional(&state.db)
+    .await?;
+    let Some(raw) = raw else { return Ok(None) };
+    let decision: Decision = serde_json::from_str(&raw)?;
+    if !matches!(&decision.current, Some(OperationAction::TrashFolder { source: expected, .. }) if expected == source)
+    {
+        return Err(invalid("folder trash does not match its move decision"));
+    }
+    let tree = decision
+        .reviewed_trees
+        .as_ref()
+        .and_then(|trees| trees.get(&source.path))
+        .ok_or_else(|| {
+            invalid("folder choice predates complete reviewed inventories; review again")
+        })?;
+    if tree
+        .first()
+        .is_none_or(|entry| !entry.name.is_empty() || entry.sha256.is_some())
+    {
+        return Err(invalid("reviewed folder inventory is incomplete"));
+    }
+    Ok(Some(tree.clone()))
 }
 
 fn invalid(message: &str) -> AppError {
@@ -429,22 +493,45 @@ async fn local_content(
     Ok((files, directories))
 }
 
-fn trash(c: &Conflict, root: &files::Root, path: &str) -> AppResult<Option<OperationAction>> {
+fn trash(
+    c: &Conflict,
+    root: &files::Root,
+    path: &str,
+    reviewed_trees: Option<&BTreeMap<String, Vec<TrashEntry>>>,
+) -> AppResult<Option<OperationAction>> {
     let abs = root.abs(&c.share.root_rel(path)?)?;
+    let source = c.share.location(path)?;
+    let reviewed = reviewed_trees.and_then(|trees| trees.get(&source.path));
     let meta = match abs.symlink_metadata() {
         Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && reviewed.is_some() => {
+            return Err(AppError::conflict(
+                "version_conflict",
+                "reviewed folder disappeared",
+            ));
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.into()),
     };
-    let source = c.share.location(path)?;
     if meta.is_dir() {
-        // Inventory validation also rejects symlinks anywhere below the folder.
-        crate::ops::plan::folder_inventory(&abs)?;
+        let reviewed = reviewed.ok_or_else(|| invalid("folder has no reviewed inventory"))?;
+        if crate::ops::plan::folder_inventory(&abs)? != *reviewed {
+            return Err(AppError::conflict(
+                "version_conflict",
+                "folder changed while queuing the choice",
+            ));
+        }
         Ok(Some(OperationAction::TrashFolder {
             source,
             expected_entries: None,
         }))
     } else if meta.is_file() {
+        if reviewed.is_some() {
+            return Err(AppError::conflict(
+                "version_conflict",
+                "reviewed folder became a file",
+            ));
+        }
         Ok(Some(OperationAction::Trash {
             source,
             expected_revision: Some(files::revision(&meta)),
@@ -475,6 +562,7 @@ pub(super) async fn submit(
     resolution: ConflictResolution,
     label: &str,
     mut remote: Evidence,
+    reviewed_local: Option<Vec<ism_core::dto::RecoveryVersion>>,
 ) -> AppResult<()> {
     if remote.destination != c.rel
         || remote.version != c.remote_vv
@@ -499,6 +587,38 @@ pub(super) async fn submit(
     } else {
         original_from
     };
+    let reviewed_local = match reviewed_local {
+        Some(versions) => versions,
+        None => {
+            let mut versions = Vec::new();
+            for path in [original_from, c.rel.as_str(), remote.location.as_str()] {
+                if !versions
+                    .iter()
+                    .any(|version: &ism_core::dto::RecoveryVersion| version.path == path)
+                {
+                    versions.push(peers::versions::local(state, &c.share, path).await?);
+                }
+            }
+            versions
+        }
+    };
+    let mut reviewed_trees = BTreeMap::new();
+    for version in &reviewed_local {
+        if serde_json::to_value(peers::versions::local(state, &c.share, &version.path).await?)?
+            != serde_json::to_value(version)?
+        {
+            return Err(AppError::conflict(
+                "version_conflict",
+                "receiving contents changed while queuing the choice",
+            ));
+        }
+        if version.state == "folder" {
+            reviewed_trees.insert(
+                c.share.location(&version.path)?.path,
+                reviewed_tree(version)?,
+            );
+        }
+    }
     let (mut source_files, source_dirs) = local_content(state, c, root, from).await?;
     let mut destinations = Vec::new();
     if !peers::inbox::overlaps(&c.rel, from)
@@ -514,6 +634,7 @@ pub(super) async fn submit(
         destinations.push((remote.location.clone(), files, dirs));
     }
     let mut decision = Decision {
+        reviewed_trees: Some(reviewed_trees),
         recovery_ids: sqlx::query_scalar(
             "SELECT id FROM sync_recovery WHERE kind='conflict' AND target_id=?
              UNION SELECT recovery_id FROM sync_recovery_links WHERE kind='conflict' AND target_id=?",
@@ -705,7 +826,7 @@ pub(super) async fn submit(
         }
         ConflictResolution::KeepRemote | ConflictResolution::KeepBoth => {
             if resolution == ConflictResolution::KeepRemote {
-                if let Some(action) = trash(c, root, from)? {
+                if let Some(action) = trash(c, root, from, decision.reviewed_trees.as_ref())? {
                     decision.steps.push(action);
                 }
                 if remote.location != from {
@@ -783,7 +904,9 @@ pub(super) async fn submit(
                                 .directories
                                 .push(rebase(&dir, &destination, &target)?);
                         }
-                    } else if let Some(action) = trash(c, root, &destination)? {
+                    } else if let Some(action) =
+                        trash(c, root, &destination, decision.reviewed_trees.as_ref())?
+                    {
                         // Do not announce this local preparation: the peer still serves its tree.
                         decision.steps.push(action);
                     }
@@ -924,8 +1047,34 @@ pub(in crate::peers) async fn finish_step(
     ok: bool,
 ) -> AppResult<()> {
     if !ok {
-        // Keep the pending preparation and its footprint. Recovery may retry it; never turn a
-        // partially applied choice into a successful resolution or unblock another choice.
+        let (status, code): (String, Option<String>) = sqlx::query_as(
+            "SELECT status,error_code FROM operation_items WHERE operation_id=? AND idx=0",
+        )
+        .bind(operation_id)
+        .fetch_one(&state.db)
+        .await?;
+        if status == "failed"
+            && matches!(
+                code.as_deref(),
+                Some(
+                    "revision_changed"
+                        | "recovery_evidence_missing"
+                        | "wrong_kind"
+                        | "not_found"
+                        | "trash_inventory_unverifiable"
+                )
+            )
+        {
+            let c = super::load_conflict(state, conflict_id).await?;
+            let decision: Decision = serde_json::from_str(raw)?;
+            reopen_choice(state, &c, &decision).await?;
+            // Failed (not recovery_required) means nothing committed, or all effects rolled back.
+            sqlx::query("UPDATE operations SET recovery_resolved=1 WHERE id=?")
+                .bind(operation_id)
+                .execute(&state.db)
+                .await?;
+        }
+        // Other failures keep their footprint; partially applied choices still need recovery.
         return Ok(());
     }
     let c = super::load_conflict(state, conflict_id).await?;
@@ -1195,8 +1344,8 @@ async fn reopen_choice(state: &AppState, c: &Conflict, decision: &Decision) -> A
     .bind(&c.id)
     .execute(&mut *tx)
     .await?;
-    sqlx::query("UPDATE pending_peer_ops SET kind='move_decision_open' WHERE kind='move_decision_wait' AND conflict_id=?")
-                .bind(&c.id).execute(&mut *tx).await?;
+    sqlx::query("UPDATE pending_peer_ops SET kind='move_decision_open',operation_id=? WHERE kind IN ('move_decision_wait','move_decision_step') AND conflict_id=?")
+                .bind(format!("move-decision:{}", c.id)).bind(&c.id).execute(&mut *tx).await?;
     for file in decision.files.iter().filter(|file| file.download) {
         sqlx::query(
                     "DELETE FROM sync_recovery_links WHERE kind='transfer' AND target_id IN
@@ -1315,8 +1464,29 @@ async fn refresh_choice(
             }
         }
         if old_path.is_dir() {
+            // Relocation may trash only the already selected peer contents, never a new tree.
+            if new_path.exists() {
+                let tree = crate::ops::plan::folder_inventory(&old_path)?;
+                if tree.iter().any(|entry| {
+                    let name = if entry.name.is_empty() {
+                        String::new()
+                    } else {
+                        format!("/{}", entry.name)
+                    };
+                    allowed.get(&name).map(|(sha, _)| sha) != Some(&entry.sha256)
+                }) {
+                    reopen_choice(state, c, decision).await?;
+                    return Ok(true);
+                }
+                decision
+                    .reviewed_trees
+                    .as_mut()
+                    .ok_or_else(|| invalid("reviewed inventories are unavailable"))?
+                    .insert(c.share.location(&old)?.path, tree);
+            }
             decision.steps.push(if new_path.exists() {
-                trash(c, &root, &old)?.ok_or_else(|| invalid("choice source disappeared"))?
+                trash(c, &root, &old, decision.reviewed_trees.as_ref())?
+                    .ok_or_else(|| invalid("choice source disappeared"))?
             } else {
                 OperationAction::MoveFolder {
                     source: c.share.location(&old)?,

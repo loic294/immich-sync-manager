@@ -1558,6 +1558,221 @@ fn contains_bytes(instance: &Instance, bytes: &[u8]) -> bool {
 }
 
 #[tokio::test]
+async fn folder_keep_remote_preserves_additions_after_review() {
+    preserves_addition(false, false).await;
+    preserves_addition(false, true).await;
+}
+
+#[tokio::test]
+async fn folder_keep_remote_preserves_empty_directories_after_review() {
+    preserves_addition(true, false).await;
+    preserves_addition(true, true).await;
+}
+
+async fn preserves_addition(directory: bool, destination: bool) {
+    let (mut a, _b, id) = setup(true, destination).await;
+    let target = ism_core::dto::RecoveryTarget {
+        kind: ism_core::dto::RecoveryKind::Conflict,
+        id: id.clone(),
+        peer_id: None,
+    };
+    let review = super::super::versions::get(&a.state, &target)
+        .await
+        .unwrap();
+    admin::resolve_reviewed(
+        &a.state,
+        "admin",
+        &id,
+        ConflictResolution::KeepRemote,
+        Some(&review.revision),
+    )
+    .await
+    .unwrap();
+    if destination {
+        let operation: String = sqlx::query_scalar(
+            "SELECT operation_id FROM pending_peer_ops WHERE kind='move_decision_step'",
+        )
+        .fetch_one(&a.state.db)
+        .await
+        .unwrap();
+        crate::ops::exec::run_operation(&a.state, &operation)
+            .await
+            .unwrap();
+    }
+    let parent = if destination { "new" } else { "old" };
+    let addition = a.shared.join(format!(
+        "{parent}/{}",
+        if directory { "new-empty" } else { "new.jpg" }
+    ));
+    if directory {
+        std::fs::create_dir_all(&addition).unwrap();
+    } else {
+        write_old(&addition, b"unreviewed addition");
+    }
+    reboot(&mut a).await;
+    let operation: String = sqlx::query_scalar(
+        "SELECT operation_id FROM pending_peer_ops WHERE kind='move_decision_step'",
+    )
+    .fetch_one(&a.state.db)
+    .await
+    .unwrap();
+    crate::ops::exec::run_operation(&a.state, &operation)
+        .await
+        .unwrap();
+    assert!(
+        addition.exists(),
+        "unreviewed addition moved to trash: {directory}"
+    );
+    assert_eq!(status(&a, &id).await, "open");
+    if destination {
+        assert!(a.shared.join("new/occupied.jpg").is_file());
+        assert!(contains_bytes(&a, b"local source"));
+    } else {
+        assert!(a.shared.join("old/nested/photo.jpg").is_file());
+    }
+    let updated = super::super::versions::get(&a.state, &target)
+        .await
+        .unwrap();
+    assert_ne!(review.revision, updated.revision);
+    admin::resolve_reviewed(
+        &a.state,
+        "admin",
+        &id,
+        ConflictResolution::KeepRemote,
+        Some(&updated.revision),
+    )
+    .await
+    .unwrap();
+    preparations(&a).await;
+    assert!(contains_bytes(&a, b"local source"));
+    if !directory {
+        assert!(contains_bytes(&a, b"unreviewed addition"));
+    }
+}
+
+#[tokio::test]
+async fn folder_keep_remote_rejects_additions_before_queuing() {
+    for directory in [false, true] {
+        let (a, _b, id) = setup(true, false).await;
+        let target = ism_core::dto::RecoveryTarget {
+            kind: ism_core::dto::RecoveryKind::Conflict,
+            id: id.clone(),
+            peer_id: None,
+        };
+        let review = super::super::versions::get(&a.state, &target)
+            .await
+            .unwrap();
+        let addition = a.shared.join(if directory {
+            "old/added-empty"
+        } else {
+            "old/added.jpg"
+        });
+        if directory {
+            std::fs::create_dir(&addition).unwrap();
+        } else {
+            write_old(&addition, b"new content");
+        }
+        let error = admin::resolve_reviewed(
+            &a.state,
+            "admin",
+            &id,
+            ConflictResolution::KeepRemote,
+            Some(&review.revision),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), "version_conflict");
+        assert!(addition.exists());
+        assert!(a.shared.join("old/nested/photo.jpg").is_file());
+        assert_eq!(status(&a, &id).await, "open");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM pending_peer_ops WHERE kind='move_decision_step'"
+            )
+            .fetch_one(&a.state.db)
+            .await
+            .unwrap(),
+            0
+        );
+    }
+}
+
+#[tokio::test]
+async fn folder_keep_remote_reopens_for_changed_reviewed_contents() {
+    for remove_directory in [false, true] {
+        let (a, _b, id) = setup(true, false).await;
+        std::fs::create_dir(a.shared.join("old/reviewed-empty")).unwrap();
+        admin::resolve(&a.state, "admin", &id, ConflictResolution::KeepRemote)
+            .await
+            .unwrap();
+        if remove_directory {
+            std::fs::remove_dir(a.shared.join("old/reviewed-empty")).unwrap();
+        } else {
+            // Same size and write_old's fixed mtime: content hashes must also be pinned.
+            write_old(&a.shared.join("old/nested/photo.jpg"), b"other source");
+        }
+        let operation: String = sqlx::query_scalar(
+            "SELECT operation_id FROM pending_peer_ops WHERE kind='move_decision_step'",
+        )
+        .fetch_one(&a.state.db)
+        .await
+        .unwrap();
+        crate::ops::exec::run_operation(&a.state, &operation)
+            .await
+            .unwrap();
+        assert_eq!(status(&a, &id).await, "open");
+        assert!(a.shared.join("old/nested").is_dir());
+        assert_eq!(
+            std::fs::read(a.shared.join("old/nested/photo.jpg")).unwrap(),
+            if remove_directory {
+                b"local source"
+            } else {
+                b"other source"
+            }
+        );
+    }
+}
+
+#[tokio::test]
+async fn folder_keep_remote_rejects_legacy_or_incomplete_queued_evidence() {
+    for field in ["$.reviewed_trees", "$.reviewed_trees.\"shared/old\""] {
+        let (a, _b, id) = setup(true, false).await;
+        admin::resolve(&a.state, "admin", &id, ConflictResolution::KeepRemote)
+            .await
+            .unwrap();
+        let operation: String = sqlx::query_scalar(
+            "SELECT operation_id FROM pending_peer_ops WHERE kind='move_decision_step'",
+        )
+        .fetch_one(&a.state.db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE pending_peer_ops SET vv_json=json_remove(vv_json,?) WHERE operation_id=?",
+        )
+        .bind(field)
+        .bind(&operation)
+        .execute(&a.state.db)
+        .await
+        .unwrap();
+        crate::ops::exec::run_operation(&a.state, &operation)
+            .await
+            .unwrap();
+        assert!(a.shared.join("old/nested/photo.jpg").is_file());
+        assert_eq!(status(&a, &id).await, "open");
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT error_code FROM operation_items WHERE operation_id=?"
+            )
+            .bind(&operation)
+            .fetch_one(&a.state.db)
+            .await
+            .unwrap(),
+            "recovery_evidence_missing"
+        );
+    }
+}
+
+#[tokio::test]
 async fn folder_keep_remote_rebuilds_nested_tree_and_retains_trash() {
     let (mut a, mut b, id) = setup(true, true).await;
     admin::resolve(&a.state, "admin", &id, ConflictResolution::KeepRemote)
