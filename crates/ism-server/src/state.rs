@@ -7,7 +7,7 @@ use ism_core::dto::OperationCommitted;
 use serde::Serialize;
 use sqlx::SqlitePool;
 use sqlx::postgres::PgPool;
-use tokio::sync::{Mutex, Notify, broadcast};
+use tokio::sync::{Mutex, Notify, broadcast, watch};
 
 use crate::config::Config;
 use crate::crypto::SecretBox;
@@ -46,6 +46,10 @@ pub struct Inner {
     pub instance_id: String,
     pub http: reqwest::Client,
     pub events: broadcast::Sender<ServerEvent>,
+    /// Content-free invalidations for paired peers, separate from mirrored UI status.
+    pub peer_events: broadcast::Sender<()>,
+    /// Changing peer credentials or configuration revokes existing streams without polling.
+    pub peer_configuration: watch::Sender<()>,
     /// Wakes the operation executor.
     pub ops_wake: Notify,
     /// Wakes the maintenance controller.
@@ -101,6 +105,8 @@ impl AppState {
             .timeout(std::time::Duration::from_secs(120))
             .build()?;
         let (events, _) = broadcast::channel(512);
+        let (peer_events, _) = broadcast::channel(64);
+        let (peer_configuration, _) = watch::channel(());
         Ok(Self(Arc::new(Inner {
             activity: crate::activity::Registry::default(),
             config,
@@ -109,6 +115,8 @@ impl AppState {
             instance_id,
             http,
             events,
+            peer_events,
+            peer_configuration,
             ops_wake: Notify::new(),
             maintenance_wake: Notify::new(),
             sync_wake: Notify::new(),
@@ -158,7 +166,23 @@ impl AppState {
     }
 
     pub fn emit(&self, event: ServerEvent) {
+        if matches!(
+            event,
+            ServerEvent::SyncChanged | ServerEvent::ConflictsChanged
+        ) {
+            let _ = self.peer_events.send(());
+        }
+        self.emit_ui(event);
+    }
+
+    /// Mirrored remote status must never wake the peer that supplied it.
+    pub fn emit_ui(&self, event: ServerEvent) {
         let _ = self.events.send(event);
+    }
+
+    /// Call immediately after committing peer credentials or share configuration changes.
+    pub fn peer_configuration_changed(&self) {
+        self.peer_configuration.send_replace(());
     }
 
     pub async fn instance_name(&self) -> String {

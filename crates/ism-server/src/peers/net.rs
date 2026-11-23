@@ -204,7 +204,7 @@ pub async fn mark(state: &AppState, peer_id: &str, result: Result<(), String>) {
         }
     };
     match updated {
-        Ok(result) if result.rows_affected() > 0 => state.emit(ServerEvent::SyncChanged),
+        Ok(result) if result.rows_affected() > 0 => state.emit_ui(ServerEvent::SyncChanged),
         Ok(_) => {}
         Err(error) => {
             tracing::error!(peer = %peer_id, "could not record peer connection status: {error}");
@@ -234,7 +234,7 @@ pub async fn mark_processing_result(state: &AppState, peer_id: &str, error: Opti
             .execute(&state.db)
             .await;
     match updated {
-        Ok(result) if result.rows_affected() > 0 => state.emit(ServerEvent::SyncChanged),
+        Ok(result) if result.rows_affected() > 0 => state.emit_ui(ServerEvent::SyncChanged),
         Ok(_) => {}
         Err(error) => {
             tracing::error!(peer = %peer_id, "could not record peer processing status: {error}");

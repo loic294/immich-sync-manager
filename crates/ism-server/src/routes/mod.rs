@@ -4,6 +4,7 @@ pub mod activity;
 pub mod admin;
 pub mod client;
 pub mod peer;
+mod peer_events;
 
 use std::convert::Infallible;
 use std::path::Path;

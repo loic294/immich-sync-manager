@@ -22,6 +22,23 @@ existing controls. A peer-specific wait is not a claim that every share or serve
 3. Both sides now share a secret; every peer request is signed and must be within 5 minutes of the
    other clock, so keep NTP on.
 
+### Change notifications
+
+Paired peers can open `GET /api/peer/v1/notifications` with the same signed GET authentication.
+This optional SSE endpoint sends `event: changed` with `data: {}` for local sync and recovery
+changes, coalescing bursts over 250 ms. It never includes paths, identifiers, transfer content or
+remote status mirrored for the UI. Idle connections receive a comment keepalive every 15 seconds.
+
+`event: catch_up` (also `{}`) means the subscriber lagged behind the bounded notification buffer.
+These are invalidation hints, not a durable event log: fetch authoritative sync/recovery state
+after connecting, reconnecting, or receiving either hint; use `/events` for replication cursors.
+Peer removal and committed peer/share configuration changes close existing streams immediately.
+Credentials and peer identity are also rechecked before every hint and keepalive; verification
+errors close the stream. Credential/configuration writers must call
+`AppState::peer_configuration_changed` immediately after committing their change.
+Allow long-lived, unbuffered responses through reverse proxies. No existing polling client uses
+this endpoint yet; clients without it keep their current behavior.
+
 ## Shares
 
 A share is a folder replicated under the same name on each instance: pick the local root and
