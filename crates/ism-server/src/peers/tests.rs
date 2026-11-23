@@ -8,6 +8,9 @@ mod isolation;
 #[path = "folder_decision_tests.rs"]
 mod folder_decisions;
 
+#[path = "notification_tests.rs"]
+mod notifications;
+
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -29,6 +32,9 @@ struct Instance {
     url: String,
     shared: PathBuf,
     tasks: Vec<tokio::task::JoinHandle<()>>,
+    requests: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, usize>>>,
+    notification_status: std::sync::Arc<std::sync::atomic::AtomicU16>,
+    snapshot_status: std::sync::Arc<std::sync::atomic::AtomicU16>,
 }
 
 impl Drop for Instance {
@@ -61,7 +67,40 @@ async fn instance(name: &str) -> Instance {
         .unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
-    let app = crate::routes::router(state.clone());
+    let requests = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let notification_status = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0));
+    let snapshot_status = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0));
+    let app = crate::routes::router(state.clone()).layer(axum::middleware::from_fn({
+        let requests = requests.clone();
+        let status = notification_status.clone();
+        let snapshot_status = snapshot_status.clone();
+        move |request: axum::extract::Request, next: axum::middleware::Next| {
+            let requests = requests.clone();
+            let status = status.clone();
+            let snapshot_status = snapshot_status.clone();
+            async move {
+                let path = request.uri().path().to_owned();
+                *requests.lock().unwrap().entry(path.clone()).or_insert(0) += 1;
+                let status = status.load(std::sync::atomic::Ordering::SeqCst);
+                if path == "/api/peer/v1/notifications" && status != 0 {
+                    return axum::response::IntoResponse::into_response(
+                        axum::http::StatusCode::from_u16(status).unwrap(),
+                    );
+                }
+                let status = snapshot_status.load(std::sync::atomic::Ordering::SeqCst);
+                if matches!(
+                    path.as_str(),
+                    "/api/peer/v1/recovery" | "/api/peer/v1/sync-activity"
+                ) && status != 0
+                {
+                    return axum::response::IntoResponse::into_response(
+                        axum::http::StatusCode::from_u16(status).unwrap(),
+                    );
+                }
+                next.run(request).await
+            }
+        }
+    }));
     let tasks = vec![
         tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
@@ -77,6 +116,9 @@ async fn instance(name: &str) -> Instance {
         url,
         shared,
         tasks,
+        requests,
+        notification_status,
+        snapshot_status,
     }
 }
 
@@ -94,22 +136,27 @@ async fn scheduler_fixture(
     stop_workers(&mut local).await;
     let entered = Arc::new(Notify::new());
     let respond = Arc::new(Notify::new());
-    let app = axum::Router::new().fallback({
-        let entered = entered.clone();
-        let respond = respond.clone();
-        move || {
+    let app = axum::Router::new()
+        .route(
+            "/api/peer/v1/notifications",
+            axum::routing::get(|| async { axum::http::StatusCode::NOT_FOUND }),
+        )
+        .fallback({
             let entered = entered.clone();
             let respond = respond.clone();
-            async move {
-                entered.notify_one();
-                respond.notified().await;
-                axum::Json(serde_json::json!({
-                    "instance_id": "different-instance", "name": "Remote", "shares": [],
-                    "total": 0, "rows": []
-                }))
+            move || {
+                let entered = entered.clone();
+                let respond = respond.clone();
+                async move {
+                    entered.notify_one();
+                    respond.notified().await;
+                    axum::Json(serde_json::json!({
+                        "instance_id": "different-instance", "name": "Remote", "shares": [],
+                        "total": 0, "rows": []
+                    }))
+                }
             }
-        }
-    });
+        });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     local.tasks.push(tokio::spawn(async move {
