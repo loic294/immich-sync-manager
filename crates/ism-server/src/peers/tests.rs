@@ -332,6 +332,214 @@ async fn stop_workers(instance: &mut Instance) {
 }
 
 #[tokio::test]
+async fn idle_peer_checks_coalesce_last_seen_writes() {
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    let peer = super::net::peers(&b.state).await.unwrap().remove(0);
+    sqlx::query("UPDATE peers SET status = 'online', last_seen_at = ? WHERE id = ?")
+        .bind(crate::db::now())
+        .bind(&peer.id)
+        .execute(&b.state.db)
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE peer_seen_writes (id INTEGER)")
+        .execute(&b.state.db)
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER count_peer_seen AFTER UPDATE OF last_seen_at ON peers
+         BEGIN INSERT INTO peer_seen_writes VALUES (1); END",
+    )
+    .execute(&b.state.db)
+    .await
+    .unwrap();
+    for _ in 0..5 {
+        let hello: super::net::Hello = super::net::get_json(&b.state, &peer, "/api/peer/v1/hello")
+            .await
+            .unwrap();
+        assert_eq!(
+            peer.instance_id.as_deref(),
+            Some(hello.instance_id.as_str())
+        );
+        super::net::mark(&b.state, &peer.id, Ok(())).await;
+    }
+    let writes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM peer_seen_writes")
+        .fetch_one(&b.state.db)
+        .await
+        .unwrap();
+    assert_eq!(
+        writes, 0,
+        "fresh idle checks should not update last_seen_at"
+    );
+    for (age, expected_writes) in [(18, 0), (20, 1)] {
+        let seen = crate::db::ts(chrono::Utc::now() - chrono::Duration::seconds(age));
+        sqlx::query("UPDATE peers SET last_seen_at = ? WHERE id = ?")
+            .bind(seen)
+            .bind(&peer.id)
+            .execute(&b.state.db)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM peer_seen_writes")
+            .execute(&b.state.db)
+            .await
+            .unwrap();
+        super::net::mark(&b.state, &peer.id, Ok(())).await;
+        let writes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM peer_seen_writes")
+            .fetch_one(&b.state.db)
+            .await
+            .unwrap();
+        assert_eq!(writes, expected_writes, "last-seen age: {age}s");
+    }
+}
+
+#[tokio::test]
+async fn unchanged_peer_status_does_not_wait_for_sqlite_writer() {
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    let peer = super::net::peers(&b.state).await.unwrap().remove(0);
+    sqlx::query(
+        "UPDATE peers SET status = 'online', last_seen_at = ?, last_error = NULL WHERE id = ?",
+    )
+    .bind(crate::db::now())
+    .bind(&peer.id)
+    .execute(&b.state.db)
+    .await
+    .unwrap();
+    let mut writer = b.state.db.begin_with("BEGIN IMMEDIATE").await.unwrap();
+    sqlx::query("UPDATE settings SET value = value WHERE key = 'instance_name'")
+        .execute(&mut *writer)
+        .await
+        .unwrap();
+    let completed = tokio::time::timeout(Duration::from_millis(500), async {
+        super::net::mark(&b.state, &peer.id, Ok(())).await;
+        super::net::mark_processing_result(&b.state, &peer.id, None).await;
+    })
+    .await;
+    writer.rollback().await.unwrap();
+    assert!(
+        completed.is_ok(),
+        "unchanged peer status waited for a writer"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_stale_peer_checks_refresh_last_seen_once() {
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    let peer = super::net::peers(&b.state).await.unwrap().remove(0);
+    sqlx::query("UPDATE peers SET status = 'online', last_seen_at = ? WHERE id = ?")
+        .bind(crate::db::ts(
+            chrono::Utc::now() - chrono::Duration::seconds(60),
+        ))
+        .bind(&peer.id)
+        .execute(&b.state.db)
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE peer_seen_writes (id INTEGER)")
+        .execute(&b.state.db)
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER count_peer_seen AFTER UPDATE OF last_seen_at ON peers
+         BEGIN INSERT INTO peer_seen_writes VALUES (1); END",
+    )
+    .execute(&b.state.db)
+    .await
+    .unwrap();
+    let writer = b.state.db.begin_with("BEGIN IMMEDIATE").await.unwrap();
+    let checks: Vec<_> = (0..5)
+        .map(|_| {
+            let state = b.state.clone();
+            let id = peer.id.clone();
+            tokio::spawn(async move { super::net::mark(&state, &id, Ok(())).await })
+        })
+        .collect();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    writer.rollback().await.unwrap();
+    for check in checks {
+        check.await.unwrap();
+    }
+    let writes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM peer_seen_writes")
+        .fetch_one(&b.state.db)
+        .await
+        .unwrap();
+    assert_eq!(writes, 1);
+    let seen: String = sqlx::query_scalar("SELECT last_seen_at FROM peers WHERE id = ?")
+        .bind(&peer.id)
+        .fetch_one(&b.state.db)
+        .await
+        .unwrap();
+    assert!(
+        crate::db::parse_ts(&seen).unwrap() > chrono::Utc::now() - chrono::Duration::seconds(20)
+    );
+}
+
+#[tokio::test]
+async fn peer_status_transitions_and_error_changes_are_notified() {
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    let peer = super::net::peers(&b.state).await.unwrap().remove(0);
+    sqlx::query(
+        "UPDATE peers SET status = 'online', last_seen_at = ?, last_error = NULL WHERE id = ?",
+    )
+    .bind(crate::db::now())
+    .bind(&peer.id)
+    .execute(&b.state.db)
+    .await
+    .unwrap();
+    let mut updates = b.state.events.subscribe();
+    super::net::mark(&b.state, &peer.id, Err("unreachable".into())).await;
+    assert!(matches!(
+        updates.try_recv(),
+        Ok(crate::state::ServerEvent::SyncChanged)
+    ));
+    super::net::mark(&b.state, &peer.id, Err("unreachable".into())).await;
+    assert!(updates.try_recv().is_err());
+    super::net::mark(&b.state, &peer.id, Err("timed out".into())).await;
+    assert!(matches!(
+        updates.try_recv(),
+        Ok(crate::state::ServerEvent::SyncChanged)
+    ));
+    super::net::mark(&b.state, &peer.id, Ok(())).await;
+    assert!(matches!(
+        updates.try_recv(),
+        Ok(crate::state::ServerEvent::SyncChanged)
+    ));
+    let (status, error): (String, Option<String>) =
+        sqlx::query_as("SELECT status, last_error FROM peers WHERE id = ?")
+            .bind(&peer.id)
+            .fetch_one(&b.state.db)
+            .await
+            .unwrap();
+    assert_eq!(
+        (status.as_str(), error.as_deref()),
+        ("online", Some("timed out"))
+    );
+    super::net::mark_processing_result(&b.state, &peer.id, Some("processing failed")).await;
+    assert!(matches!(
+        updates.try_recv(),
+        Ok(crate::state::ServerEvent::SyncChanged)
+    ));
+    super::net::mark_processing_result(&b.state, &peer.id, Some("processing failed")).await;
+    assert!(updates.try_recv().is_err());
+    super::net::mark_processing_result(&b.state, &peer.id, None).await;
+    assert!(matches!(
+        updates.try_recv(),
+        Ok(crate::state::ServerEvent::SyncChanged)
+    ));
+    let error: Option<String> = sqlx::query_scalar("SELECT last_error FROM peers WHERE id = ?")
+        .bind(&peer.id)
+        .fetch_one(&b.state.db)
+        .await
+        .unwrap();
+    assert_eq!(error, None);
+}
+
+#[tokio::test]
 async fn recovery_automatically_finishes_local_bookkeeping_once() {
     let (mut a, mut b) = pair().await;
     stop_workers(&mut a).await;
