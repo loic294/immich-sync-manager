@@ -590,7 +590,16 @@ pub(crate) async fn eligibility(
     Ok(Eligibility::Ready(override_id))
 }
 
-async fn next(state: &AppState) -> AppResult<Option<(Transfer, Option<String>)>> {
+#[cfg(test)]
+pub(super) struct EligibilityPause {
+    pub reached: tokio::sync::oneshot::Sender<()>,
+    pub resume: tokio::sync::oneshot::Receiver<()>,
+}
+
+async fn next(
+    state: &AppState,
+    #[cfg(test)] pause: &mut Option<EligibilityPause>,
+) -> AppResult<Option<(Transfer, Option<String>)>> {
     let shares = super::shares(state).await?;
     type R = (
         String,
@@ -641,9 +650,15 @@ async fn next(state: &AppState) -> AppResult<Option<(Transfer, Option<String>)>>
             let Some(share) = shares.iter().find(|share| share.id == share_id) else {
                 continue;
             };
-            if let Eligibility::Ready(ov) =
-                eligibility(state, share, &peer_id, &id, &rel, attempts, &updated).await?
+            let eligible = eligibility(state, share, &peer_id, &id, &rel, attempts, &updated).await?;
+            #[cfg(test)]
+            if matches!(eligible, Eligibility::Waiting { blocked: true, .. })
+                && let Some(pause) = pause.take()
             {
+                let _ = pause.reached.send(());
+                let _ = pause.resume.await;
+            }
+            if let Eligibility::Ready(ov) = eligible {
                 return Ok(Some((
                     Transfer {
                         id,
@@ -668,11 +683,20 @@ async fn next(state: &AppState) -> AppResult<Option<(Transfer, Option<String>)>>
 }
 
 pub async fn run(state: AppState) {
+    run_inner(state, #[cfg(test)] None).await;
+}
+
+#[cfg(test)]
+pub(super) async fn run_paused(state: AppState, pause: EligibilityPause) {
+    run_inner(state, Some(pause)).await;
+}
+
+async fn run_inner(state: AppState, #[cfg(test)] mut pause: Option<EligibilityPause>) {
     let tick = Duration::from_secs(state.config.tick_secs.max(1));
     let mut tasks = tokio::task::JoinSet::new();
     loop {
         if tasks.len() < state.config.peer_transfer_concurrency {
-            match next(&state).await {
+            match next(&state, #[cfg(test)] &mut pause).await {
                 Ok(Some((t, ov))) => {
                     match claim(&state, &t.id, ov.as_deref()).await {
                         Ok(true) => {}
