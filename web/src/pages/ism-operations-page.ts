@@ -9,6 +9,7 @@ import { tabKeydown } from '@/util/tabs';
 import '@/components/ism-operation-table';
 import '@/components/ism-operation-detail';
 import '@/components/ism-pagination';
+import '@/components/ism-background-activity';
 
 const FILTERS = [
   ['', 'All'],
@@ -64,7 +65,9 @@ export class IsmOperationsPage extends IsmPage {
     return html`${this.frame(
       () => html`
       <h2 class="sr-only">Operations</h2>
+      <ism-background-activity @operation-open=${(e: CustomEvent<string>) => this.detail.value?.show(e.detail)}></ism-background-activity>
       <section class="min-w-0 rounded-box border border-base-300 bg-base-100">
+        <h2 class="px-4 pt-4 text-lg font-semibold">Managed file operations</h2>
         <div role="tablist" aria-label="Operation status" class="tabs tabs-border flex-nowrap overflow-x-auto" @keydown=${tabKeydown}>
           ${FILTERS.map(
             ([value, label]) => html`<button type="button" role="tab"

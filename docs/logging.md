@@ -46,12 +46,30 @@ filter over global `debug` or `trace`, which also enables third-party library di
 Runtime logs complement, rather than replace, ISM's persistent records in the database on `/data`:
 
 - **Audit:** administrative actions, settings changes, login failures and recovery actions.
-- **Operations:** per-item progress, outcomes, errors and recovery details.
+- **Operations:** live background activity and sync waiting reasons, plus managed file-operation
+  progress, outcomes, errors and recovery details. Background activity includes scans, hashing,
+  peer event/inventory processing, transfers, maintenance, upload verification, and recovery.
 - **Sync / Conflicts:** queued or failed transfers and conflict details.
 - **Overview / Mappings:** maintenance blocks, watcher warnings and pending library scans.
 
 These records survive container replacement as long as the `/data` volume is preserved. Keep
 that volume backed up; do not delete it to clear a log or to recover a blocked operation.
+
+Background runs retain their current phase, measured counters, resource, and timestamps.
+Unknown totals show counts or a phase, not an invented percentage or ETA. Counters are scoped to
+the displayed phase (for example bytes hashed versus files reconciled); progress writes and
+notifications are coalesced to a one-second cadence. No progress update is not proof of a hang.
+Unexpected worker exits and interrupted runs remain visible rather than appearing healthy.
+
+Recent completed background history is kept for seven days, capped at 1,000 runs; older resolved
+issues share that bound. Active runs and unresolved failures are not evicted by retention.
+Repeated failures update the scoped issue, and a successful subsequent run resolves it. On restart,
+unfinished runs are marked interrupted; actual queued work is recovered by the existing workers,
+not by the reporting system. Managed file-operation history is unchanged.
+
+The live activity section remains visible when managed-operation history is filtered or paginated.
+It refreshes from live notifications and independently every five seconds. A lost connection,
+failed snapshot, or persistence error is shown explicitly, retaining the last received evidence.
 
 ## Sharing a report
 

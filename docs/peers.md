@@ -10,6 +10,12 @@ the ISM trash, never straight to deletion.
 
 ## Pairing
 
+Use **Operations -> Background activity** to see peer connection checks, event processing,
+inventory backfill, file transfer/verification, and recovery work together. Queued transfers explain
+their actual wait: offline peer, allowed hours, retry backoff, unavailable root, dependent original
+file, recovery barrier, or transfer capacity. The related **Sync** and **Peers** pages retain their
+existing controls. A peer-specific wait is not a claim that every share or server has stopped.
+
 1. On instance A: **Peers → Create invite**. The invite is valid for 24 hours and works once.
 2. On instance B: **Peers → Accept invite**, paste it, and give A's URL (e.g. `http://192.0.2.10:8080`)
    and B's own callback URL as seen from A.

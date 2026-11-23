@@ -1,5 +1,7 @@
 //! Immich Sync Manager server.
 
+mod activity;
+mod activity_blockers;
 mod auth;
 mod config;
 mod crypto;
@@ -41,20 +43,41 @@ async fn main() -> anyhow::Result<()> {
     let listen = config.listen;
     let state = AppState::new(config, pool, secrets).await?;
 
+    activity::recover(&state)
+        .await
+        .context("activity restart recovery failed")?;
+    tokio::spawn(activity::run(state.clone()));
+
     maintenance::recover_after_restart(&state)
         .await
         .context("restart recovery failed")?;
     peers::transfer::recover_after_restart(&state)
         .await
         .context("peer transfer restart recovery failed")?;
-    tokio::spawn(maintenance::run(state.clone()));
-    tokio::spawn(ops::exec::run(state.clone()));
-    tokio::spawn(peers::run(state.clone()));
-    tokio::spawn(peers::scan_worker(state.clone()));
-    tokio::spawn(peers::transfer::run(state.clone()));
-    tokio::spawn(peers::recovery::run(state.clone()));
-    tokio::spawn(watch::run(state.clone()));
-    tokio::spawn(watch::scheduler::run(state.clone()));
+    activity::spawn(
+        &state,
+        "Maintenance controller",
+        maintenance::run(state.clone()),
+    );
+    activity::spawn(&state, "Operation executor", ops::exec::run(state.clone()));
+    activity::spawn(&state, "Peer workers", peers::run(state.clone()));
+    activity::spawn(&state, "Share scanner", peers::scan_worker(state.clone()));
+    activity::spawn(
+        &state,
+        "Transfer dispatcher",
+        peers::transfer::run(state.clone()),
+    );
+    activity::spawn(
+        &state,
+        "Recovery worker",
+        peers::recovery::run(state.clone()),
+    );
+    activity::spawn(&state, "File watcher", watch::run(state.clone()));
+    activity::spawn(
+        &state,
+        "Library scheduler",
+        watch::scheduler::run(state.clone()),
+    );
     let janitor = state.clone();
     tokio::spawn(async move {
         loop {

@@ -416,6 +416,9 @@ pub struct OperationActivity {
     pub finished_at: Option<String>,
     pub handled_at: Option<String>,
     pub recovery_resolved: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub phase: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -423,6 +426,50 @@ pub struct OperationActivity {
 pub struct OperationPage {
     pub rows: Vec<OperationActivity>,
     pub total: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct BackgroundActivity {
+    pub id: String,
+    pub task_key: String,
+    pub title: String,
+    pub resource: String,
+    pub status: BackgroundStatus,
+    pub phase: String,
+    pub done: u64,
+    pub total: Option<u64>,
+    pub unit: String,
+    pub started_at: String,
+    pub updated_at: String,
+    pub finished_at: Option<String>,
+    pub next_at: Option<String>,
+    pub error: Option<String>,
+    pub operation_id: Option<String>,
+    pub page: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum BackgroundStatus {
+    Running,
+    Waiting,
+    Blocked,
+    Completed,
+    Failed,
+    Interrupted,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct BackgroundActivityPage {
+    // Current work and unresolved issues are never hidden by history pagination.
+    pub current: Vec<BackgroundActivity>,
+    pub history: Vec<BackgroundActivity>,
+    pub total: i64,
+    pub observed_at: String,
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]

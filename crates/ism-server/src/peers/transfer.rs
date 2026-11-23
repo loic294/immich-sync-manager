@@ -78,6 +78,15 @@ fn existing_original_for_companion(
     }))
 }
 
+pub(crate) fn retry_at(attempts: i64, updated: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    if attempts <= 0 {
+        return None;
+    }
+    db::parse_ts(updated)
+        .and_then(|at| at.checked_add_signed(chrono::Duration::minutes(attempts)))
+        .filter(|at| *at > chrono::Utc::now())
+}
+
 fn peer_upload_file(
     folder: &std::path::Path,
     name: &str,
@@ -495,7 +504,11 @@ struct Transfer {
     restore_parent: Option<String>,
 }
 
-async fn original_pending(state: &AppState, share_id: &str, rel: &str) -> AppResult<bool> {
+pub(crate) async fn original_pending(
+    state: &AppState,
+    share_id: &str,
+    rel: &str,
+) -> AppResult<bool> {
     let extensions = state.sidecar_extensions();
     if !is_companion_name(rel, &extensions) {
         return Ok(false);
@@ -521,6 +534,62 @@ async fn original_pending(state: &AppState, share_id: &str, rel: &str) -> AppRes
     }))
 }
 
+pub(crate) enum Eligibility {
+    Ready(Option<String>),
+    Waiting {
+        reason: String,
+        next_at: Option<String>,
+        blocked: bool,
+    },
+}
+
+pub(crate) async fn eligibility(
+    state: &AppState,
+    share: &super::Share,
+    peer: &str,
+    id: &str,
+    rel: &str,
+    attempts: i64,
+    updated: &str,
+) -> AppResult<Eligibility> {
+    match super::inbox::require_stable_transfer(state, share, &[rel], id).await {
+        Ok(()) => {}
+        Err(e) if matches!(e.code(), "recovery_required" | "root_unavailable") => {
+            return Ok(Eligibility::Waiting {
+                reason: crate::error::redact(e.message()),
+                next_at: None,
+                blocked: true,
+            });
+        }
+        Err(e) => return Err(e),
+    }
+    if let Some(at) = retry_at(attempts, updated) {
+        return Ok(Eligibility::Waiting {
+            reason: "Retry backoff after a failed transfer".into(),
+            next_at: Some(db::ts(at)),
+            blocked: false,
+        });
+    }
+    let (ok, override_id) = allowed(state, &share.id, peer).await?;
+    if !ok {
+        let view = super::admin::schedule(state).await?;
+        let schedule = Schedule::new(&view.timezone, &view.windows).map_err(AppError::internal)?;
+        return Ok(Eligibility::Waiting {
+            reason: "Waiting for allowed file-transfer hours".into(),
+            next_at: schedule.next_allowed(chrono::Utc::now()).map(db::ts),
+            blocked: false,
+        });
+    }
+    if original_pending(state, &share.id, rel).await? {
+        return Ok(Eligibility::Waiting {
+            reason: "Waiting for the original file before transferring its companion".into(),
+            next_at: None,
+            blocked: false,
+        });
+    }
+    Ok(Eligibility::Ready(override_id))
+}
+
 async fn next(state: &AppState) -> AppResult<Option<(Transfer, Option<String>)>> {
     let shares = super::shares(state).await?;
     type R = (
@@ -538,7 +607,6 @@ async fn next(state: &AppState) -> AppResult<Option<(Transfer, Option<String>)>>
         Option<String>,
         Option<String>,
     );
-    let now = chrono::Utc::now();
     let mut offset = 0_i64;
     loop {
         let rows: Vec<R> = sqlx::query_as(
@@ -573,20 +641,9 @@ async fn next(state: &AppState) -> AppResult<Option<(Transfer, Option<String>)>>
             let Some(share) = shares.iter().find(|share| share.id == share_id) else {
                 continue;
             };
-            match super::inbox::require_stable_transfer(state, share, &[&rel], &id).await {
-                Ok(()) => {}
-                Err(e) if matches!(e.code(), "recovery_required" | "root_unavailable") => continue,
-                Err(e) => return Err(e),
-            }
-            // Back off after failures: one minute per attempt.
-            if attempts > 0
-                && db::parse_ts(&updated)
-                    .is_some_and(|u| now - u < chrono::Duration::minutes(attempts))
+            if let Eligibility::Ready(ov) =
+                eligibility(state, share, &peer_id, &id, &rel, attempts, &updated).await?
             {
-                continue;
-            }
-            let (ok, ov) = allowed(state, &share_id, &peer_id).await?;
-            if ok && !original_pending(state, &share_id, &rel).await? {
                 return Ok(Some((
                     Transfer {
                         id,
@@ -732,6 +789,41 @@ enum Outcome {
 }
 
 async fn run_one(state: &AppState, t: &Transfer) -> Result<Outcome, String> {
+    let task = crate::activity::Task::start(
+        state,
+        format!("transfer:{}", t.id),
+        "Peer file transfer",
+        &t.rel,
+        Some("/sync"),
+    )
+    .await
+    .map_err(|e| e.message().to_owned())?;
+    let result = run_one_reporting(state, t, &task).await;
+    let report = match &result {
+        Err(e) => Err(AppError::conflict(
+            "transfer_failed",
+            crate::error::redact(e),
+        )),
+        Ok(Outcome::Blocked(reason)) => Err(AppError::conflict("transfer_blocked", *reason)),
+        _ => Ok(()),
+    };
+    let phase = match &result {
+        Ok(Outcome::Deferred) => "Attempt deferred; file remains queued for its prerequisites",
+        Ok(Outcome::Dropped) => "Attempt ended; transfer is no longer applicable",
+        _ => "Transfer attempt finished",
+    };
+    task.finish_with_phase(&report, phase)
+        .await
+        .map_err(|e| e.message().to_owned())?;
+    result
+}
+
+async fn run_one_reporting(
+    state: &AppState,
+    t: &Transfer,
+    task: &crate::activity::Reporter,
+) -> Result<Outcome, String> {
+    task.phase("Verifying peer source evidence");
     // Retain legacy queue entries for inspection, but never adopt or publish their content.
     if super::excluded_path(&t.rel, &state.junk_rules()) {
         return Ok(Outcome::Blocked(
@@ -795,7 +887,9 @@ async fn run_one(state: &AppState, t: &Transfer) -> Result<Outcome, String> {
             return Ok(Outcome::Deferred);
         }
     }
+    task.waiting("Waiting for the replication-operation lock");
     let operation_guard = state.replication_operation_lock.lock().await;
+    task.phase("Verifying local file and transfer prerequisites");
     if let Err(e) = super::inbox::require_stable_transfer(state, &share, &[&t.rel], &t.id).await {
         return if matches!(e.code(), "recovery_required" | "root_unavailable") {
             Ok(Outcome::Deferred)
@@ -993,6 +1087,7 @@ async fn run_one(state: &AppState, t: &Transfer) -> Result<Outcome, String> {
         let expected_bytes = end - done + 1;
         let mut received = 0_u64;
         let mut stream = resp.bytes_stream();
+        task.phase("Downloading file contents");
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| net::net_error(&e))?;
             if received + chunk.len() as u64 > expected_bytes {
@@ -1001,6 +1096,7 @@ async fn run_one(state: &AppState, t: &Transfer) -> Result<Outcome, String> {
             file.write_all(&chunk).await.map_err(|e| e.to_string())?;
             received += chunk.len() as u64;
             done += chunk.len() as u64;
+            task.progress(done, Some(expected_size), "bytes transferred");
             if done - reported >= PROGRESS_EVERY || last_report.elapsed() >= Duration::from_secs(1)
             {
                 if !super::activity::record_progress(
@@ -1048,10 +1144,16 @@ async fn run_one(state: &AppState, t: &Transfer) -> Result<Outcome, String> {
     file.sync_all().await.map_err(|e| e.to_string())?;
     drop(file);
     let check = staging.clone();
-    let hash = tokio::task::spawn_blocking(move || files::sha256_file(&check))
-        .await
-        .map_err(|e| e.to_string())?
-        .map_err(|e| e.to_string())?;
+    task.phase("Verifying downloaded checksum");
+    let reporter = task.clone();
+    let hash = tokio::task::spawn_blocking(move || {
+        files::sha256_reporting(&check, |done| {
+            reporter.progress(done, Some(expected_size), "bytes hashed")
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
     if hash != t.sha256 {
         if t.retained_token.is_some() {
             super::retained::preserve_staging(&root, &t.id).map_err(m)?;
@@ -1061,7 +1163,9 @@ async fn run_one(state: &AppState, t: &Transfer) -> Result<Outcome, String> {
         return Err("downloaded data does not match its checksum".into());
     }
 
+    task.waiting("Waiting for the replication-operation lock before publication");
     let _operation_guard = state.replication_operation_lock.lock().await;
+    task.phase("Verifying destination and submitting safe publication");
     if let Err(e) = super::inbox::require_stable_transfer(state, &share, &[&t.rel], &t.id).await {
         return if matches!(e.code(), "recovery_required" | "root_unavailable") {
             Ok(Outcome::Deferred)

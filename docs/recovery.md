@@ -4,6 +4,12 @@ ISM fails closed: sync recovery completes only after ISM verifies the filesystem
 bookkeeping, and any required Immich effects. Failed sync work enters a durable recovery queue
 automatically; the **Needs attention** tab also provides **Fix selected** and **Fix all**.
 
+**Operations -> Background activity** shows recovery execution and peer forwarding alongside
+the tasks they depend on. Waiting entries explain unavailable evidence, mounts/peers, maintenance,
+or version decisions; related operation links open existing recovery details. Interrupted background
+run records are diagnostic history, not permission to bypass a barrier or automatically retry a
+file operation.
+
 | Recovery state | Meaning |
 | --- | --- |
 | **Queued / Fixing** | Recovery is admitted or running, not yet complete. |

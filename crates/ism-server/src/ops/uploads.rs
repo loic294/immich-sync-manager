@@ -440,12 +440,23 @@ pub async fn commit(
     principal: &Principal,
     id: &str,
 ) -> AppResult<OperationAccepted> {
+    let task = crate::activity::Task::start(
+        state,
+        format!("upload:{id}"),
+        "Upload verification",
+        id,
+        Some("/operations"),
+    )
+    .await?;
+    task.waiting("Waiting for the upload lock");
     let guard = state.lock_upload(id).await;
     let (state, principal, id) = (state.clone(), principal.clone(), id.to_owned());
     // A disconnected client must not interrupt checksum verification and publication.
     tokio::spawn(async move {
         let _guard = guard;
-        commit_locked(&state, &principal, &id).await
+        let result = commit_locked(&state, &principal, &id, &task).await;
+        task.finish(&result).await?;
+        result
     })
     .await
     .map_err(AppError::internal)?
@@ -455,7 +466,9 @@ async fn commit_locked(
     state: &AppState,
     principal: &Principal,
     id: &str,
+    task: &crate::activity::Reporter,
 ) -> AppResult<OperationAccepted> {
+    task.phase("Checking upload completeness");
     let (req, status) = load(state, principal, id).await?;
     if status != "receiving" {
         let op: Option<String> =
@@ -477,6 +490,8 @@ async fn commit_locked(
     }
     let dir = staging(state, &req, id).await?;
     for (i, spec) in req.files.iter().enumerate() {
+        task.phase(&format!("Verifying checksum for {}", spec.name));
+        task.progress(i as u64, Some(req.files.len() as u64), "files verified");
         let path = dir.join(i.to_string());
         let metadata = std::fs::metadata(&path).map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
@@ -498,10 +513,16 @@ async fn commit_locked(
                 format!("{}: received {len} of {} bytes", spec.name, spec.size),
             ));
         }
-        let hash = tokio::task::spawn_blocking(move || files::sha256_file(&path))
-            .await
-            .map_err(AppError::internal)?
-            .map_err(AppError::internal)?;
+        let reporter = task.clone();
+        let size = spec.size;
+        let hash = tokio::task::spawn_blocking(move || {
+            files::sha256_reporting(&path, |done| {
+                reporter.progress(done, Some(size), "bytes hashed")
+            })
+        })
+        .await
+        .map_err(AppError::internal)?
+        .map_err(AppError::internal)?;
         if !hash.eq_ignore_ascii_case(&spec.sha256) {
             return Err(AppError::conflict(
                 "checksum_mismatch",
@@ -527,6 +548,12 @@ async fn commit_locked(
         allow_owner_transfer: false,
         allow_partial: false,
     };
+    task.progress(
+        req.files.len() as u64,
+        Some(req.files.len() as u64),
+        "files verified",
+    );
+    task.waiting("Waiting to submit safe upload publication");
     let _operation_guard = state
         .lock_operation_submission(&principal.key(), &request.idempotency_key)
         .await;
@@ -558,14 +585,22 @@ async fn cleanup_checked(state: &AppState, req: &CreateUpload, id: &str) -> AppR
 
 /// Removes the staging folder of a published or abandoned upload.
 pub async fn cleanup(state: &AppState, id: &str) {
-    let result = async {
-        let req: String = sqlx::query_scalar("SELECT request_json FROM uploads WHERE id = ?")
-            .bind(id)
-            .fetch_one(&state.db)
-            .await?;
-        let req: CreateUpload = serde_json::from_str(&req)?;
-        cleanup_checked(state, &req, id).await
-    }
+    let result = crate::activity::observe(
+        state,
+        format!("cleanup:{id}"),
+        "Upload staging cleanup",
+        id,
+        Some("/operations"),
+        |task| async move {
+            task.phase("Removing staging for a published or abandoned upload");
+            let req: String = sqlx::query_scalar("SELECT request_json FROM uploads WHERE id = ?")
+                .bind(id)
+                .fetch_one(&state.db)
+                .await?;
+            let req: CreateUpload = serde_json::from_str(&req)?;
+            cleanup_checked(state, &req, id).await
+        },
+    )
     .await;
     if let Err(error) = result {
         tracing::error!(upload_id = %id, code = %error.code(), "could not clean up upload staging");
@@ -626,12 +661,33 @@ pub async fn expire(state: &AppState) {
         }
     };
     for id in ids {
+        let task = match crate::activity::Task::start(
+            state,
+            format!("expire:{id}"),
+            "Expired upload cleanup",
+            &id,
+            Some("/operations"),
+        )
+        .await
+        {
+            Ok(task) => task,
+            Err(error) => {
+                tracing::error!("cannot record upload expiry: {}", error.message());
+                continue;
+            }
+        };
+        task.waiting("Waiting for the upload lock");
         let _guard = state.lock_upload(&id).await;
+        task.phase("Checking expired upload and clearing abandoned staging");
         let result = sqlx::query("UPDATE uploads SET status = 'failed' WHERE id = ? AND status = 'receiving' AND created_at < ?")
             .bind(&id)
             .bind(&cutoff)
             .execute(&state.db)
             .await;
+        let report = result.as_ref().map(|_| ()).map_err(AppError::internal);
+        if let Err(error) = task.finish(&report).await {
+            tracing::error!("cannot record upload expiry outcome: {}", error.message());
+        }
         match result {
             Ok(result) if result.rows_affected() == 1 => cleanup(state, &id).await,
             Ok(_) => {}
@@ -648,6 +704,24 @@ pub async fn fill_asset_ids(
     server_id: &str,
     library_id: &str,
 ) -> AppResult<usize> {
+    crate::activity::observe(
+        state,
+        format!("asset-lookup:{library_id}"),
+        "Imported asset lookup",
+        library_id,
+        Some("/operations"),
+        |task| async move { fill_asset_ids_reporting(state, server_id, library_id, &task).await },
+    )
+    .await
+}
+
+async fn fill_asset_ids_reporting(
+    state: &AppState,
+    server_id: &str,
+    library_id: &str,
+    task: &crate::activity::Reporter,
+) -> AppResult<usize> {
+    task.phase("Looking up published uploads in Immich");
     let cutoff = db::ts(chrono::Utc::now() - chrono::Duration::days(14));
     let waiting: Vec<(String, String, i64)> = sqlx::query_as(
         "SELECT u.request_json, i.operation_id, i.idx FROM uploads u
@@ -668,7 +742,9 @@ pub async fn fill_asset_ids(
     let server = crate::immich::registry::server(state, server_id).await?;
     let mut lookup = AssetLookup::new(state, &server, library_id).await;
     let mut filled = 0;
-    for (request_json, operation_id, index) in waiting {
+    let total = waiting.len() as u64;
+    for (done, (request_json, operation_id, index)) in waiting.into_iter().enumerate() {
+        task.progress(done as u64, Some(total), "uploads checked");
         let Ok(req) = serde_json::from_str::<CreateUpload>(&request_json) else {
             continue;
         };

@@ -85,15 +85,46 @@ pub async fn preview(
     req: &OperationRequest,
 ) -> AppResult<PreviewResponse> {
     check_grants(principal, req)?;
+    let key = crate::crypto::sha256_hex(
+        format!("{}\0{}", principal.key(), req.idempotency_key).as_bytes(),
+    );
+    crate::activity::observe(
+        state,
+        format!("preview:{key}"),
+        "Operation preview",
+        req.label.as_deref().unwrap_or("Managed file request"),
+        Some("/operations"),
+        |task| async move { preview_reporting(state, principal, req, &task).await },
+    )
+    .await
+}
+
+async fn preview_reporting(
+    state: &AppState,
+    principal: &Principal,
+    req: &OperationRequest,
+    task: &crate::activity::Reporter,
+) -> AppResult<PreviewResponse> {
+    task.phase("Planning and verifying requested file actions");
     let ctx = plan::Ctx::new(state, principal, req.allow_owner_transfer).await?;
     let mut items = Vec::with_capacity(req.actions.len());
     let mut blockers: Vec<Issue> = Vec::new();
     for (index, action) in req.actions.iter().enumerate() {
+        task.progress(
+            index as u64,
+            Some(req.actions.len() as u64),
+            "actions planned",
+        );
         let p = plan::plan(&ctx, action).await?;
         for b in &p.blockers {
             if !blockers.iter().any(|x| x.code == b.code) {
                 blockers.push(b.clone());
             }
+            task.progress(
+                req.actions.len() as u64,
+                Some(req.actions.len() as u64),
+                "actions planned",
+            );
         }
         items.push(p.preview(index as u32, action.kind()));
     }
@@ -113,13 +144,28 @@ pub async fn submit(
     req: OperationRequest,
 ) -> AppResult<OperationAccepted> {
     validate_key(&req.idempotency_key)?;
+    let key = crate::crypto::sha256_hex(
+        format!("{}\0{}", principal.key(), req.idempotency_key).as_bytes(),
+    );
+    let task = crate::activity::Task::start(
+        state,
+        format!("submission:{key}"),
+        "Operation admission",
+        req.label.as_deref().unwrap_or("Managed file request"),
+        Some("/operations"),
+    )
+    .await?;
+    task.waiting("Waiting for the operation submission lock");
     let guard = state
         .lock_operation_submission(&principal.key(), &req.idempotency_key)
         .await;
     let (state, principal) = (state.clone(), principal.clone());
     tokio::spawn(async move {
         let _guard = guard;
-        submit_locked(&state, &principal, req).await
+        task.phase("Validating and admitting the managed operation");
+        let result = submit_locked(&state, &principal, req).await;
+        task.finish(&result).await?;
+        result
     })
     .await
     .map_err(AppError::internal)?

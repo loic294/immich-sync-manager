@@ -194,9 +194,38 @@ pub(crate) async fn step(state: &AppState, now_ms: i64) -> AppResult<Option<i64>
 }
 
 async fn scan(state: &AppState, server_id: &str, library_id: &str) -> AppResult<bool> {
+    let task = crate::activity::Task::start(
+        state,
+        format!("library:{library_id}"),
+        "Scoped library synchronization",
+        library_id,
+        Some("/mappings"),
+    )
+    .await?;
+    let result = scan_reporting(state, server_id, library_id, &task).await;
+    task.finish_with_phase(
+        &result,
+        if matches!(result, Ok(false)) {
+            "Attempt deferred; scoped work remains queued behind maintenance"
+        } else {
+            "Scoped synchronization finished"
+        },
+    )
+    .await?;
+    result
+}
+
+async fn scan_reporting(
+    state: &AppState,
+    server_id: &str,
+    library_id: &str,
+    task: &crate::activity::Reporter,
+) -> AppResult<bool> {
     // Direct file APIs do not pass through Immich's library queue. Serialize dispatch
     // with barrier admission, but release this lock before waiting for queued scans.
+    task.waiting("Waiting for maintenance admission");
     let guard = state.maintenance_lock.lock().await;
+    task.phase("Preparing scoped synchronization");
     let server = registry::server(state, server_id).await?;
     if !server.maintenance.scans_allowed() {
         return Ok(false);
@@ -234,7 +263,11 @@ async fn scan(state: &AppState, server_id: &str, library_id: &str) -> AppResult<
             files.insert(work.path, kind);
         }
     }
-    for (path, kind) in files {
+    let total = files.len() as u64;
+    task.progress(0, Some(total), "paths dispatched");
+    for (index, (path, kind)) in files.into_iter().enumerate() {
+        task.phase("Synchronizing files through the Immich API");
+        task.progress(index as u64, Some(total), "paths dispatched");
         if server.external_library_move_mode == ImmichMoveMode::DbOnly {
             if kind == WorkKind::Removed {
                 return Err(AppError::conflict(
@@ -273,6 +306,7 @@ async fn scan(state: &AppState, server_id: &str, library_id: &str) -> AppResult<
         folders.insert(Work::folder_for_file(&path)?.path);
     }
     let mut scanned: Vec<String> = Vec::new();
+    task.progress(total, Some(total), "paths dispatched");
     if !folders.is_empty() {
         let capable = match server.external_library_api_capable {
             Some(capable) => capable,
@@ -292,6 +326,7 @@ async fn scan(state: &AppState, server_id: &str, library_id: &str) -> AppResult<
         {
             continue;
         }
+        task.phase("Dispatching scoped folder scans to Immich");
         api.scan_library_folder(library_id, &folder)
             .await
             .map_err(immich)?;
@@ -304,12 +339,25 @@ async fn scan(state: &AppState, server_id: &str, library_id: &str) -> AppResult<
     let timing = &state.config.timing;
     let mut deadline = tokio::time::Instant::now() + timing.scan_timeout;
     let mut idle = IdleConfirmation::default();
+    task.waiting("Waiting for Immich to finish the library queue and confirm it idle");
     loop {
         tokio::time::sleep(timing.poll).await;
         let queues = api.queues().await.map_err(immich)?;
         let library = queues
             .iter()
             .find(|q| q.name == crate::maintenance::LIBRARY_QUEUE);
+        if let Some(queue) = library {
+            task.progress(
+                queue.statistics.active.max(0) as u64,
+                None,
+                "active Immich jobs",
+            );
+        }
+        task.waiting(if library.is_some_and(|q| q.is_paused) {
+            "Immich library queue is paused by a write barrier; waiting for release"
+        } else {
+            "Waiting for Immich library queue idle confirmation"
+        });
         if idle.observe(library.is_some_and(crate::immich::api::Queue::is_idle)) {
             return Ok(true);
         }

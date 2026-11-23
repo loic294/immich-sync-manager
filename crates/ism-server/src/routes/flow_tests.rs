@@ -28,6 +28,54 @@ struct Reply {
     body: bytes::Bytes,
 }
 
+#[tokio::test]
+async fn background_activity_requires_admin_and_keeps_current_work_outside_history_pagination() {
+    let h = harness().await;
+    let uri = "/api/admin/operations/background?limit=1&offset=99";
+    assert_eq!(
+        send(&h.app, get(uri, &[])).await.status,
+        StatusCode::UNAUTHORIZED
+    );
+    let task = crate::activity::Task::start(
+        &h.state,
+        "scan:example",
+        "Share scan",
+        "Archive",
+        Some("/peers"),
+    )
+    .await
+    .unwrap();
+    task.waiting("Waiting for the replication-operation lock");
+    task.progress(15, None, "files discovered");
+    let auth = [("cookie", h.cookie.as_str())];
+    let reply = send(&h.app, get(uri, &auth)).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.json());
+    assert_eq!(
+        reply.json()["current"][0]["phase"],
+        "Waiting for the replication-operation lock"
+    );
+    assert_eq!(reply.json()["current"][0]["done"], 15);
+    assert!(reply.json()["current"][0]["total"].is_null());
+    assert_eq!(reply.json()["history"].as_array().unwrap().len(), 0);
+    assert_eq!(
+        send(
+            &h.app,
+            get("/api/admin/operations/background?limit=0", &auth)
+        )
+        .await
+        .status,
+        StatusCode::BAD_REQUEST
+    );
+    task.finish(&Ok(())).await.unwrap();
+    let reply = send(
+        &h.app,
+        get("/api/admin/operations/background?limit=1", &auth),
+    )
+    .await;
+    assert_eq!(reply.json()["current"].as_array().unwrap().len(), 0);
+    assert_eq!(reply.json()["history"][0]["status"], "completed");
+}
+
 impl Reply {
     fn json(&self) -> Value {
         serde_json::from_slice(&self.body).unwrap_or(Value::Null)

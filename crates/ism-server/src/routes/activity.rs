@@ -28,6 +28,7 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/live", get(live))
         .route("/operations/page", get(operations))
+        .route("/operations/background", get(background))
         .route("/operations/{id}/detail", get(operation_detail))
         .route("/operations/{id}/handled", post(mark_handled))
         .route("/sync/page", get(sync))
@@ -116,6 +117,10 @@ async fn operation_page(
             CASE WHEN o.source = 'peer' THEN 'ISM: ' || COALESCE(p.name, 'removed peer')
                  WHEN o.source = 'admin' THEN 'ISM: ' || ?
                  ELSE upper(o.source) || CASE WHEN c.name IS NULL THEN '' ELSE ': ' || c.name END END AS source,
+            (SELECT json_extract(step.value,'$.label') FROM operation_items item,
+                json_each(item.progress_json,'$.steps') step
+             WHERE item.operation_id=o.id AND json_extract(step.value,'$.status')='running'
+             ORDER BY item.idx,step.key LIMIT 1) AS phase,
             COUNT(i.idx) AS total,
             COALESCE(SUM(i.status NOT IN ('pending','running')),0) AS done,
             group_concat(DISTINCT CASE
@@ -169,6 +174,16 @@ async fn operation_page(
                 finished_at: r.try_get("finished_at")?,
                 handled_at: r.try_get("handled_at")?,
                 recovery_resolved: r.try_get::<i64, _>("recovery_resolved")? != 0,
+                phase: r.try_get::<Option<String>, _>("phase")?.or_else(|| {
+                    match r.try_get::<String, _>("status").ok()?.as_str() {
+                        "waiting_maintenance" => {
+                            Some("Waiting for the Immich maintenance barrier".into())
+                        }
+                        "running" => Some("Planning and verifying the next action".into()),
+                        "queued" => Some("Queued for the operation executor".into()),
+                        _ => None,
+                    }
+                }),
             })
         })
         .collect::<Result<Vec<_>, sqlx::Error>>()?;
@@ -181,6 +196,15 @@ async fn operations(
     Query(q): Query<PageQuery>,
 ) -> AppResult<Json<OperationPage>> {
     Ok(Json(operation_page(&state, &q, None).await?))
+}
+
+async fn background(
+    State(state): State<AppState>,
+    Admin(_): Admin,
+    Query(q): Query<PageQuery>,
+) -> AppResult<Json<ism_core::dto::BackgroundActivityPage>> {
+    let (limit, offset) = q.bounds()?;
+    Ok(Json(crate::activity::page(&state, limit, offset).await?))
 }
 
 async fn operation_detail(

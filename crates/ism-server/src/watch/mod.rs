@@ -252,6 +252,36 @@ pub(crate) async fn pass(
     root: &Root,
     scope: Option<&str>,
 ) -> AppResult<PassOutcome> {
+    let task = crate::activity::Task::start(
+        state,
+        format!("watch:{}", root.mapping.root_id),
+        "File detection scan",
+        &root.name,
+        Some("/mappings"),
+    )
+    .await?;
+    let result = pass_reporting(state, root, scope, &task).await;
+    let phase = match &result {
+        Ok(PassOutcome::Paused(reason)) => {
+            format!("Detection paused: {}", crate::error::redact(reason))
+        }
+        Ok(PassOutcome::Baseline) => "Initial file baseline saved".into(),
+        Ok(PassOutcome::Changes(changes)) => {
+            format!("Detection finished: {} changes recorded", changes.len())
+        }
+        Err(_) => "Detection ended".into(),
+    };
+    task.finish_with_phase(&result, &phase).await?;
+    result
+}
+
+async fn pass_reporting(
+    state: &AppState,
+    root: &Root,
+    scope: Option<&str>,
+    task: &crate::activity::Reporter,
+) -> AppResult<PassOutcome> {
+    task.phase("Checking root availability");
     let root_id = root.mapping.root_id.as_str();
     let available = {
         let root = root.clone();
@@ -269,7 +299,14 @@ pub(crate) async fn pass(
         let base = root.base();
         let scope = scope.map(str::to_owned);
         let junk = state.junk_rules();
-        tokio::task::spawn_blocking(move || poll::walk(&base, scope.as_deref(), &junk)).await
+        task.phase("Enumerating files");
+        let reporter = task.clone();
+        tokio::task::spawn_blocking(move || {
+            poll::walk_reporting(&base, scope.as_deref(), &junk, |done| {
+                reporter.progress(done, None, "files discovered")
+            })
+        })
+        .await
     };
     let new = match walked {
         Ok(Ok(tree)) => tree,
@@ -281,6 +318,7 @@ pub(crate) async fn pass(
         Err(e) => return Err(AppError::internal(e)),
     };
     let old = poll::load(state, root_id, scope).await?;
+    task.phase("Comparing and saving the file snapshot");
     if scope.is_none() {
         let status = load_status(state, root_id).await?;
         if status.last_pass_at.is_none() {

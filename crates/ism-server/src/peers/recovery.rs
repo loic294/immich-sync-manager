@@ -2192,7 +2192,22 @@ pub async fn tick(state: &AppState) -> AppResult<()> {
             continue;
         }
         state.emit(ServerEvent::SyncChanged);
-        let (status, code, detail, consumes_attempt) = match process(state, &kind, &id).await {
+        let result = crate::activity::observe(
+            state,
+            format!("recovery:{job}"),
+            "Recovery execution",
+            &format!("{kind}: {id}"),
+            Some("/sync"),
+            |task| {
+                let (kind, id) = (&kind, &id);
+                async move {
+                    task.phase("Verifying evidence and applying the recovery plan");
+                    process(state, kind, id).await
+                }
+            },
+        )
+        .await;
+        let (status, code, detail, consumes_attempt) = match result {
             Ok(true) => ("fixed", None, None, false),
             Ok(false) => (
                 "waiting",
@@ -2446,7 +2461,13 @@ async fn forward_loop(state: AppState) {
                 for peer in peers {
                     let state = state.clone();
                     workers.spawn(async move {
-                        if let Err(error) = forward_peer(&state, &peer).await {
+                        if let Err(error) = crate::activity::observe(&state, format!("recovery-forward:{peer}"),
+                            "Forward recovery request", &peer, Some("/sync"), |task| {
+                                let (state,peer)=(&state,&peer);
+                                async move {
+                                task.phase("Forwarding recovery decisions to peer");
+                                forward_peer(state,peer).await
+                            }}).await {
                             tracing::error!(peer=%peer, "outgoing recovery worker: {}", error.message());
                         }
                     });

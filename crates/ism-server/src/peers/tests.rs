@@ -5931,14 +5931,22 @@ async fn competing_peer_event_stays_unacknowledged_and_reports_the_error() {
         .await
         .unwrap();
     assert_eq!(hash, old_hash);
-    assert!(matches!(
-        updates.try_recv().unwrap(),
-        crate::state::ServerEvent::SyncChanged
-    ));
+    let mut sync_changed = || {
+        let mut changed = false;
+        while let Ok(event) = updates.try_recv() {
+            match event {
+                crate::state::ServerEvent::SyncChanged => changed = true,
+                crate::state::ServerEvent::ActivityChanged => {}
+                other => panic!("unexpected sync event: {other:?}"),
+            }
+        }
+        changed
+    };
+    assert!(sync_changed());
     super::poll_peer(&b.state, &peer).await;
     assert!(
-        updates.try_recv().is_err(),
-        "unchanged errors should not reload the UI"
+        !sync_changed(),
+        "unchanged errors should not reload sync state"
     );
     sqlx::query("DELETE FROM event_log WHERE origin = ?")
         .bind(&a.state.instance_id)
@@ -5953,7 +5961,7 @@ async fn competing_peer_event_stays_unacknowledged_and_reports_the_error() {
         .unwrap();
     assert!(error.is_some_and(|error| error.contains("conflicting contents")));
     assert!(
-        updates.try_recv().is_err(),
+        !sync_changed(),
         "durable input is not discarded when the peer removes its log"
     );
 }

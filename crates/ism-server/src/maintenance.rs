@@ -85,9 +85,26 @@ pub async fn acquire(state: &AppState, server_id: &str) -> AppResult<()> {
 /// Checks the settings, pauses the library queue and confirms it idle. On failure the queue is
 /// resumed (when possible) and the server blocked; no file has been touched.
 async fn prepare(state: &AppState, server_id: &str) -> AppResult<()> {
+    crate::activity::observe(
+        state,
+        format!("prepare:{server_id}"),
+        "Prepare Immich write barrier",
+        server_id,
+        Some("/servers"),
+        |task| async move { prepare_reporting(state, server_id, &task).await },
+    )
+    .await
+}
+
+async fn prepare_reporting(
+    state: &AppState,
+    server_id: &str,
+    task: &crate::activity::Reporter,
+) -> AppResult<()> {
+    task.phase("Verifying settings and pausing the Immich library queue");
     let server = registry::server(state, server_id).await?;
     let outcome = match registry::admin_api(state, &server).await {
-        Ok(api) => pause_confirmed(state, &api)
+        Ok(api) => pause_confirmed(state, &api, task)
             .await
             .map_err(|e| (Some(api), e)),
         Err(e) => Err((None, PauseError::Other(e))),
@@ -167,7 +184,11 @@ async fn library_queue(api: &Api) -> AppResult<api::Queue> {
 /// active job. Jobs queued meanwhile (an administrator clicking Scan, for example) wait in the
 /// paused queue and only run after the release, so `waiting`/`delayed` jobs do not delay
 /// admission; waiting for them would deadlock behind a held scan.
-async fn pause_confirmed(state: &AppState, api: &Api) -> Result<(), PauseError> {
+async fn pause_confirmed(
+    state: &AppState,
+    api: &Api,
+    task: &crate::activity::Reporter,
+) -> Result<(), PauseError> {
     let timing = &state.config.timing;
     if let Some(drift) = settings_drift(api).await? {
         return Err(PauseError::Drift(drift));
@@ -180,6 +201,12 @@ async fn pause_confirmed(state: &AppState, api: &Api) -> Result<(), PauseError> 
     let mut confirmation = IdleConfirmation::default();
     loop {
         let queue = library_queue(api).await?;
+        task.waiting("Confirming the paused Immich library queue has no active jobs");
+        task.progress(
+            queue.statistics.active.max(0) as u64,
+            None,
+            "active Immich jobs",
+        );
         if confirmation.observe(queue.is_held()) {
             break;
         }
@@ -220,6 +247,34 @@ pub async fn release(state: &AppState, server_id: &str) -> AppResult<()> {
 
 /// Resumes a queue ISM paused. Failures block the server (shown with a retry action).
 async fn resume(state: &AppState, server_id: &str) -> AppResult<()> {
+    let task = crate::activity::Task::start(
+        state,
+        format!("resume:{server_id}"),
+        "Resume Immich library queue",
+        server_id,
+        Some("/servers"),
+    )
+    .await?;
+    task.phase("Resuming the library queue after managed operations");
+    let result = resume_inner(state, server_id).await;
+    let report = match &result {
+        Err(e) => Err(blocked(e.message())),
+        Ok(()) => {
+            let server = registry::server(state, server_id).await?;
+            if server.maintenance.phase == Phase::Blocked {
+                Err(blocked(server.maintenance.message.unwrap_or_else(|| {
+                    "Library queue resume needs attention".into()
+                })))
+            } else {
+                Ok(())
+            }
+        }
+    };
+    task.finish(&report).await?;
+    result
+}
+
+async fn resume_inner(state: &AppState, server_id: &str) -> AppResult<()> {
     let server = registry::server(state, server_id).await?;
     let result = match registry::admin_api(state, &server).await {
         Ok(api) => api
@@ -412,6 +467,21 @@ async fn check_drift(state: &AppState, server: &Server) -> AppResult<()> {
     if !server.compatible || server.maintenance.drift.is_some() {
         return Ok(());
     }
+    crate::activity::observe(
+        state,
+        format!("drift:{}", server.id),
+        "Immich settings verification",
+        &server.name,
+        Some("/servers"),
+        |task| async move {
+            task.phase("Checking Immich file watcher and scheduled scan settings");
+            check_drift_inner(state, server).await
+        },
+    )
+    .await
+}
+
+async fn check_drift_inner(state: &AppState, server: &Server) -> AppResult<()> {
     let api = registry::admin_api(state, server).await?;
     if let Some(message) = settings_drift(&api).await? {
         tracing::warn!(server = %server.name, "{message}");

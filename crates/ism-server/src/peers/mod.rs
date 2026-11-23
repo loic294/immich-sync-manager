@@ -433,6 +433,16 @@ async fn register_local(
     root: &Root,
     rel: &str,
 ) -> AppResult<Option<Row>> {
+    register_local_reporting(state, share, root, rel, None).await
+}
+
+async fn register_local_reporting(
+    state: &AppState,
+    share: &Share,
+    root: &Root,
+    rel: &str,
+    task: Option<&crate::activity::Reporter>,
+) -> AppResult<Option<Row>> {
     let root_rel = share.root_rel(rel)?;
     let abs = root.abs(&root_rel)?;
     let meta = match fs::metadata(&abs) {
@@ -447,9 +457,20 @@ async fn register_local(
     }
     let existing = row(state, &share.id, rel).await?;
     let (size, mtime) = (meta.len() as i64, files::mtime_ns(&meta));
-    let fingerprint = tokio::task::spawn_blocking(move || files::replacement_fingerprint(&abs))
-        .await
-        .map_err(AppError::internal)??;
+    let reporter = task.cloned();
+    let total = meta.len();
+    if let Some(task) = task {
+        task.phase(&format!("Verifying checksum for {rel}"));
+    }
+    let fingerprint = tokio::task::spawn_blocking(move || {
+        files::replacement_fingerprint_reporting(&abs, |done| {
+            if let Some(task) = &reporter {
+                task.progress(done, Some(total), "bytes hashed");
+            }
+        })
+    })
+    .await
+    .map_err(AppError::internal)??;
     let Some((revision, sha)) = fingerprint else {
         return Err(AppError::conflict(
             "revision_changed",
@@ -505,7 +526,25 @@ async fn register_local(
 
 /// Compares a share with its rows and records local changes as events.
 pub async fn scan_share(state: &AppState, share: &Share) -> AppResult<()> {
+    crate::activity::observe(
+        state,
+        format!("share:{}", share.id),
+        "Share inventory scan",
+        &share.name,
+        Some("/peers"),
+        |task| async move { scan_share_reporting(state, share, &task).await },
+    )
+    .await
+}
+
+async fn scan_share_reporting(
+    state: &AppState,
+    share: &Share,
+    task: &crate::activity::Reporter,
+) -> AppResult<()> {
+    task.waiting("Waiting for the replication-operation lock");
     let _operation_guard = state.replication_operation_lock.lock().await;
+    task.phase("Checking active operations and uncertain paths");
     inbox::require_no_active_operations(state).await?;
     let mut blocked = blocked_footprints(state, share).await?;
     blocked.extend(admin::move_decision_footprints(state, share).await?);
@@ -521,6 +560,8 @@ pub async fn scan_share(state: &AppState, share: &Share) -> AppResult<()> {
         )));
     }
     let junk = share.junk.clone();
+    task.phase("Enumerating share files");
+    let reporter = task.clone();
     let (found, blocked, incomplete) = tokio::task::spawn_blocking(move || {
         let mut found = Vec::new();
         let mut uncertain = blocked.clone();
@@ -573,6 +614,7 @@ pub async fn scan_share(state: &AppState, share: &Share) -> AppResult<()> {
                 }
             };
             found.push((rel, meta.len() as i64, files::mtime_ns(&meta)));
+            reporter.progress(found.len() as u64, None, "files discovered");
         }
         let incomplete = uncertain.len() > blocked.len();
         Ok::<_, std::io::Error>((found, uncertain, incomplete))
@@ -591,7 +633,11 @@ pub async fn scan_share(state: &AppState, share: &Share) -> AppResult<()> {
         .collect();
     let settle_cutoff = now_ns() - SETTLE_SECS * 1_000_000_000;
     let mut seen = HashSet::new();
-    for (rel, _size, mtime) in found {
+    task.phase("Hashing and reconciling settled files");
+    let total = found.len() as u64;
+    task.progress(0, Some(total), "files checked");
+    for (index, (rel, _size, mtime)) in found.into_iter().enumerate() {
+        task.progress(index as u64, Some(total), "files checked");
         seen.insert(rel.clone());
         if mtime > settle_cutoff || blocked.iter().any(|p| inbox::overlaps(&rel, p)) {
             continue;
@@ -599,8 +645,10 @@ pub async fn scan_share(state: &AppState, share: &Share) -> AppResult<()> {
         if RelPath::parse(&rel).is_err() {
             continue;
         }
-        register_local(state, share, &root, &rel).await?;
+        register_local_reporting(state, share, &root, &rel, Some(task)).await?;
     }
+    task.progress(total, Some(total), "files checked");
+    task.phase("Reconciling removed files and publishing inventory");
     for (rel, (_, _, deleted)) in known {
         // A newly ignored row is not evidence that the file was deleted.
         if deleted
@@ -2103,12 +2151,54 @@ async fn settle_conflict(
 // Workers
 
 async fn poll_peer(state: &AppState, peer: &net::Peer) {
+    if let Err(e) = crate::activity::observe(
+        state,
+        format!("peer:{}", peer.id),
+        "Peer synchronization",
+        &peer.name,
+        Some("/peers"),
+        |task| async move { poll_peer_reporting(state, peer, &task).await },
+    )
+    .await
+    {
+        tracing::warn!(peer=%peer.id, "peer background task: {}", e.message());
+    }
+    // Always process decisions, including after failed peer connections.
+    if let Err(error) = crate::activity::observe(
+        state,
+        format!("move-decisions:{}", peer.id),
+        "Peer move decision verification",
+        &peer.name,
+        Some("/sync"),
+        |task| async move {
+            task.waiting("Waiting for safe decision verification");
+            admin::process_move_decisions(state).await
+        },
+    )
+    .await
+    {
+        tracing::warn!("move decision verification deferred: {}", error.message());
+    }
+}
+
+async fn poll_peer_reporting(
+    state: &AppState,
+    peer: &net::Peer,
+    task: &crate::activity::Reporter,
+) -> AppResult<()> {
+    task.phase("Connecting to peer and verifying its identity");
     let hello: Result<net::Hello, String> = net::get_json(state, peer, "/api/peer/v1/hello").await;
     match hello {
         Ok(h) if peer.instance_id.as_deref() == Some(h.instance_id.as_str()) => {
             net::mark(state, &peer.id, Ok(())).await;
+            task.phase("Synchronizing shared settings");
             sync_settings(state, peer).await;
+            task.phase("Pulling and applying peer events");
             let pulled = pull(state, peer).await;
+            if let Ok(n) = &pulled {
+                task.progress(*n as u64, None, "events applied");
+            }
+            task.phase("Fetching and applying share inventory backfill");
             let filled = backfill(state, peer).await;
             let outcome = pulled.and(filled);
             let retained_error = inbox::processing_error(state, &peer.id)
@@ -2124,6 +2214,18 @@ async fn poll_peer(state: &AppState, peer: &net::Peer) {
                     .or(retained_error.as_deref()),
             )
             .await;
+            if let Err(error) = outcome {
+                return Err(AppError::conflict(
+                    "peer_processing",
+                    crate::error::redact(&error),
+                ));
+            }
+            if let Some(error) = retained_error {
+                return Err(AppError::conflict(
+                    "peer_processing",
+                    crate::error::redact(&error),
+                ));
+            }
         }
         Ok(_) => {
             net::mark(
@@ -2131,17 +2233,21 @@ async fn poll_peer(state: &AppState, peer: &net::Peer) {
                 &peer.id,
                 Err("the peer answered with another instance id".into()),
             )
-            .await
+            .await;
+            return Err(AppError::conflict(
+                "peer_identity",
+                "the peer answered with another instance id",
+            ));
         }
         Err(e) => {
-            net::mark(state, &peer.id, Err(e)).await;
+            net::mark(state, &peer.id, Err(e.clone())).await;
+            return Err(AppError::conflict(
+                "peer_unreachable",
+                crate::error::redact(&e),
+            ));
         }
     }
-    // Peer futures share the polling task. Awaiting this lock in the outer scheduler can
-    // prevent it from polling a peer future that already owns the lock.
-    if let Err(error) = admin::process_move_decisions(state).await {
-        tracing::warn!("move decision verification deferred: {}", error.message());
-    }
+    Ok(())
 }
 
 /// Merges the peer's shared file settings. Peers from before shared settings answer 404.

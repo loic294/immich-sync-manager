@@ -628,6 +628,17 @@ async fn due_scans_wait_for_the_write_barrier() {
     let view = scheduler::views(&state).await.unwrap();
     assert!(view[0].waiting_for_barrier);
     assert_eq!(view[0].due_in_secs, Some(0));
+    let activity = crate::activity::page(&state, 25, 0).await.unwrap();
+    assert!(
+        activity
+            .current
+            .iter()
+            .any(|a| a.phase == "Waiting for the Immich maintenance barrier")
+    );
+    assert!(activity.current.iter().any(|a| {
+        a.phase
+            .contains("managed operations hold the write barrier")
+    }));
     assert!(
         server.received_requests().await.unwrap().is_empty(),
         "direct file APIs must also wait for the barrier"

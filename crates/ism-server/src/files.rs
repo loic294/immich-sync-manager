@@ -188,21 +188,35 @@ pub fn modified_rfc3339(meta: &Metadata) -> Option<String> {
 }
 
 pub fn sha256_file(path: &Path) -> io::Result<String> {
+    sha256_reporting(path, |_| {})
+}
+
+pub fn sha256_reporting(path: &Path, mut progress: impl FnMut(u64)) -> io::Result<String> {
     let mut file = fs::File::open(path)?;
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 1 << 20];
+    let mut done = 0;
     loop {
         let n = file.read(&mut buf)?;
         if n == 0 {
             break;
         }
         hasher.update(&buf[..n]);
+        done += n as u64;
+        progress(done);
     }
     Ok(hex::encode(hasher.finalize()))
 }
 
 /// Reads a fresh fingerprint without trusting the metadata-keyed hash cache.
 pub fn replacement_fingerprint(path: &Path) -> io::Result<Option<(String, String)>> {
+    replacement_fingerprint_reporting(path, |_| {})
+}
+
+pub fn replacement_fingerprint_reporting(
+    path: &Path,
+    progress: impl FnMut(u64),
+) -> io::Result<Option<(String, String)>> {
     let before = match fs::symlink_metadata(path) {
         Ok(meta) if meta.is_file() => meta,
         Ok(_) => {
@@ -214,7 +228,7 @@ pub fn replacement_fingerprint(path: &Path) -> io::Result<Option<(String, String
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
     };
-    let hash = sha256_file(path)?;
+    let hash = sha256_reporting(path, progress)?;
     let after = fs::symlink_metadata(path)?;
     if !after.is_file() || revision(&before) != revision(&after) {
         return Err(io::Error::new(

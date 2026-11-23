@@ -2,6 +2,7 @@ import { api } from '@/api/client';
 import type { AccountInput } from '@/api/generated/AccountInput';
 import type { AccountView } from '@/api/generated/AccountView';
 import type { AuditEntry } from '@/api/generated/AuditEntry';
+import type { BackgroundActivityPage } from '@/api/generated/BackgroundActivityPage';
 import type { ClientTokenCreated } from '@/api/generated/ClientTokenCreated';
 import type { ClientTokenInput } from '@/api/generated/ClientTokenInput';
 import type { ClientTokenView } from '@/api/generated/ClientTokenView';
@@ -46,6 +47,8 @@ const enc = encodeURIComponent;
 
 /** Typed wrappers over the administration API. */
 export const admin = {
+  backgroundActivity: (limit = 25, offset = 0) =>
+    api.get<BackgroundActivityPage>(`${A}/operations/background`, { query: { limit, offset } }),
   setup: (body: { username: string; password: string; instance_name: string }) =>
     api.post<void>(`${A}/setup`, { body }),
   login: (body: { username: string; password: string }) => api.post<void>(`${A}/login`, { body }),

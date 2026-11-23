@@ -44,7 +44,17 @@ fn rel_of(base: &Path, path: &Path) -> Option<String> {
 /// Files under `base/scope` (the whole folder without a scope). Symlinks are not followed;
 /// ISM-ignored paths and `junk` names are skipped. A missing scope is empty; any other error
 /// fails the pass.
+#[cfg(test)]
 pub fn walk(base: &Path, scope: Option<&str>, junk: &JunkRules) -> io::Result<Tree> {
+    walk_reporting(base, scope, junk, |_| {})
+}
+
+pub fn walk_reporting(
+    base: &Path,
+    scope: Option<&str>,
+    junk: &JunkRules,
+    mut progress: impl FnMut(u64),
+) -> io::Result<Tree> {
     let skip = |rel: &str| ignore::ignored(rel) || junk.path_is_junk(rel);
     let start = scope.map_or_else(|| base.to_path_buf(), |s| base.join(s));
     let mut tree = Tree::new();
@@ -54,6 +64,7 @@ pub fn walk(base: &Path, scope: Option<&str>, junk: &JunkRules) -> io::Result<Tr
         Ok(meta) if meta.is_file() => {
             if let Some(rel) = scope.filter(|r| !skip(r)) {
                 tree.insert(rel.to_owned(), entry(&meta));
+                progress(tree.len() as u64);
             }
             return Ok(tree);
         }
@@ -88,6 +99,7 @@ pub fn walk(base: &Path, scope: Option<&str>, junk: &JunkRules) -> io::Result<Tr
         match item.metadata() {
             Ok(meta) => {
                 tree.insert(rel, entry(&meta));
+                progress(tree.len() as u64);
             }
             Err(e)
                 if e.io_error()

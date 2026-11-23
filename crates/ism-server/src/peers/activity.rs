@@ -29,14 +29,27 @@ pub async fn run(state: AppState) {
                             if running.insert(peer.id.clone()) {
                                 let state = state.clone();
                                 active.push(async move {
-                                    if let Err(error)=super::recovery::refresh(&state,&peer).await {
+                                    if let Err(error)=crate::activity::observe(&state, format!("recovery-refresh:{}",peer.id),
+                                        "Peer recovery refresh", &peer.name, Some("/sync"), |task| {
+                                            let (state,peer)=(&state,&peer);
+                                            async move {
+                                            task.phase("Fetching current recovery evidence from peer");
+                                            super::recovery::refresh(state,peer).await
+                                        }}).await {
                                         tracing::warn!(peer=%peer.id,"cannot refresh recovery: {}",error.message());
                                         if let Err(error)=super::recovery::unavailable(&state,&peer.id,&error).await {
                                             tracing::error!("cannot persist recovery availability: {}",error.message());
                                         }
                                     }
-                                    if let Err(error) = refresh(&state, &peer).await {
-                                        unavailable(&state, &peer.id, &error).await;
+                                    if let Err(error) = crate::activity::observe(&state, format!("activity-refresh:{}",peer.id),
+                                        "Peer transfer activity refresh", &peer.name, Some("/sync"), |task| {
+                                            let (state,peer)=(&state,&peer);
+                                            async move {
+                                            task.phase("Fetching receiver-owned transfer progress");
+                                            refresh(state,peer).await
+                                                .map_err(|e| AppError::conflict("activity_refresh",crate::error::redact(&e)))
+                                        }}).await {
+                                        unavailable(&state, &peer.id, error.message()).await;
                                     }
                                     peer.id
                                 });

@@ -6,6 +6,28 @@ use serde_json::Value;
 const INBOX_LIMIT: i64 = 10_000;
 
 pub(super) async fn backfill(state: &AppState, peer: &net::Peer) -> Result<usize, String> {
+    crate::activity::observe(
+        state,
+        format!("backfill:{}", peer.id),
+        "Peer inventory backfill",
+        &peer.name,
+        Some("/peers"),
+        |task| async move {
+            backfill_reporting(state, peer, &task)
+                .await
+                .map_err(|e| AppError::conflict("peer_backfill", crate::error::redact(&e)))
+        },
+    )
+    .await
+    .map_err(|e| e.message().to_owned())
+}
+
+async fn backfill_reporting(
+    state: &AppState,
+    peer: &net::Peer,
+    task: &crate::activity::Reporter,
+) -> Result<usize, String> {
+    task.phase("Fetching inventory pages and saving durable receipts");
     let all = shares(state).await.map_err(|e| e.message().to_owned())?;
     let pending: Option<(String, String)> = sqlx::query_as(
         "SELECT share_id, after_path FROM share_backfills WHERE peer_id = ?
@@ -66,8 +88,10 @@ pub(super) async fn backfill(state: &AppState, peer: &net::Peer) -> Result<usize
                 .map_err(|e| e.to_string())?;
         }
     }
+    task.waiting("Waiting for the replication-operation lock before applying inventory");
     let _guard = state.replication_operation_lock.lock().await;
-    let applied = replay_inventory(state, peer, &all)
+    task.phase("Applying inventory entries");
+    let applied = replay_inventory(state, peer, &all, task)
         .await
         .map_err(|e| e.message().to_owned())?;
     if applied > 0 {
@@ -130,7 +154,12 @@ async fn admit_inventory(
     Ok(())
 }
 
-async fn replay_inventory(state: &AppState, peer: &net::Peer, all: &[Share]) -> AppResult<usize> {
+async fn replay_inventory(
+    state: &AppState,
+    peer: &net::Peer,
+    all: &[Share],
+    task: &crate::activity::Reporter,
+) -> AppResult<usize> {
     let rows: Vec<(String, String, String, Option<String>)> = sqlx::query_as(
         "SELECT share_id, path, entry_json, operation_id FROM peer_backfill_inbox WHERE peer_id = ?
          ORDER BY attempted_at IS NOT NULL, attempted_at, share_id, path LIMIT ?",
@@ -140,7 +169,9 @@ async fn replay_inventory(state: &AppState, peer: &net::Peer, all: &[Share]) -> 
     .fetch_all(&state.db)
     .await?;
     let mut applied = 0;
-    for (share_id, path, raw, operation) in rows {
+    let total = rows.len() as u64;
+    for (done, (share_id, path, raw, operation)) in rows.into_iter().enumerate() {
+        task.progress(done as u64, Some(total), "inventory entries checked");
         sqlx::query("UPDATE peer_backfill_inbox SET attempted_at = ? WHERE peer_id = ? AND share_id = ? AND path = ?")
             .bind(db::now()).bind(&peer.id).bind(&share_id).bind(&path).execute(&state.db).await?;
         let result = if let Some(operation) = operation {
@@ -545,6 +576,28 @@ pub(super) async fn finish_operation_in(
 
 /// Replay validated input on every poll, even when reception is unavailable or bounded.
 pub(super) async fn pull(state: &AppState, peer: &net::Peer) -> Result<usize, String> {
+    crate::activity::observe(
+        state,
+        format!("pull:{}", peer.id),
+        "Peer event processing",
+        &peer.name,
+        Some("/peers"),
+        |task| async move {
+            pull_reporting(state, peer, &task)
+                .await
+                .map_err(|e| AppError::conflict("peer_events", crate::error::redact(&e)))
+        },
+    )
+    .await
+    .map_err(|e| e.message().to_owned())
+}
+
+async fn pull_reporting(
+    state: &AppState,
+    peer: &net::Peer,
+    task: &crate::activity::Reporter,
+) -> Result<usize, String> {
+    task.phase("Fetching peer events and saving durable receipts");
     if peer.instance_id.is_none() {
         return Ok(0);
     }
@@ -573,11 +626,14 @@ pub(super) async fn pull(state: &AppState, peer: &net::Peer) -> Result<usize, St
     } else {
         Ok(())
     };
+    task.waiting("Waiting for the replication-operation lock before applying events");
     let _guard = state.replication_operation_lock.lock().await;
-    let applied = replay(state, peer)
+    task.phase("Verifying and applying received events");
+    let applied = replay(state, peer, task)
         .await
         .map_err(|e| e.message().to_owned())?;
     if applied > 0 {
+        task.progress(applied as u64, None, "events applied");
         state.emit(ServerEvent::SyncChanged);
         Ok(applied)
     } else {
@@ -585,7 +641,11 @@ pub(super) async fn pull(state: &AppState, peer: &net::Peer) -> Result<usize, St
     }
 }
 
-async fn replay(state: &AppState, peer: &net::Peer) -> AppResult<usize> {
+async fn replay(
+    state: &AppState,
+    peer: &net::Peer,
+    task: &crate::activity::Reporter,
+) -> AppResult<usize> {
     // Rotate blocked rows fairly, but preserve dependencies explicitly rather than by cursor.
     let mut rows: Vec<(i64, String, Option<String>, String)> = sqlx::query_as(
         "SELECT seq, event_json, operation_id, status FROM peer_inbox
@@ -600,7 +660,9 @@ async fn replay(state: &AppState, peer: &net::Peer) -> AppResult<usize> {
     let all = shares(state).await?;
     let mut applied = 0;
     let mut first_error = None;
-    for (seq, raw, operation_id, status) in rows {
+    let total = rows.len() as u64;
+    for (done, (seq, raw, operation_id, status)) in rows.into_iter().enumerate() {
+        task.progress(done as u64, Some(total), "events checked");
         sqlx::query("UPDATE peer_inbox SET attempted_at = ? WHERE peer_id = ? AND seq = ?")
             .bind(db::now())
             .bind(&peer.id)
@@ -1141,7 +1203,7 @@ async fn operation_footprints_for(
     Ok(blocked)
 }
 
-pub(super) async fn require_no_active_operations(state: &AppState) -> AppResult<()> {
+pub(crate) async fn require_no_active_operations(state: &AppState) -> AppResult<()> {
     let active: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM operations WHERE status IN ('running','waiting_maintenance'))",
     )
@@ -1302,7 +1364,7 @@ pub async fn require_stable_share(
     require_stable_share_for(state, share, paths, &[]).await
 }
 
-pub(super) async fn require_stable_transfer(
+pub(crate) async fn require_stable_transfer(
     state: &AppState,
     share: &Share,
     paths: &[&str],

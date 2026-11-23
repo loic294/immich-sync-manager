@@ -2,4 +2,4 @@
 import type { OperationStatus } from "./OperationStatus";
 import type { Progress } from "./Progress";
 
-export type OperationActivity = { operation_id: string, title: string, label: string | null, source: string, destination: string, status: OperationStatus, progress: Progress, created_at: string, finished_at: string | null, handled_at: string | null, recovery_resolved: boolean, };
+export type OperationActivity = { operation_id: string, title: string, label: string | null, source: string, destination: string, status: OperationStatus, progress: Progress, created_at: string, finished_at: string | null, handled_at: string | null, recovery_resolved: boolean, phase?: string, };

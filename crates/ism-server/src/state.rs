@@ -16,6 +16,7 @@ use crate::crypto::SecretBox;
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerEvent {
+    ActivityChanged,
     OperationUpdated {
         operation_id: String,
     },
@@ -38,6 +39,7 @@ pub enum ServerEvent {
 }
 
 pub struct Inner {
+    pub activity: crate::activity::Registry,
     pub config: Config,
     pub db: SqlitePool,
     pub secrets: SecretBox,
@@ -100,6 +102,7 @@ impl AppState {
             .build()?;
         let (events, _) = broadcast::channel(512);
         Ok(Self(Arc::new(Inner {
+            activity: crate::activity::Registry::default(),
             config,
             db,
             secrets,

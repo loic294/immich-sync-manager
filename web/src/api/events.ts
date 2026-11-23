@@ -1,6 +1,7 @@
 import { type ReadonlySignal, signal } from '@preact/signals-core';
 
 export type ChangeType =
+  | 'activity_changed'
   | 'operation_updated'
   | 'operation_committed'
   | 'maintenance_changed'
@@ -35,6 +36,7 @@ export interface EventsClient {
 }
 
 const TYPES = new Set<ChangeType>([
+  'activity_changed',
   'operation_updated',
   'operation_committed',
   'maintenance_changed',

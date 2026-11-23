@@ -28,7 +28,8 @@ export class IsmOperationTable extends IsmElement {
                   bubbles: true,
                   composed: true,
                 }),
-              )}>${op.title}</button></td>
+              )}>${op.title}</button>
+              ${op.phase ? html`<p class="mt-1 text-xs text-base-content/70">${op.phase}</p>` : ''}</td>
           <td class="break-words">${op.source}</td>
           <td class="break-words">${op.destination}</td>
           <td><span class=${statusBadge(op.status)}>${humanize(op.status)}</span>

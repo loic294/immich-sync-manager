@@ -6,6 +6,11 @@ share is watched.
 
 ## Modes
 
+**Operations -> Background activity** shows root and share scans while they run, including file
+enumeration, checksum verification, and reconciliation progress. It also shows paused detection,
+file-settling delays, and library batches waiting for maintenance or Immich queue completion.
+An unknown scan total stays unknown until enumeration provides one.
+
 Set per mapping on the Mappings page (eye button):
 
 | Mode | Behavior |

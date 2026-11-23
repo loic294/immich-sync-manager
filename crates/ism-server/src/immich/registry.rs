@@ -306,6 +306,21 @@ pub async fn forget_pool(state: &AppState, server_id: &str) {
 /// Checks version and schema, then records the result. Direct writes stay disabled unless both
 /// match exactly.
 pub async fn check_compatibility(state: &AppState, server_id: &str) -> AppResult<Server> {
+    crate::activity::observe(
+        state,
+        format!("compatibility:{server_id}"),
+        "Immich compatibility check",
+        server_id,
+        Some("/servers"),
+        |task| async move {
+            task.phase("Checking Immich version, database schema and API capabilities");
+            check_compatibility_inner(state, server_id).await
+        },
+    )
+    .await
+}
+
+async fn check_compatibility_inner(state: &AppState, server_id: &str) -> AppResult<Server> {
     let server = server(state, server_id).await?;
     let (version, mut problems) = match api::server_version(&state.http, &server.url).await {
         Ok(v) => {
@@ -362,6 +377,25 @@ pub async fn check_compatibility(state: &AppState, server_id: &str) -> AppResult
 
 /// Reloads the server's libraries (admin view) and adds ISM's exclusion patterns where missing.
 pub async fn refresh_libraries(state: &AppState, server: &Server) -> AppResult<usize> {
+    crate::activity::observe(
+        state,
+        format!("libraries:{}", server.id),
+        "Refresh Immich libraries",
+        &server.name,
+        Some("/servers"),
+        |task| async move {
+            task.phase("Fetching libraries and reconciling exclusion patterns");
+            refresh_libraries_inner(state, server, &task).await
+        },
+    )
+    .await
+}
+
+async fn refresh_libraries_inner(
+    state: &AppState,
+    server: &Server,
+    task: &crate::activity::Reporter,
+) -> AppResult<usize> {
     let api = admin_api(state, server).await?;
     let libraries = api
         .libraries()
@@ -374,7 +408,12 @@ pub async fn refresh_libraries(state: &AppState, server: &Server) -> AppResult<u
         .bind(&server.id)
         .execute(&mut *tx)
         .await?;
-    for lib in &libraries {
+    for (done, lib) in libraries.iter().enumerate() {
+        task.progress(
+            done as u64,
+            Some(libraries.len() as u64),
+            "libraries checked",
+        );
         let mut patterns = lib.exclusion_patterns.clone();
         let missing: Vec<String> = wanted
             .iter()
