@@ -80,6 +80,156 @@ async fn instance(name: &str) -> Instance {
     }
 }
 
+async fn scheduler_fixture(
+    activity: bool,
+) -> (
+    Instance,
+    std::sync::Arc<tokio::sync::Notify>,
+    std::sync::Arc<tokio::sync::Notify>,
+) {
+    use std::sync::Arc;
+    use tokio::sync::Notify;
+
+    let mut local = instance("Scheduler").await;
+    stop_workers(&mut local).await;
+    let entered = Arc::new(Notify::new());
+    let respond = Arc::new(Notify::new());
+    let app = axum::Router::new().fallback({
+        let entered = entered.clone();
+        let respond = respond.clone();
+        move || {
+            let entered = entered.clone();
+            let respond = respond.clone();
+            async move {
+                entered.notify_one();
+                respond.notified().await;
+                axum::Json(serde_json::json!({
+                    "instance_id": "different-instance", "name": "Remote", "shares": [],
+                    "total": 0, "rows": []
+                }))
+            }
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    local.tasks.push(tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    }));
+    let secret = local
+        .state
+        .secrets
+        .encrypt(super::net::SECRET_PURPOSE, "synthetic-secret")
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO peers(id,name,url,instance_id,secret_enc,status,created_at)
+         VALUES('remote','Remote',?,'expected-instance',?,'online',?)",
+    )
+    .bind(url)
+    .bind(secret)
+    .bind(crate::db::now())
+    .execute(&local.state.db)
+    .await
+    .unwrap();
+    let state = local.state.clone();
+    local.tasks.push(tokio::spawn(async move {
+        if activity {
+            super::activity::run(state).await;
+        } else {
+            super::replicate(state).await;
+        }
+    }));
+    tokio::time::timeout(Duration::from_secs(2), entered.notified())
+        .await
+        .expect("scheduler must admit the peer worker");
+    (local, entered, respond)
+}
+
+async fn scheduler_releases_worker_connection(activity: bool) {
+    let (mut local, _, respond) = scheduler_fixture(activity).await;
+    // Keep seven connections, including the writer, leaving the eighth for the worker.
+    let mut writer = local.state.db.acquire().await.unwrap();
+    let mut transaction = sqlx::Connection::begin(&mut *writer).await.unwrap();
+    sqlx::query("UPDATE peers SET name=name WHERE id='remote'")
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    let mut held = Vec::new();
+    for _ in 0..6 {
+        held.push(local.state.db.acquire().await.unwrap());
+    }
+    respond.notify_one();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while local.state.db.num_idle() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("worker must acquire the last connection");
+
+    // The next queue check now waits for the connection owned by the worker.
+    if activity {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    } else {
+        local.state.sync_wake.notify_one();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    transaction.commit().await.unwrap();
+    let available = tokio::time::timeout(Duration::from_secs(2), local.state.db.acquire())
+        .await
+        .expect("admitted worker must release its connection while the scheduler loads peers")
+        .unwrap();
+    drop(available);
+    stop_workers(&mut local).await;
+}
+
+#[tokio::test]
+async fn replication_scheduler_does_not_starve_admitted_worker() {
+    scheduler_releases_worker_connection(false).await;
+}
+
+#[tokio::test]
+async fn activity_scheduler_does_not_starve_admitted_worker() {
+    scheduler_releases_worker_connection(true).await;
+}
+
+#[tokio::test]
+async fn schedulers_suppress_duplicates_and_cancel_admitted_workers() {
+    for activity in [false, true] {
+        let (mut local, entered, _respond) = scheduler_fixture(activity).await;
+        local.state.sync_wake.notify_one();
+        tokio::time::sleep(Duration::from_secs(if activity { 5 } else { 2 })).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), entered.notified())
+                .await
+                .is_err(),
+            "a scheduler must not admit a second worker for a running peer"
+        );
+        let scheduler = local.tasks.pop().unwrap();
+        scheduler.abort();
+        assert!(scheduler.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let page = crate::activity::page(&local.state, 100, 0).await.unwrap();
+                if page.current.iter().chain(&page.history).any(|row| {
+                    row.status == ism_core::dto::BackgroundStatus::Interrupted
+                        && row.task_key
+                            == if activity {
+                                "recovery-refresh:remote"
+                            } else {
+                                "peer:remote"
+                            }
+                }) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("scheduler shutdown must cancel the admitted worker, not detach it");
+        stop_workers(&mut local).await;
+    }
+}
+
 /// Writes a file that looks settled to the scanner.
 fn write_old(path: &Path, bytes: &[u8]) {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -6171,6 +6321,104 @@ async fn competing_peer_event_stays_unacknowledged_and_reports_the_error() {
     assert!(
         !sync_changed(),
         "durable input is not discarded when the peer removes its log"
+    );
+}
+
+#[tokio::test]
+async fn transfer_wakes_when_operation_finishes_during_eligibility_scan() {
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    let share = super::shares(&b.state).await.unwrap().remove(0);
+    let peer = admin::list_peers(&b.state).await.unwrap().remove(0);
+    sqlx::query("UPDATE peers SET status = 'online' WHERE id = ?")
+        .bind(&peer.id)
+        .execute(&b.state.db)
+        .await
+        .unwrap();
+    super::queue_transfer(
+        &b.state,
+        &peer.id,
+        &share,
+        "album/photo.jpg",
+        &crate::crypto::sha256_hex(b"photo"),
+        5,
+        &VersionVector::default(),
+    )
+    .await
+    .unwrap();
+    let accepted = crate::ops::submit(
+        &b.state,
+        &Principal::Admin {
+            username: "test".into(),
+        },
+        OperationRequest {
+            idempotency_key: "transfer-wake-race".into(),
+            label: None,
+            actions: vec![OperationAction::CreateFolder {
+                target: loc("shared/album"),
+            }],
+            allow_owner_transfer: false,
+            allow_partial: false,
+        },
+    )
+    .await
+    .unwrap();
+    while tokio::time::timeout(Duration::from_millis(20), b.state.sync_wake.notified())
+        .await
+        .is_ok()
+    {}
+    let (reached, scanned) = tokio::sync::oneshot::channel();
+    let (resume, resumed) = tokio::sync::oneshot::channel();
+    let worker = tokio::spawn(super::transfer::run_paused(
+        b.state.clone(),
+        super::transfer::EligibilityPause {
+            reached,
+            resume: resumed,
+        },
+    ));
+    tokio::time::timeout(Duration::from_secs(2), scanned)
+        .await
+        .expect("transfer never encountered the blocking operation")
+        .unwrap();
+    let before: (String, i64) = sqlx::query_as(
+        "SELECT status, attempts FROM transfers WHERE share_id = ? AND rel_path = 'album/photo.jpg'",
+    )
+    .bind(&share.id)
+    .fetch_one(&b.state.db)
+    .await
+    .unwrap();
+    assert_eq!((before.0.as_str(), before.1), ("queued", 0));
+    crate::ops::exec::complete_for_test(&b.state, &accepted.operation_id)
+        .await
+        .unwrap();
+    let status: String = sqlx::query_scalar("SELECT status FROM operations WHERE id = ?")
+        .bind(&accepted.operation_id)
+        .fetch_one(&b.state.db)
+        .await
+        .unwrap();
+    assert_eq!(status, "completed");
+    resume.send(()).unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let status: Option<String> = sqlx::query_scalar(
+                "SELECT status FROM transfers WHERE share_id = ? AND rel_path = 'album/photo.jpg'",
+            )
+            .bind(&share.id)
+            .fetch_optional(&b.state.db)
+            .await
+            .unwrap();
+            if status.as_deref() != Some("queued") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    worker.abort();
+    assert!(
+        result.is_ok(),
+        "queued transfer was not claimed promptly after the operation finished"
     );
 }
 

@@ -145,6 +145,11 @@ async fn set_status(state: &AppState, id: &str, status: OperationStatus) -> AppR
     Ok(())
 }
 
+#[cfg(test)]
+pub(crate) async fn complete_for_test(state: &AppState, id: &str) -> AppResult<()> {
+    set_status(state, id, OperationStatus::Completed).await
+}
+
 async fn set_item(
     state: &AppState,
     id: &str,

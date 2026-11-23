@@ -1,9 +1,8 @@
 //! Receiver-owned transfer activity, mirrored incrementally to the source.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::time::Duration;
 
-use futures_util::{StreamExt, stream::FuturesUnordered};
 use ism_core::dto::{Location, SyncActivity, SyncPage, SyncProgress};
 use serde::{Deserialize, Serialize};
 use sqlx::{Row, SqliteConnection};
@@ -16,8 +15,9 @@ use crate::state::{AppState, ServerEvent};
 const CHANGE_LIMIT: i64 = 500;
 
 pub async fn run(state: AppState) {
-    let mut active = FuturesUnordered::new();
-    let mut running = HashSet::new();
+    // Spawned workers keep progressing during peer-list queries; dropping the set aborts them.
+    let mut active = tokio::task::JoinSet::new();
+    let mut running = HashMap::new();
     let mut interval = tokio::time::interval(Duration::from_secs(5));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -26,9 +26,10 @@ pub async fn run(state: AppState) {
                 match net::peers(&state).await {
                     Ok(peers) => {
                         for peer in peers {
-                            if running.insert(peer.id.clone()) {
+                            if !running.contains_key(&peer.id) {
+                                let id = peer.id.clone();
                                 let state = state.clone();
-                                active.push(async move {
+                                let worker = active.spawn(async move {
                                     if let Err(error)=crate::activity::observe(&state, format!("recovery-refresh:{}",peer.id),
                                         "Peer recovery refresh", &peer.name, Some("/sync"), |task| {
                                             let (state,peer)=(&state,&peer);
@@ -53,14 +54,21 @@ pub async fn run(state: AppState) {
                                     }
                                     peer.id
                                 });
+                                running.insert(id, worker.id());
                             }
                         }
                     }
                     Err(error) => tracing::error!("cannot load peers for sync activity: {}", error.message()),
                 }
             }
-            Some(id) = active.next(), if !active.is_empty() => {
-                running.remove(&id);
+            Some(result) = active.join_next(), if !active.is_empty() => {
+                match result {
+                    Ok(id) => { running.remove(&id); }
+                    Err(error) => {
+                        running.retain(|_, id| *id != error.id());
+                        tracing::error!("peer activity worker failed: {error}");
+                    }
+                }
             }
         }
     }
