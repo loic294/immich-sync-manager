@@ -6175,6 +6175,104 @@ async fn competing_peer_event_stays_unacknowledged_and_reports_the_error() {
 }
 
 #[tokio::test]
+async fn transfer_wakes_when_operation_finishes_during_eligibility_scan() {
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    let share = super::shares(&b.state).await.unwrap().remove(0);
+    let peer = admin::list_peers(&b.state).await.unwrap().remove(0);
+    sqlx::query("UPDATE peers SET status = 'online' WHERE id = ?")
+        .bind(&peer.id)
+        .execute(&b.state.db)
+        .await
+        .unwrap();
+    super::queue_transfer(
+        &b.state,
+        &peer.id,
+        &share,
+        "album/photo.jpg",
+        &crate::crypto::sha256_hex(b"photo"),
+        5,
+        &VersionVector::default(),
+    )
+    .await
+    .unwrap();
+    let accepted = crate::ops::submit(
+        &b.state,
+        &Principal::Admin {
+            username: "test".into(),
+        },
+        OperationRequest {
+            idempotency_key: "transfer-wake-race".into(),
+            label: None,
+            actions: vec![OperationAction::CreateFolder {
+                target: loc("shared/album"),
+            }],
+            allow_owner_transfer: false,
+            allow_partial: false,
+        },
+    )
+    .await
+    .unwrap();
+    while tokio::time::timeout(Duration::from_millis(20), b.state.sync_wake.notified())
+        .await
+        .is_ok()
+    {}
+    let (reached, scanned) = tokio::sync::oneshot::channel();
+    let (resume, resumed) = tokio::sync::oneshot::channel();
+    let worker = tokio::spawn(super::transfer::run_paused(
+        b.state.clone(),
+        super::transfer::EligibilityPause {
+            reached,
+            resume: resumed,
+        },
+    ));
+    tokio::time::timeout(Duration::from_secs(2), scanned)
+        .await
+        .expect("transfer never encountered the blocking operation")
+        .unwrap();
+    let before: (String, i64) = sqlx::query_as(
+        "SELECT status, attempts FROM transfers WHERE share_id = ? AND rel_path = 'album/photo.jpg'",
+    )
+    .bind(&share.id)
+    .fetch_one(&b.state.db)
+    .await
+    .unwrap();
+    assert_eq!((before.0.as_str(), before.1), ("queued", 0));
+    crate::ops::exec::complete_for_test(&b.state, &accepted.operation_id)
+        .await
+        .unwrap();
+    let status: String = sqlx::query_scalar("SELECT status FROM operations WHERE id = ?")
+        .bind(&accepted.operation_id)
+        .fetch_one(&b.state.db)
+        .await
+        .unwrap();
+    assert_eq!(status, "completed");
+    resume.send(()).unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let status: Option<String> = sqlx::query_scalar(
+                "SELECT status FROM transfers WHERE share_id = ? AND rel_path = 'album/photo.jpg'",
+            )
+            .bind(&share.id)
+            .fetch_optional(&b.state.db)
+            .await
+            .unwrap();
+            if status.as_deref() != Some("queued") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    worker.abort();
+    assert!(
+        result.is_ok(),
+        "queued transfer was not claimed promptly after the operation finished"
+    );
+}
+
+#[tokio::test]
 async fn transfers_are_deferred_without_consuming_retries_during_recovery() {
     let (_a, b) = pair().await;
     for task in &b.tasks {
