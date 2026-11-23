@@ -484,6 +484,302 @@ async fn file_api_errors_do_not_mask_authentication_or_claim_removals_were_scann
 }
 
 #[tokio::test]
+async fn restart_retries_stale_removals_without_blocking_other_work() {
+    let (dir, state, server, _fake) = setup().await;
+    let (root, base) = map_root(&state, dir.path()).await;
+    std::fs::write(base.join("trip/old.jpg"), "recreated").unwrap();
+    Mock::given(method("POST"))
+        .and(path("/api/libraries/lib1/files/remove"))
+        .respond_with(
+            ResponseTemplate::new(400)
+                .set_body_json(json!({ "message": "Removed file still exists" })),
+        )
+        .with_priority(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/libraries/lib1/files/add"))
+        .respond_with(ResponseTemplate::new(204))
+        .with_priority(1)
+        .expect(2)
+        .mount(&server)
+        .await;
+    handle(
+        &state,
+        &root,
+        vec![
+            outside_change("trip/old.jpg", ChangeKind::Removed),
+            outside_change("trip/new.jpg", ChangeKind::Added),
+        ],
+    )
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE scan_schedule SET due_at = NULL, last_error = 'Immich answered 400: Removed file still exists'",
+    )
+    .execute(&state.db)
+    .await
+    .unwrap();
+
+    scheduler::recover(&state).await.unwrap();
+    assert!(due_at(&state).await.is_some(), "failed work is rescheduled");
+    scheduler::step(&state, i64::MAX / 2).await.unwrap();
+    wait_for_sync(&state).await;
+
+    assert_eq!(scan_requests(&server).await, 0);
+    let additions: Vec<serde_json::Value> = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|request| request.url.path() == "/api/libraries/lib1/files/add")
+        .map(|request| request.body_json().unwrap())
+        .collect();
+    assert_eq!(
+        additions,
+        [
+            json!({ "path": "/library/trip/new.jpg" }),
+            json!({ "path": "/library/trip/old.jpg" }),
+        ]
+    );
+    assert_eq!(scheduler::views(&state).await.unwrap()[0].last_error, None);
+    let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM scan_work")
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(remaining, 0);
+    assert_eq!(
+        std::fs::read(base.join("trip/old.jpg")).unwrap(),
+        b"recreated"
+    );
+}
+
+#[tokio::test]
+async fn removal_rejection_stays_queued_if_the_file_cannot_be_verified() {
+    for remove_marker in [false, true] {
+        let (dir, state, server, _fake) = setup().await;
+        let (root, base) = map_root(&state, dir.path()).await;
+        if remove_marker {
+            std::fs::write(base.join("trip/old.jpg"), "recreated").unwrap();
+            std::fs::remove_file(base.join(files::SENTINEL)).unwrap();
+        }
+        Mock::given(method("POST"))
+            .and(path("/api/libraries/lib1/files/remove"))
+            .respond_with(
+                ResponseTemplate::new(400)
+                    .set_body_json(json!({ "message": "Removed file still exists" })),
+            )
+            .with_priority(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        handle(
+            &state,
+            &root,
+            vec![outside_change("trip/old.jpg", ChangeKind::Removed)],
+        )
+        .await
+        .unwrap();
+        scheduler::step(&state, i64::MAX / 2).await.unwrap();
+        wait_for_sync(&state).await;
+
+        assert!(
+            scheduler::views(&state).await.unwrap()[0]
+                .last_error
+                .is_some()
+        );
+        assert_eq!(scan_requests(&server).await, 0);
+        let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM scan_work")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+        assert_eq!(remaining, 1);
+    }
+}
+
+#[tokio::test]
+async fn recreated_file_disappearing_during_scan_keeps_the_removal_queued() {
+    let (dir, state, server, _fake) = setup().await;
+    let (root, base) = map_root(&state, dir.path()).await;
+    let recreated = base.join("trip/old.jpg");
+    std::fs::write(&recreated, "recreated").unwrap();
+    Mock::given(method("POST"))
+        .and(path("/api/libraries/lib1/files/remove"))
+        .respond_with(
+            ResponseTemplate::new(400)
+                .set_body_json(json!({ "message": "Removed file still exists" })),
+        )
+        .with_priority(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/libraries/lib1/files/add"))
+        .respond_with(ResponseTemplate::new(204))
+        .with_priority(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/libraries/lib1/scan"))
+        .respond_with(move |_request: &wiremock::Request| {
+            std::fs::remove_file(&recreated).unwrap();
+            ResponseTemplate::new(204)
+        })
+        .with_priority(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    handle(
+        &state,
+        &root,
+        vec![
+            outside_change("trip/old.jpg", ChangeKind::Removed),
+            outside_change("trip/other.jpg", ChangeKind::Changed),
+        ],
+    )
+    .await
+    .unwrap();
+    scheduler::step(&state, i64::MAX / 2).await.unwrap();
+    wait_for_sync(&state).await;
+
+    assert!(
+        scheduler::views(&state).await.unwrap()[0]
+            .last_error
+            .as_ref()
+            .unwrap()
+            .contains("changed during synchronization")
+    );
+    let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM scan_work")
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(remaining, 2);
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable custom Immich runtime and synthetic library"]
+async fn real_immich_recreated_file_recovery_preserves_asset_identity() {
+    let url = std::env::var("ISM_PROOF_URL").unwrap();
+    let key = std::env::var("ISM_PROOF_KEY").unwrap();
+    let user = std::env::var("ISM_PROOF_USER").unwrap();
+    let library = std::env::var("ISM_PROOF_LIBRARY").unwrap();
+    let root = PathBuf::from(std::env::var("ISM_PROOF_ROOT").unwrap());
+    let run = std::env::var("ISM_PROOF_RUN").unwrap();
+    std::fs::write(root.join(files::SENTINEL), "photos").unwrap();
+    let (_dir, state, _server, _fake) = setup().await;
+    let encrypted = state
+        .secrets
+        .encrypt(registry::API_KEY_PURPOSE, &key)
+        .unwrap();
+    sqlx::query(
+        "UPDATE immich_servers SET url = ?, external_library_api_capable = 1 WHERE id = 's1'",
+    )
+    .bind(&url)
+    .execute(&state.db)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE immich_accounts SET api_key_enc = ?, immich_user_id = ? WHERE id = 'a1'")
+        .bind(encrypted)
+        .bind(user)
+        .execute(&state.db)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO immich_libraries (id,server_id,name,owner_user_id,import_paths_json,exclusion_patterns_json,refreshed_at)
+         VALUES (?,'s1','Synthetic','proof','[\"/mnt/ext\"]','[]',?)",
+    )
+    .bind(&library)
+    .bind(crate::db::now())
+    .execute(&state.db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO mappings (root_id,name,container_path,server_id,library_id,immich_import_path,created_at)
+         VALUES ('photos','Synthetic',?,'s1',?,'/mnt/ext',?)",
+    )
+    .bind(root.to_str().unwrap())
+    .bind(&library)
+    .bind(crate::db::now())
+    .execute(&state.db)
+    .await
+    .unwrap();
+    let api = crate::immich::api::Api::new(state.http.clone(), &url, key);
+    let old = format!("/mnt/ext/{run}/recreated.png");
+    let new = format!("/mnt/ext/{run}/other.png");
+    api.sync_library_file_add(&library, &old).await.unwrap();
+    let before = api.asset_id_by_path(&old).await.unwrap().unwrap();
+    assert_eq!(api.asset_id_by_path(&new).await.unwrap(), None);
+    let rejected = api
+        .sync_library_file_remove(&library, &old)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        rejected,
+        crate::immich::api::ApiError::Status { status: 400, ref message }
+            if message == "Removed file still exists"
+    ));
+    scheduler::request_work_at(
+        &state,
+        "s1",
+        &library,
+        "synthetic runtime proof",
+        &[
+            scheduler::Work {
+                path: old.clone(),
+                kind: scheduler::WorkKind::Removed,
+            },
+            scheduler::Work {
+                path: new.clone(),
+                kind: scheduler::WorkKind::Added,
+            },
+        ],
+        0,
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE scan_schedule SET due_at = NULL, last_error = 'Immich answered 400: Removed file still exists' WHERE library_id = ?")
+        .bind(&library)
+        .execute(&state.db)
+        .await
+        .unwrap();
+    scheduler::recover(&state).await.unwrap();
+    scheduler::step(&state, i64::MAX / 2).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            let running: bool =
+                sqlx::query_scalar("SELECT running FROM scan_schedule WHERE library_id = ?")
+                    .bind(&library)
+                    .fetch_one(&state.db)
+                    .await
+                    .unwrap();
+            if !running {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let error: Option<String> =
+        sqlx::query_scalar("SELECT last_error FROM scan_schedule WHERE library_id = ?")
+            .bind(&library)
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+    assert_eq!(error, None);
+    assert_eq!(api.asset_id_by_path(&old).await.unwrap(), Some(before));
+    assert!(api.asset_id_by_path(&new).await.unwrap().is_some());
+    assert!(root.join(run).join("recreated.png").is_file());
+    let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM scan_work")
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(remaining, 0);
+}
+
+#[tokio::test]
 async fn requests_during_a_run_and_restart_keep_their_scopes() {
     let (_dir, state, server, _fake) = setup().await;
     scheduler::request_work_at(
