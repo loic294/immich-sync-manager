@@ -76,6 +76,9 @@ impl Task {
             error: None,
             operation_id: None,
             page: page.map(str::to_owned),
+            count: 1,
+            reasons: Vec::new(),
+            examples: Vec::new(),
         };
         let id = activity.id.clone();
         persist(
@@ -508,7 +511,7 @@ mod tests {
                 .unwrap()
                 .current
                 .iter()
-                .any(|a| a.phase == reason)
+                .any(|a| a.phase.ends_with(&reason))
         );
         sqlx::query("UPDATE transfers SET attempts=2 WHERE id='download'")
             .execute(&state.db)
@@ -518,7 +521,7 @@ mod tests {
         let transfer = p
             .current
             .iter()
-            .find(|a| a.task_key == "transfer:download")
+            .find(|a| a.task_key == "transfer-queue:peer:share")
             .unwrap();
         assert!(transfer.phase.contains("backoff"));
         assert!(transfer.next_at.is_some());
@@ -545,6 +548,104 @@ mod tests {
                 .iter()
                 .any(|a| a.status == BackgroundStatus::Blocked && a.phase.contains("not mounted"))
         );
+    }
+
+    #[tokio::test]
+    async fn bulk_sync_work_is_grouped_with_reasons_instead_of_listed_per_file() {
+        let (dir, state) = harness().await;
+        let root = dir.path().join("archive");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join(".ism-root"), "photos\n").unwrap();
+        sqlx::query("INSERT INTO mappings(root_id,name,container_path,created_at) VALUES ('photos','Archive',?,?)")
+            .bind(root.to_string_lossy().as_ref()).bind(db::now()).execute(&state.db).await.unwrap();
+        sqlx::query("INSERT INTO peers(id,name,url,secret_enc,status,created_at) VALUES ('peer','Peer example','http://peer.example','unused','online',?)")
+            .bind(db::now()).execute(&state.db).await.unwrap();
+        sqlx::query("INSERT INTO shares(id,name,root_id,path,peer_ids_json,enabled) VALUES ('share','Archive','photos','','[\"peer\"]',1)")
+            .execute(&state.db).await.unwrap();
+        let n = 3000;
+        let mut tx = state.db.begin().await.unwrap();
+        for i in 0..n {
+            let path = format!("2024/photo-{i}.jpg");
+            let activity = ism_core::dto::SyncActivity {
+                id: format!("out-{i}"),
+                outgoing: true,
+                peer_id: "peer".into(),
+                share_name: "Archive".into(),
+                relative_path: path.clone(),
+                location: ism_core::dto::Location {
+                    root_id: "photos".into(),
+                    path: path.clone(),
+                },
+                source: "ISM: Local".into(),
+                destination: "ISM: Peer example".into(),
+                destination_path: path.clone(),
+                status: "failed".into(),
+                size: 10,
+                bytes_done: 10,
+                error: Some(if i % 3 == 0 {
+                    format!("{path} changed on the receiver")
+                } else {
+                    "receiver disk full".into()
+                }),
+                queued_at: db::now(),
+                finished_at: None,
+                operation_id: None,
+                readd_available: false,
+                recovery: None,
+            };
+            sqlx::query("INSERT INTO outgoing_sync(peer_id,id,activity_json) VALUES ('peer',?,?)")
+                .bind(&activity.id)
+                .bind(serde_json::to_string(&activity).unwrap())
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            for status in ["queued", "failed"] {
+                sqlx::query("INSERT INTO transfers(id,peer_id,share_id,rel_path,sha256,size,vv_json,status,queued_at,updated_at,error)
+                             VALUES (?,'peer','share',?,'example',100,'{}',?,?,?,?)")
+                    .bind(format!("{status}-{i}"))
+                    .bind(&path)
+                    .bind(status)
+                    .bind(db::now())
+                    .bind(db::now())
+                    .bind((status == "failed").then_some("checksum mismatch"))
+                    .execute(&mut *tx)
+                    .await
+                    .unwrap();
+            }
+        }
+        tx.commit().await.unwrap();
+        let started = std::time::Instant::now();
+        let snapshot = page(&state, 25, 0).await.unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(snapshot.current.len(), 3, "{:#?}", snapshot.current);
+        let outgoing = snapshot
+            .current
+            .iter()
+            .find(|a| a.title == "Outgoing peer synchronization")
+            .unwrap();
+        assert_eq!(outgoing.count, n);
+        assert_eq!(outgoing.status, BackgroundStatus::Blocked);
+        assert_eq!(outgoing.reasons[0].reason, "receiver disk full");
+        assert_eq!(outgoing.reasons[0].count, 2000);
+        assert_eq!(outgoing.reasons[1].reason, "<item> changed on the receiver");
+        assert_eq!(outgoing.examples.len(), 5);
+        let failed = snapshot
+            .current
+            .iter()
+            .find(|a| a.task_key == "transfer-failed:peer:share")
+            .unwrap();
+        assert_eq!((failed.count, failed.total), (n, Some(n * 100)));
+        let queue = snapshot
+            .current
+            .iter()
+            .find(|a| a.task_key == "transfer-queue:peer:share")
+            .unwrap();
+        assert_eq!(queue.count, n);
+        assert!(!queue.phase.is_empty());
     }
 
     #[tokio::test]

@@ -3,6 +3,7 @@
 use ism_core::dto::{BackgroundActivity, BackgroundStatus};
 use ism_core::maintenance::Phase;
 use sqlx::Row;
+use std::collections::HashMap;
 
 use crate::db;
 use crate::error::{AppResult, redact};
@@ -33,6 +34,101 @@ fn entry(
         error: None,
         operation_id: None,
         page: Some(page.into()),
+        count: 1,
+        reasons: Vec::new(),
+        examples: Vec::new(),
+    }
+}
+
+const EXAMPLES: usize = 5;
+const REASONS: usize = 5;
+/// Queued transfers whose full eligibility is evaluated: the head of the queue is what the
+/// transfer worker examines next, so it explains why the queue is or is not moving.
+const QUEUE_HEAD: i64 = 10;
+
+/// Folds per-item evidence into one row per group so thousands of files stay readable and cheap.
+#[derive(Default)]
+struct Groups {
+    order: Vec<String>,
+    rows: HashMap<String, (BackgroundActivity, HashMap<String, u64>)>,
+}
+
+impl Groups {
+    /// `row.resource` names the group scope; `item` is the individual file or target.
+    fn add(
+        &mut self,
+        key: String,
+        mut row: BackgroundActivity,
+        item: &str,
+        reason: Option<String>,
+    ) {
+        let reason = reason.map(|r| r.replace(item, "<item>"));
+        let example = ism_core::dto::ActivityExample {
+            resource: item.into(),
+            detail: row.error.clone(),
+        };
+        match self.rows.get_mut(&key) {
+            Some((group, reasons)) => {
+                group.count += 1;
+                group.done += row.done;
+                group.total = group.total.zip(row.total).map(|(a, b)| a + b);
+                if row.started_at < group.started_at {
+                    group.started_at = row.started_at;
+                }
+                if row.updated_at > group.updated_at {
+                    group.updated_at = row.updated_at;
+                }
+                group.next_at = match (group.next_at.take(), row.next_at) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (a, b) => a.or(b),
+                };
+                if group.examples.len() < EXAMPLES {
+                    group.examples.push(example);
+                }
+                tally(reasons, reason);
+            }
+            None => {
+                let mut reasons = HashMap::new();
+                tally(&mut reasons, reason);
+                row.id = format!("state:{key}");
+                row.task_key = key.clone();
+                row.examples = vec![example];
+                self.order.push(key.clone());
+                self.rows.insert(key, (row, reasons));
+            }
+        }
+    }
+
+    fn finish(mut self, out: &mut Vec<BackgroundActivity>) {
+        for key in self.order {
+            let Some((mut row, reasons)) = self.rows.remove(&key) else {
+                continue;
+            };
+            if row.count == 1 {
+                let item = row.examples.pop().map(|e| e.resource).unwrap_or_default();
+                row.resource = format!("{} / {item}", row.resource);
+                row.examples.clear();
+            } else {
+                let mut reasons: Vec<_> = reasons.into_iter().collect();
+                reasons.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+                row.reasons = reasons
+                    .into_iter()
+                    .take(REASONS)
+                    .map(|(reason, count)| ism_core::dto::ActivityReason { reason, count })
+                    .collect();
+                if !row.reasons.is_empty() {
+                    row.error = None;
+                }
+                row.operation_id = None;
+            }
+            out.push(row);
+        }
+    }
+}
+
+fn tally(reasons: &mut HashMap<String, u64>, reason: Option<String>) {
+    if let Some(reason) = reason {
+        *reasons.entry(reason).or_default() += 1;
     }
 }
 
@@ -180,33 +276,33 @@ pub async fn get(state: &AppState) -> AppResult<Vec<BackgroundActivity>> {
         row.started_at=r.try_get("requested_at")?;
         out.push(row);
     }
+    let mut outgoing = Groups::default();
     for json in sqlx::query_scalar::<_, String>("SELECT activity_json FROM outgoing_sync")
         .fetch_all(&state.db)
         .await?
     {
         let transfer: ism_core::dto::SyncActivity = serde_json::from_str(&json)?;
-        if !matches!(
-            transfer.status.as_str(),
-            "queued" | "running" | "publishing" | "failed"
-        ) {
-            continue;
-        }
+        let (phase, status) = match transfer.status.as_str() {
+            "queued" => ("Queued on the receiving ISM", BackgroundStatus::Waiting),
+            "running" => (
+                "The receiving ISM is downloading",
+                BackgroundStatus::Running,
+            ),
+            "publishing" => (
+                "The receiving ISM is waiting for safe publication",
+                BackgroundStatus::Running,
+            ),
+            "failed" => (
+                "The receiving ISM reported a failure",
+                BackgroundStatus::Blocked,
+            ),
+            _ => continue,
+        };
         let mut row = entry(
-            format!("outgoing:{}:{}", transfer.peer_id, transfer.id),
+            String::new(),
             "Outgoing peer synchronization",
-            format!(
-                "{} / {} / {}",
-                transfer.destination, transfer.share_name, transfer.relative_path
-            ),
-            format!(
-                "Receiver reports {}{}",
-                transfer.status,
-                if transfer.status == "publishing" {
-                    "; waiting for safe publication"
-                } else {
-                    ""
-                }
-            ),
+            format!("{} / {}", transfer.destination, transfer.share_name),
+            phase.into(),
             "/sync",
         );
         row.done = transfer.bytes_done;
@@ -214,133 +310,244 @@ pub async fn get(state: &AppState) -> AppResult<Vec<BackgroundActivity>> {
         row.unit = "bytes".into();
         row.started_at = transfer.queued_at;
         row.error = transfer.error.map(|e| redact(&e));
-        row.status = match transfer.status.as_str() {
-            "running" | "publishing" => BackgroundStatus::Running,
-            "failed" => BackgroundStatus::Blocked,
-            _ => BackgroundStatus::Waiting,
-        };
-        out.push(row);
+        row.status = status;
+        let reason = row.error.clone();
+        outgoing.add(
+            format!(
+                "outgoing:{}:{}:{}",
+                transfer.peer_id, transfer.share_name, transfer.status
+            ),
+            row,
+            &transfer.relative_path,
+            reason,
+        );
     }
-    let rows = sqlx::query(
-        "SELECT t.*,p.name AS peer_name,p.status AS peer_status FROM transfers t
-         JOIN peers p ON p.id=t.peer_id WHERE t.status IN ('queued','running','failed') ORDER BY t.queued_at,t.id",
-    ).fetch_all(&state.db).await?;
+    outgoing.finish(&mut out);
+    let share_name = |id: &str| {
+        shares
+            .iter()
+            .find(|s| s.id == id)
+            .map_or_else(|| id.to_owned(), |s| s.name.clone())
+    };
     let running: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM transfers WHERE status='running'")
         .fetch_one(&state.db)
         .await?;
-    for r in rows {
-        let id: String = r.try_get("id")?;
+    // In-flight transfers are few (bounded by the concurrency limit) and each reports progress.
+    for r in sqlx::query(
+        "SELECT t.id,t.share_id,t.rel_path,t.size,t.bytes_done,t.queued_at,t.updated_at,p.name AS peer_name
+         FROM transfers t JOIN peers p ON p.id=t.peer_id WHERE t.status='running' ORDER BY t.queued_at,t.id",
+    )
+    .fetch_all(&state.db)
+    .await?
+    {
         let share_id: String = r.try_get("share_id")?;
-        let peer_id: String = r.try_get("peer_id")?;
-        let path: String = r.try_get("rel_path")?;
-        let status: String = r.try_get("status")?;
         let mut row = entry(
-            format!("transfer:{id}"),
+            format!("transfer:{}", r.try_get::<String, _>("id")?),
             "Peer file transfer",
             format!(
                 "{} / {} / {}",
                 r.try_get::<String, _>("peer_name")?,
-                shares
-                    .iter()
-                    .find(|s| s.id == share_id)
-                    .map_or(share_id.as_str(), |s| &s.name),
-                path
+                share_name(&share_id),
+                r.try_get::<String, _>("rel_path")?
             ),
-            "Queued for transfer".into(),
+            "Downloading, verifying, or preparing safe publication".into(),
             "/sync",
         );
+        row.status = BackgroundStatus::Running;
+        row.unit = "bytes".into();
+        row.done = r.try_get::<i64, _>("bytes_done")?.max(0) as u64;
+        row.total = Some(r.try_get::<i64, _>("size")?.max(0) as u64);
+        row.started_at = r.try_get("queued_at")?;
+        row.updated_at = r.try_get("updated_at")?;
+        out.push(row);
+    }
+    let mut failed = Groups::default();
+    for r in sqlx::query(
+        "SELECT t.peer_id,t.share_id,t.rel_path,t.size,t.bytes_done,t.queued_at,t.updated_at,t.error,
+                p.name AS peer_name
+         FROM transfers t JOIN peers p ON p.id=t.peer_id WHERE t.status='failed' ORDER BY t.queued_at,t.id",
+    )
+    .fetch_all(&state.db)
+    .await?
+    {
+        let peer_id: String = r.try_get("peer_id")?;
+        let share_id: String = r.try_get("share_id")?;
+        let path: String = r.try_get("rel_path")?;
+        let mut row = entry(
+            String::new(),
+            "Peer file transfer",
+            format!("{} / {}", r.try_get::<String, _>("peer_name")?, share_name(&share_id)),
+            "Transfer needs recovery".into(),
+            "/sync",
+        );
+        row.status = BackgroundStatus::Blocked;
         row.unit = "bytes".into();
         row.done = r.try_get::<i64, _>("bytes_done")?.max(0) as u64;
         row.total = Some(r.try_get::<i64, _>("size")?.max(0) as u64);
         row.started_at = r.try_get("queued_at")?;
         row.updated_at = r.try_get("updated_at")?;
         row.error = r.try_get::<Option<String>, _>("error")?.map(|e| redact(&e));
-        if status == "running" {
-            row.status = BackgroundStatus::Running;
-            row.phase = "Downloading, verifying, or preparing safe publication".into();
-        } else if status == "failed" {
+        let reason = row.error.clone();
+        failed.add(format!("transfer-failed:{peer_id}:{share_id}"), row, &path, reason);
+    }
+    failed.finish(&mut out);
+    for r in sqlx::query(
+        "SELECT t.peer_id,t.share_id,p.name AS peer_name,p.status AS peer_status,COUNT(*) AS n,
+                COALESCE(SUM(t.size),0) AS size,COALESCE(SUM(t.bytes_done),0) AS done,
+                MIN(t.queued_at) AS first_at,MAX(t.updated_at) AS last_at
+         FROM transfers t JOIN peers p ON p.id=t.peer_id WHERE t.status='queued'
+         GROUP BY t.peer_id,t.share_id ORDER BY MIN(t.queued_at)",
+    )
+    .fetch_all(&state.db)
+    .await?
+    {
+        let peer_id: String = r.try_get("peer_id")?;
+        let share_id: String = r.try_get("share_id")?;
+        let n = r.try_get::<i64, _>("n")?.max(0) as u64;
+        let mut row = entry(
+            format!("transfer-queue:{peer_id}:{share_id}"),
+            "Peer file transfer queue",
+            format!(
+                "{} / {}",
+                r.try_get::<String, _>("peer_name")?,
+                share_name(&share_id)
+            ),
+            String::new(),
+            "/sync",
+        );
+        row.count = n;
+        row.unit = "bytes".into();
+        row.done = r.try_get::<i64, _>("done")?.max(0) as u64;
+        row.total = Some(r.try_get::<i64, _>("size")?.max(0) as u64);
+        row.started_at = r.try_get("first_at")?;
+        row.updated_at = r.try_get("last_at")?;
+        let Some(share) = shares.iter().find(|s| s.id == share_id) else {
             row.status = BackgroundStatus::Blocked;
-            row.phase = "Transfer needs recovery".into();
-        } else if r.try_get::<String, _>("peer_status")? != "online" {
+            row.phase = "The transfer share is no longer available".into();
+            out.push(row);
+            continue;
+        };
+        if r.try_get::<String, _>("peer_status")? != "online" {
             row.phase = "Waiting for the peer to come online".into();
-        } else if let Some(share) = shares.iter().find(|s| s.id == share_id) {
-            use crate::peers::transfer::Eligibility;
-            match crate::peers::transfer::eligibility(
+            out.push(row);
+            continue;
+        }
+        use crate::peers::transfer::Eligibility;
+        let mut reasons: HashMap<String, u64> = HashMap::new();
+        let mut ready = false;
+        let mut blocked = false;
+        for h in sqlx::query(
+            "SELECT id,rel_path,attempts,updated_at FROM transfers
+             WHERE status='queued' AND peer_id=? AND share_id=? ORDER BY queued_at,id LIMIT ?",
+        )
+        .bind(&peer_id)
+        .bind(&share_id)
+        .bind(QUEUE_HEAD)
+        .fetch_all(&state.db)
+        .await?
+        {
+            let id: String = h.try_get("id")?;
+            let path: String = h.try_get("rel_path")?;
+            let updated: String = h.try_get("updated_at")?;
+            let detail = match crate::peers::transfer::eligibility(
                 state,
                 share,
                 &peer_id,
                 &id,
                 &path,
-                r.try_get("attempts")?,
-                &row.updated_at,
+                h.try_get("attempts")?,
+                &updated,
             )
             .await?
             {
-                Eligibility::Ready(_)
-                    if running >= state.config.peer_transfer_concurrency as i64 =>
-                {
-                    row.phase = "Waiting for a free transfer slot".into();
+                Eligibility::Ready(_) => {
+                    ready = true;
+                    "Ready to transfer".to_owned()
                 }
-                Eligibility::Ready(_) => {}
                 Eligibility::Waiting {
                     reason,
                     next_at,
-                    blocked,
+                    blocked: b,
                 } => {
-                    row.status = if blocked {
-                        BackgroundStatus::Blocked
-                    } else {
-                        BackgroundStatus::Waiting
+                    blocked |= b;
+                    row.next_at = match (row.next_at.take(), next_at) {
+                        (Some(a), Some(b)) => Some(a.min(b)),
+                        (a, b) => a.or(b),
                     };
-                    row.phase = reason;
-                    row.next_at = next_at;
+                    reason
                 }
+            };
+            *reasons.entry(detail.clone()).or_default() += 1;
+            if row.examples.len() < EXAMPLES {
+                row.examples.push(ism_core::dto::ActivityExample {
+                    resource: path,
+                    detail: Some(detail),
+                });
             }
-        } else {
-            row.status = BackgroundStatus::Blocked;
-            row.phase = "The transfer share is no longer available".into();
         }
+        let mut reasons: Vec<_> = reasons.into_iter().collect();
+        reasons.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        let limit = state.config.peer_transfer_concurrency as i64;
+        row.phase = if ready && running >= limit {
+            format!("Waiting for a free transfer slot ({running} of {limit} in use)")
+        } else if ready {
+            "Next file starts as soon as the transfer worker picks it up".into()
+        } else {
+            format!(
+                "Next files in the queue are waiting: {}",
+                reasons.first().map_or("", |r| r.0.as_str())
+            )
+        };
+        if !ready && blocked {
+            row.status = BackgroundStatus::Blocked;
+        }
+        row.reasons = reasons
+            .into_iter()
+            .take(REASONS)
+            .map(|(reason, count)| ism_core::dto::ActivityReason { reason, count })
+            .collect();
         out.push(row);
     }
+    let mut recovery = Groups::default();
     for r in sqlx::query(
         "SELECT * FROM sync_recovery WHERE state NOT IN ('fixed') ORDER BY created_at,id",
     )
     .fetch_all(&state.db)
     .await?
     {
-        let id: String = r.try_get("id")?;
         let kind: String = r.try_get("kind")?;
         let target: String = r.try_get("target_id")?;
         let status: String = r.try_get("state")?;
         let detail: Option<String> = r.try_get("detail")?;
         let mut row = entry(
-            format!("recovery:{id}"),
+            String::new(),
             "Recovery verification",
-            format!("{kind}: {target}"),
-            detail.map(|d| redact(&d)).unwrap_or_else(|| {
-                match status.as_str() {
-                    "queued" => "Queued for recovery verification",
-                    "fixing" => "Verifying evidence and applying the recovery plan",
-                    "needs_decision" => "Waiting for an administrator to choose a version",
-                    "not_retryable" => "Recovery cannot continue automatically",
-                    _ => "Waiting for dependent work or new evidence",
-                }
-                .into()
-            }),
+            kind.clone(),
+            match status.as_str() {
+                "queued" => "Queued for recovery verification",
+                "fixing" => "Verifying evidence and applying the recovery plan",
+                "needs_decision" => "Waiting for an administrator to choose a version",
+                "not_retryable" => "Recovery cannot continue automatically",
+                _ => "Waiting for dependent work or new evidence",
+            }
+            .into(),
             "/sync",
         );
         row.started_at = r.try_get("created_at")?;
         row.updated_at = r.try_get("updated_at")?;
         if kind == "operation" {
-            row.operation_id = Some(target);
+            row.operation_id = Some(target.clone());
         }
+        row.error = detail.map(|d| redact(&d));
         row.status = match status.as_str() {
             "fixing" => BackgroundStatus::Running,
             "needs_decision" | "not_retryable" => BackgroundStatus::Blocked,
             _ => BackgroundStatus::Waiting,
         };
-        out.push(row);
+        let reason = row.error.clone();
+        recovery.add(format!("recovery:{kind}:{status}"), row, &target, reason);
     }
+    recovery.finish(&mut out);
     for r in sqlx::query(
         "SELECT i.peer_id,p.name,i.share_name,i.status,i.error,i.operation_id,COUNT(*) AS n
          FROM peer_inbox i JOIN peers p ON p.id=i.peer_id WHERE i.status!='done'
@@ -419,6 +626,7 @@ pub async fn get(state: &AppState) -> AppResult<Vec<BackgroundActivity>> {
         row.updated_at=r.try_get("updated_at")?;
         out.push(row);
     }
+    let mut uploads = Groups::default();
     for r in sqlx::query(
         "SELECT u.id,u.operation_id,u.created_at FROM uploads u JOIN operation_items i ON i.operation_id=u.operation_id
          WHERE i.kind='publish_upload' AND i.status='done' AND i.result_json IS NOT NULL
@@ -427,11 +635,12 @@ pub async fn get(state: &AppState) -> AppResult<Vec<BackgroundActivity>> {
                 OR EXISTS(SELECT 1 FROM json_each(u.request_json,'$.files') f WHERE json_extract(f.value,'$.role')='original'))",
     ).fetch_all(&state.db).await? {
         let id:String=r.try_get("id")?;
-        let mut row=entry(format!("upload-asset:{id}"),"Imported upload asset ID",id,
+        let mut row=entry(String::new(),"Imported upload asset ID","Uploads".into(),
             "Published file is waiting for Immich import and asset lookup".into(),"/operations");
         row.operation_id=r.try_get("operation_id")?;
         row.started_at=r.try_get("created_at")?;
-        out.push(row);
+        uploads.add("upload-asset".into(),row,&id,None);
     }
+    uploads.finish(&mut out);
     Ok(out)
 }

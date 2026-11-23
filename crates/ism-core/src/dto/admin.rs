@@ -447,6 +447,33 @@ pub struct BackgroundActivity {
     pub error: Option<String>,
     pub operation_id: Option<String>,
     pub page: Option<String>,
+    /// Number of queued items this row summarizes; bulk work is grouped rather than listed.
+    #[serde(default = "one")]
+    pub count: u64,
+    /// Most frequent reasons among the grouped items, largest first.
+    #[serde(default)]
+    pub reasons: Vec<ActivityReason>,
+    /// A few representative items from the group.
+    #[serde(default)]
+    pub examples: Vec<ActivityExample>,
+}
+
+fn one() -> u64 {
+    1
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct ActivityReason {
+    pub reason: String,
+    pub count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct ActivityExample {
+    pub resource: String,
+    pub detail: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]

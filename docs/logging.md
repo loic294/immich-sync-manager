@@ -49,6 +49,9 @@ Runtime logs complement, rather than replace, ISM's persistent records in the da
 - **Operations:** live background activity and sync waiting reasons, plus managed file-operation
   progress, outcomes, errors and recovery details. Background activity includes scans, hashing,
   peer event/inventory processing, transfers, maintenance, upload verification, and recovery.
+  Bulk waits and failures are grouped per peer and share (or kind) with an item count, the most
+  common reasons and a few example files; expand a row for those details and use **Sync** for
+  the full per-file list.
 - **Sync / Conflicts:** queued or failed transfers and conflict details.
 - **Overview / Mappings:** maintenance blocks, watcher warnings and pending library scans.
 
