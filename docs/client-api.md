@@ -25,6 +25,9 @@ shown once; only a hash is stored. A token never inherits more than its grants: 
 Immich account performs each change from the path mapping, never from an owner id supplied by the
 client.
 
+Credential last-used times are updated at most once per minute during normal use. Authorization
+and revocation are checked on every request.
+
 ## Discovery
 
 `GET /api/v1/client/info` →
