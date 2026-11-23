@@ -13,6 +13,30 @@ describe('ism-sync-page', () => {
     vi.useRealTimers();
   });
 
+  it('opens sync issues directly when linked from background activity', async () => {
+    const original = window.location.href;
+    window.history.replaceState(null, '', '/sync?view=attention');
+    try {
+      vi.spyOn(api, 'get').mockImplementation(async (path) => {
+        if (path === '/api/admin/sync')
+          return { allowed_now: true, override_active: null } as never;
+        if (path === '/api/admin/sync/page' || path === '/api/admin/recovery/page')
+          return { rows: [], total: 0 } as never;
+        if (path === '/api/admin/sync/schedule') return { timezone: 'UTC', windows: [] } as never;
+        return [] as never;
+      });
+      const page = await mount('ism-sync-page');
+      await vi.waitFor(() =>
+        expect(page.querySelector('#sync-tab-attention')?.getAttribute('aria-selected')).toBe(
+          'true',
+        ),
+      );
+      expect(page.querySelector('ism-recovery-list')).not.toBeNull();
+    } finally {
+      window.history.replaceState(null, '', original);
+    }
+  });
+
   it('refreshes transfer statistics every five seconds and stops when disconnected', async () => {
     vi.useFakeTimers();
     const get = vi.spyOn(api, 'get').mockImplementation(async (path) => {
@@ -168,10 +192,11 @@ describe('ism-sync-page', () => {
     warnings = ['Outgoing sync with Remote is not up to date.'];
     await page.reload();
     await page.updateComplete;
-    expect(page.textContent).toContain('Waiting for transfer speed');
+    expect(page.textContent).toContain('Check the message below');
     expect(page.textContent).toContain('Outgoing sync with Remote is not up to date.');
     expect(page.textContent).not.toContain('6 sec remaining');
 
+    warnings = [];
     progress.bytes_done = progress.bytes_total;
     progress.files_completed = 7;
     progress.publishing = 1;
@@ -181,6 +206,15 @@ describe('ism-sync-page', () => {
     expect(page.textContent).toContain('7 of 8 files transferred');
     progress.publishing = 0;
     progress.files_completed = 8;
+    warnings = ['Outgoing sync with Remote is not up to date.'];
+    await page.reload();
+    await page.updateComplete;
+    const summary = page.querySelector('[aria-labelledby="sync-progress-title"]');
+    expect(summary?.textContent).not.toContain('Complete');
+    expect(summary?.textContent).toContain('Reported sync progress');
+    expect(summary?.textContent).toContain('Check the message below');
+    expect(summary?.querySelector('progress')).toBeNull();
+    warnings = [];
     await page.reload();
     await page.updateComplete;
     expect(page.textContent).toContain('Complete');

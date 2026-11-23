@@ -17,7 +17,7 @@ const LABELS: Record<RecoveryState, string> = {
   waiting: 'Waiting',
   needs_decision: 'Choose a version',
   fixed: 'Fixed',
-  not_retryable: 'Not retryable',
+  not_retryable: "Can't fix automatically",
 };
 
 const BADGES: Record<RecoveryState, string> = {
@@ -28,6 +28,60 @@ const BADGES: Record<RecoveryState, string> = {
   fixed: 'badge badge-success badge-soft',
   not_retryable: 'badge badge-error badge-soft',
 };
+
+function issueGuidance(row: RecoveryView): string {
+  if (row.state === 'fixing') return 'ISM is checking and fixing this issue.';
+  if (row.state === 'needs_decision') {
+    if (row.target.kind !== 'conflict') {
+      return 'A related file needs a version choice. Find that file in this list.';
+    }
+    return row.code === 'version_conflict'
+      ? 'The files changed. Compare the versions again before choosing which to keep.'
+      : 'Compare the versions, then choose which to keep.';
+  }
+  switch (row.code) {
+    case 'peer_unreachable':
+      return "Can't reach the other instance. Check that it is running and connected; ISM will try again.";
+    case 'peer_recovery_unavailable':
+    case 'peer_evidence_unavailable':
+      return "Can't get the information needed from the other instance. Check its connection; ISM will try again.";
+    case 'peer_share_changed':
+      return 'This folder is no longer shared with the other instance. Check its sharing settings.';
+    case 'root_unavailable':
+      return 'The shared folder is unavailable. Check that its storage is mounted and its folder mapping is correct.';
+    case 'maintenance_blocked':
+    case 'direct_writes_unavailable':
+      return "Immich isn't ready for file changes. Check server maintenance for the reason.";
+    case 'peer_busy':
+      return 'The other instance is busy. ISM will try again.';
+    case 'recovery_plan_unchanged':
+      return 'ISM tried the same fix several times without success. Check Technical details for what needs to change.';
+    case 'recovery_worker_failed':
+      return 'The fix stopped unexpectedly. Select this issue and choose Fix selected to try again.';
+    case 'invalid_saved_recovery':
+      return "ISM can't read this saved issue. Check the server logs; it can't be fixed from this page.";
+    case 'recovery_exhausted':
+      return "ISM couldn't find a complete copy. Restore this file from a backup if you have one.";
+    case 'recovery_evidence_missing':
+      return "ISM can't verify this file yet. Make sure both instances are online; it will check again.";
+    case 'recovery_evidence_changed':
+    case 'revision_changed':
+    case 'recovery_changed':
+    case 'peer_content_changed':
+      return 'The file changed while ISM was checking it. ISM will check again.';
+    case 'awaiting_receiver':
+      return 'The other instance is checking this issue.';
+    case 'awaiting_completion':
+      return 'The fix is running. ISM is waiting for it to finish.';
+    default:
+      if (row.state === 'queued') return 'ISM is preparing the fix.';
+      if (row.state === 'fixed') return 'This issue has been fixed.';
+      if (row.state === 'not_retryable') return "ISM can't fix this issue automatically.";
+      return row.code || row.detail
+        ? "ISM couldn't finish checking this issue. If it stays here, check Technical details."
+        : 'ISM will check this issue again.';
+  }
+}
 
 export class IsmRecoveryList extends IsmPage {
   static override properties = {
@@ -54,7 +108,7 @@ export class IsmRecoveryList extends IsmPage {
     super();
     this.rows = [];
     this.total = 0;
-    this.limit = 250;
+    this.limit = 25;
     this.offset = 0;
     this.selected = new Map();
   }
@@ -85,7 +139,7 @@ export class IsmRecoveryList extends IsmPage {
       async () => {
         this.result = await admin.fixIssues({ targets: all ? [] : targets, all, resolution: null });
       },
-      'Recovery queued. Independent sync continues.',
+      'Fix requested. ISM will check eligible issues.',
     );
     if (ok) this.selected = new Map();
   }
@@ -160,7 +214,7 @@ export class IsmRecoveryList extends IsmPage {
       () => html`
       <div class="flex flex-wrap items-center justify-between gap-3">
         <div><h2 class="text-base font-semibold">Sync issues</h2>
-          <p class="text-sm text-base-content/70">Independent sync continues while these issues are recovered.</p></div>
+          <p class="text-sm text-base-content/70">Issues are handled per file whenever it is safe to do so.</p></div>
         <div class="flex flex-wrap items-center gap-2">
           <span role="status" class="text-sm">${this.selected.size} selected</span>
           <button class="btn btn-primary btn-sm max-sm:min-h-11" ?disabled=${!!this.busy || !canFixSelected}
@@ -207,7 +261,7 @@ export class IsmRecoveryList extends IsmPage {
           ${this.result.items.filter((row) => row.state === 'queued' || row.state === 'fixing').length} queued or fixing ·
           ${this.result.items.filter((row) => row.state === 'waiting').length} waiting ·
           ${this.result.items.filter((row) => row.state === 'needs_decision').length} need a decision ·
-          ${this.result.items.filter((row) => row.state === 'not_retryable').length} not retryable</span>
+          ${this.result.items.filter((row) => row.state === 'not_retryable').length} can't be fixed automatically</span>
       </div>`
           : nothing
       }
@@ -233,6 +287,7 @@ export class IsmRecoveryList extends IsmPage {
               @change=${(event: Event) => this.select(row, (event.target as HTMLInputElement).checked)}></label></td>
             <td class="max-w-96 break-all max-sm:max-w-none max-sm:px-2 max-sm:py-1">
               <span class="font-medium">${row.title}</span>
+              <p class="mt-1 text-sm">${issueGuidance(row)}</p>
               ${row.local_instance ? html`<p class="text-sm text-base-content/70">${row.local_instance}${row.peer_instance ? html` / ${row.peer_instance}` : nothing}</p>` : nothing}
               ${this.review.render(row.target)}
               ${

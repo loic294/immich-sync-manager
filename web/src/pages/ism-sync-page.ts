@@ -91,7 +91,8 @@ export class IsmSyncPage extends IsmPage {
     this.peers = [];
     this.rows = [];
     this.total = 0;
-    this.view = 'active';
+    const view = new URLSearchParams(window.location.search).get('view');
+    this.view = view === 'attention' || view === 'completed' ? view : 'active';
     this.limit = 250;
     this.offset = 0;
     this.progress = undefined;
@@ -153,31 +154,38 @@ export class IsmSyncPage extends IsmPage {
   private renderProgress() {
     const p = this.progress;
     if (!p) return nothing;
-    const complete = p.files_total > 0 && p.files_completed === p.files_total;
+    const uncertain = this.warnings.length > 0;
+    const complete = !uncertain && p.files_total > 0 && p.files_completed === p.files_total;
     const value =
       p.bytes_total > 0
         ? percent(p.bytes_done, p.bytes_total)
         : percent(p.files_completed, p.files_total);
-    const eta = complete
-      ? 'Complete'
-      : p.eta_seconds !== null
-        ? `${formatDuration(p.eta_seconds)} remaining`
-        : p.publishing > 0 && p.bytes_done === p.bytes_total
-          ? 'Finishing publication'
-          : p.files_total === 0
-            ? 'No transfers queued'
-            : p.failed > 0 && p.running === 0 && p.queued === 0
-              ? 'Needs attention'
-              : 'Waiting for transfer speed';
+    const eta = uncertain
+      ? 'Check the message below'
+      : complete
+        ? 'Complete'
+        : p.eta_seconds !== null
+          ? `${formatDuration(p.eta_seconds)} remaining`
+          : p.publishing > 0 && p.bytes_done === p.bytes_total
+            ? 'Finishing publication'
+            : p.files_total === 0
+              ? 'No transfers queued'
+              : p.failed > 0 && p.running === 0 && p.queued === 0
+                ? 'Needs attention'
+                : 'Waiting for transfer speed';
     return html`<section class="rounded-box border border-base-300 bg-base-100 p-4" aria-labelledby="sync-progress-title">
       <div class="flex flex-wrap items-baseline justify-between gap-x-6 gap-y-1">
-        <h2 id="sync-progress-title" class="text-base font-semibold">Current sync</h2>
+        <h2 id="sync-progress-title" class="text-base font-semibold">${uncertain ? 'Reported sync progress' : 'Current sync'}</h2>
         <span class="text-sm tabular-nums">${p.files_completed.toLocaleString()} of ${p.files_total.toLocaleString()} files transferred</span>
       </div>
-      <div class="my-3 flex items-center gap-3">
+      ${
+        uncertain
+          ? nothing
+          : html`<div class="my-3 flex items-center gap-3">
         <progress class="progress progress-primary flex-1" aria-label="Total sync progress" value=${value} max="100"></progress>
         <span class="min-w-10 text-right text-sm tabular-nums">${value}%</span>
-      </div>
+      </div>`
+      }
       <div class="flex flex-wrap items-baseline justify-between gap-x-6 gap-y-2 text-sm tabular-nums">
         <span>${formatBytes(p.bytes_done)} of ${formatBytes(p.bytes_total)}</span>
         <span>${formatBitRate(p.bytes_per_second)} <span class="text-base-content/70">(last minute)</span></span>

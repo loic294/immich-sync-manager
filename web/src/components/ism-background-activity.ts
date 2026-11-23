@@ -11,7 +11,8 @@ import '@/components/ism-icon';
 import '@/components/ism-pagination';
 
 type Filter = 'attention' | 'running' | 'waiting' | 'all';
-const ATTENTION = ['failed', 'blocked', 'interrupted'];
+const RESTARTED =
+  'ISM restarted before this run reported an outcome; queued work is recovered separately';
 const FILTERS: readonly [Filter, string][] = [
   ['attention', 'Needs attention'],
   ['running', 'Running'],
@@ -28,9 +29,186 @@ const PAGES: Record<string, string> = {
 const POLL_MS = 10_000;
 const STALE_MS = 35_000;
 
+function needsAttention(task: BackgroundActivity) {
+  return task.status === 'failed' || task.status === 'blocked' || task.status === 'interrupted';
+}
+
+function activityTitle(task: BackgroundActivity) {
+  if (task.task_key.startsWith('recovery:conflict:')) return 'Files with different versions';
+  const titles: Record<string, string> = {
+    'Peer file transfer queue': 'Files queued for sync',
+    'Peer event application': 'Changes from another instance',
+    'Peer inventory application': 'Checking files from another instance',
+    'Outgoing peer synchronization': 'Files syncing to another instance',
+    'Peer recovery refresh': 'Checking sync issues',
+    'Recovery verification': 'Checking sync issues',
+    'Recovery execution': 'Fixing a sync issue',
+    'Scoped library synchronization': 'Updating the Immich library',
+    'Library synchronization': 'Updating the Immich library',
+    'Peer file transfer': 'File transfer',
+    'Share inventory scan': 'Checking shared files',
+    'Imported upload asset ID': 'Waiting for Immich to find uploaded files',
+    'Peer synchronization': 'Syncing with another instance',
+    'Pending peer inventory': 'Files waiting to sync',
+    'Peer connection': 'Connection to another instance',
+    'Peer inventory backfill': 'Checking files from another instance',
+    'Peer transfer activity refresh': 'Checking sync progress',
+    'Peer recovery request': 'Fixing issues on another instance',
+    'Immich maintenance': 'Preparing Immich for changes',
+    'Prepare Immich write barrier': 'Preparing Immich for changes',
+    'Resume Immich library queue': 'Resuming Immich library updates',
+    'Operation preview': 'Checking a file operation',
+    'Operation admission': 'Preparing a file operation',
+  };
+  return titles[task.title] ?? task.title;
+}
+
+function explain(message: string): string {
+  const prefix = 'Next files in the queue are waiting: ';
+  if (message.startsWith(prefix)) return explain(message.slice(prefix.length));
+  const checksum = 'Verifying checksum for ';
+  if (message.startsWith(checksum))
+    return `Checking the contents of ${message.slice(checksum.length)}`;
+  const inventory = 'Inventory pagination will continue after ';
+  if (message.startsWith(inventory))
+    return `Continuing to check files after ${message.slice(inventory.length)}`;
+  if (message.endsWith(' changed on the receiver'))
+    return `${message.slice(0, -' changed on the receiver'.length).replaceAll('<item>', 'The file')} changed on the other instance.`;
+  if (message.includes('No space left on device'))
+    return 'Storage is full. Free space on the affected instance.';
+  if (message.startsWith('peer returned unexpected Content-Range '))
+    return 'The other instance sent an unexpected part of the file. Open Sync issues for details.';
+  if (message.startsWith('peer returned ') && message.endsWith(' requested bytes'))
+    return 'The other instance sent an incomplete file. Open Sync issues for details.';
+  const messages: Record<string, string> = {
+    'peer publication waits for a dependent inbox effect':
+      'An earlier change to this file must finish first. Check Sync issues if it needs attention.',
+    'peer footprint waits for unresolved managed operations':
+      'An earlier change to this file must finish first. Check Sync issues if it needs attention.',
+    'peer footprint waits for a failed companion transfer':
+      "A file needed for this change couldn't sync. Open Sync issues for details.",
+    'peer bookkeeping waits for active managed operations':
+      'Waiting for another file change to finish. Check Operations if it stays here.',
+    'peer effect waits for conflict resolution':
+      'Files have different versions. Review them in Sync.',
+    'Waiting for the original file before transferring its companion':
+      'The original file must sync first. Check Sync issues if it cannot finish.',
+    'Retry backoff after a failed transfer': 'The transfer failed. ISM will try again',
+    'Waiting for allowed file-transfer hours': 'Waiting for the scheduled sync hours',
+    'Scoped synchronization failed; retained work waits for a new request':
+      "Couldn't update the library. Check folder mappings for details.",
+    [RESTARTED]: 'ISM restarted before this finished. Check current work for its latest status.',
+    'Verifying evidence and applying the recovery plan': 'Checking and fixing a sync issue.',
+    'Queued for recovery verification': 'ISM will check these sync issues.',
+    'Waiting for dependent work or new evidence': 'Waiting for other work or updated information.',
+    'Waiting for an administrator to choose a version':
+      'Compare the versions in Sync, then choose which to keep. You can keep both.',
+    'Recovery cannot continue automatically':
+      "ISM couldn't fix this automatically. Open Sync issues for details.",
+    'The receiving ISM reported a failure':
+      "The other instance couldn't sync some files. Open Sync issues for details.",
+    'Transfer needs recovery': 'The transfer failed. Open Sync issues for details.',
+    'Published file is waiting for Immich import and asset lookup':
+      'Waiting for Immich to finish importing the uploaded files.',
+    'source version is no longer at the queued path; recovery will reconcile its current location':
+      'The original file is no longer in the expected location. ISM will check where it went.',
+    'filesystem changes may have completed, but peer bookkeeping failed; reconcile replica state and events before resolving recovery':
+      'The files may have changed, but ISM could not finish recording the change. Open Sync issues for details.',
+    'receiver disk full': 'The receiving instance has run out of storage. Free space there.',
+    'downloaded data does not match its checksum':
+      'The downloaded file did not match the original. Open Sync issues for details.',
+    'checksum mismatch':
+      "The file's contents did not match what was expected. Check the file before trying again.",
+    'peer file changed during the transfer':
+      'The file changed on the other instance during download.',
+    'the file has an unresolved conflict':
+      'This file has different versions. Compare them in Sync.',
+    'peer source tree changed; a new choice is required':
+      'The folder changed on the other instance. Compare the versions in Sync, then choose again.',
+    'matching peer file checksums have different sizes':
+      'The files appear to match, but their sizes differ. Open Sync issues for details.',
+    'peer returned an invalid Content-Range':
+      'The other instance sent an unexpected part of the file. Open Sync issues for details.',
+    'peer sent more data than the requested range':
+      'The other instance sent an unexpected part of the file. Open Sync issues for details.',
+    'share location changed while downloading':
+      "The shared folder's location changed during download. Check the share's settings.",
+    'root location changed while downloading':
+      'The destination folder changed during download. Check the folder mapping.',
+    'Waiting for the replication-operation lock': 'Waiting for another file change to finish.',
+    'Waiting for the replication-operation lock before applying inventory':
+      'Waiting to check files from the other instance.',
+    'Waiting for the replication-operation lock before applying events':
+      'Waiting to apply changes from the other instance.',
+    'Checking active operations and uncertain paths': 'Checking which files need to wait.',
+    'Enumerating share files': 'Finding files in the shared folder.',
+    'Hashing and reconciling settled files': 'Checking files that have finished changing.',
+    'Reconciling removed files and publishing inventory': 'Checking for removed files.',
+    'Fetching inventory pages and saving durable receipts':
+      'Getting the list of files from the other instance.',
+    'Applying inventory entries': 'Checking files from the other instance.',
+    'Fetching peer events and saving durable receipts': 'Getting changes from the other instance.',
+    'Verifying and applying received events': 'Checking and applying received changes.',
+    'Connecting to peer and verifying its identity': 'Connecting to the other instance.',
+    'Pulling and applying peer events': 'Getting and applying changes from the other instance.',
+    'Fetching and applying share inventory backfill': 'Checking files from the other instance.',
+    'Fetching current recovery evidence from peer': 'Checking sync issues on the other instance.',
+    'Fetching receiver-owned transfer progress': 'Getting sync progress from the other instance.',
+    'Forwarding recovery decisions to peer': 'Sending the sync decision to the other instance.',
+    'Waiting for safe decision verification': 'Waiting to check a sync decision.',
+    'Verifying peer source evidence': 'Checking the file on the other instance.',
+    'Verifying local file and transfer prerequisites':
+      'Checking whether this file is ready to sync.',
+    'Verifying downloaded checksum': 'Checking the downloaded file.',
+    'Verifying destination and submitting safe publication': 'Checking where to save the file.',
+    'Attempt deferred; file remains queued for its prerequisites':
+      'This file is waiting for another change to finish.',
+    'Attempt ended; transfer is no longer applicable': 'This transfer is no longer needed.',
+    'Waiting for maintenance admission': 'Waiting for Immich to be ready for changes.',
+    'Preparing scoped synchronization': 'Preparing to update changed files in Immich.',
+    'Synchronizing files through the Immich API': 'Updating changed files in Immich.',
+    'Dispatching scoped folder scans to Immich': 'Asking Immich to check changed folders.',
+    'Waiting for Immich to finish the library queue and confirm it idle':
+      'Waiting for Immich to finish updating the library.',
+    'Synchronizing scoped paths or waiting for the Immich library queue':
+      'Updating changed files in Immich.',
+    'Waiting for the Immich maintenance barrier':
+      'Waiting for Immich to finish another file change.',
+    'Immich library queue is paused by a write barrier; waiting for release':
+      'Waiting for Immich to finish another file change.',
+    'Waiting for Immich library queue idle confirmation':
+      'Waiting for Immich to finish updating the library.',
+    'Synchronizing files and folders through the Immich API':
+      'Updating changed files and folders in Immich.',
+    'Checking Immich version, database schema and API capabilities':
+      'Checking the Immich connection and compatibility.',
+    'Fetching libraries and reconciling exclusion patterns':
+      'Updating library settings from Immich.',
+    'Removing staging for a published or abandoned upload': 'Cleaning up temporary upload files.',
+    'Checking expired upload and clearing abandoned staging': 'Cleaning up an expired upload.',
+    'Checking the original photo for this sidecar':
+      'Checking the original file for a related file.',
+    'Waiting for file changes to settle (debounce)': 'Waiting for file changes to finish.',
+    'Waiting for the library scheduler': 'Waiting to update Immich.',
+    'Verifying settings and pausing the Immich library queue':
+      'Checking Immich settings and pausing library updates.',
+    'Confirming the paused Immich library queue has no active jobs':
+      'Waiting for Immich to finish its current library work.',
+    'Resuming the library queue after managed operations': 'Resuming Immich library updates.',
+    'The receiving ISM is waiting for safe publication': 'The other instance is saving the files.',
+    'Downloading, verifying, or preparing safe publication': 'Downloading and checking the file.',
+    'Waiting for the upload lock': 'Waiting for another upload step to finish.',
+    'Waiting to submit safe upload publication': 'Waiting to save the uploaded files.',
+    'Planning and verifying requested file actions': 'Checking the requested file changes.',
+    'Waiting for the operation submission lock': 'Waiting to start the file change.',
+    'Validating and admitting the managed operation': 'Checking and starting the file change.',
+  };
+  return (messages[message] ?? message).replaceAll('<item>', 'the file');
+}
+
 function matches(filter: Filter, task: BackgroundActivity) {
   if (filter === 'all') return true;
-  if (filter === 'attention') return ATTENTION.includes(task.status);
+  if (filter === 'attention') return needsAttention(task);
   return task.status === filter;
 }
 
@@ -111,7 +289,17 @@ export class IsmBackgroundActivity extends IsmPage {
   private measure(task: BackgroundActivity) {
     const bytes = task.unit.startsWith('bytes');
     const fmt = (n: number) => (bytes ? formatBytes(n) : n.toLocaleString());
-    const unit = bytes ? task.unit.replace('bytes', '').trim() : task.unit;
+    const units: Record<string, string> = {
+      hashed: 'checked',
+      transferred: 'downloaded',
+      'paths dispatched': 'items sent to Immich',
+      'events applied': 'changes applied',
+      'events checked': 'changes checked',
+      'inventory entries checked': 'files checked',
+      'actions planned': 'actions checked',
+    };
+    const rawUnit = bytes ? task.unit.replace('bytes', '').trim() : task.unit;
+    const unit = units[rawUnit] ?? rawUnit;
     const measured = task.total !== null && task.total > 0;
     return { bytes, fmt, unit, measured };
   }
@@ -119,7 +307,7 @@ export class IsmBackgroundActivity extends IsmPage {
   private icon(task: BackgroundActivity) {
     if (task.status === 'running')
       return html`<span class="loading loading-spinner loading-sm text-info" aria-hidden="true"></span>`;
-    if (ATTENTION.includes(task.status))
+    if (needsAttention(task))
       return html`<ism-icon name="circle-alert" class="text-error"></ism-icon>`;
     if (task.status === 'completed')
       return html`<ism-icon name="circle-check" class="text-success"></ism-icon>`;
@@ -152,18 +340,23 @@ export class IsmBackgroundActivity extends IsmPage {
       (Date.parse(task.finished_at ?? new Date(now).toISOString()) - Date.parse(task.started_at)) /
       1000;
     const reasonTotal = task.reasons.reduce((n, r) => n + r.count, 0);
+    const syncIssue =
+      (task.page === '/sync' && needsAttention(task)) ||
+      task.phase === 'peer effect waits for conflict resolution';
+    const href = syncIssue ? '/sync?view=attention' : task.page;
+    const label = syncIssue ? 'Review sync issues' : task.page && PAGES[task.page];
     return html`<div class="grid gap-4 px-3 pb-4 pl-10 text-sm md:grid-cols-[minmax(0,3fr)_minmax(0,2fr)]">
       <div class="min-w-0 space-y-3">
         ${stalled ? html`<p class="text-warning">No progress reported for ${formatDuration((now - Date.parse(task.updated_at)) / 1000)}.</p>` : nothing}
-        ${task.next_at ? html`<p>Next eligible: <span class="font-medium">${formatDate(task.next_at)}</span></p>` : nothing}
-        ${task.error ? html`<p class="break-words text-error">${task.error}</p>` : nothing}
+        ${task.next_at ? html`<p>Scheduled for: <span class="font-medium">${formatDate(task.next_at)}</span></p>` : nothing}
+        ${task.error ? html`<p class="break-words text-error">${explain(task.error)}</p>` : nothing}
         ${
           task.reasons.length > 0
             ? html`<div>
-              <h5 class="mb-1 font-medium">${task.count > reasonTotal ? `Reasons (first ${reasonTotal.toLocaleString()} checked)` : 'Reasons'}</h5>
+              <h5 class="mb-1 font-medium">${task.count > reasonTotal ? `Reasons (${reasonTotal.toLocaleString()} of ${task.count.toLocaleString()})` : 'Reasons'}</h5>
               <ul class="space-y-1">${task.reasons.map(
                 (r) => html`<li class="flex items-baseline justify-between gap-3">
-                  <span class="min-w-0 break-words">${r.reason}</span>
+                  <span class="min-w-0 break-words">${explain(r.reason)}</span>
                   <span class="shrink-0 tabular-nums text-base-content/70">${r.count.toLocaleString()}</span>
                 </li>`,
               )}</ul>
@@ -177,7 +370,7 @@ export class IsmBackgroundActivity extends IsmPage {
               <ul class="space-y-1">${task.examples.map(
                 (e) => html`<li class="min-w-0">
                   <span class="break-all font-mono text-xs">${e.resource}</span>
-                  ${e.detail ? html`<span class="block break-words text-xs text-base-content/70">${e.detail}</span>` : nothing}
+                  ${e.detail ? html`<span class="block break-words text-xs text-base-content/70">${explain(e.detail)}</span>` : nothing}
                 </li>`,
               )}</ul>
             </div>`
@@ -192,7 +385,7 @@ export class IsmBackgroundActivity extends IsmPage {
         <dt class="text-base-content/60">Last update</dt><dd>${formatDate(task.updated_at)}</dd>
         <dd class="col-span-2 mt-2 flex flex-wrap gap-2">
           ${task.operation_id ? html`<button type="button" class="btn btn-sm" @click=${() => this.dispatchEvent(new CustomEvent('operation-open', { detail: task.operation_id, bubbles: true, composed: true }))}>Open related operation</button>` : nothing}
-          ${task.page && PAGES[task.page] ? html`<a class="btn btn-sm" href=${task.page}>${PAGES[task.page]}</a>` : nothing}
+          ${href && label ? html`<a class="btn btn-sm" href=${href}>${label}</a>` : nothing}
         </dd>
       </dl>
     </div>`;
@@ -207,10 +400,10 @@ export class IsmBackgroundActivity extends IsmPage {
               <span class="flex justify-center">${this.icon(task)}</span>
               <span class="min-w-0">
                 <span class="flex min-w-0 items-baseline gap-2">
-                  <span class="shrink-0 font-medium">${task.title}</span>
-                  <span class="truncate text-sm text-base-content/70" title=${task.resource}>${task.resource}</span>
+                  <span class="min-w-0 font-medium">${activityTitle(task)}</span>
+                  ${task.task_key.startsWith('recovery:conflict:') && task.resource === 'conflict' ? nothing : html`<span class="truncate text-sm text-base-content/70" title=${task.resource}>${task.resource}</span>`}
                 </span>
-                <span class="block truncate text-sm ${ATTENTION.includes(task.status) ? 'text-error' : 'text-base-content/80'}" title=${task.phase}>${task.phase}</span>
+                <span class="block text-sm ${needsAttention(task) ? 'text-error' : 'text-base-content/80'}" title=${explain(task.phase)}>${explain(task.phase)}</span>
               </span>
               ${this.aside(task, now)}
             </summary>
@@ -248,7 +441,7 @@ export class IsmBackgroundActivity extends IsmPage {
     const current = this.snapshot?.current ?? [];
     const filter = this.activeFilter(current);
     const order = (t: BackgroundActivity) =>
-      ATTENTION.includes(t.status) ? 0 : t.status === 'running' ? 1 : 2;
+      needsAttention(t) ? 0 : t.status === 'running' ? 1 : 2;
     const visible = current
       .filter((t) => matches(filter, t))
       .sort(

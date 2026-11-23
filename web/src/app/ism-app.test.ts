@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { api } from '@/api/client';
 import { events } from '@/api/events';
+import type { BackgroundActivity } from '@/api/generated/BackgroundActivity';
 import type { SessionInfo } from '@/api/generated/SessionInfo';
 import type { AppRoute } from '@/app/routes';
 import { session } from '@/stores/session';
@@ -78,5 +79,61 @@ describe('ism-app', () => {
     expect(app.querySelector('nav a[aria-current="page"]')?.textContent).toContain('Overview');
     expect(app.textContent).toContain('Instance A');
     expect(events.start).toHaveBeenCalledOnce();
+  });
+
+  it('opens sync issues from an activity link through the app router', async () => {
+    const activity: BackgroundActivity = {
+      id: 'blocked-transfer',
+      task_key: 'transfer:example',
+      title: 'Peer file transfer queue',
+      resource: 'Example share',
+      status: 'blocked',
+      phase: 'peer publication waits for a dependent inbox effect',
+      done: 0,
+      total: null,
+      unit: 'files',
+      started_at: '2026-01-01T00:00:00Z',
+      updated_at: '2026-01-01T00:00:00Z',
+      finished_at: null,
+      next_at: null,
+      error: null,
+      operation_id: null,
+      page: '/sync',
+      count: 1,
+      reasons: [],
+      examples: [],
+    };
+    vi.spyOn(api, 'get').mockImplementation(async (path: string) => {
+      if (path === '/api/admin/session')
+        return { ...BASE, authenticated: true, username: 'admin' } as never;
+      if (path === '/api/admin/overview') return undefined as never;
+      if (path === '/api/admin/operations/background')
+        return {
+          current: [activity],
+          history: [],
+          total: 0,
+          observed_at: new Date().toISOString(),
+          warnings: [],
+        } as never;
+      if (path === '/api/admin/sync') return { allowed_now: true, override_active: null } as never;
+      if (path === '/api/admin/sync/schedule') return { timezone: 'UTC', windows: [] } as never;
+      if (path.endsWith('/page')) return { rows: [], total: 0 } as never;
+      if (
+        path === '/api/admin/sync/overrides' ||
+        path === '/api/admin/shares' ||
+        path === '/api/admin/peers'
+      )
+        return [] as never;
+      throw new Error(`unexpected GET ${path}`);
+    });
+    window.history.replaceState(null, '', '/operations');
+    const app = await mount('ism-app');
+    await until(() => expect(app.querySelector('a[href="/sync?view=attention"]')).not.toBeNull());
+    app.querySelector<HTMLAnchorElement>('a[href="/sync?view=attention"]')?.click();
+    await until(() =>
+      expect(app.querySelector('#sync-tab-attention')?.getAttribute('aria-selected')).toBe('true'),
+    );
+    expect(window.location.pathname + window.location.search).toBe('/sync?view=attention');
+    expect(app.querySelector('ism-recovery-list')).not.toBeNull();
   });
 });
