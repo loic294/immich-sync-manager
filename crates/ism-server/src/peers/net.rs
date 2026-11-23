@@ -139,7 +139,31 @@ fn http_failure(status: reqwest::StatusCode, body: &str) -> String {
 }
 
 pub async fn mark(state: &AppState, peer_id: &str, result: Result<(), String>) {
-    let now = crate::db::now();
+    let time = chrono::Utc::now();
+    let now = crate::db::ts(time);
+    let cutoff = crate::db::ts(time - chrono::Duration::seconds(20));
+    let current: Result<Option<(String, bool, Option<String>)>, _> = sqlx::query_as(
+        "SELECT status, last_seen_at IS NULL OR julianday(last_seen_at) IS NULL
+                OR julianday(last_seen_at) <= julianday(?), last_error
+         FROM peers WHERE id = ?",
+    )
+    .bind(&cutoff)
+    .bind(peer_id)
+    .fetch_optional(&state.db)
+    .await;
+    let (status, stale, last_error) = match current {
+        Ok(Some(current)) => current,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::error!(peer = %peer_id, "could not read peer connection status: {error}");
+            return;
+        }
+    };
+    match &result {
+        Ok(()) if status == "online" && !stale => return,
+        Err(error) if status == "offline" && last_error.as_ref() == Some(error) => return,
+        _ => {}
+    }
     let updated = match result {
         Ok(()) => {
             let changed = sqlx::query(
@@ -153,10 +177,13 @@ pub async fn mark(state: &AppState, peer_id: &str, result: Result<(), String>) {
                 .as_ref()
                 .is_ok_and(|result| result.rows_affected() == 0)
                 && let Err(error) = sqlx::query(
-                    "UPDATE peers SET last_seen_at = ? WHERE id = ? AND status = 'online'",
+                    "UPDATE peers SET last_seen_at = ? WHERE id = ? AND status = 'online'
+                     AND (last_seen_at IS NULL OR julianday(last_seen_at) IS NULL
+                          OR julianday(last_seen_at) <= julianday(?))",
                 )
                 .bind(now)
                 .bind(peer_id)
+                .bind(cutoff)
                 .execute(&state.db)
                 .await
             {
@@ -186,6 +213,19 @@ pub async fn mark(state: &AppState, peer_id: &str, result: Result<(), String>) {
 }
 
 pub async fn mark_processing_result(state: &AppState, peer_id: &str, error: Option<&str>) {
+    let current: Result<Option<(Option<String>,)>, _> =
+        sqlx::query_as("SELECT last_error FROM peers WHERE id = ?")
+            .bind(peer_id)
+            .fetch_optional(&state.db)
+            .await;
+    match current {
+        Ok(Some((current,))) if current.as_deref() != error => {}
+        Ok(_) => return,
+        Err(error) => {
+            tracing::error!(peer = %peer_id, "could not read peer processing status: {error}");
+            return;
+        }
+    }
     let updated =
         sqlx::query("UPDATE peers SET last_error = ? WHERE id = ? AND last_error IS NOT ?")
             .bind(error)
