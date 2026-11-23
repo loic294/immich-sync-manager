@@ -370,6 +370,7 @@ pub async fn discover(state: &AppState) -> AppResult<()> {
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
+    state.emit(ServerEvent::SyncChanged);
     Ok(())
 }
 
@@ -2432,7 +2433,7 @@ async fn forward_peer(state: &AppState, peer_id: &str) -> AppResult<()> {
         }
     }
     tx.commit().await?;
-    state.emit(ServerEvent::SyncChanged);
+    state.emit_ui(ServerEvent::SyncChanged);
     Ok(())
 }
 
