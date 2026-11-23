@@ -14,6 +14,7 @@ use crate::state::AppState;
 pub const SESSION_COOKIE: &str = "ism_session";
 pub const CSRF_HEADER: &str = "x-ism-request";
 pub const SESSION_DAYS: i64 = 14;
+const TOKEN_USAGE_INTERVAL: Duration = Duration::minutes(1);
 
 /// Who performs a request. Every managed operation records its principal.
 #[derive(Debug, Clone)]
@@ -181,24 +182,37 @@ impl FromRequestParts<AppState> for Client {
         };
         let (id, secret) =
             split_token(raw.trim()).ok_or_else(|| AppError::unauthorized("malformed token"))?;
-        let row: Option<(String, String, String, String, String)> = sqlx::query_as(
-            "SELECT kind, secret_hash, roots_json, actions_json, id FROM client_tokens
+        let row: Option<(String, String, String, String, String, Option<String>)> = sqlx::query_as(
+            "SELECT kind, secret_hash, roots_json, actions_json, id, last_used_at FROM client_tokens
              WHERE id = ? AND revoked_at IS NULL",
         )
         .bind(id)
         .fetch_optional(&state.db)
         .await?;
-        let Some((kind, hash, roots, actions, token_id)) = row else {
+        let Some((kind, hash, roots, actions, token_id, last_used)) = row else {
             return Err(AppError::unauthorized("unknown or revoked token"));
         };
         if !constant_time_eq(sha256_hex(secret.as_bytes()).as_bytes(), hash.as_bytes()) {
             return Err(AppError::unauthorized("unknown or revoked token"));
         }
-        let _ = sqlx::query("UPDATE client_tokens SET last_used_at = ? WHERE id = ?")
-            .bind(db::now())
+        let now = Utc::now();
+        let refresh_usage = last_used
+            .as_deref()
+            .and_then(db::parse_ts)
+            .is_none_or(|last| last > now || now - last >= TOKEN_USAGE_INTERVAL);
+        if refresh_usage
+            && let Err(error) = sqlx::query(
+                "UPDATE client_tokens SET last_used_at = ?
+                 WHERE id = ? AND revoked_at IS NULL AND last_used_at IS ?",
+            )
+            .bind(db::ts(now))
             .bind(&token_id)
+            .bind(last_used)
             .execute(&state.db)
-            .await;
+            .await
+        {
+            tracing::warn!(token = %token_id, "could not record client token usage: {error}");
+        }
         let actions: Vec<ClientAction> = serde_json::from_str(&actions).unwrap_or_default();
         Ok(Self(Principal::Client(ClientGrant {
             token_id,
