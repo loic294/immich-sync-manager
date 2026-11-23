@@ -21,7 +21,6 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::sync::Arc;
 
-use futures_util::stream::{FuturesUnordered, StreamExt};
 use ism_core::dto::{ConflictSide, Location, OperationAction, OperationRequest};
 use ism_core::file_settings::{JunkRules, SharedSettings};
 use ism_core::paths::RelPath;
@@ -2279,8 +2278,9 @@ pub async fn run(state: AppState) {
 /// Polls each peer independently so a slow connection does not delay the others.
 async fn replicate(state: AppState) {
     let tick = std::time::Duration::from_secs(state.config.tick_secs.max(1));
-    let mut active = FuturesUnordered::new();
-    let mut running = HashSet::new();
+    // Spawned workers keep progressing during peer-list queries; dropping the set aborts them.
+    let mut active = tokio::task::JoinSet::new();
+    let mut running = HashMap::new();
     let mut next_poll = HashMap::new();
     loop {
         let peers = match net::peers(&state).await {
@@ -2294,20 +2294,31 @@ async fn replicate(state: AppState) {
         next_poll.retain(|id, _| current.contains(id));
         let now = std::time::Instant::now();
         for peer in peers {
-            if !running.contains(&peer.id) && next_poll.get(&peer.id).is_none_or(|due| *due <= now)
+            if !running.contains_key(&peer.id)
+                && next_poll.get(&peer.id).is_none_or(|due| *due <= now)
             {
-                running.insert(peer.id.clone());
+                let id = peer.id.clone();
                 let state = state.clone();
-                active.push(async move {
+                let worker = active.spawn(async move {
                     poll_peer(&state, &peer).await;
                     peer.id
                 });
+                running.insert(id, worker.id());
             }
         }
         tokio::select! {
-            Some(id) = active.next(), if !active.is_empty() => {
-                running.remove(&id);
-                next_poll.insert(id, std::time::Instant::now() + tick);
+            Some(result) = active.join_next(), if !active.is_empty() => {
+                let id = match result {
+                    Ok(id) => Some(id),
+                    Err(error) => {
+                        tracing::error!("peer synchronization worker failed: {error}");
+                        running.iter().find_map(|(peer, id)| (*id == error.id()).then(|| peer.clone()))
+                    }
+                };
+                if let Some(id) = id {
+                    running.remove(&id);
+                    next_poll.insert(id, std::time::Instant::now() + tick);
+                }
             }
             () = tokio::time::sleep(tick) => {}
             () = state.sync_wake.notified() => { next_poll.clear(); }
