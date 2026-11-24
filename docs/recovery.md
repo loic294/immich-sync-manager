@@ -114,7 +114,8 @@ its worker finishes.
 These bounded limits do not guarantee immediate progress: multiple stalled jobs can fill a kind's
 slots before another peer arrives, three stalled unattributed jobs block other unattributed jobs,
 and shared maintenance or path barriers still apply. Jobs are not cancelled to free slots. Waiting
-jobs retry after 30 seconds; interrupted claims are recovered before the affected queue resumes.
+jobs retry after 30 seconds, except for legacy publication archives missing their original
+version vector as described below; interrupted claims are recovered before the affected queue resumes.
 
 Recovery checks retained complete staging, upload staging, local copies, and authenticated share
 peers' applicable trash inventories. It can transfer the exact verified file without restoring
@@ -133,6 +134,21 @@ hashes, folder inventories, and journaled Immich effects before replaying bookke
 Fix requests coalesce, and verified completion is idempotent. Sync **Resolve** admits this same
 workflow instead of accepting an administrator's filesystem attestation; server recovery cannot
 be acknowledged while sync maintenance remains unresolved.
+
+A peer publication that failed before execution because its destination already exists has no
+pending sync entry to re-add. New transfer archives retain the exact merged queued version vector.
+Recovery verifies that vector and transfer identity against the current destination. Identical
+content completes the publication; different content opens a normal version conflict.
+An unambiguous managed trash operation after the publication failure can also prove an identical
+destination, but only when its inventory and deletion event verify the content and causal history.
+Recovery preserves that deletion and its version; it waits if evidence is missing or ambiguous.
+It does not write or restore the library file.
+
+Older transfer archives have no saved version vector; matching hashes, event timestamps, or a
+single matching event cannot establish their merged history. Those publications remain visible in
+**Waiting**, and their files and recoverable records are preserved. They do not automatically
+retry. **Fix** rechecks the evidence but cannot complete the
+publication while the original vector is unavailable.
 
 On restart, interrupted recovery jobs are requeued. An untouched peer upload can resume only when
 its staging still matches the saved request; other interrupted work retains its evidence and any

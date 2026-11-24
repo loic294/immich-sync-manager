@@ -2267,6 +2267,592 @@ async fn verify_applied_folder_event(state: &AppState, id: &str) -> AppResult<bo
     operation_completed(state, id).await
 }
 
+async fn settle_existing_publish_destination(
+    state: &AppState,
+    id: &str,
+) -> AppResult<Option<bool>> {
+    use ism_core::dto::{CreateUpload, Location, OnConflict, OperationAction};
+    let candidate: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM operations o JOIN operation_items i ON i.operation_id=o.id
+         WHERE o.id=? AND o.source='peer' AND o.status='failed' AND o.recovery_resolved=0
+           AND i.idx=0 AND i.kind='publish_upload' AND i.status='failed'
+           AND i.error_code='destination_exists' AND i.journal_json IS NULL
+           AND (SELECT count(*) FROM operation_items WHERE operation_id=o.id)=1
+           AND NOT EXISTS(SELECT 1 FROM pending_peer_ops WHERE operation_id=o.id)
+           AND NOT EXISTS(SELECT 1 FROM pending_peer_events WHERE operation_id=o.id))",
+    )
+    .bind(id)
+    .fetch_one(&state.db)
+    .await?;
+    if !candidate {
+        return Ok(None);
+    }
+    let _guard = state.replication_operation_lock.lock().await;
+    type Publication = (
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        i64,
+        Option<String>,
+        Option<String>,
+    );
+    let rows: Vec<Publication> = sqlx::query_as(
+        "SELECT i.action_json,u.id,u.request_json,h.peer_id,h.share_id,h.rel_path,h.finished_at,
+                h.id,h.sha256,h.size,h.vv_json,o.finished_at
+         FROM operations o JOIN operation_items i ON i.operation_id=o.id
+         JOIN uploads u ON u.operation_id=o.id AND u.principal=o.principal
+         JOIN transfer_history h ON h.operation_id=o.id AND o.principal='peer:'||h.peer_id
+            AND u.idempotency_key='peer-transfer:'||h.id
+         JOIN peers p ON p.id=h.peer_id AND p.instance_id IS NOT NULL
+         WHERE o.id=? AND o.status='failed' AND o.source='peer' AND o.recovery_resolved=0
+           AND o.cancel_requested=0 AND i.kind='publish_upload' AND i.status='failed'
+           AND i.idx=0 AND i.error_code='destination_exists' AND i.journal_json IS NULL AND u.status='failed'
+           AND (SELECT count(*) FROM operation_items WHERE operation_id=o.id)=1
+           AND NOT EXISTS(SELECT 1 FROM pending_peer_ops WHERE operation_id=o.id)
+           AND NOT EXISTS(SELECT 1 FROM pending_peer_events WHERE operation_id=o.id)",
+    )
+    .bind(id)
+    .fetch_all(&state.db)
+    .await?;
+    let [
+        (
+            action,
+            upload_id,
+            raw,
+            peer_id,
+            share_id,
+            rel,
+            transferred_at,
+            transfer_id,
+            transfer_sha,
+            transfer_size,
+            saved_version,
+            failed_at,
+        ),
+    ] = rows.as_slice()
+    else {
+        return Err(AppError::conflict(
+            "recovery_evidence_missing",
+            "the publication has no unambiguous archived transfer",
+        ));
+    };
+    let upload: CreateUpload = serde_json::from_str(raw)?;
+    let [file] = upload.files.as_slice() else {
+        return Err(AppError::conflict(
+            "recovery_evidence_missing",
+            "the publication is not a single-file transfer",
+        ));
+    };
+    if !matches!(crate::ops::exec::parse_action(action)?,
+        OperationAction::PublishUpload { upload_id: ref item } if item == upload_id)
+        || upload.on_conflict != OnConflict::Fail
+        || upload.existing_original.is_some()
+        || upload.provenance.is_some()
+        || file.expected_revision.is_some()
+        || file.expected_sha256.is_some()
+        || upload.idempotency_key.as_ref() != Some(&format!("peer-transfer:{transfer_id}"))
+        || file.sha256.len() != 64
+        || !file.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || !file.sha256.eq_ignore_ascii_case(transfer_sha)
+        || i64::try_from(file.size).ok() != Some(*transfer_size)
+    {
+        return Err(AppError::conflict(
+            "recovery_evidence_missing",
+            "the upload does not match the archived transfer",
+        ));
+    }
+    let share = super::shares(state)
+        .await?
+        .into_iter()
+        .find(|s| s.id == *share_id && s.includes(peer_id))
+        .ok_or_else(|| {
+            AppError::conflict("peer_share_changed", "publication share is unavailable")
+        })?;
+    let path = files::parse_rel(&upload.target.path)?
+        .join(&file.name)
+        .map_err(|e| AppError::invalid_location(e.to_string()))?;
+    files::parse_rel(path.as_str())?;
+    let location = Location {
+        root_id: upload.target.root_id.clone(),
+        path: path.to_string(),
+    };
+    if share.rel_of(&location).as_ref() != Some(rel) {
+        return Err(AppError::conflict(
+            "recovery_evidence_missing",
+            "the archived transfer does not match the publication destination",
+        ));
+    }
+    let remote_version: VersionVector = serde_json::from_str(
+        saved_version.as_deref().ok_or_else(|| {
+            AppError::conflict(
+                "recovery_archive_version_missing",
+                "the archived transfer has no saved version vector; investigate its original causal history before retrying",
+            )
+        })?,
+    ).map_err(|_| AppError::conflict("recovery_evidence_missing", "the archived transfer version is invalid"))?;
+    let failed_at = failed_at.as_deref().ok_or_else(|| {
+        AppError::conflict(
+            "recovery_evidence_missing",
+            "the publication failure time is unavailable",
+        )
+    })?;
+    if failed_at < transferred_at.as_str() {
+        return Err(AppError::conflict(
+            "recovery_evidence_missing",
+            "the publication predates the archived transfer",
+        ));
+    }
+    super::inbox::require_stable_share_for(state, &share, &[rel], &[id.to_owned()]).await?;
+    let root = files::root(&state.db, &upload.target.root_id).await?;
+    root.ensure_available()?;
+    let current = root.abs(&path)?;
+    fn fingerprint_error(error: std::io::Error) -> AppError {
+        if matches!(
+            error.kind(),
+            std::io::ErrorKind::InvalidInput | std::io::ErrorKind::NotFound
+        ) {
+            AppError::conflict(
+                "recovery_evidence_changed",
+                "the destination could not be verified",
+            )
+        } else {
+            error.into()
+        }
+    }
+    let fingerprint = |file: std::path::PathBuf| -> std::io::Result<Option<(String, u64, String)>> {
+        let Some((revision, sha)) = files::replacement_fingerprint(&file)? else {
+            return Ok(None);
+        };
+        let meta = std::fs::symlink_metadata(&file)?;
+        if revision != files::revision(&meta) || !meta.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "file changed during verification",
+            ));
+        }
+        Ok(Some((revision, meta.len(), sha)))
+    };
+    let current_file = current.clone();
+    let current_fingerprint = tokio::task::spawn_blocking(move || fingerprint(current_file))
+        .await
+        .map_err(AppError::internal)?
+        .map_err(fingerprint_error)?;
+    let mut trash_id = None;
+    let mut deletion = None;
+    let (revision, size, sha, evidence_path) = if let Some((revision, size, sha)) =
+        current_fingerprint
+    {
+        (revision, size, sha, current.clone())
+    } else {
+        type TrashEvidence = (
+            String,
+            String,
+            Option<String>,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        );
+        let trash: Vec<TrashEvidence> = sqlx::query_as(
+            "SELECT t.id,t.quarantine_rel,t.file_inventory_json,t.trashed_at,
+                    t.restored_at,t.purged_at,o.status,o.finished_at,o.request_json
+             FROM trash t LEFT JOIN operations o ON o.id=t.operation_id
+             WHERE t.root_id=? AND t.path=? AND t.is_folder=0
+               AND t.trashed_at>?",
+        )
+        .bind(&location.root_id)
+        .bind(&location.path)
+        .bind(failed_at)
+        .fetch_all(&state.db)
+        .await?;
+        let [
+            (
+                id,
+                quarantine,
+                inventory,
+                trashed_at,
+                restored,
+                purged,
+                Some(status),
+                Some(finished_at),
+                Some(request),
+            ),
+        ] = trash.as_slice()
+        else {
+            return Err(AppError::conflict(
+                "recovery_evidence_missing",
+                "the destination has no unambiguous managed trash record",
+            ));
+        };
+        let request: serde_json::Value = serde_json::from_str(request)?;
+        let has_action = request["actions"].as_array().is_some_and(|actions| {
+            actions.iter().any(|action| {
+                action["kind"] == "trash"
+                    && action["source"]["root_id"] == location.root_id
+                    && action["source"]["path"] == location.path
+            })
+        });
+        if restored.is_some()
+            || purged.is_some()
+            || status != "completed"
+            || !has_action
+            || quarantine != &format!("{}/{id}", files::TRASH_DIR)
+        {
+            return Err(AppError::conflict(
+                "recovery_evidence_missing",
+                "the managed trash operation is not verifiable",
+            ));
+        }
+        let inventory: Vec<crate::ops::plan::TrashEntry> =
+            serde_json::from_str(inventory.as_deref().ok_or_else(|| {
+                AppError::conflict(
+                    "recovery_evidence_missing",
+                    "the trash inventory is unavailable",
+                )
+            })?)?;
+        if !matches!(inventory.as_slice(), [entry] if entry.name == file.name && entry.sha256.as_deref() == Some(transfer_sha.as_str()))
+        {
+            return Err(AppError::conflict(
+                "recovery_evidence_missing",
+                "the trash inventory does not match the publication",
+            ));
+        }
+        let latest: Option<(String, String, String, String)> = sqlx::query_as(
+            "SELECT kind,origin,at,data_json FROM event_log WHERE share_name=? AND
+               (json_extract(data_json,'$.path')=? OR json_extract(data_json,'$.from')=?
+                 OR (kind LIKE 'folder_%' AND (
+                   ? LIKE json_extract(data_json,'$.path')||'/%'
+                   OR ? LIKE json_extract(data_json,'$.from')||'/%')))
+             ORDER BY seq DESC LIMIT 1",
+        )
+        .bind(&share.name)
+        .bind(rel)
+        .bind(rel)
+        .bind(rel)
+        .bind(rel)
+        .fetch_optional(&state.db)
+        .await?;
+        let Some((kind, origin, at, data)) = latest else {
+            return Err(AppError::conflict(
+                "recovery_evidence_missing",
+                "the subsequent deletion event is unavailable",
+            ));
+        };
+        let event: super::EventData = serde_json::from_str(&data)?;
+        if kind != "file_deleted"
+            || origin != state.instance_id
+            || event.path != *rel
+            || at.as_str() < trashed_at.as_str()
+            || at.as_str() > finished_at.as_str()
+            || !matches!(event.vv.compare(&remote_version), Causality::Dominates)
+            || event.vv.get(&state.instance_id) <= remote_version.get(&state.instance_id)
+        {
+            return Err(AppError::conflict(
+                "recovery_evidence_missing",
+                "the subsequent deletion is not causally verified",
+            ));
+        }
+        let held = root.abs(
+            &RelPath::parse(&format!("{quarantine}/{path}"))
+                .map_err(|e| AppError::invalid_location(e.to_string()))?,
+        )?;
+        let held_file = held.clone();
+        let Some((revision, size, sha)) =
+            tokio::task::spawn_blocking(move || fingerprint(held_file))
+                .await
+                .map_err(AppError::internal)?
+                .map_err(fingerprint_error)?
+        else {
+            return Err(AppError::conflict(
+                "recovery_evidence_missing",
+                "the trashed destination is unavailable",
+            ));
+        };
+        trash_id = Some(id.clone());
+        deletion = Some(event.vv);
+        (revision, size, sha, held)
+    };
+    if size == file.size && sha.eq_ignore_ascii_case(&file.sha256) {
+        if deletion.is_some() {
+            crate::ops::exec::verified_file_absence_at_root(state, &root, &path).await?;
+        } else {
+            crate::ops::exec::verified_asset_at_root(state, &root, &path, file.role).await?;
+        }
+        let mut replica = if let Some(deletion) = &deletion {
+            match super::row(state, share_id, rel).await? {
+                Some(row)
+                    if row.deleted
+                        && row
+                            .sha256
+                            .as_deref()
+                            .is_none_or(|sha| sha.eq_ignore_ascii_case(transfer_sha))
+                        && matches!(
+                            row.vv.compare(deletion),
+                            Causality::Equal | Causality::Dominates
+                        ) =>
+                {
+                    row
+                }
+                Some(_) => {
+                    return Err(AppError::conflict(
+                        "recovery_evidence_changed",
+                        "the deletion replica state changed",
+                    ));
+                }
+                None => super::Row {
+                    size: *transfer_size,
+                    mtime_ns: 0,
+                    sha256: Some(transfer_sha.clone()),
+                    deleted: true,
+                    vv: deletion.clone(),
+                },
+            }
+        } else {
+            super::register_local(state, &share, &root, rel)
+                .await?
+                .filter(|row| {
+                    !row.deleted
+                        && row.size == *transfer_size
+                        && row
+                            .sha256
+                            .as_deref()
+                            .is_some_and(|sha| sha.eq_ignore_ascii_case(transfer_sha))
+                })
+                .ok_or_else(|| {
+                    AppError::conflict(
+                        "recovery_evidence_changed",
+                        "the destination changed during verification",
+                    )
+                })?
+        };
+        replica.vv.merge(&remote_version);
+        let meta = std::fs::symlink_metadata(&evidence_path).map_err(fingerprint_error)?;
+        let current_absent = if deletion.is_some() {
+            match current.symlink_metadata() {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+                Ok(_) => false,
+                Err(error) => return Err(error.into()),
+            }
+        } else {
+            true
+        };
+        if !meta.is_file() || files::revision(&meta) != revision || !current_absent {
+            return Err(AppError::conflict(
+                "recovery_evidence_changed",
+                "the destination changed during verification",
+            ));
+        }
+        let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
+        super::put_row_in(&mut tx, share_id, rel, &replica).await?;
+        let item = sqlx::query(
+            "UPDATE operation_items SET status='done',error_code=NULL,error_message=NULL,result_json=?
+             WHERE operation_id=? AND idx=0 AND status='failed' AND error_code='destination_exists'
+               AND journal_json IS NULL
+               AND EXISTS(SELECT 1 FROM operations WHERE id=? AND status='failed' AND recovery_resolved=0)",
+        )
+        .bind(
+            serde_json::json!({
+                "recovery_verified": true,
+                "location": rel,
+                "existing_destination": if deletion.is_some() { "trashed" } else { "present" },
+                "trash_id": trash_id,
+            })
+            .to_string(),
+        )
+        .bind(id)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+        let committed = sqlx::query(
+            "UPDATE uploads SET status='committed' WHERE id=? AND operation_id=? AND status='failed'",
+        )
+        .bind(upload_id)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+        if item.rows_affected() != 1 || committed.rows_affected() != 1 {
+            return Err(AppError::conflict(
+                "recovery_evidence_changed",
+                "the publication changed during verification",
+            ));
+        }
+        tx.commit().await?;
+        super::operation_finished(state, id, &[]).await?;
+        state.emit(ServerEvent::OperationUpdated {
+            operation_id: id.into(),
+        });
+        return operation_completed(state, id).await.map(Some);
+    }
+    if deletion.is_some() {
+        return Err(AppError::conflict(
+            "recovery_evidence_missing",
+            "the deleted destination did not match the publication",
+        ));
+    }
+    drop(_guard);
+    let peer = net::peer(state, peer_id).await?;
+    let remote = remote_evidence(state, &peer, &share, rel, &remote_version).await?;
+    let _guard = state.replication_operation_lock.lock().await;
+    root.ensure_available()?;
+    super::inbox::require_stable_share_for(state, &share, &[rel], &[id.to_owned()]).await?;
+    let unchanged: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM operations o
+         JOIN operation_items i ON i.operation_id=o.id
+         JOIN uploads u ON u.operation_id=o.id
+         JOIN transfer_history h ON h.operation_id=o.id
+         WHERE o.id=? AND o.status='failed' AND o.cancel_requested=0 AND o.recovery_resolved=0
+         AND o.source='peer' AND o.principal='peer:'||h.peer_id
+         AND i.idx=0 AND i.status='failed' AND i.error_code='destination_exists'
+         AND i.journal_json IS NULL AND i.action_json=?
+         AND u.id=? AND u.status='failed' AND u.principal=o.principal
+         AND u.request_json=? AND u.idempotency_key='peer-transfer:'||h.id
+         AND h.id=? AND h.share_id=? AND h.peer_id=? AND h.rel_path=? AND h.sha256=? AND h.size=?
+         AND h.vv_json IS ?
+         AND NOT EXISTS(SELECT 1 FROM pending_peer_ops WHERE operation_id=o.id)
+         AND NOT EXISTS(SELECT 1 FROM pending_peer_events WHERE operation_id=o.id))",
+    )
+    .bind(id)
+    .bind(action)
+    .bind(upload_id)
+    .bind(raw)
+    .bind(transfer_id)
+    .bind(share_id)
+    .bind(peer_id)
+    .bind(rel)
+    .bind(transfer_sha)
+    .bind(transfer_size)
+    .bind(saved_version)
+    .fetch_one(&state.db)
+    .await?;
+    let current_share = super::shares(state)
+        .await?
+        .into_iter()
+        .find(|current| current.id == *share_id && current.includes(peer_id));
+    let current_root = files::root(&state.db, &upload.target.root_id).await?;
+    let current_peer = net::peer(state, peer_id).await?;
+    let current_file = evidence_path.clone();
+    let refreshed = tokio::task::spawn_blocking(move || fingerprint(current_file))
+        .await
+        .map_err(AppError::internal)?
+        .map_err(fingerprint_error)?;
+    if !unchanged
+        || current_peer.url != peer.url
+        || current_peer.instance_id != peer.instance_id
+        || current_peer.secret != peer.secret
+        || current_root.mapping != root.mapping
+        || current_root.server_id != root.server_id
+        || current_root.library_id != root.library_id
+        || current_share.is_none_or(|current| current.rel_of(&location).as_ref() != Some(rel))
+        || refreshed
+            .as_ref()
+            .is_none_or(|(new_revision, new_size, new_sha)| {
+                *new_revision != revision || *new_size != size || *new_sha != sha
+            })
+        || remote.path != *rel
+        || remote.deleted
+        || remote.sha256.is_none()
+        || remote.size.is_none()
+        || remote.size == Some(size) && remote.sha256.as_deref() == Some(sha.as_str())
+        || !matches!(
+            remote.vv.compare(&remote_version),
+            Causality::Equal | Causality::Dominates
+        )
+    {
+        return Err(AppError::conflict(
+            "recovery_evidence_changed",
+            "the conflict evidence changed during verification",
+        ));
+    }
+    let other_transfer: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM transfers WHERE share_id=? AND rel_path=?
+         AND status IN ('queued','running','failed','cancelled'))",
+    )
+    .bind(share_id)
+    .bind(rel)
+    .fetch_one(&state.db)
+    .await?;
+    if other_transfer {
+        return Err(AppError::conflict(
+            "recovery_required",
+            "the destination has another unresolved transfer",
+        ));
+    }
+    let local = super::register_local(state, &share, &root, rel).await?;
+    if local.is_none_or(|row| {
+        row.deleted
+            || u64::try_from(row.size).ok() != Some(size)
+            || row.sha256.as_deref() != Some(sha.as_str())
+    }) {
+        return Err(AppError::conflict(
+            "recovery_evidence_changed",
+            "the destination changed during conflict preparation",
+        ));
+    }
+    let existing_conflicts: Vec<(String, String)> = sqlx::query_as(
+        "SELECT peer_id,status FROM conflicts WHERE share_id=? AND rel_path=?
+         AND status IN ('open','resolving')",
+    )
+    .bind(share_id)
+    .bind(rel)
+    .fetch_all(&state.db)
+    .await?;
+    if existing_conflicts.len() > 1
+        || existing_conflicts
+            .iter()
+            .any(|(conflict_peer, status)| conflict_peer != peer_id || status != "open")
+    {
+        return Err(AppError::conflict(
+            "recovery_evidence_changed",
+            "another conflict already owns the destination",
+        ));
+    }
+    super::conflict(
+        state,
+        super::ConflictInput {
+            share: &share,
+            rel,
+            kind: "changed_on_both",
+            detail: format!(
+                "{rel} already exists with different content than {}'s copy",
+                peer.name
+            ),
+            remote: ism_core::dto::ConflictSide {
+                instance: peer.name.clone(),
+                sha256: remote.sha256.clone(),
+                size: remote.size,
+                modified_at: None,
+                deleted: remote.deleted,
+            },
+            remote_vv: &remote.vv,
+            peer_id,
+            from: None,
+        },
+    )
+    .await?;
+    discover(state).await?;
+    sqlx::query(
+        "INSERT OR IGNORE INTO sync_recovery_links(recovery_id,kind,target_id)
+         SELECT ?,'conflict',id FROM conflicts WHERE share_id=? AND rel_path=? AND status='open'",
+    )
+    .bind(format!("operation:{id}"))
+    .bind(share_id)
+    .bind(rel)
+    .execute(&state.db)
+    .await?;
+    Err(AppError::conflict(
+        "choose_version",
+        "the existing destination differs from the peer publication; choose a version",
+    ))
+}
+
 async fn repair_operation(state: &AppState, id: &str) -> AppResult<bool> {
     let replacement: Option<String> = sqlx::query_scalar(
         "SELECT replacement_operation_id FROM sync_recovery WHERE kind='operation' AND target_id=?",
@@ -2280,6 +2866,21 @@ async fn repair_operation(state: &AppState, id: &str) -> AppResult<bool> {
     }
     if operation_completed(state, id).await? {
         return Ok(true);
+    }
+    let verified: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM operations WHERE id=? AND status='failed')
+         AND EXISTS(SELECT 1 FROM operation_items WHERE operation_id=? AND status='done'
+                    AND json_extract(result_json,'$.recovery_verified')=1)
+         AND NOT EXISTS(SELECT 1 FROM operation_items WHERE operation_id=? AND status!='done')",
+    )
+    .bind(id)
+    .bind(id)
+    .bind(id)
+    .fetch_one(&state.db)
+    .await?;
+    if verified {
+        super::operation_finished(state, id, &[]).await?;
+        return operation_completed(state, id).await;
     }
     let (status, principal): (String, String) =
         sqlx::query_as("SELECT status,principal FROM operations WHERE id = ?")
@@ -2457,6 +3058,9 @@ async fn repair_operation(state: &AppState, id: &str) -> AppResult<bool> {
     }
     if verify_applied_peer_move(state, id).await? {
         return operation_completed(state, id).await;
+    }
+    if let Some(done) = settle_existing_publish_destination(state, id).await? {
+        return Ok(done);
     }
     if !principal.starts_with("peer:") {
         return Err(AppError::conflict(
@@ -2706,7 +3310,8 @@ async fn eligible_jobs(
                 END AS peer_id,
                 r.updated_at
              FROM sync_recovery r
-             WHERE (r.state='queued' OR (r.state='waiting' AND r.updated_at <
+             WHERE (r.state='queued' OR (r.state='waiting'
+                     AND COALESCE(r.code,'')!='recovery_archive_version_missing' AND r.updated_at <
                      CASE WHEN r.code='awaiting_completion' THEN ? ELSE ? END)
                  OR (r.state='needs_decision' AND EXISTS(SELECT 1 FROM sync_recovery_links l JOIN conflicts c ON l.kind='conflict' AND c.id=l.target_id
                      WHERE l.recovery_id=r.id AND c.status='resolved')))
@@ -2761,7 +3366,8 @@ async fn eligible_jobs(
 async fn run_job(state: &AppState, job: String, kind: String, id: String) -> AppResult<()> {
     let claimed = sqlx::query(
         "UPDATE sync_recovery SET state='fixing',updated_at=?
-         WHERE id=? AND (state='queued' OR (state='waiting' AND updated_at <
+         WHERE id=? AND (state='queued' OR (state='waiting'
+                 AND COALESCE(code,'')!='recovery_archive_version_missing' AND updated_at <
                  CASE WHEN code='awaiting_completion' THEN ? ELSE ? END)
              OR (state='needs_decision' AND EXISTS(
                  SELECT 1 FROM sync_recovery_links l JOIN conflicts c
@@ -2822,6 +3428,7 @@ async fn run_job(state: &AppState, job: String, kind: String, id: String) -> App
                         | "peer_unreachable"
                         | "peer_share_changed"
                         | "recovery_evidence_missing"
+                        | "recovery_archive_version_missing"
                         | "recovery_evidence_changed"
                         | "recovery_plan_unchanged"
                         | "revision_changed"
@@ -3300,6 +3907,569 @@ mod policy_tests {
 
     use super::*;
     use crate::{config::Config, crypto::SecretBox};
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum ExistingDestination {
+        Identical,
+        IdenticalBlocked,
+        TrashedIdentical,
+        Different,
+        DifferentUppercase,
+        DifferentKeepRemote,
+        DifferentBlocked,
+        DifferentQueued,
+        DifferentNewerQueuedAtDecision,
+        MissingVersion,
+        LegacyTrashed,
+        InvalidVersion,
+        WrongTransfer,
+        AmbiguousTrash,
+        UnlinkedDeletion,
+        DeletionBeforeFailure,
+    }
+
+    async fn failed_existing_publication(existing: ExistingDestination) {
+        use ism_core::dto::{CreateUpload, FileRole, Location, OnConflict, UploadFileSpec};
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new(
+            Config::for_tests(dir.path()),
+            crate::db::connect(dir.path()).await.unwrap(),
+            SecretBox::open_or_create(dir.path()).unwrap(),
+        )
+        .await
+        .unwrap();
+        let root = dir.path().join("photos");
+        std::fs::create_dir_all(root.join("album")).unwrap();
+        std::fs::write(root.join(".ism-root"), "photos\n").unwrap();
+        let target = root.join("album/photo.jpg");
+        std::fs::write(&target, b"peer-content").unwrap();
+        let (_, sha) = files::replacement_fingerprint(&target).unwrap().unwrap();
+        let remote = FileEvidence {
+            path: "album/photo.jpg".into(),
+            sha256: Some(sha.clone()),
+            size: Some(12),
+            vv: serde_json::from_str(r#"{"remote":1,"merged":2}"#).unwrap(),
+            deleted: false,
+            last_move_seq: None,
+            inventory: None,
+            modified_at: None,
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                axum::Router::new().fallback(move || {
+                    let remote = remote.clone();
+                    async move { axum::Json(remote) }
+                }),
+            )
+            .await
+            .unwrap();
+        });
+        let secret = state
+            .secrets
+            .encrypt(net::SECRET_PURPOSE, "synthetic-key")
+            .unwrap();
+        sqlx::query("INSERT INTO peers(id,name,url,instance_id,secret_enc,status,created_at) VALUES('peer','Peer',?,'remote',?,'online',?)")
+            .bind(url).bind(secret).bind(db::now()).execute(&state.db).await.unwrap();
+        sqlx::query("INSERT INTO mappings(root_id,name,container_path,created_at) VALUES('photos','Photos',?,?)")
+            .bind(root.to_string_lossy().as_ref()).bind(db::now()).execute(&state.db).await.unwrap();
+        sqlx::query("INSERT INTO shares(id,name,root_id,path,peer_ids_json,enabled) VALUES('share','Photos','photos','','[\"peer\"]',1)")
+            .execute(&state.db).await.unwrap();
+        let request = CreateUpload {
+            idempotency_key: Some("peer-transfer:transfer".into()),
+            target: Location {
+                root_id: "photos".into(),
+                path: "album".into(),
+            },
+            provenance: None,
+            files: vec![UploadFileSpec {
+                name: "photo.jpg".into(),
+                role: FileRole::Original,
+                size: 12,
+                sha256: if existing == ExistingDestination::DifferentUppercase {
+                    sha.to_ascii_uppercase()
+                } else {
+                    sha.clone()
+                },
+                expected_revision: None,
+                expected_sha256: None,
+            }],
+            on_conflict: OnConflict::Fail,
+            existing_original: None,
+        };
+        let operation = serde_json::json!({
+            "idempotency_key": "upload:upl_test",
+            "actions": [{"kind":"publish_upload","upload_id":"upl_test"}],
+            "allow_owner_transfer": false,
+            "allow_partial": false
+        });
+        sqlx::query("INSERT INTO operations(id,idempotency_key,principal,source,request_json,status,created_at,finished_at) VALUES('publication','upload:upl_test','peer:peer','peer',?,'failed',?,'2025-01-02T00:00:01.000Z')")
+            .bind(operation.to_string()).bind(db::now()).execute(&state.db).await.unwrap();
+        sqlx::query("INSERT INTO operation_items(operation_id,idx,kind,action_json,status,error_code) VALUES('publication',0,'publish_upload',?,'failed','destination_exists')")
+            .bind(operation["actions"][0].to_string()).execute(&state.db).await.unwrap();
+        sqlx::query("INSERT INTO uploads(id,principal,request_json,status,created_at,operation_id,idempotency_key) VALUES('upl_test','peer:peer',?,'failed',?,'publication','peer-transfer:transfer')")
+            .bind(serde_json::to_string(&request).unwrap()).bind(db::now()).execute(&state.db).await.unwrap();
+        let version = match existing {
+            ExistingDestination::MissingVersion | ExistingDestination::LegacyTrashed => None,
+            ExistingDestination::InvalidVersion => Some("invalid"),
+            _ => Some(r#"{"remote":1,"merged":2}"#),
+        };
+        sqlx::query("INSERT INTO transfer_history(id,peer_id,share_id,rel_path,sha256,size,queued_at,finished_at,operation_id,vv_json) VALUES('transfer','peer','share','album/photo.jpg',?,12,?,?,'publication',?)")
+            .bind(&sha).bind("2025-01-02T00:00:00.000Z").bind("2025-01-02T00:00:00.000Z").bind(version).execute(&state.db).await.unwrap();
+        let changed = serde_json::json!({
+            "path": "album/photo.jpg",
+            "sha256": sha,
+            "size": 12,
+            "vv": {"remote": 1}
+        });
+        sqlx::query("INSERT INTO event_log(origin,origin_seq,share_name,kind,data_json,at) VALUES('remote',1,'Photos','file_changed',?,'2025-01-01T00:00:00.000Z')")
+            .bind(changed.to_string()).execute(&state.db).await.unwrap();
+        match existing {
+            ExistingDestination::Identical
+            | ExistingDestination::IdenticalBlocked
+            | ExistingDestination::MissingVersion
+            | ExistingDestination::InvalidVersion
+            | ExistingDestination::WrongTransfer => {}
+            ExistingDestination::TrashedIdentical
+            | ExistingDestination::LegacyTrashed
+            | ExistingDestination::AmbiguousTrash
+            | ExistingDestination::UnlinkedDeletion
+            | ExistingDestination::DeletionBeforeFailure => {
+                let held = root.join(".ism-trash/trash_test/album");
+                std::fs::create_dir_all(&held).unwrap();
+                std::fs::rename(&target, held.join("photo.jpg")).unwrap();
+                let trash_request = serde_json::json!({"actions":[{"kind":"trash","source":{"root_id":"photos","path":"album/photo.jpg"}}]});
+                sqlx::query("INSERT INTO operations(id,idempotency_key,principal,source,request_json,status,created_at,finished_at) VALUES('delete','delete','admin','admin',?,'completed','2025-01-03T00:00:00.000Z','2025-01-03T00:00:02.000Z')")
+                    .bind(trash_request.to_string()).execute(&state.db).await.unwrap();
+                let inventory = serde_json::json!([{"name":"photo.jpg","sha256":sha}]);
+                sqlx::query("INSERT INTO trash(id,root_id,path,quarantine_rel,is_folder,size,trashed_at,operation_id,file_inventory_json) VALUES('trash_test','photos','album/photo.jpg','.ism-trash/trash_test',0,12,'2025-01-03T00:00:00.000Z','delete',?)")
+                    .bind(inventory.to_string()).execute(&state.db).await.unwrap();
+                if existing == ExistingDestination::AmbiguousTrash {
+                    sqlx::query("INSERT INTO trash(id,root_id,path,quarantine_rel,is_folder,size,trashed_at,operation_id,file_inventory_json) VALUES('trash_other','photos','album/photo.jpg','.ism-trash/trash_other',0,12,'2025-01-03T00:00:01.000Z','delete',?)")
+                        .bind(inventory.to_string()).execute(&state.db).await.unwrap();
+                }
+                let mut version = VersionVector::default();
+                if existing != ExistingDestination::UnlinkedDeletion {
+                    version.increment("remote");
+                    version.increment("merged");
+                    version.increment("merged");
+                }
+                version.increment(&state.instance_id);
+                let deleted = serde_json::json!({"path":"album/photo.jpg","vv":version});
+                sqlx::query("INSERT INTO event_log(origin,origin_seq,share_name,kind,data_json,at) VALUES(?,1,'Photos','file_deleted',?,'2025-01-03T00:00:01.000Z')")
+                    .bind(&state.instance_id).bind(deleted.to_string()).execute(&state.db).await.unwrap();
+                if existing == ExistingDestination::DeletionBeforeFailure {
+                    sqlx::query("UPDATE operations SET finished_at='2025-01-03T00:00:00.500Z' WHERE id='publication'")
+                        .execute(&state.db).await.unwrap();
+                }
+            }
+            ExistingDestination::Different
+            | ExistingDestination::DifferentUppercase
+            | ExistingDestination::DifferentKeepRemote
+            | ExistingDestination::DifferentBlocked
+            | ExistingDestination::DifferentQueued
+            | ExistingDestination::DifferentNewerQueuedAtDecision => {
+                std::fs::write(&target, b"local-change").unwrap();
+            }
+        }
+        if existing == ExistingDestination::DifferentQueued {
+            let share = super::super::shares(&state).await.unwrap().remove(0);
+            let version = serde_json::from_str(r#"{"remote":2,"merged":2}"#).unwrap();
+            super::super::queue_transfer(
+                &state,
+                "peer",
+                &share,
+                "album/photo.jpg",
+                &sha,
+                12,
+                &version,
+            )
+            .await
+            .unwrap();
+        }
+        if existing == ExistingDestination::WrongTransfer {
+            sqlx::query(
+                "UPDATE uploads SET idempotency_key='peer-transfer:other' WHERE id='upl_test'",
+            )
+            .execute(&state.db)
+            .await
+            .unwrap();
+        }
+        if existing == ExistingDestination::IdenticalBlocked {
+            let blocked_request = serde_json::json!({"actions":[{"kind":"trash","source":{"root_id":"photos","path":"album/photo.jpg"}}]});
+            sqlx::query("INSERT INTO operations(id,idempotency_key,principal,source,request_json,status,created_at) VALUES('other','other','admin','admin',?,'failed',?)")
+                .bind(blocked_request.to_string()).bind(db::now()).execute(&state.db).await.unwrap();
+        }
+        sqlx::query("INSERT INTO sync_recovery(id,kind,target_id,state,created_at,updated_at) VALUES('operation:publication','operation','publication','queued',?,?)")
+            .bind(db::now()).bind(db::now()).execute(&state.db).await.unwrap();
+        run_job(
+            &state,
+            "operation:publication".into(),
+            "operation".into(),
+            "publication".into(),
+        )
+        .await
+        .unwrap();
+        let (recovery, code, detail, attempts): (String, Option<String>, Option<String>, i64) =
+            sqlx::query_as("SELECT state,code,detail,attempts FROM sync_recovery WHERE id='operation:publication'")
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+        assert_eq!(attempts, 0);
+        if matches!(
+            existing,
+            ExistingDestination::IdenticalBlocked
+                | ExistingDestination::DifferentQueued
+                | ExistingDestination::MissingVersion
+                | ExistingDestination::LegacyTrashed
+                | ExistingDestination::InvalidVersion
+                | ExistingDestination::WrongTransfer
+                | ExistingDestination::AmbiguousTrash
+                | ExistingDestination::UnlinkedDeletion
+                | ExistingDestination::DeletionBeforeFailure
+        ) {
+            assert_eq!(
+                (recovery.as_str(), code.as_deref()),
+                (
+                    "waiting",
+                    Some(
+                        if matches!(
+                            existing,
+                            ExistingDestination::MissingVersion
+                                | ExistingDestination::LegacyTrashed
+                        ) {
+                            "recovery_archive_version_missing"
+                        } else if matches!(
+                            existing,
+                            ExistingDestination::IdenticalBlocked
+                                | ExistingDestination::DifferentQueued
+                        ) {
+                            "recovery_required"
+                        } else {
+                            "recovery_evidence_missing"
+                        }
+                    )
+                ),
+                "{detail:?}"
+            );
+            assert!(!operation_completed(&state, "publication").await.unwrap());
+            assert!(
+                super::super::row(&state, "share", "album/photo.jpg")
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            let (operation, item, upload): (String, String, String) = sqlx::query_as(
+                "SELECT o.status,i.status,u.status FROM operations o JOIN operation_items i ON i.operation_id=o.id JOIN uploads u ON u.operation_id=o.id WHERE o.id='publication'",
+            ).fetch_one(&state.db).await.unwrap();
+            assert_eq!(
+                (operation.as_str(), item.as_str(), upload.as_str()),
+                ("failed", "failed", "failed")
+            );
+            if existing == ExistingDestination::DifferentQueued {
+                let count: i64 = sqlx::query_scalar(
+                    "SELECT count(*) FROM transfers WHERE share_id='share' AND rel_path='album/photo.jpg' AND status='queued'",
+                ).fetch_one(&state.db).await.unwrap();
+                assert_eq!(count, 1);
+                assert_eq!(std::fs::read(&target).unwrap(), b"local-change");
+            }
+            if existing == ExistingDestination::LegacyTrashed {
+                assert!(!target.exists());
+                assert_eq!(
+                    std::fs::read(root.join(".ism-trash/trash_test/album/photo.jpg")).unwrap(),
+                    b"peer-content"
+                );
+                sqlx::query("UPDATE sync_recovery SET updated_at='2024-01-01T00:00:00Z' WHERE id='operation:publication'")
+                    .execute(&state.db).await.unwrap();
+                sqlx::query("INSERT INTO conflicts(id,share_id,rel_path,kind,detail,local_json,remote_json,remote_vv_json,peer_id,status,created_at) VALUES('independent','share','other.jpg','changed_on_both','resolved independently','{}','{}','{}','peer','resolved','2024-01-01')")
+                    .execute(&state.db).await.unwrap();
+                sqlx::query("INSERT INTO sync_recovery(id,kind,target_id,state,created_at,updated_at) VALUES('conflict:independent','conflict','independent','queued','2024-01-01','2024-01-01')")
+                    .execute(&state.db).await.unwrap();
+                let ready =
+                    eligible_jobs(&state, 50, None, None, &[], RECOVERY_CONCURRENCY_PER_PEER)
+                        .await
+                        .unwrap();
+                assert!(!ready.iter().any(|(id, ..)| id == "operation:publication"));
+                assert!(ready.iter().any(|(id, ..)| id == "conflict:independent"));
+                run_job(
+                    &state,
+                    "conflict:independent".into(),
+                    "conflict".into(),
+                    "independent".into(),
+                )
+                .await
+                .unwrap();
+                let independent = get(&state, RecoveryKind::Conflict, "independent")
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(independent.state, RecoveryState::Fixed);
+                let admitted = submit_one(
+                    &state,
+                    RecoveryTarget {
+                        kind: RecoveryKind::Operation,
+                        id: "publication".into(),
+                        peer_id: None,
+                    },
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+                assert_eq!(admitted[0].state, RecoveryState::Queued);
+                let ready =
+                    eligible_jobs(&state, 50, None, None, &[], RECOVERY_CONCURRENCY_PER_PEER)
+                        .await
+                        .unwrap();
+                assert!(ready.iter().any(|(id, ..)| id == "operation:publication"));
+                run_job(
+                    &state,
+                    "operation:publication".into(),
+                    "operation".into(),
+                    "publication".into(),
+                )
+                .await
+                .unwrap();
+                let retry = get(&state, RecoveryKind::Operation, "publication")
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(retry.state, RecoveryState::Waiting);
+                assert_eq!(
+                    retry.code.as_deref(),
+                    Some("recovery_archive_version_missing")
+                );
+                assert!(retry.can_fix);
+                assert!(!operation_completed(&state, "publication").await.unwrap());
+                assert!(!target.exists());
+                assert_eq!(
+                    std::fs::read(root.join(".ism-trash/trash_test/album/photo.jpg")).unwrap(),
+                    b"peer-content"
+                );
+            }
+        } else if matches!(
+            existing,
+            ExistingDestination::Different
+                | ExistingDestination::DifferentUppercase
+                | ExistingDestination::DifferentKeepRemote
+                | ExistingDestination::DifferentBlocked
+                | ExistingDestination::DifferentNewerQueuedAtDecision
+        ) {
+            assert_eq!(
+                (recovery.as_str(), code.as_deref()),
+                ("needs_decision", Some("choose_version"))
+            );
+            let linked: i64 = sqlx::query_scalar("SELECT count(*) FROM sync_recovery_links l JOIN conflicts c ON l.kind='conflict' AND l.target_id=c.id WHERE l.recovery_id='operation:publication' AND c.status='open'")
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+            assert_eq!(linked, 1);
+            assert_eq!(std::fs::read(&target).unwrap(), b"local-change");
+            let conflict: String = sqlx::query_scalar(
+                "SELECT target_id FROM sync_recovery_links WHERE recovery_id='operation:publication' AND kind='conflict'",
+            ).fetch_one(&state.db).await.unwrap();
+            if existing == ExistingDestination::DifferentNewerQueuedAtDecision {
+                let share = super::super::shares(&state).await.unwrap().remove(0);
+                let mut version = super::super::row(&state, "share", "album/photo.jpg")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .vv;
+                version.0.insert("remote".into(), 99);
+                version.0.insert("merged".into(), 2);
+                let newer_hash = "b".repeat(64);
+                super::super::queue_transfer(
+                    &state,
+                    "peer",
+                    &share,
+                    "album/photo.jpg",
+                    &newer_hash,
+                    12,
+                    &version,
+                )
+                .await
+                .unwrap();
+                let err =
+                    admin::resolve(&state, "admin", &conflict, ConflictResolution::KeepRemote)
+                        .await
+                        .unwrap_err();
+                assert_eq!(err.code(), "recovery_evidence_changed");
+                let (queued_hash, status): (String, String) = sqlx::query_as(
+                    "SELECT sha256,status FROM transfers WHERE share_id='share' AND rel_path='album/photo.jpg'",
+                ).fetch_one(&state.db).await.unwrap();
+                assert_eq!((queued_hash, status), (newer_hash, "queued".into()));
+                let conflict_status: String =
+                    sqlx::query_scalar("SELECT status FROM conflicts WHERE id=?")
+                        .bind(&conflict)
+                        .fetch_one(&state.db)
+                        .await
+                        .unwrap();
+                assert_eq!(conflict_status, "open");
+                assert!(!operation_completed(&state, "publication").await.unwrap());
+                assert_eq!(std::fs::read(&target).unwrap(), b"local-change");
+                server.abort();
+                return;
+            }
+            if existing == ExistingDestination::DifferentBlocked {
+                let blocked_request = serde_json::json!({"actions":[{"kind":"trash","source":{"root_id":"photos","path":"album/photo.jpg"}}]});
+                sqlx::query("INSERT INTO operations(id,idempotency_key,principal,source,request_json,status,created_at) VALUES('other','other','admin','admin',?,'failed',?)")
+                    .bind(blocked_request.to_string()).bind(db::now()).execute(&state.db).await.unwrap();
+                let err = admin::resolve(&state, "admin", &conflict, ConflictResolution::KeepLocal)
+                    .await
+                    .unwrap_err();
+                assert_eq!(err.code(), "recovery_required");
+                server.abort();
+                return;
+            }
+            let resolution = if matches!(
+                existing,
+                ExistingDestination::Different | ExistingDestination::DifferentUppercase
+            ) {
+                ConflictResolution::KeepLocal
+            } else {
+                ConflictResolution::KeepRemote
+            };
+            admin::resolve(&state, "admin", &conflict, resolution)
+                .await
+                .unwrap();
+            if matches!(
+                existing,
+                ExistingDestination::Different | ExistingDestination::DifferentUppercase
+            ) {
+                run_job(
+                    &state,
+                    "operation:publication".into(),
+                    "operation".into(),
+                    "publication".into(),
+                )
+                .await
+                .unwrap();
+                assert!(operation_completed(&state, "publication").await.unwrap());
+                let replica = super::super::row(&state, "share", "album/photo.jpg")
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(!replica.deleted);
+                assert_eq!(replica.vv.get("remote"), 1);
+                assert_eq!(replica.vv.get("merged"), 2);
+                assert_eq!(std::fs::read(&target).unwrap(), b"local-change");
+            } else {
+                let transfer: String = sqlx::query_scalar(
+                    "SELECT target_id FROM sync_recovery_links WHERE recovery_id='operation:publication' AND kind='transfer'",
+                ).fetch_one(&state.db).await.unwrap();
+                let share = super::super::shares(&state).await.unwrap().remove(0);
+                super::super::inbox::require_stable_transfer(
+                    &state,
+                    &share,
+                    &["album/photo.jpg"],
+                    &transfer,
+                )
+                .await
+                .unwrap();
+                assert!(!operation_completed(&state, "publication").await.unwrap());
+                assert_eq!(std::fs::read(&target).unwrap(), b"local-change");
+            }
+        } else {
+            assert_eq!(recovery, "fixed", "{code:?}: {detail:?}");
+            assert!(operation_completed(&state, "publication").await.unwrap());
+            assert_eq!(target.exists(), existing == ExistingDestination::Identical);
+            let replica = super::super::row(&state, "share", "album/photo.jpg")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                replica.deleted,
+                existing == ExistingDestination::TrashedIdentical
+            );
+            assert_eq!(replica.vv.get("remote"), 1);
+            if replica.deleted {
+                assert_eq!(replica.vv.get(&state.instance_id), 1);
+            }
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn failed_publication_completes_when_existing_destination_is_identical() {
+        failed_existing_publication(ExistingDestination::Identical).await;
+    }
+
+    #[tokio::test]
+    async fn failed_publication_waits_for_an_unrelated_overlapping_operation() {
+        failed_existing_publication(ExistingDestination::IdenticalBlocked).await;
+    }
+
+    #[tokio::test]
+    async fn failed_publication_completes_when_later_trashed_destination_was_identical() {
+        failed_existing_publication(ExistingDestination::TrashedIdentical).await;
+    }
+
+    #[tokio::test]
+    async fn failed_publication_opens_conflict_when_existing_destination_differs() {
+        failed_existing_publication(ExistingDestination::Different).await;
+    }
+
+    #[tokio::test]
+    async fn failed_publication_conflict_accepts_equivalent_uppercase_hash() {
+        failed_existing_publication(ExistingDestination::DifferentUppercase).await;
+    }
+
+    #[tokio::test]
+    async fn failed_publication_conflict_can_queue_remote_replacement() {
+        failed_existing_publication(ExistingDestination::DifferentKeepRemote).await;
+    }
+
+    #[tokio::test]
+    async fn failed_publication_conflict_waits_for_other_overlapping_operations() {
+        failed_existing_publication(ExistingDestination::DifferentBlocked).await;
+    }
+
+    #[tokio::test]
+    async fn failed_publication_does_not_replace_an_existing_queued_transfer() {
+        failed_existing_publication(ExistingDestination::DifferentQueued).await;
+    }
+
+    #[tokio::test]
+    async fn failed_publication_does_not_link_an_unrelated_newer_transfer() {
+        failed_existing_publication(ExistingDestination::DifferentNewerQueuedAtDecision).await;
+    }
+
+    #[tokio::test]
+    async fn failed_publication_waits_when_version_evidence_is_missing() {
+        failed_existing_publication(ExistingDestination::MissingVersion).await;
+    }
+
+    #[tokio::test]
+    async fn failed_publication_waits_when_trash_lineage_is_ambiguous() {
+        failed_existing_publication(ExistingDestination::AmbiguousTrash).await;
+    }
+
+    #[tokio::test]
+    async fn failed_publication_waits_when_archived_version_is_invalid() {
+        failed_existing_publication(ExistingDestination::InvalidVersion).await;
+    }
+
+    #[tokio::test]
+    async fn legacy_trashed_publication_waits_even_with_a_matching_event() {
+        failed_existing_publication(ExistingDestination::LegacyTrashed).await;
+    }
+
+    #[tokio::test]
+    async fn failed_publication_waits_when_trash_predates_failure() {
+        failed_existing_publication(ExistingDestination::DeletionBeforeFailure).await;
+    }
+
+    #[tokio::test]
+    async fn failed_publication_waits_when_transfer_identity_differs() {
+        failed_existing_publication(ExistingDestination::WrongTransfer).await;
+    }
+
+    #[tokio::test]
+    async fn failed_publication_waits_when_deletion_did_not_see_the_publication() {
+        failed_existing_publication(ExistingDestination::UnlinkedDeletion).await;
+    }
 
     async fn startup_reset_retries_without_blocking_other_queue(block_local: bool) {
         let dir = tempfile::tempdir().unwrap();

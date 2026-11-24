@@ -1491,8 +1491,8 @@ pub(super) async fn archive_transfer(
     operation_id: Option<&str>,
 ) -> AppResult<()> {
     sqlx::query(
-        "INSERT INTO transfer_history (id, peer_id, share_id, rel_path, sha256, size, queued_at, finished_at, operation_id, run_id)
-         SELECT id, peer_id, share_id, rel_path, sha256, size, queued_at, ?, ?, run_id FROM transfers WHERE id = ?",
+        "INSERT INTO transfer_history (id, peer_id, share_id, rel_path, sha256, size, queued_at, finished_at, operation_id, run_id, vv_json)
+         SELECT id, peer_id, share_id, rel_path, sha256, size, queued_at, ?, ?, run_id, vv_json FROM transfers WHERE id = ?",
     )
     .bind(db::now()).bind(operation_id).bind(id).execute(conn).await?;
     Ok(())
@@ -1535,6 +1535,51 @@ mod tests {
     use crate::ops::plan::upload_file_needs_sync_add;
     use ism_core::dto::FileRole;
     use ism_core::file_settings::DEFAULT_SIDECAR_EXTENSIONS;
+
+    #[tokio::test]
+    async fn archive_preserves_the_final_merged_queued_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::state::AppState::new(
+            crate::config::Config::for_tests(dir.path()),
+            crate::db::connect(dir.path()).await.unwrap(),
+            crate::crypto::SecretBox::open_or_create(dir.path()).unwrap(),
+        )
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO peers(id,name,url,secret_enc,status,created_at) VALUES('peer','Peer','https://peer.example','unused','online',?)")
+            .bind(crate::db::now()).execute(&state.db).await.unwrap();
+        sqlx::query("INSERT INTO shares(id,name,root_id,path,peer_ids_json,enabled) VALUES('share','Archive','photos','','[\"peer\"]',1)")
+            .execute(&state.db).await.unwrap();
+        let share = super::super::shares(&state).await.unwrap().remove(0);
+        let first = serde_json::from_str(r#"{"one":2}"#).unwrap();
+        let second = serde_json::from_str(r#"{"two":3}"#).unwrap();
+        let hash = "a".repeat(64);
+        super::super::queue_transfer(&state, "peer", &share, "photo.jpg", &hash, 12, &first)
+            .await
+            .unwrap();
+        super::super::queue_transfer(&state, "peer", &share, "photo.jpg", &hash, 12, &second)
+            .await
+            .unwrap();
+        let (id, queued): (String, String) =
+            sqlx::query_as("SELECT id,vv_json FROM transfers WHERE share_id='share'")
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+        let queued: ism_core::version::VersionVector = serde_json::from_str(&queued).unwrap();
+        assert_eq!(queued.get("one"), 2);
+        assert_eq!(queued.get("two"), 3);
+        let mut tx = state.db.begin().await.unwrap();
+        super::archive_transfer(&mut tx, &id, None).await.unwrap();
+        tx.commit().await.unwrap();
+        let archived: String =
+            sqlx::query_scalar("SELECT vv_json FROM transfer_history WHERE id=?")
+                .bind(id)
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+        let archived: ism_core::version::VersionVector = serde_json::from_str(&archived).unwrap();
+        assert_eq!(archived, queued);
+    }
 
     #[tokio::test]
     async fn panicked_transfer_task_reports_only_its_running_row() {

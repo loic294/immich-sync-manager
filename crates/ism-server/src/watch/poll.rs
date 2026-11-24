@@ -158,12 +158,17 @@ pub async fn load(state: &AppState, root_id: &str, scope: Option<&str>) -> AppRe
     let (exact, lo, hi) = scope_bounds(scope);
     let rows: Vec<(String, i64, i64, Option<i64>)> = sqlx::query_as(
         "SELECT rel_path, size, mtime_ns, inode FROM watch_snapshot
-         WHERE root_id = ? AND (rel_path = ? OR (rel_path >= ? AND rel_path < ?))",
+         WHERE root_id = ? AND rel_path = ?
+         UNION ALL
+         SELECT rel_path, size, mtime_ns, inode FROM watch_snapshot
+         WHERE root_id = ? AND rel_path >= ? AND rel_path < ? AND rel_path != ?",
     )
     .bind(root_id)
     .bind(exact)
+    .bind(root_id)
     .bind(lo)
     .bind(hi)
+    .bind(scope.unwrap_or(""))
     .fetch_all(&state.db)
     .await?;
     Ok(rows

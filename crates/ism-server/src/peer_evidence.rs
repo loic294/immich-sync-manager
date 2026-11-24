@@ -1,10 +1,10 @@
 //! Cached receiver activity, with freshness and malformed records kept explicit.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
 
-use futures_util::TryStreamExt;
 use ism_core::dto::{ActivityExample, SyncActivity, SyncProgress};
-use sqlx::{FromRow, Row};
+use sqlx::FromRow;
 
 use crate::db;
 use crate::error::{AppResult, redact};
@@ -12,6 +12,14 @@ use crate::state::AppState;
 
 const EXAMPLES: usize = 5;
 const REASONS: usize = 32;
+
+type Records = Arc<BTreeMap<(String, String), Arc<str>>>;
+
+#[derive(Default)]
+pub(crate) struct Cache {
+    revision: Option<i64>,
+    records: Records,
+}
 
 #[derive(FromRow)]
 struct PeerRow {
@@ -87,13 +95,58 @@ fn decode(
 }
 
 pub(crate) async fn snapshot(state: &AppState) -> AppResult<Snapshot> {
+    let mut cache = state.peer_evidence.lock().await;
     let mut tx = state.db.begin().await?;
+    let (revision, deleted_revision): (i64, i64) = sqlx::query_as(
+        "SELECT revision,deleted_revision FROM outgoing_sync_revision WHERE singleton=1",
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+    let records =
+        if cache.revision == Some(revision) {
+            cache.records.clone()
+        } else {
+            let changes: Vec<(String, String, String)> = match cache.revision {
+            Some(previous) => sqlx::query_as(
+                "SELECT peer_id,id,activity_json FROM outgoing_sync WHERE evidence_revision > ?",
+            )
+            .bind(previous)
+            .fetch_all(&mut *tx)
+            .await?,
+            None => sqlx::query_as(
+                "SELECT peer_id,id,activity_json FROM outgoing_sync ORDER BY peer_id,id",
+            )
+            .fetch_all(&mut *tx)
+            .await?,
+        };
+            let mut records = cache.records.clone();
+            let updated = Arc::make_mut(&mut records);
+            if cache
+                .revision
+                .is_some_and(|previous| deleted_revision > previous)
+            {
+                let keys: Vec<(String, String)> =
+                    sqlx::query_as("SELECT peer_id,id FROM outgoing_sync")
+                        .fetch_all(&mut *tx)
+                        .await?;
+                let keys: HashSet<_> = keys.into_iter().collect();
+                updated.retain(|key, _| keys.contains(key));
+            }
+            for (peer_id, id, json) in changes {
+                updated.insert((peer_id, id), Arc::from(json));
+            }
+            records
+        };
     let rows: Vec<PeerRow> = sqlx::query_as(
         "SELECT p.id,p.name,p.instance_id,p.status,c.progress_json,c.error,c.updated_at
          FROM peers p LEFT JOIN peer_sync_state c ON c.peer_id=p.id ORDER BY p.name,p.id",
     )
     .fetch_all(&mut *tx)
     .await?;
+    tx.commit().await?;
+    cache.revision = Some(revision);
+    cache.records = records.clone();
+    drop(cache);
     let mut peers: Vec<_> = rows
         .into_iter()
         .map(|row| {
@@ -124,20 +177,14 @@ pub(crate) async fn snapshot(state: &AppState) -> AppResult<Snapshot> {
         .collect();
     let mut groups: HashMap<(usize, String, String, bool), usize> = HashMap::new();
     let mut orphaned = 0;
-    let mut records =
-        sqlx::query("SELECT peer_id,id,activity_json FROM outgoing_sync ORDER BY peer_id,id")
-            .fetch(&mut *tx);
-    while let Some(record) = records.try_next().await? {
-        let peer_id: String = record.try_get("peer_id")?;
-        let Some(&peer_index) = peer_indexes.get(&peer_id) else {
+    for ((peer_id, id), json) in records.iter() {
+        let Some(&peer_index) = peer_indexes.get(peer_id) else {
             orphaned += 1;
             continue;
         };
         let peer = &mut peers[peer_index];
         peer.cached_count += 1;
-        let id: String = record.try_get("id")?;
-        let json: String = record.try_get("activity_json")?;
-        let Some((activity, queued_at)) = decode(&peer_id, &id, &json) else {
+        let Some((activity, queued_at)) = decode(peer_id, id, json) else {
             peer.invalid_count += 1;
             continue;
         };
@@ -217,7 +264,177 @@ pub(crate) async fn snapshot(state: &AppState) -> AppResult<Snapshot> {
             }
         }
     }
-    drop(records);
-    tx.commit().await?;
     Ok(Snapshot { peers, orphaned })
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    #[tokio::test]
+    async fn unchanged_records_are_reused_and_committed_changes_invalidate_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new(
+            crate::config::Config::for_tests(dir.path()),
+            db::connect(dir.path()).await.unwrap(),
+            crate::crypto::SecretBox::open_or_create(dir.path()).unwrap(),
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO peers(id,name,url,secret_enc,status,created_at)
+             VALUES('peer','Example peer','https://peer.example','unused','offline',?)",
+        )
+        .bind(db::now())
+        .execute(&state.db)
+        .await
+        .unwrap();
+        assert_eq!(snapshot(&state).await.unwrap().peers[0].cached_count, 0);
+        let empty = state.peer_evidence.lock().await.records.clone();
+        snapshot(&state).await.unwrap();
+        assert!(Arc::ptr_eq(
+            &empty,
+            &state.peer_evidence.lock().await.records
+        ));
+        sqlx::query(
+            "INSERT INTO outgoing_sync(peer_id,id,activity_json) VALUES('peer','item','{}')",
+        )
+        .execute(&state.db)
+        .await
+        .unwrap();
+        let observed = snapshot(&state).await.unwrap();
+        assert_eq!(observed.peers[0].cached_count, 1);
+        assert_eq!(observed.peers[0].invalid_count, 1);
+        let inserted = state.peer_evidence.lock().await.records.clone();
+        assert!(!Arc::ptr_eq(&empty, &inserted));
+        sqlx::query("UPDATE peers SET name='Renamed peer'")
+            .execute(&state.db)
+            .await
+            .unwrap();
+        assert_eq!(
+            snapshot(&state).await.unwrap().peers[0].name,
+            "Renamed peer"
+        );
+        assert!(Arc::ptr_eq(
+            &inserted,
+            &state.peer_evidence.lock().await.records
+        ));
+        sqlx::query("UPDATE outgoing_sync SET activity_json=activity_json")
+            .execute(&state.db)
+            .await
+            .unwrap();
+        snapshot(&state).await.unwrap();
+        assert!(Arc::ptr_eq(
+            &inserted,
+            &state.peer_evidence.lock().await.records
+        ));
+        let mut tx = state.db.begin().await.unwrap();
+        sqlx::query("DELETE FROM outgoing_sync")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.rollback().await.unwrap();
+        snapshot(&state).await.unwrap();
+        assert!(Arc::ptr_eq(
+            &inserted,
+            &state.peer_evidence.lock().await.records
+        ));
+        sqlx::query("UPDATE outgoing_sync SET activity_json='{\"changed\":true}'")
+            .execute(&state.db)
+            .await
+            .unwrap();
+        snapshot(&state).await.unwrap();
+        assert!(!Arc::ptr_eq(
+            &inserted,
+            &state.peer_evidence.lock().await.records
+        ));
+        assert_eq!(
+            state
+                .peer_evidence
+                .lock()
+                .await
+                .records
+                .get(&("peer".into(), "item".into()))
+                .map(AsRef::as_ref),
+            Some("{\"changed\":true}")
+        );
+        sqlx::query("DELETE FROM outgoing_sync")
+            .execute(&state.db)
+            .await
+            .unwrap();
+        let deleted = snapshot(&state).await.unwrap();
+        assert_eq!(deleted.peers[0].cached_count, 0);
+        assert_eq!(deleted.peers[0].invalid_count, 0);
+    }
+
+    #[tokio::test]
+    async fn cache_tracks_deletes_reinsertions_and_key_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new(
+            crate::config::Config::for_tests(dir.path()),
+            db::connect(dir.path()).await.unwrap(),
+            crate::crypto::SecretBox::open_or_create(dir.path()).unwrap(),
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO peers(id,name,url,secret_enc,status,created_at)
+             VALUES('peer','Example peer','https://peer.example','unused','offline',?)",
+        )
+        .bind(db::now())
+        .execute(&state.db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO outgoing_sync(peer_id,id,activity_json) VALUES('peer','first','{\"version\":1}'),('peer','second','{}')",
+        )
+        .execute(&state.db)
+        .await
+        .unwrap();
+        assert_eq!(snapshot(&state).await.unwrap().peers[0].cached_count, 2);
+
+        let mut tx = state.db.begin().await.unwrap();
+        sqlx::query("DELETE FROM outgoing_sync WHERE peer_id='peer' AND id='first'")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE outgoing_sync SET id='third' WHERE peer_id='peer' AND id='second'")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO outgoing_sync(peer_id,id,activity_json) VALUES('peer','first','{\"version\":2}')",
+        )
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        let observed = snapshot(&state).await.unwrap();
+        assert_eq!(observed.peers[0].cached_count, 2);
+        assert_eq!(observed.peers[0].invalid_count, 2);
+        let cache = state.peer_evidence.lock().await;
+        assert!(cache.records.contains_key(&("peer".into(), "first".into())));
+        assert!(cache.records.contains_key(&("peer".into(), "third".into())));
+        assert_eq!(
+            cache
+                .records
+                .get(&("peer".into(), "first".into()))
+                .map(AsRef::as_ref),
+            Some("{\"version\":2}")
+        );
+        assert!(
+            !cache
+                .records
+                .contains_key(&("peer".into(), "second".into()))
+        );
+        drop(cache);
+        sqlx::query("DELETE FROM peers WHERE id='peer'")
+            .execute(&state.db)
+            .await
+            .unwrap();
+        let observed = snapshot(&state).await.unwrap();
+        assert!(observed.peers.is_empty());
+        assert_eq!(observed.orphaned, 0);
+    }
 }

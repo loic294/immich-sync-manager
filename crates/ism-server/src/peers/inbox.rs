@@ -1384,7 +1384,51 @@ pub(super) async fn require_move_choice_stable(
     conflict_id: &str,
 ) -> AppResult<()> {
     let retained = retained_choice_transfers(state, share, conflict_id).await?;
-    require_operations_stable_except(state, share, paths, &[], &retained).await
+    let parents = publication_conflict_parents(state, share, conflict_id).await?;
+    require_operations_stable_except(state, share, paths, &parents, &retained).await
+}
+
+pub(super) async fn publication_conflict_parents(
+    state: &AppState,
+    share: &Share,
+    conflict_id: &str,
+) -> AppResult<Vec<String>> {
+    sqlx::query_scalar(
+        "SELECT DISTINCT o.id FROM conflicts c
+         JOIN shares s ON s.id=c.share_id
+         JOIN sync_recovery_links l ON l.kind='conflict' AND l.target_id=c.id
+         JOIN sync_recovery r ON r.id=l.recovery_id AND r.kind='operation' AND r.state='needs_decision'
+         JOIN operations o ON o.id=r.target_id AND o.source='peer' AND o.status='failed'
+             AND o.recovery_resolved=0 AND o.cancel_requested=0
+         JOIN operation_items i ON i.operation_id=o.id AND i.idx=0 AND i.kind='publish_upload'
+             AND i.status='failed' AND i.error_code='destination_exists' AND i.journal_json IS NULL
+         JOIN uploads u ON u.operation_id=o.id AND u.principal=o.principal AND u.status='failed'
+             AND json_extract(i.action_json,'$.upload_id')=u.id
+         JOIN transfer_history h ON h.operation_id=o.id AND o.principal='peer:'||h.peer_id
+             AND u.idempotency_key='peer-transfer:'||h.id
+             AND h.vv_json IS NOT NULL
+             AND json_extract(u.request_json,'$.idempotency_key')=u.idempotency_key
+             AND json_extract(u.request_json,'$.on_conflict')='fail'
+             AND json_array_length(u.request_json,'$.files')=1
+             AND lower(json_extract(u.request_json,'$.files[0].sha256'))=lower(h.sha256)
+             AND json_extract(u.request_json,'$.files[0].size')=h.size
+             AND json_extract(u.request_json,'$.target.root_id')=?
+             AND CASE WHEN json_extract(u.request_json,'$.target.path')=''
+                 THEN json_extract(u.request_json,'$.files[0].name')
+                 ELSE json_extract(u.request_json,'$.target.path')||'/'||json_extract(u.request_json,'$.files[0].name') END
+               = CASE WHEN s.path='' THEN c.rel_path ELSE s.path||'/'||c.rel_path END
+         WHERE c.id=? AND c.share_id=? AND c.status IN ('open','resolving')
+             AND c.peer_id=h.peer_id AND c.share_id=h.share_id AND c.rel_path=h.rel_path
+             AND (SELECT count(*) FROM operation_items WHERE operation_id=o.id)=1
+             AND NOT EXISTS(SELECT 1 FROM pending_peer_ops WHERE operation_id=o.id)
+             AND NOT EXISTS(SELECT 1 FROM pending_peer_events WHERE operation_id=o.id)",
+    )
+    .bind(&share.root_id)
+    .bind(conflict_id)
+    .bind(&share.id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(Into::into)
 }
 
 pub(super) async fn retained_choice_transfers(
@@ -1545,7 +1589,7 @@ pub(crate) async fn require_stable_transfer(
     require_stable_share_for(state, share, paths, &parents).await
 }
 
-async fn require_stable_share_for(
+pub(super) async fn require_stable_share_for(
     state: &AppState,
     share: &Share,
     paths: &[&str],

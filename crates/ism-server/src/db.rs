@@ -82,6 +82,36 @@ pub fn json_vec(raw: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     #[tokio::test]
+    async fn transfer_history_version_migration_leaves_legacy_evidence_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = super::connect(dir.path()).await.unwrap();
+        sqlx::query("ALTER TABLE transfer_history DROP COLUMN vv_json")
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM _sqlx_migrations WHERE version=26")
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO peers(id,name,url,secret_enc,status,created_at) VALUES('peer','Peer','https://peer.example','unused','online','2025-01-01')")
+            .execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO shares(id,name,root_id,path,peer_ids_json,enabled) VALUES('share','Archive','photos','','[\"peer\"]',1)")
+            .execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO transfer_history(id,peer_id,share_id,rel_path,sha256,size,queued_at,finished_at) VALUES('transfer','peer','share','photo.jpg','checksum',12,'2025-01-01','2025-01-02')")
+            .execute(&db).await.unwrap();
+        db.close().await;
+
+        let migrated = super::connect(dir.path()).await.unwrap();
+        let row: (String, i64, Option<String>) =
+            sqlx::query_as("SELECT sha256,size,vv_json FROM transfer_history WHERE id='transfer'")
+                .fetch_one(&migrated)
+                .await
+                .unwrap();
+        assert_eq!(row, ("checksum".into(), 12, None));
+        migrated.close().await;
+    }
+
+    #[tokio::test]
     async fn share_scan_failure_paths_migration_preserves_existing_failure() {
         let dir = tempfile::tempdir().unwrap();
         let db = super::connect(dir.path()).await.unwrap();
