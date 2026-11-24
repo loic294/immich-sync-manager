@@ -905,9 +905,10 @@ async fn apply_received(
     Ok(accepted.is_none())
 }
 
-/// Receiver-only compatibility: a peer prune is acknowledged only when nothing exists here.
-/// It never deletes, consults conflict decisions or is advertised to other peers; a local
-/// entry at the path keeps the event (and later overlapping events) pending with an error.
+/// Receiver-only compatibility: a peer prune is retained, never applied or acknowledged.
+/// Nothing here deletes or advertises it, so it stays pending (path-scoped, holding later
+/// overlapping events) until a version that can handle and propagate prunes replays it,
+/// even when the folder is already absent here and only transitive peers still have it.
 async fn folder_pruned(
     state: &AppState,
     peer: &net::Peer,
@@ -916,28 +917,25 @@ async fn folder_pruned(
 ) -> AppResult<bool> {
     let root = files::root(&state.db, &share.root_id).await?;
     root.ensure_available()?;
-    let abs = root.abs(&share.root_rel(&event.data.path)?)?;
-    let present = || match abs.symlink_metadata() {
-        Ok(_) => Err(AppError::conflict(
-            "peer_folder_prune_unsupported",
-            format!(
-                "{} pruned folder '{}' in share '{}', but this instance never deletes folders for \
-                 peer prunes and the local entry still exists. Review it and move it to the ISM \
-                 trash if it should be removed; until it is gone, this event and later changes \
-                 inside it stay pending.",
-                peer.name, event.data.path, share.name
-            ),
-        )),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.into()),
+    let local = match root
+        .abs(&share.root_rel(&event.data.path)?)?
+        .symlink_metadata()
+    {
+        Ok(_) => "the local folder was left untouched",
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            "it is already absent here, but other peers may still have it"
+        }
+        Err(error) => return Err(error.into()),
     };
-    present()?;
-    let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
-    present()?;
-    done_in(&mut tx, &peer.id, event, false).await?;
-    tx.commit().await?;
-    tracing::info!(peer = %peer.name, path = %event.data.path, "peer folder prune acknowledged: nothing exists locally");
-    Ok(true)
+    Err(AppError::conflict(
+        "peer_folder_prune_unsupported",
+        format!(
+            "{} pruned folder '{}' in share '{}'; this version cannot apply or forward folder \
+             prunes, so the event is kept pending and {local}. Upgrade this instance to process \
+             it; until then, later changes inside that folder wait.",
+            peer.name, event.data.path, share.name
+        ),
+    ))
 }
 
 async fn conflict_decision(

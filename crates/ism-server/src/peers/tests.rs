@@ -5437,20 +5437,58 @@ async fn unsupported_peer_events_are_not_silently_acknowledged() {
 }
 
 #[tokio::test]
-async fn received_folder_prunes_never_delete_and_do_not_stall_unrelated_events() {
-    let (a, b) = pair().await;
-    for instance in [&a, &b] {
-        for task in instance.tasks.iter().skip(1) {
-            task.abort();
-        }
+async fn received_folder_prunes_are_retained_without_stalling_unrelated_events() {
+    let (a, mut b) = pair().await;
+    stop_workers(&mut b).await;
+    for task in a.tasks.iter().skip(1) {
+        task.abort();
     }
-    let share = super::shares(&a.state).await.unwrap().remove(0);
+    // Gamma is paired only with Beta: a transitive peer that still has both folders.
+    let mut c = instance("Gamma").await;
+    stop_workers(&mut c).await;
+    let invite = admin::create_invite(&b.state).await.unwrap();
+    admin::accept(
+        &c.state,
+        PeerAcceptInput {
+            name: String::new(),
+            url: b.url.clone(),
+            invite: invite.invite,
+            callback_url: c.url.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    let b_share = super::shares(&b.state).await.unwrap().remove(0);
+    let shared = |peer_ids: Vec<String>| ShareInput {
+        name: "Family".into(),
+        location: loc("shared"),
+        peer_ids,
+        enabled: true,
+    };
+    let b_peers = admin::list_peers(&b.state)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|peer| peer.id)
+        .collect();
+    admin::update_share(&b.state, &b_share.id, shared(b_peers))
+        .await
+        .unwrap();
+    let c_peer = admin::list_peers(&c.state).await.unwrap().remove(0);
+    admin::create_share(&c.state, shared(vec![c_peer.id.clone()]))
+        .await
+        .unwrap();
+    for dir in ["gone", "kept"] {
+        std::fs::create_dir(c.shared.join(dir)).unwrap();
+    }
     std::fs::create_dir(b.shared.join("kept")).unwrap();
+
+    let share = super::shares(&a.state).await.unwrap().remove(0);
     for (kind, path) in [
         (super::FOLDER_PRUNED, "gone"),
         (super::FOLDER_PRUNED, "kept"),
         ("folder_created", "later"),
-        ("folder_created", "kept/inner"),
+        ("folder_created", "gone/inner"),
     ] {
         super::append_local(
             &a.state,
@@ -5468,18 +5506,23 @@ async fn received_folder_prunes_never_delete_and_do_not_stall_unrelated_events()
         .fetch_one(&a.state.db)
         .await
         .unwrap();
-    let peer = super::net::peers(&b.state).await.unwrap().remove(0);
+    let peer = super::net::peers(&b.state)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|peer| peer.name == "Alpha")
+        .unwrap();
     let inbox = |state: AppState| async move {
-        sqlx::query_as::<_, (String, String, Option<String>)>(
-            "SELECT json_extract(event_json, '$.data.path'), status, error FROM peer_inbox
-             WHERE status != 'done' ORDER BY seq",
+        sqlx::query_as::<_, (String, String, String, Option<String>)>(
+            "SELECT json_extract(event_json, '$.kind'), json_extract(event_json, '$.data.path'),
+                 status, error FROM peer_inbox WHERE status != 'done' ORDER BY seq",
         )
         .fetch_all(&state.db)
         .await
         .unwrap()
     };
-    let pending_operation = |state: AppState| async move {
-        sqlx::query_scalar::<_, String>("SELECT operation_id FROM pending_peer_events")
+    let count = |state: AppState, sql: &'static str| async move {
+        sqlx::query_scalar::<_, i64>(sql)
             .fetch_one(&state.db)
             .await
             .unwrap()
@@ -5491,53 +5534,84 @@ async fn received_folder_prunes_never_delete_and_do_not_stall_unrelated_events()
         assert!(b.shared.join("kept").is_dir());
         let rows = inbox(b.state.clone()).await;
         assert_eq!(
-            rows.iter().map(|r| r.0.as_str()).collect::<Vec<_>>(),
-            ["kept", "later", "kept/inner"]
+            rows.iter()
+                .map(|r| (r.0.as_str(), r.1.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("folder_pruned", "gone"),
+                ("folder_pruned", "kept"),
+                ("folder_created", "later"),
+                ("folder_created", "gone/inner"),
+            ]
         );
         assert!(
             rows[0]
-                .2
+                .3
                 .as_deref()
                 .unwrap()
-                .contains("never deletes folders")
+                .contains("other peers may still have it")
         );
-        assert_eq!(rows[2].1, "pending");
-        assert!(rows[2].2.is_none());
+        assert!(rows[1].3.as_deref().unwrap().contains("left untouched"));
+        assert_eq!(rows[3].2, "pending");
+        assert!(rows[3].3.is_none());
     }
-    let peer_row = super::net::peer(&b.state, &peer.id).await.unwrap();
     let received: i64 = sqlx::query_scalar("SELECT received_cursor FROM peers WHERE id = ?")
         .bind(&peer.id)
         .fetch_one(&b.state.db)
         .await
         .unwrap();
     assert_eq!(received, last);
-    assert!(peer_row.cursor < last);
-    let receipts: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM peer_event_receipts WHERE kind = 'folder_pruned'")
-            .fetch_one(&b.state.db)
-            .await
-            .unwrap();
-    assert_eq!(receipts, 2);
-    let advertised: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM event_log WHERE kind = 'folder_pruned'")
-            .fetch_one(&b.state.db)
-            .await
-            .unwrap();
-    assert_eq!(advertised, 0);
-    let conflicts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM conflicts")
+    assert_eq!(
+        count(
+            b.state.clone(),
+            "SELECT COUNT(*) FROM peer_event_receipts WHERE kind = 'folder_pruned'"
+        )
+        .await,
+        2
+    );
+    assert_eq!(
+        count(
+            b.state.clone(),
+            "SELECT COUNT(*) FROM event_log WHERE kind = 'folder_pruned'"
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        count(b.state.clone(), "SELECT COUNT(*) FROM conflicts").await,
+        0
+    );
+
+    // The unrelated later event proceeds independently and reaches the transitive peer.
+    let operation_id: String = sqlx::query_scalar("SELECT operation_id FROM pending_peer_events")
         .fetch_one(&b.state.db)
         .await
         .unwrap();
-    assert_eq!(conflicts, 0);
-
-    // The unrelated later event proceeds independently of the blocked prune.
-    let operation_id = pending_operation(b.state.clone()).await;
     crate::ops::exec::run_operation(&b.state, &operation_id)
         .await
         .unwrap();
     assert!(b.shared.join("later").is_dir());
+    let _ = super::pull(&c.state, &c_peer).await;
+    assert_eq!(
+        count(
+            c.state.clone(),
+            "SELECT COUNT(*) FROM peer_event_receipts
+             WHERE kind = 'folder_created' AND json_extract(data_json, '$.path') = 'later'"
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        count(
+            c.state.clone(),
+            "SELECT COUNT(*) FROM peer_event_receipts WHERE kind = 'folder_pruned'"
+        )
+        .await,
+        0
+    );
+    assert!(c.shared.join("gone").is_dir() && c.shared.join("kept").is_dir());
 
-    // Restart keeps the prune blocked; it is acknowledged only once the folder is gone here.
+    // After a restart both prunes remain recoverable on Beta, holding only their own paths.
     let restarted = AppState::new(
         Config::for_tests(b._dir.path()),
         b.state.db.clone(),
@@ -5550,47 +5624,26 @@ async fn received_folder_prunes_never_delete_and_do_not_stall_unrelated_events()
         .unwrap();
     super::pull(&restarted, &peer).await.unwrap_err();
     assert!(b.shared.join("kept").is_dir());
+    assert!(!b.shared.join("gone").exists());
     assert_eq!(
         inbox(restarted.clone())
             .await
             .iter()
-            .map(|r| r.0.as_str())
+            .map(|r| r.1.as_str())
             .collect::<Vec<_>>(),
-        ["kept", "kept/inner"]
+        ["gone", "kept", "gone/inner"]
     );
-    let accepted = crate::ops::submit(
-        &restarted,
-        &Principal::Admin {
-            username: "test".into(),
-        },
-        OperationRequest {
-            idempotency_key: "trash-kept".into(),
-            label: None,
-            actions: vec![OperationAction::TrashFolder {
-                source: loc("shared/kept"),
-                expected_entries: None,
-            }],
-            allow_owner_transfer: false,
-            allow_partial: false,
-        },
+    let retained: Vec<String> = sqlx::query_scalar(
+        "SELECT event_json FROM peer_inbox WHERE json_extract(event_json, '$.kind') = 'folder_pruned'",
     )
+    .fetch_all(&restarted.db)
     .await
     .unwrap();
-    crate::ops::exec::run_operation(&restarted, &accepted.operation_id)
-        .await
-        .unwrap();
-    assert!(!b.shared.join("kept").exists());
-    super::pull(&restarted, &peer).await.unwrap();
-    let operation_id = pending_operation(restarted.clone()).await;
-    crate::ops::exec::run_operation(&restarted, &operation_id)
-        .await
-        .unwrap();
-    assert!(b.shared.join("kept/inner").is_dir());
-    assert!(inbox(restarted.clone()).await.is_empty());
-    assert_eq!(
-        super::net::peer(&restarted, &peer.id).await.unwrap().cursor,
-        last
-    );
+    for raw in retained {
+        let event: super::PeerEvent = serde_json::from_str(&raw).unwrap();
+        assert_eq!(event.origin, a.state.instance_id);
+    }
+    assert!(super::net::peer(&restarted, &peer.id).await.unwrap().cursor < last);
 }
 
 #[tokio::test]
