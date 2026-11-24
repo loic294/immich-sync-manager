@@ -2504,6 +2504,383 @@ async fn independent_transfer_candidate_cost_grows_linearly_with_unrelated_confl
     state.db.close().await;
 }
 
+async fn scan_peer(state: &AppState) -> (String, super::Share) {
+    let peer = super::net::peers(state).await.unwrap().remove(0);
+    sqlx::query("UPDATE peers SET status = 'online' WHERE id = ?")
+        .bind(&peer.id)
+        .execute(&state.db)
+        .await
+        .unwrap();
+    (peer.id, super::shares(state).await.unwrap().remove(0))
+}
+
+/// Queues a synthetic transfer at queue position `order` and returns its id.
+async fn queue_scan_row(
+    state: &AppState,
+    peer_id: &str,
+    share: &super::Share,
+    rel: &str,
+    order: i64,
+    attempts: i64,
+) -> String {
+    let mut vv = VersionVector::default();
+    vv.increment("scan-source");
+    super::queue_transfer(state, peer_id, share, rel, &"b".repeat(64), 1, &vv)
+        .await
+        .unwrap();
+    let base = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    sqlx::query(
+        "UPDATE transfers SET queued_at = ?, attempts = ?, updated_at = ?
+         WHERE share_id = ? AND rel_path = ?",
+    )
+    .bind(crate::db::ts(base + chrono::Duration::milliseconds(order)))
+    .bind(attempts)
+    .bind(crate::db::now())
+    .bind(&share.id)
+    .bind(rel)
+    .execute(&state.db)
+    .await
+    .unwrap();
+    sqlx::query_scalar("SELECT id FROM transfers WHERE share_id = ? AND rel_path = ?")
+        .bind(&share.id)
+        .bind(rel)
+        .fetch_one(&state.db)
+        .await
+        .unwrap()
+}
+
+async fn insert_undecided_event(
+    state: &AppState,
+    peer_id: &str,
+    share: &super::Share,
+    seq: i64,
+    path: &str,
+) {
+    let mut vv = VersionVector::default();
+    vv.increment("scan-source");
+    let event = super::PeerEvent {
+        seq,
+        origin: "scan-source".into(),
+        origin_seq: seq,
+        share: share.name.clone(),
+        kind: "file_changed".into(),
+        data: super::EventData {
+            path: path.into(),
+            sha256: Some("b".repeat(64)),
+            size: Some(1),
+            vv,
+            ..Default::default()
+        },
+    };
+    sqlx::query(
+        "INSERT INTO peer_inbox(peer_id,seq,origin,origin_seq,share_name,event_json,error)
+         VALUES (?,?,?,?,?,?,'peer effect waits for conflict resolution')",
+    )
+    .bind(peer_id)
+    .bind(event.seq)
+    .bind(&event.origin)
+    .bind(event.origin_seq)
+    .bind(&share.name)
+    .bind(serde_json::to_string(&event).unwrap())
+    .execute(&state.db)
+    .await
+    .unwrap();
+}
+
+/// Adds units `from..to` of queued rows that must keep waiting, one of each kind: a companion
+/// queued before its original, that original in retry backoff, and an edited sibling whose
+/// inbox event still waits for a conflict decision.
+async fn add_waiting_scan_units(
+    state: &AppState,
+    peer_id: &str,
+    share: &super::Share,
+    from: i64,
+    to: i64,
+) {
+    for unit in from..to {
+        let order = unit * 3;
+        let companion = format!("scan/c{unit}/photo.jpg.xmp");
+        queue_scan_row(state, peer_id, share, &companion, order, 0).await;
+        queue_scan_row(
+            state,
+            peer_id,
+            share,
+            &format!("scan/c{unit}/photo.jpg"),
+            order + 1,
+            1,
+        )
+        .await;
+        queue_scan_row(
+            state,
+            peer_id,
+            share,
+            &format!("scan/e{unit}/photo.edited.jpg"),
+            order + 2,
+            0,
+        )
+        .await;
+        insert_undecided_event(
+            state,
+            peer_id,
+            share,
+            10_000 + unit,
+            &format!("scan/e{unit}/photo.jpg"),
+        )
+        .await;
+    }
+}
+
+const SCAN_READY: &str = "scan/ready/photo.jpg";
+const SCAN_READY_ORDER: i64 = 1_000_000;
+
+#[tokio::test]
+async fn transfer_scan_pass_work_grows_linearly_with_waiting_rows() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    let db = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(b.state.db.connect_options().as_ref().clone())
+        .await
+        .unwrap();
+    let state = AppState::new(
+        b.state.config.clone(),
+        db,
+        SecretBox::open_or_create(b._dir.path()).unwrap(),
+    )
+    .await
+    .unwrap();
+    let (peer, share) = scan_peer(&state).await;
+    let ready = queue_scan_row(&state, &peer, &share, SCAN_READY, SCAN_READY_ORDER, 0).await;
+    let opcodes = Arc::new(AtomicUsize::new(0));
+    {
+        let mut connection = state.db.acquire().await.unwrap();
+        let counter = opcodes.clone();
+        connection
+            .lock_handle()
+            .await
+            .unwrap()
+            .set_progress_handler(1, move || {
+                counter.fetch_add(1, Ordering::Relaxed);
+                true
+            });
+    }
+    let mut measurements = Vec::new();
+    let mut units = 0;
+    for target in [16, 32, 64] {
+        add_waiting_scan_units(&state, &peer, &share, units, target).await;
+        units = target;
+        assert!(
+            super::transfer::original_pending(&state, &share.id, "scan/c0/photo.jpg.xmp")
+                .await
+                .unwrap(),
+            "the fixture companion must wait for its original"
+        );
+        let mut work = 0;
+        let mut elapsed = Duration::ZERO;
+        for _ in 0..2 {
+            opcodes.store(0, Ordering::Relaxed);
+            let started = std::time::Instant::now();
+            let next = super::transfer::next_for_test(&state, None).await.unwrap();
+            elapsed = started.elapsed();
+            work = opcodes.load(Ordering::Relaxed);
+            assert_eq!(next.as_deref(), Some(ready.as_str()));
+        }
+        measurements.push((units * 3, work, elapsed));
+    }
+    eprintln!("waiting rows / SQLite VM instructions / pass time: {measurements:?}");
+    let first = measurements[1].1 - measurements[0].1;
+    let second = measurements[2].1 - measurements[1].1;
+    assert!(
+        second * 4 <= first * 9,
+        "a scheduler pass must not repeat share-wide reads for every waiting row: {measurements:?}"
+    );
+    state.db.close().await;
+}
+
+/// Starts a scheduler pass and holds it after the first row that waits on a blocking gate.
+async fn paused_scan_pass(
+    state: &AppState,
+) -> (
+    tokio::task::JoinHandle<Option<String>>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let (reached, at_blocked_row) = tokio::sync::oneshot::channel();
+    let (resume, resumed) = tokio::sync::oneshot::channel();
+    let pass = tokio::spawn({
+        let state = state.clone();
+        async move {
+            super::transfer::next_for_test(
+                &state,
+                Some(super::transfer::EligibilityPause {
+                    reached,
+                    resume: resumed,
+                }),
+            )
+            .await
+            .unwrap()
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(5), at_blocked_row)
+        .await
+        .expect("the pass never reached a blocked row")
+        .unwrap();
+    (pass, resume)
+}
+
+#[tokio::test]
+async fn transfer_scan_pass_rechecks_evidence_that_changes_after_it_was_read() {
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    let state = b.state.clone();
+    let (peer, share) = scan_peer(&state).await;
+    add_waiting_scan_units(&state, &peer, &share, 0, 1).await;
+    let ready = queue_scan_row(&state, &peer, &share, SCAN_READY, SCAN_READY_ORDER, 0).await;
+    let next = || super::transfer::next_for_test(&state, None);
+    assert_eq!(next().await.unwrap().as_deref(), Some(ready.as_str()));
+    std::fs::create_dir_all(b._dir.path().join("photos/shared/scan")).unwrap();
+    let operation = |key: &str, path: &str| {
+        let state = state.clone();
+        let (key, path) = (key.to_owned(), path.to_owned());
+        async move {
+            crate::ops::submit(
+                &state,
+                &Principal::Admin {
+                    username: "test".into(),
+                },
+                OperationRequest {
+                    idempotency_key: key,
+                    label: None,
+                    actions: vec![OperationAction::CreateFolder { target: loc(&path) }],
+                    allow_owner_transfer: false,
+                    allow_partial: false,
+                },
+            )
+            .await
+            .unwrap()
+            .operation_id
+        }
+    };
+    let set_status = |id: String, status: &'static str| {
+        let state = state.clone();
+        async move {
+            sqlx::query("UPDATE operations SET status = ? WHERE id = ?")
+                .bind(status)
+                .bind(id)
+                .execute(&state.db)
+                .await
+                .unwrap();
+        }
+    };
+
+    // An unrelated operation becomes active.
+    let unrelated = operation("scan-race-active", "shared/elsewhere").await;
+    assert_eq!(next().await.unwrap().as_deref(), Some(ready.as_str()));
+    let (pass, resume) = paused_scan_pass(&state).await;
+    set_status(unrelated.clone(), "running").await;
+    resume.send(()).unwrap();
+    assert_eq!(pass.await.unwrap(), None, "active operation");
+    set_status(unrelated, "completed").await;
+    assert_eq!(next().await.unwrap().as_deref(), Some(ready.as_str()));
+
+    // An operation footprint now covers the row.
+    let (pass, resume) = paused_scan_pass(&state).await;
+    let covering = operation("scan-race-footprint", "shared/scan/ready").await;
+    resume.send(()).unwrap();
+    assert_eq!(pass.await.unwrap(), None, "operation footprint");
+    set_status(covering, "completed").await;
+    assert_eq!(next().await.unwrap().as_deref(), Some(ready.as_str()));
+
+    // An inbox effect for the row now waits for a decision.
+    let (pass, resume) = paused_scan_pass(&state).await;
+    insert_undecided_event(&state, &peer, &share, 20_000, SCAN_READY).await;
+    resume.send(()).unwrap();
+    assert_eq!(pass.await.unwrap(), None, "undecided inbox effect");
+    sqlx::query("DELETE FROM peer_inbox WHERE peer_id = ? AND seq = 20000")
+        .bind(&peer)
+        .execute(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(next().await.unwrap().as_deref(), Some(ready.as_str()));
+
+    // A companion transfer of the row fails.
+    let (pass, resume) = paused_scan_pass(&state).await;
+    let companion = queue_scan_row(
+        &state,
+        &peer,
+        &share,
+        "scan/ready/photo.jpg.xmp",
+        SCAN_READY_ORDER + 1,
+        0,
+    )
+    .await;
+    sqlx::query("UPDATE transfers SET status = 'failed' WHERE id = ?")
+        .bind(&companion)
+        .execute(&state.db)
+        .await
+        .unwrap();
+    resume.send(()).unwrap();
+    assert_eq!(pass.await.unwrap(), None, "failed companion transfer");
+    sqlx::query("DELETE FROM transfers WHERE id = ?")
+        .bind(&companion)
+        .execute(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(next().await.unwrap().as_deref(), Some(ready.as_str()));
+
+    // The share's root stops being verifiable.
+    let marker = b._dir.path().join("photos/.ism-root");
+    let (pass, resume) = paused_scan_pass(&state).await;
+    std::fs::write(&marker, "elsewhere\n").unwrap();
+    resume.send(()).unwrap();
+    assert_eq!(pass.await.unwrap(), None, "unavailable root");
+    std::fs::write(&marker, "photos\n").unwrap();
+    assert_eq!(next().await.unwrap().as_deref(), Some(ready.as_str()));
+
+    // Evidence that clears after a row was passed over counts from the next pass.
+    let edited: String =
+        sqlx::query_scalar("SELECT id FROM transfers WHERE rel_path = 'scan/e0/photo.edited.jpg'")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+    let (pass, resume) = paused_scan_pass(&state).await;
+    sqlx::query("DELETE FROM peer_inbox WHERE peer_id = ? AND seq = 10000")
+        .bind(&peer)
+        .execute(&state.db)
+        .await
+        .unwrap();
+    resume.send(()).unwrap();
+    assert_eq!(pass.await.unwrap().as_deref(), Some(ready.as_str()));
+    assert_eq!(next().await.unwrap().as_deref(), Some(edited.as_str()));
+}
+
+#[tokio::test]
+#[ignore = "timing at live queue scale; run explicitly with --ignored --nocapture"]
+async fn transfer_scan_pass_live_scale_timing() {
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    let state = b.state.clone();
+    let (peer, share) = scan_peer(&state).await;
+    add_waiting_scan_units(&state, &peer, &share, 0, 900).await;
+    let ready = queue_scan_row(&state, &peer, &share, SCAN_READY, SCAN_READY_ORDER, 0).await;
+    for _ in 0..2 {
+        let started = std::time::Instant::now();
+        let next = super::transfer::next_for_test(&state, None).await.unwrap();
+        eprintln!(
+            "2700 waiting rows, 900 undecided inbox effects: pass took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(next.as_deref(), Some(ready.as_str()));
+    }
+}
+
 #[tokio::test]
 async fn recovery_batch_preserves_decisions_and_never_dismisses_unverified_work() {
     let (mut a, mut b) = pair().await;

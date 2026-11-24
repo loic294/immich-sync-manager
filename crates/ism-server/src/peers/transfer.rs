@@ -712,6 +712,15 @@ pub(super) async fn run_paused(state: AppState, pause: EligibilityPause) {
     run_inner(state, Some(pause)).await;
 }
 
+/// One scheduler pass: the transfer it would claim next, if any.
+#[cfg(test)]
+pub(super) async fn next_for_test(
+    state: &AppState,
+    mut pause: Option<EligibilityPause>,
+) -> AppResult<Option<String>> {
+    Ok(next(state, &mut pause).await?.map(|(t, _)| t.id))
+}
+
 async fn run_inner(state: AppState, #[cfg(test)] mut pause: Option<EligibilityPause>) {
     let tick = Duration::from_secs(state.config.tick_secs.max(1));
     let mut tasks = tokio::task::JoinSet::new();
