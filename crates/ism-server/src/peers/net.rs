@@ -183,6 +183,7 @@ pub async fn mark(state: &AppState, peer_id: &str, result: Result<(), String>) {
         Err(error) if status == "offline" && last_error.as_ref() == Some(error) => return,
         _ => {}
     }
+    let online = result.is_ok();
     let updated = match result {
         Ok(()) => {
             let changed = sqlx::query(
@@ -223,7 +224,15 @@ pub async fn mark(state: &AppState, peer_id: &str, result: Result<(), String>) {
         }
     };
     match updated {
-        Ok(result) if result.rows_affected() > 0 => state.emit_ui(ServerEvent::SyncChanged),
+        Ok(result) if result.rows_affected() > 0 => {
+            state.emit_ui(ServerEvent::SyncChanged);
+            if online
+                && status != "online"
+                && let Err(error) = super::versions::wake_peer(state, peer_id).await
+            {
+                tracing::warn!(peer=%peer_id, %error, "could not resume conflict evidence preparation");
+            }
+        }
         Ok(_) => {}
         Err(error) => {
             tracing::error!(peer = %peer_id, "could not record peer connection status: {error}");

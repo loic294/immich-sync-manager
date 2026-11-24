@@ -941,8 +941,22 @@ async fn trash_fingerprint(path: PathBuf) -> AppResult<(String, String)> {
 }
 
 pub(crate) fn folder_inventory(path: &Path) -> io::Result<Vec<TrashEntry>> {
+    folder_inventory_with_limit(path, None)
+}
+
+pub(crate) fn folder_inventory_bounded(path: &Path, limit: usize) -> io::Result<Vec<TrashEntry>> {
+    folder_inventory_with_limit(path, Some(limit))
+}
+
+fn folder_inventory_with_limit(path: &Path, limit: Option<usize>) -> io::Result<Vec<TrashEntry>> {
     let mut inventory = Vec::new();
     for entry in walkdir::WalkDir::new(path).follow_links(false) {
+        if limit.is_some_and(|limit| inventory.len() >= limit) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "folder exceeds the version evidence entry limit",
+            ));
+        }
         let entry = entry.map_err(io::Error::other)?;
         let name = entry
             .path()
