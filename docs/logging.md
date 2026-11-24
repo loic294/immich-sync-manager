@@ -70,6 +70,9 @@ work or replace its actual result. Unsaved outcomes stay in the live section unt
 warnings distinguish in-memory evidence from durable history and report persistence failures.
 If ISM stops before a start is saved, that run cannot be recovered. If only its start/progress was
 saved, restart marks it interrupted, not successful, even if the work actually finished.
+An unreadable saved activity is not overwritten or removed by recovery and is shown as an
+unreadable record; it does not prevent ISM from starting or hide other activity. See the server
+logs for details. Completed or resolved records remain subject to the normal history retention.
 
 Recent completed background history is kept for seven days, capped at 1,000 runs; older resolved
 issues share that bound. Active runs and unresolved failures are not evicted by retention.

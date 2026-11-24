@@ -1,6 +1,6 @@
 //! Observability only: these records never authorize or schedule filesystem mutations.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
@@ -19,11 +19,18 @@ struct Pending {
 }
 
 #[derive(Default)]
+struct UnreadableReports {
+    ids: HashSet<String>,
+    suppressed: bool,
+}
+
+#[derive(Default)]
 pub struct Registry(
     Mutex<HashMap<String, Pending>>,
     Mutex<Option<String>>,
     tokio::sync::Mutex<()>,
     AtomicI64,
+    Mutex<UnreadableReports>,
 );
 
 impl Registry {
@@ -219,6 +226,75 @@ fn status(a: &BackgroundActivity) -> &'static str {
     }
 }
 
+#[derive(sqlx::FromRow)]
+struct SavedActivity {
+    id: String,
+    task_key: String,
+    status: String,
+    revision: i64,
+    updated_at: String,
+    finished_at: Option<String>,
+    activity_json: String,
+}
+
+impl SavedActivity {
+    fn decode(&self) -> Option<BackgroundActivity> {
+        let activity: BackgroundActivity = serde_json::from_str(&self.activity_json).ok()?;
+        (activity.id == self.id
+            && activity.task_key == self.task_key
+            && status(&activity) == self.status)
+            .then_some(activity)
+    }
+
+    fn placeholder(&self) -> BackgroundActivity {
+        let status = match self.status.as_str() {
+            "completed" => BackgroundStatus::Completed,
+            "failed" => BackgroundStatus::Failed,
+            "interrupted" => BackgroundStatus::Interrupted,
+            _ => BackgroundStatus::Blocked,
+        };
+        BackgroundActivity {
+            id: self.id.clone(),
+            task_key: self.task_key.clone(),
+            title: "Unreadable saved activity".into(),
+            resource: "ISM".into(),
+            status,
+            phase: "Saved activity could not be read; see server logs".into(),
+            done: 0,
+            total: None,
+            unit: "items".into(),
+            started_at: String::new(),
+            updated_at: self.updated_at.clone(),
+            finished_at: self.finished_at.clone(),
+            next_at: None,
+            error: None,
+            operation_id: None,
+            page: Some("/operations".into()),
+            count: 1,
+            reasons: Vec::new(),
+            examples: Vec::new(),
+        }
+    }
+}
+
+fn report_unreadable(state: &AppState, id: &str) {
+    const LIMIT: usize = 100;
+    let mut reports = lock(&state.activity.4);
+    if reports.ids.contains(id) {
+        return;
+    }
+    if reports.ids.len() < LIMIT {
+        reports.ids.insert(id.to_owned());
+        tracing::error!(
+            activity_id = id,
+            "saved background activity is unreadable or inconsistent; raw data retained"
+        );
+    } else if !reports.suppressed {
+        reports.suppressed = true;
+        tracing::error!("additional unreadable background activity records will not be logged");
+    }
+}
+
 async fn persist(state: &AppState, pending: &Pending) -> AppResult<()> {
     let a = &pending.activity;
     let mut tx = state.db.begin().await?;
@@ -270,11 +346,17 @@ pub async fn recover(state: &AppState) -> AppResult<()> {
             .fetch_one(&state.db)
             .await?;
     state.activity.3.fetch_max(revision, Ordering::Relaxed);
-    let rows: Vec<(String, i64)> = sqlx::query_as(
-        "SELECT activity_json,revision FROM background_activity WHERE status IN ('running','waiting')",
-    ).fetch_all(&state.db).await?;
-    for (json, revision) in rows {
-        let mut activity: BackgroundActivity = serde_json::from_str(&json)?;
+    let rows: Vec<SavedActivity> = sqlx::query_as(
+        "SELECT id,task_key,status,revision,updated_at,finished_at,activity_json
+         FROM background_activity WHERE status IN ('running','waiting')",
+    )
+    .fetch_all(&state.db)
+    .await?;
+    for row in rows {
+        let Some(mut activity) = row.decode() else {
+            report_unreadable(state, &row.id);
+            continue;
+        };
         activity.status = BackgroundStatus::Interrupted;
         activity.phase = "ISM restarted before this run reported an outcome; queued work is recovered separately".into();
         activity.updated_at = db::now();
@@ -284,7 +366,7 @@ pub async fn recover(state: &AppState) -> AppResult<()> {
             &Pending {
                 activity,
                 revision: state.activity.revision(),
-                saved_revision: revision,
+                saved_revision: row.revision,
             },
         )
         .await?;
@@ -366,17 +448,23 @@ pub async fn run(state: AppState) {
 }
 
 pub async fn page(state: &AppState, limit: i64, offset: i64) -> AppResult<BackgroundActivityPage> {
-    let json: Vec<String> = sqlx::query_scalar(
-        "SELECT activity_json FROM background_activity
+    let rows: Vec<SavedActivity> = sqlx::query_as(
+        "SELECT id,task_key,status,revision,updated_at,finished_at,activity_json FROM background_activity
          WHERE status IN ('running','waiting','blocked') OR
          (status IN ('failed','interrupted') AND resolved=0) ORDER BY updated_at DESC,id",
     )
     .fetch_all(&state.db)
     .await?;
-    let mut current: HashMap<String, BackgroundActivity> = json
-        .into_iter()
-        .map(|j| serde_json::from_str::<BackgroundActivity>(&j).map(|a| (a.id.clone(), a)))
-        .collect::<Result<_, _>>()?;
+    let mut current = HashMap::new();
+    let mut unreadable = Vec::new();
+    for row in rows {
+        if let Some(activity) = row.decode() {
+            current.insert(activity.id.clone(), activity);
+        } else {
+            report_unreadable(state, &row.id);
+            unreadable.push(row.placeholder());
+        }
+    }
     let mut warnings: Vec<_> = lock(&state.activity.1).iter().cloned().collect();
     {
         let registry = lock(&state.activity.0);
@@ -395,8 +483,9 @@ pub async fn page(state: &AppState, limit: i64, offset: i64) -> AppResult<Backgr
     )
     .fetch_one(&state.db)
     .await?;
-    let history: Vec<String> = sqlx::query_scalar(
-        "SELECT activity_json FROM background_activity WHERE status='completed' OR resolved=1
+    let history: Vec<SavedActivity> = sqlx::query_as(
+        "SELECT id,task_key,status,revision,updated_at,finished_at,activity_json
+         FROM background_activity WHERE status='completed' OR resolved=1
          ORDER BY finished_at DESC,revision DESC,id DESC LIMIT ? OFFSET ?",
     )
     .bind(limit)
@@ -404,6 +493,24 @@ pub async fn page(state: &AppState, limit: i64, offset: i64) -> AppResult<Backgr
     .fetch_all(&state.db)
     .await?;
     let mut current: Vec<_> = current.into_values().collect();
+    let mut has_unreadable = !unreadable.is_empty();
+    current.extend(unreadable);
+    let history = history
+        .into_iter()
+        .map(|row| match row.decode() {
+            Some(activity) => activity,
+            None => {
+                has_unreadable = true;
+                report_unreadable(state, &row.id);
+                row.placeholder()
+            }
+        })
+        .collect();
+    if has_unreadable {
+        warnings.push(
+            "Some saved background activity records could not be read; see server logs.".into(),
+        );
+    }
     let blockers = super::activity_blockers::get(state).await?;
     let keys: std::collections::HashSet<_> = current
         .iter()
@@ -419,10 +526,7 @@ pub async fn page(state: &AppState, limit: i64, offset: i64) -> AppResult<Backgr
     current.sort_by(|a, b| a.started_at.cmp(&b.started_at).then(a.id.cmp(&b.id)));
     Ok(BackgroundActivityPage {
         current,
-        history: history
-            .into_iter()
-            .map(|j| serde_json::from_str(&j))
-            .collect::<Result<_, _>>()?,
+        history,
         total,
         observed_at: db::now(),
         warnings,
@@ -483,6 +587,173 @@ mod tests {
         .await
         .unwrap();
         (dir, state)
+    }
+
+    #[tokio::test]
+    async fn unreadable_records_do_not_stop_restart_or_hide_other_activity() {
+        let (dir, state) = harness().await;
+        let task = Task::start(&state, "healthy", "Healthy work", "Archive", None)
+            .await
+            .unwrap();
+        flush(&state).await.unwrap();
+        for (id, status, finished_at, json) in [
+            ("bad-current", "running", None, "not json"),
+            ("bad-history", "completed", Some(db::now()), "{}"),
+        ] {
+            sqlx::query(
+                "INSERT INTO background_activity
+                 (id,task_key,status,revision,updated_at,finished_at,activity_json)
+                 VALUES (?,?,?,0,?,?,?)",
+            )
+            .bind(id)
+            .bind(id)
+            .bind(status)
+            .bind(db::now())
+            .bind(finished_at)
+            .bind(json)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        }
+        drop(task);
+        let restarted = AppState::new(
+            Config::for_tests(dir.path()),
+            state.db.clone(),
+            SecretBox::open_or_create(dir.path()).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let before_recovery = page(&restarted, 25, 0).await;
+        let recovery = recover(&restarted).await;
+        assert!(
+            before_recovery.is_ok() && recovery.is_ok(),
+            "snapshot error: {:?}; recovery error: {:?}",
+            before_recovery.err(),
+            recovery.err()
+        );
+        let snapshot = page(&restarted, 25, 0).await.unwrap();
+        assert_eq!(snapshot.total, 1);
+        assert!(
+            snapshot
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("could not be read"))
+        );
+        assert!(snapshot.current.iter().any(|entry| {
+            entry.task_key == "healthy" && entry.status == BackgroundStatus::Interrupted
+        }));
+        assert!(snapshot.current.iter().any(|entry| {
+            entry.task_key == "bad-current"
+                && entry.status == BackgroundStatus::Blocked
+                && entry.phase.contains("read")
+                && entry.started_at.is_empty()
+        }));
+        assert!(snapshot.history.iter().any(|entry| {
+            entry.task_key == "bad-history"
+                && entry.status == BackgroundStatus::Completed
+                && entry.phase.contains("read")
+                && entry.started_at.is_empty()
+        }));
+        let saved: String = sqlx::query_scalar(
+            "SELECT activity_json FROM background_activity WHERE id='bad-current'",
+        )
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+        assert_eq!(saved, "not json");
+        let history: String = sqlx::query_scalar(
+            "SELECT activity_json FROM background_activity WHERE id='bad-history'",
+        )
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+        assert_eq!(history, "{}");
+    }
+
+    #[tokio::test]
+    async fn inconsistent_record_identity_does_not_replace_other_activity() {
+        let (dir, state) = harness().await;
+        let task = Task::start(&state, "healthy", "Healthy work", "Archive", None)
+            .await
+            .unwrap();
+        flush(&state).await.unwrap();
+        let healthy_json: String =
+            sqlx::query_scalar("SELECT activity_json FROM background_activity WHERE id=?")
+                .bind(&task.reporter.id)
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+        let healthy: serde_json::Value = serde_json::from_str(&healthy_json).unwrap();
+        let mut mismatches = Vec::new();
+        for (id, task_key, status, mismatch) in [
+            ("wrong-id", "healthy", "running", "id"),
+            ("wrong-key", "stored-key", "running", "task_key"),
+            ("wrong-status", "wrong-status", "waiting", "status"),
+        ] {
+            let mut json = healthy.clone();
+            if mismatch != "id" {
+                json["id"] = id.into();
+            }
+            if mismatch != "task_key" {
+                json["task_key"] = task_key.into();
+            }
+            if mismatch != "status" {
+                json["status"] = status.into();
+            }
+            let json = serde_json::to_string(&json).unwrap();
+            sqlx::query(
+                "INSERT INTO background_activity
+                 (id,task_key,status,revision,updated_at,activity_json)
+                 VALUES (?,?,?,10000,?,?)",
+            )
+            .bind(id)
+            .bind(task_key)
+            .bind(status)
+            .bind(db::now())
+            .bind(&json)
+            .execute(&state.db)
+            .await
+            .unwrap();
+            mismatches.push((id, task_key, json));
+        }
+        drop(task);
+        let restarted = AppState::new(
+            Config::for_tests(dir.path()),
+            state.db.clone(),
+            SecretBox::open_or_create(dir.path()).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        recover(&restarted).await.unwrap();
+        let snapshot = page(&restarted, 25, 0).await.unwrap();
+        assert!(snapshot.current.iter().any(|entry| {
+            entry.task_key == "healthy" && entry.status == BackgroundStatus::Interrupted
+        }));
+        for (id, task_key, original) in mismatches {
+            assert!(snapshot.current.iter().any(|entry| {
+                entry.id == id
+                    && entry.task_key == task_key
+                    && entry.status == BackgroundStatus::Blocked
+                    && entry.phase.contains("read")
+            }));
+            let saved: String =
+                sqlx::query_scalar("SELECT activity_json FROM background_activity WHERE id=?")
+                    .bind(id)
+                    .fetch_one(&state.db)
+                    .await
+                    .unwrap();
+            assert_eq!(saved, original);
+        }
+        let revision: i64 = sqlx::query_scalar(
+            "SELECT revision FROM background_activity WHERE task_key='healthy' AND id!=?",
+        )
+        .bind("wrong-id")
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+        assert!(revision > 10000);
     }
 
     #[tokio::test]

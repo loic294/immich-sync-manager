@@ -336,9 +336,8 @@ export class IsmBackgroundActivity extends IsmPage {
   private details(task: BackgroundActivity, now: number) {
     const { measured, fmt, unit } = this.measure(task);
     const stalled = task.status === 'running' && now - Date.parse(task.updated_at) > 60_000;
-    const elapsed =
-      (Date.parse(task.finished_at ?? new Date(now).toISOString()) - Date.parse(task.started_at)) /
-      1000;
+    const finished = task.finished_at === null ? now : Date.parse(task.finished_at);
+    const elapsed = (finished - Date.parse(task.started_at)) / 1000;
     const reasonTotal = task.reasons.reduce((n, r) => n + r.count, 0);
     const syncIssue =
       (task.page === '/sync' && needsAttention(task)) ||
@@ -381,7 +380,7 @@ export class IsmBackgroundActivity extends IsmPage {
         <dt class="text-base-content/60">Status</dt><dd>${humanize(task.status)}</dd>
         ${measured ? html`<dt class="text-base-content/60">Progress</dt><dd class="tabular-nums">${fmt(task.done)} / ${fmt(task.total ?? 0)} ${unit}</dd>` : nothing}
         <dt class="text-base-content/60">${task.id.startsWith('state:') ? 'Oldest item' : 'Started'}</dt><dd>${formatDate(task.started_at)}</dd>
-        ${!task.id.startsWith('state:') ? html`<dt class="text-base-content/60">${task.finished_at ? 'Duration' : 'Elapsed'}</dt><dd>${formatDuration(elapsed)}</dd>` : nothing}
+        ${Number.isFinite(elapsed) && !task.id.startsWith('state:') ? html`<dt class="text-base-content/60">${task.finished_at ? 'Duration' : 'Elapsed'}</dt><dd>${formatDuration(elapsed)}</dd>` : nothing}
         <dt class="text-base-content/60">Last update</dt><dd>${formatDate(task.updated_at)}</dd>
         <dd class="col-span-2 mt-2 flex flex-wrap gap-2">
           ${task.operation_id ? html`<button type="button" class="btn btn-sm" @click=${() => this.dispatchEvent(new CustomEvent('operation-open', { detail: task.operation_id, bubbles: true, composed: true }))}>Open related operation</button>` : nothing}

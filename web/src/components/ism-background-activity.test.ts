@@ -42,6 +42,7 @@ describe('background activity', () => {
     const page = await mount('ism-background-activity');
     await vi.waitFor(() => expect(page.textContent).toContain('41 files discovered'));
     expect(page.querySelector('progress')).toBeNull();
+    expect(page.textContent).toContain('Elapsed');
     get.mockResolvedValue(
       snapshot([
         { ...task, done: 15, total: 50, unit: 'files checked', phase: 'Reconciling files' },
@@ -56,6 +57,30 @@ describe('background activity', () => {
     await vi.waitFor(() => expect(get).toHaveBeenCalledWith(25, 25));
     expect(page.textContent).toContain('Checking shared files');
     expect(page.querySelector('a')?.getAttribute('href')).toBe('/peers');
+  });
+
+  it.each([
+    ['a missing start time', '', null],
+    ['an invalid start time', 'not-a-date', null],
+    ['an invalid finish time', task.started_at, 'not-a-date'],
+  ])('does not invent an elapsed duration with %s', async (_label, started_at, finished_at) => {
+    vi.spyOn(admin, 'backgroundActivity').mockResolvedValue(
+      snapshot([
+        {
+          ...task,
+          status: 'blocked',
+          started_at,
+          finished_at,
+          phase: 'Saved activity could not be read',
+        },
+      ]),
+    );
+    const page = await mount('ism-background-activity');
+    await vi.waitFor(() => expect(page.textContent).toContain('Saved activity could not be read'));
+    expect(page.textContent).toContain('Started');
+    expect(page.textContent).not.toContain('Elapsed');
+    expect(page.textContent).not.toContain('Duration');
+    expect(page.textContent).not.toContain('NaN');
   });
 
   it('groups bulk blockers into one row with reasons and examples, without a misleading progress bar', async () => {
@@ -254,6 +279,8 @@ describe('background activity', () => {
     );
     expect(page.querySelector('[aria-selected="true"]')?.textContent).toContain('Needs attention');
     expect(page.textContent).toContain('ISM restarted before this finished');
+    expect(page.textContent).toContain('Duration');
+    expect(page.textContent).toContain('1 min');
   });
 
   it('explains waiting and failed work, and opens related operations without unsupported actions', async () => {
