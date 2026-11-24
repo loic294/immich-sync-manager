@@ -2378,7 +2378,8 @@ async fn sync_settings(state: &AppState, peer: &net::Peer) {
 pub async fn run(state: AppState) {
     let mut workers = tokio::task::JoinSet::new();
     workers.spawn(replicate(state.clone()));
-    workers.spawn(activity::run(state));
+    workers.spawn(activity::run(state.clone()));
+    workers.spawn(versions::run(state));
     while let Some(result) = workers.join_next().await {
         match result {
             Ok(()) => tracing::error!("peer background worker stopped unexpectedly"),

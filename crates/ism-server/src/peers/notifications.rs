@@ -169,6 +169,11 @@ pub(super) async fn run(state: &AppState, peer: &net::Peer) {
                     if let Some(refresh) = &refresh {
                         refresh.complete(success);
                     }
+                    if success && refresh.is_some() {
+                        // A hint can represent prepared evidence even when the recovery rows
+                        // themselves did not change.
+                        state.emit_ui(crate::state::ServerEvent::SyncChanged);
+                    }
                     if !success {
                         retry = Some(refresh);
                     }

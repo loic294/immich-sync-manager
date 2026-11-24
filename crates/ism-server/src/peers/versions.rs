@@ -12,66 +12,113 @@ use crate::error::{AppError, AppResult};
 use crate::files;
 use crate::state::AppState;
 
-const SNAPSHOT_TTL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
-const SNAPSHOTS_PER_TARGET: usize = 4;
-
-#[derive(Clone)]
-pub struct Snapshot {
-    pub share_id: String,
-    pub peer_id: String,
-    pub view: RecoveryVersions,
-    pub created: std::time::Instant,
+struct Snapshot {
+    share_id: String,
+    peer_id: String,
+    view: RecoveryVersions,
 }
 
-fn remember(
+async fn remember(
     state: &AppState,
     target: &str,
+    generation: i64,
     share_id: &str,
     peer_id: &str,
     view: &RecoveryVersions,
-) {
-    let mut snapshots = state
-        .version_snapshots
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    snapshots.retain(|_, snapshot| snapshot.created.elapsed() < SNAPSHOT_TTL);
-    snapshots.insert(
-        (target.to_owned(), view.revision.clone()),
-        Snapshot {
-            share_id: share_id.to_owned(),
-            peer_id: peer_id.to_owned(),
-            view: view.clone(),
-            created: std::time::Instant::now(),
-        },
-    );
-    let mut revisions: Vec<_> = snapshots
-        .iter()
-        .filter(|((id, _), _)| id == target)
-        .map(|((_, revision), snapshot)| (snapshot.created, revision.clone()))
-        .collect();
-    revisions.sort_by(|a, b| b.0.cmp(&a.0));
-    for (_, revision) in revisions.into_iter().skip(SNAPSHOTS_PER_TARGET) {
-        snapshots.remove(&(target.to_owned(), revision));
+) -> AppResult<()> {
+    let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
+    let valid: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM conflicts c JOIN conflict_evidence_jobs j ON j.target_id=c.id
+         WHERE c.id=? AND c.status='open' AND c.share_id=? AND c.peer_id=? AND j.generation=?)",
+    )
+    .bind(target)
+    .bind(share_id)
+    .bind(peer_id)
+    .bind(generation)
+    .fetch_one(&mut *tx)
+    .await?;
+    if !valid {
+        return Err(AppError::conflict(
+            "version_conflict",
+            "the conflict changed while its versions were being prepared",
+        ));
     }
+    let saved = sqlx::query(
+        "INSERT INTO recovery_version_snapshots(target_id,revision,share_id,peer_id,view_json,created_at)
+         VALUES (?,?,?,?,?,?) ON CONFLICT(target_id,revision) DO UPDATE SET
+         view_json=excluded.view_json, created_at=excluded.created_at
+         WHERE recovery_version_snapshots.share_id=excluded.share_id
+           AND recovery_version_snapshots.peer_id=excluded.peer_id",
+    )
+    .bind(target)
+    .bind(&view.revision)
+    .bind(share_id)
+    .bind(peer_id)
+    .bind(serde_json::to_string(view)?)
+    .bind(crate::db::now())
+    .execute(&mut *tx)
+    .await?;
+    if saved.rows_affected() != 1 {
+        return Err(AppError::conflict(
+            "peer_share_changed",
+            "the reviewed share is unavailable",
+        ));
+    }
+    sqlx::query(
+        "DELETE FROM recovery_version_snapshots WHERE target_id=?
+         AND revision NOT IN (SELECT revision FROM recovery_version_snapshots WHERE target_id=?
+                              ORDER BY created_at DESC, rowid DESC LIMIT 4)
+         AND NOT EXISTS (SELECT 1 FROM sync_recovery WHERE kind='conflict' AND target_id=?
+                         AND decision_revision=recovery_version_snapshots.revision
+                         AND state NOT IN ('fixed','dismissed'))",
+    )
+    .bind(target)
+    .bind(target)
+    .bind(target)
+    .execute(&mut *tx)
+    .await?;
+    let prepared = sqlx::query(
+        "UPDATE conflict_evidence_jobs SET state='ready',error=NULL,error_detail=NULL
+         WHERE target_id=? AND generation=? AND state='queued'",
+    )
+    .bind(target)
+    .bind(generation)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    if prepared.rows_affected() != 0 {
+        state.version_event_wake.notify_one();
+    }
+    Ok(())
 }
 
-fn recall(state: &AppState, target: &str, revision: &str) -> Option<Snapshot> {
-    state
-        .version_snapshots
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(&(target.to_owned(), revision.to_owned()))
-        .filter(|snapshot| snapshot.created.elapsed() < SNAPSHOT_TTL)
-        .cloned()
+async fn recall(state: &AppState, target: &str, revision: &str) -> AppResult<Option<Snapshot>> {
+    let row: Option<(String, String, String)> = sqlx::query_as(
+        "SELECT s.share_id,s.peer_id,s.view_json FROM recovery_version_snapshots s
+         JOIN conflicts c ON c.id=s.target_id AND c.share_id=s.share_id AND c.peer_id=s.peer_id
+         WHERE s.target_id=? AND s.revision=?",
+    )
+    .bind(target)
+    .bind(revision)
+    .fetch_optional(&state.db)
+    .await?;
+    row.map(|(share_id, peer_id, json)| {
+        Ok(Snapshot {
+            share_id,
+            peer_id,
+            view: serde_json::from_str(&json)?,
+        })
+    })
+    .transpose()
 }
 
 #[cfg(test)]
-pub(super) fn expire(state: &AppState, target: &str) {
-    state
-        .version_snapshots
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .retain(|(id, _), _| id != target);
+pub(super) async fn expire(state: &AppState, target: &str) {
+    sqlx::query("DELETE FROM recovery_version_snapshots WHERE target_id=?")
+        .bind(target)
+        .execute(&state.db)
+        .await
+        .unwrap();
 }
 
 #[derive(Deserialize)]
@@ -129,8 +176,15 @@ pub(super) async fn local(
     root.ensure_available()?;
     let abs = root.abs(&share.root_rel(path)?)?;
     let base = path.to_owned();
+    let permit = state
+        .version_scan_limit
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(AppError::internal)?;
     let entries = tokio::task::spawn_blocking(
         move || -> AppResult<(String, Vec<FileEntry>, Vec<String>)> {
+            let _permit = permit;
             let meta = match std::fs::symlink_metadata(&abs) {
                 Ok(meta) => meta,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -147,7 +201,17 @@ pub(super) async fn local(
             let mut out = Vec::new();
             let mut directories = Vec::new();
             let paths = if folder {
-                let entries = crate::ops::plan::folder_inventory(&abs)?;
+                let entries =
+                    crate::ops::plan::folder_inventory_bounded(&abs, 10_000).map_err(|error| {
+                        if error.kind() == std::io::ErrorKind::InvalidData {
+                            AppError::conflict(
+                                "version_evidence_too_large",
+                                "folder exceeds the 10,000-entry version evidence limit",
+                            )
+                        } else {
+                            error.into()
+                        }
+                    })?;
                 directories.push(base.clone());
                 directories.extend(
                     entries
@@ -222,8 +286,215 @@ pub(super) async fn local(
 /// The comparison must answer before a reverse proxy in front of this instance times out.
 const COMPARISON_DEADLINE: std::time::Duration = std::time::Duration::from_secs(50);
 
+/// Retry immediately when a disconnected peer becomes reachable again.
+pub(super) async fn wake_peer(state: &AppState, peer_id: &str) -> AppResult<()> {
+    sqlx::query(
+        "UPDATE conflict_evidence_jobs SET next_attempt=''
+         WHERE state='queued' AND error IS NOT NULL AND target_id IN
+         (SELECT id FROM conflicts WHERE peer_id=? AND status='open')",
+    )
+    .bind(peer_id)
+    .execute(&state.db)
+    .await?;
+    state.version_wake.notify_waiters();
+    Ok(())
+}
+
+pub(super) async fn reprepare(state: &AppState, target: &str) -> AppResult<()> {
+    sqlx::query(
+        "UPDATE conflict_evidence_jobs SET generation=generation+1, state='queued',
+         attempts=0,next_attempt='',error=NULL,error_detail=NULL WHERE target_id=?",
+    )
+    .bind(target)
+    .execute(&state.db)
+    .await?;
+    state.version_wake.notify_waiters();
+    Ok(())
+}
+
+async fn worker(state: AppState) {
+    loop {
+        let notified = state.version_wake.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        let claim: Result<Option<(String, i64, i64)>, sqlx::Error> = sqlx::query_as(
+            "UPDATE conflict_evidence_jobs SET state='running'
+             WHERE target_id=(SELECT j.target_id FROM conflict_evidence_jobs j
+                 JOIN conflicts c ON c.id=j.target_id
+                 WHERE j.state='queued' AND j.next_attempt<=? AND c.status='open'
+                 ORDER BY j.next_attempt,j.target_id LIMIT 1)
+             AND state='queued' RETURNING target_id,generation,attempts",
+        )
+        .bind(crate::db::now())
+        .fetch_optional(&state.db)
+        .await;
+        match claim {
+            Ok(Some((id, generation, attempts))) => {
+                let target = RecoveryTarget {
+                    kind: RecoveryKind::Conflict,
+                    id: id.clone(),
+                    peer_id: None,
+                };
+                let result = within(COMPARISON_DEADLINE, get(&state, &target)).await;
+                let notify = result.is_ok() || attempts == 0;
+                let updated = match result {
+                    Ok(_) => {
+                        sqlx::query(
+                            "UPDATE conflict_evidence_jobs SET state='ready',error=NULL,error_detail=NULL
+                         WHERE target_id=? AND generation=? AND state='running'",
+                        )
+                        .bind(&id)
+                        .bind(generation)
+                        .execute(&state.db)
+                        .await
+                    }
+                    Err(error) => {
+                        if attempts == 0 {
+                            tracing::warn!(conflict_id=%id, code=%error.code(), "conflict evidence preparation deferred: {}", error.message());
+                        } else {
+                            tracing::debug!(conflict_id=%id, code=%error.code(), "conflict evidence preparation still deferred: {}", error.message());
+                        }
+                        let seconds = 2_i64 << attempts.clamp(0, 7);
+                        let next =
+                            crate::db::ts(chrono::Utc::now() + chrono::Duration::seconds(seconds));
+                        sqlx::query(
+                            "UPDATE conflict_evidence_jobs SET state=?,attempts=attempts+1,
+                             next_attempt=?,error=?,error_detail=? WHERE target_id=? AND generation=? AND state='running'",
+                        )
+                        .bind(if error.code() == "version_evidence_too_large" { "blocked" } else { "queued" })
+                        .bind(next)
+                        .bind(error.code())
+                        .bind(crate::error::redact(error.message()))
+                        .bind(&id)
+                        .bind(generation)
+                        .execute(&state.db)
+                        .await
+                    }
+                };
+                match updated {
+                    Ok(result) if result.rows_affected() > 0 && notify => {
+                        state.version_event_wake.notify_one()
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::error!(conflict_id=%id, %error, "could not record conflict evidence preparation");
+                        loop {
+                            match sqlx::query(
+                                "UPDATE conflict_evidence_jobs SET state='queued' WHERE target_id=? AND generation=? AND state='running'",
+                            ).bind(&id).bind(generation).execute(&state.db).await {
+                                Ok(_) => break,
+                                Err(reset) => {
+                                    tracing::error!(conflict_id=%id, %reset, "could not release conflict evidence claim; retrying");
+                                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                                }
+                            }
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    }
+                }
+            }
+            Ok(None) => {
+                let next: Result<Option<String>, sqlx::Error> = sqlx::query_scalar(
+                    "SELECT MIN(j.next_attempt) FROM conflict_evidence_jobs j
+                     JOIN conflicts c ON c.id=j.target_id WHERE j.state='queued' AND c.status='open'",
+                ).fetch_one(&state.db).await;
+                let delay = match next {
+                    Ok(Some(next)) => crate::db::parse_ts(&next)
+                        .map(|at| (at - chrono::Utc::now()).to_std().unwrap_or_default())
+                        .unwrap_or_default(),
+                    Ok(None) => std::time::Duration::from_secs(300),
+                    Err(error) => {
+                        tracing::error!(%error, "could not schedule conflict evidence preparation");
+                        std::time::Duration::from_secs(5)
+                    }
+                };
+                tokio::select! {
+                    () = tokio::time::sleep(delay) => {}
+                    () = &mut notified => {}
+                }
+            }
+            Err(error) => {
+                tracing::error!(%error, "could not claim conflict evidence preparation");
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+        }
+    }
+}
+
+pub(super) async fn run(state: AppState) {
+    loop {
+        match sqlx::query("UPDATE conflict_evidence_jobs SET state='queued' WHERE state='running'")
+            .execute(&state.db)
+            .await
+        {
+            Ok(_) => break,
+            Err(error) => {
+                tracing::error!(%error, "could not restore conflict evidence jobs");
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+        }
+    }
+    let mut workers = tokio::task::JoinSet::new();
+    workers.spawn(worker(state.clone()));
+    workers.spawn(worker(state.clone()));
+    workers.spawn(async move {
+        loop {
+            state.version_event_wake.notified().await;
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            state.emit(crate::state::ServerEvent::ConflictsChanged);
+        }
+    });
+    while let Some(result) = workers.join_next().await {
+        tracing::error!(?result, "conflict evidence worker stopped unexpectedly");
+    }
+}
+
 /// [`get`] bounded by a deadline; a slow peer becomes a retryable error instead of a proxy 504.
 pub async fn get_bounded(state: &AppState, target: &RecoveryTarget) -> AppResult<RecoveryVersions> {
+    if target.kind == RecoveryKind::Conflict && target.peer_id.is_none() {
+        let json: Option<String> = sqlx::query_scalar(
+            "SELECT s.view_json FROM recovery_version_snapshots s
+             JOIN conflicts c ON c.id=s.target_id AND c.share_id=s.share_id AND c.peer_id=s.peer_id
+             JOIN conflict_evidence_jobs j ON j.target_id=c.id
+             WHERE s.target_id=? AND c.status='open' AND j.state='ready'
+             ORDER BY s.created_at DESC, s.rowid DESC LIMIT 1",
+        )
+        .bind(&target.id)
+        .fetch_optional(&state.db)
+        .await?;
+        if let Some(json) = json {
+            return Ok(serde_json::from_str(&json)?);
+        }
+        let job: Option<(String, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT j.state,j.error,j.error_detail FROM conflict_evidence_jobs j
+             JOIN conflicts c ON c.id=j.target_id WHERE c.id=? AND c.status='open'",
+        )
+        .bind(&target.id)
+        .fetch_optional(&state.db)
+        .await?;
+        let (status, error, detail) =
+            job.ok_or_else(|| AppError::not_found("open conflict not found"))?;
+        if status == "ready" {
+            return Err(AppError::internal("prepared conflict evidence is missing"));
+        }
+        if status == "blocked" {
+            return Err(AppError::conflict_dynamic(
+                error.unwrap_or_else(|| "version_evidence_blocked".into()),
+                detail.unwrap_or_else(|| "Conflict evidence cannot be prepared.".into()),
+            ));
+        }
+        let message = match (error, detail) {
+            (Some(code), Some(detail)) => {
+                format!("Conflict evidence is waiting ({code}): {detail}")
+            }
+            _ => "Conflict evidence is still being prepared. Try again shortly.".into(),
+        };
+        return Err(AppError::new(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "peer_busy",
+            message,
+        ));
+    }
     within(COMPARISON_DEADLINE, get(state, target)).await
 }
 
@@ -278,6 +549,16 @@ pub async fn get(state: &AppState, target: &RecoveryTarget) -> AppResult<Recover
             "version evidence belongs to a conflict",
         ));
     }
+    let generation: Option<i64> = sqlx::query_scalar(
+        "SELECT j.generation FROM conflict_evidence_jobs j JOIN conflicts c ON c.id=j.target_id
+         WHERE j.target_id=? AND c.status='open'",
+    )
+    .bind(&target.id)
+    .fetch_optional(&state.db)
+    .await?;
+    let generation = generation.ok_or_else(|| {
+        AppError::conflict("not_open", "the version decision is already executing")
+    })?;
     let context = admin::version_context(state, &target.id).await?;
     let peer = net::peer(state, &context.peer_id).await?;
     let mut receiving = Vec::new();
@@ -304,7 +585,12 @@ pub async fn get(state: &AppState, target: &RecoveryTarget) -> AppResult<Recover
             .collect(),
         directories,
     };
-    let revision = crate::crypto::sha256_hex(&serde_json::to_vec(&(&receiving, &source))?);
+    let revision = crate::crypto::sha256_hex(&serde_json::to_vec(&(
+        &context.share.id,
+        &context.peer_id,
+        &receiving,
+        &source,
+    ))?);
     let view = RecoveryVersions {
         share: context.share.name.clone(),
         revision,
@@ -314,10 +600,12 @@ pub async fn get(state: &AppState, target: &RecoveryTarget) -> AppResult<Recover
     remember(
         state,
         &target.id,
+        generation,
         &context.share.id,
         &context.peer_id,
         &view,
-    );
+    )
+    .await?;
     Ok(view)
 }
 
@@ -336,6 +624,7 @@ pub(super) async fn validate_reviewed(
         view,
         ..
     } = recall(state, id, revision)
+        .await?
         .ok_or_else(|| AppError::conflict("version_conflict", "review current versions again"))?;
     let share = super::shares(state)
         .await?
@@ -404,6 +693,35 @@ pub(super) async fn validate_reviewed(
     Ok(view.receiving)
 }
 
+async fn require_preview_transfer(state: &AppState, share: &Share, peer_id: &str) -> AppResult<()> {
+    if !super::transfer::allowed(state, &share.id, peer_id).await?.0 {
+        return Err(AppError::conflict(
+            "preview_outside_transfer_hours",
+            "Peer previews are unavailable outside allowed file-transfer hours.",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) async fn authorize_peer_preview(
+    state: &AppState,
+    query: &PreviewQuery,
+    peer_id: &str,
+) -> AppResult<()> {
+    let snapshot = recall(state, &query.target.id, &query.revision)
+        .await?
+        .ok_or_else(|| AppError::conflict("preview_expired", "refresh current versions"))?;
+    let share = super::shares(state)
+        .await?
+        .into_iter()
+        .find(|share| share.id == snapshot.share_id && share.includes(peer_id))
+        .filter(|_| snapshot.peer_id == peer_id)
+        .ok_or_else(|| {
+            AppError::conflict("peer_share_changed", "the preview share is unavailable")
+        })?;
+    require_preview_transfer(state, &share, peer_id).await
+}
+
 pub async fn preview(state: &AppState, query: &PreviewQuery) -> AppResult<Response> {
     if let Some(peer_id) = &query.target.peer_id {
         if super::recovery::outgoing(state, peer_id, query.target.kind, &query.target.id)
@@ -412,6 +730,21 @@ pub async fn preview(state: &AppState, query: &PreviewQuery) -> AppResult<Respon
         {
             return Err(AppError::not_found("receiver recovery target not found"));
         }
+        let reviewed = get_bounded(state, &query.target.target()).await?;
+        if reviewed.revision != query.revision {
+            return Err(AppError::conflict(
+                "preview_changed",
+                "refresh current versions",
+            ));
+        }
+        let share = super::shares(state)
+            .await?
+            .into_iter()
+            .find(|share| share.name == reviewed.share && share.includes(peer_id))
+            .ok_or_else(|| {
+                AppError::conflict("peer_share_changed", "the preview share is unavailable")
+            })?;
+        require_preview_transfer(state, &share, peer_id).await?;
         let peer = net::peer(state, peer_id).await?;
         let source = query.source.to_string();
         let kind = serde_json::to_value(query.target.kind)?;
@@ -429,7 +762,7 @@ pub async fn preview(state: &AppState, query: &PreviewQuery) -> AppResult<Respon
             ],
         )
         .map_err(AppError::internal)?;
-        let response = net::request(
+        let mut response = net::request(
             state,
             &peer.url,
             &peer.secret,
@@ -444,7 +777,44 @@ pub async fn preview(state: &AppState, query: &PreviewQuery) -> AppResult<Respon
         .send()
         .await
         .map_err(|error| AppError::conflict("preview_unavailable", net::net_error(&error)))?;
-        return crate::routes::activity::image_response(response).await;
+        if !response.status().is_success() {
+            let status = response.status();
+            let mut body = Vec::new();
+            while let Some(chunk) = response.chunk().await.map_err(AppError::internal)? {
+                if body.len() + chunk.len() > 4096 {
+                    return Err(AppError::conflict(
+                        "preview_unavailable",
+                        format!("Peer returned HTTP {status}"),
+                    ));
+                }
+                body.extend_from_slice(&chunk);
+            }
+            if serde_json::from_slice::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|value| value["error"]["code"].as_str().map(str::to_owned))
+                .as_deref()
+                == Some("preview_outside_transfer_hours")
+            {
+                return Err(AppError::conflict(
+                    "preview_outside_transfer_hours",
+                    "Peer previews are unavailable outside allowed file-transfer hours.",
+                ));
+            }
+            return Err(AppError::conflict(
+                "preview_unavailable",
+                format!("Peer returned HTTP {status}"),
+            ));
+        }
+        let mut response = crate::routes::activity::image_response(response).await?;
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            header::HeaderValue::from_static("private, no-store"),
+        );
+        response.headers_mut().insert(
+            header::X_CONTENT_TYPE_OPTIONS,
+            header::HeaderValue::from_static("nosniff"),
+        );
+        return Ok(response);
     }
     if query.target.kind != RecoveryKind::Conflict {
         return Err(AppError::not_found("version preview not found"));
@@ -455,6 +825,7 @@ pub async fn preview(state: &AppState, query: &PreviewQuery) -> AppResult<Respon
         view,
         ..
     } = recall(state, &query.target.id, &query.revision)
+        .await?
         .ok_or_else(|| AppError::conflict("preview_expired", "refresh current versions"))?;
     let selected = if query.source {
         view.source
@@ -490,6 +861,7 @@ pub async fn preview(state: &AppState, query: &PreviewQuery) -> AppResult<Respon
             AppError::conflict("peer_share_changed", "the preview share is unavailable")
         })?;
     let bytes = if query.source {
+        require_preview_transfer(state, &share, &peer_id).await?;
         let peer = net::peer(state, &peer_id).await?;
         let url = reqwest::Url::parse_with_params(
             "http://ism.example",
@@ -513,6 +885,12 @@ pub async fn preview(state: &AppState, query: &PreviewQuery) -> AppResult<Respon
         .await
         .map_err(|error| AppError::conflict("preview_unavailable", net::net_error(&error)))?;
         if !response.status().is_success() {
+            if matches!(
+                response.status(),
+                reqwest::StatusCode::CONFLICT | reqwest::StatusCode::NOT_FOUND
+            ) {
+                reprepare(state, &query.target.id).await?;
+            }
             return Err(AppError::conflict(
                 "preview_unavailable",
                 format!("Peer returned HTTP {}", response.status()),
@@ -533,7 +911,17 @@ pub async fn preview(state: &AppState, query: &PreviewQuery) -> AppResult<Respon
         let root = files::root(&state.db, &share.root_id).await?;
         root.ensure_available()?;
         let path = root.abs(&share.root_rel(&query.path)?)?;
-        let file = tokio::fs::File::open(&path).await?;
+        let file = match tokio::fs::File::open(&path).await {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                reprepare(state, &query.target.id).await?;
+                return Err(AppError::conflict(
+                    "preview_changed",
+                    "refresh current versions",
+                ));
+            }
+            Err(error) => return Err(error.into()),
+        };
         use tokio::io::AsyncReadExt;
         let mut bytes = Vec::new();
         file.take(4 * 1024 * 1024 + 1)
@@ -548,6 +936,7 @@ pub async fn preview(state: &AppState, query: &PreviewQuery) -> AppResult<Respon
         bytes
     };
     if crate::crypto::sha256_hex(&bytes) != selected.sha256 {
+        reprepare(state, &query.target.id).await?;
         return Err(AppError::conflict(
             "preview_changed",
             "refresh current versions",
