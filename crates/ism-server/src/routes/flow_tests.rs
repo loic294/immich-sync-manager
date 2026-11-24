@@ -194,7 +194,8 @@ async fn attention_covers_standalone_local_conditions_and_clears_resolved_source
         );
     }
 
-    sqlx::query("DELETE FROM scan_work")
+    // Acknowledged rows awaiting cleanup are no longer retained work.
+    sqlx::query("UPDATE scan_schedule SET acked_through=(SELECT MAX(id) FROM scan_work)")
         .execute(&h.state.db)
         .await
         .unwrap();

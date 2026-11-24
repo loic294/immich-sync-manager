@@ -303,7 +303,8 @@ pub(crate) async fn selected_snapshot(
     }
     let scans: Vec<Scan> = sqlx::query_as(
         "SELECT s.library_id,l.name AS library_name,s.due_at,s.last_finished_at,s.last_error,
-                (SELECT COUNT(*) FROM scan_work w WHERE w.library_id=s.library_id) AS pending
+                (SELECT COUNT(*) FROM scan_work w
+                 WHERE w.library_id=s.library_id AND w.id>s.acked_through) AS pending
          FROM scan_schedule s LEFT JOIN immich_libraries l ON l.id=s.library_id
          WHERE s.running=0 AND s.last_error IS NOT NULL
              AND (? IS NULL OR s.library_id IN (SELECT value FROM json_each(?)))

@@ -410,11 +410,7 @@ async fn targeted_scan_errors_are_visible_and_never_broadened() {
             .unwrap()
             .contains("500")
     );
-    let retained: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM scan_work")
-        .fetch_one(&state.db)
-        .await
-        .unwrap();
-    assert_eq!(retained, 1, "failed work remains durable");
+    assert_eq!(retained(&state).await, 1, "failed work remains durable");
     while let Ok(event) = events.try_recv() {
         assert!(!matches!(event, ServerEvent::LibraryScanned { .. }));
     }
@@ -544,10 +540,7 @@ async fn restart_retries_stale_removals_without_blocking_other_work() {
         ]
     );
     assert_eq!(scheduler::views(&state).await.unwrap()[0].last_error, None);
-    let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM scan_work")
-        .fetch_one(&state.db)
-        .await
-        .unwrap();
+    let remaining: i64 = retained(&state).await;
     assert_eq!(remaining, 0);
     assert_eq!(
         std::fs::read(base.join("trip/old.jpg")).unwrap(),
@@ -590,10 +583,7 @@ async fn removal_rejection_stays_queued_if_the_file_cannot_be_verified() {
                 .is_some()
         );
         assert_eq!(scan_requests(&server).await, 0);
-        let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM scan_work")
-            .fetch_one(&state.db)
-            .await
-            .unwrap();
+        let remaining: i64 = retained(&state).await;
         assert_eq!(remaining, 1);
     }
 }
@@ -651,10 +641,7 @@ async fn recreated_file_disappearing_during_scan_keeps_the_removal_queued() {
             .unwrap()
             .contains("changed during synchronization")
     );
-    let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM scan_work")
-        .fetch_one(&state.db)
-        .await
-        .unwrap();
+    let remaining: i64 = retained(&state).await;
     assert_eq!(remaining, 2);
 }
 
@@ -772,10 +759,7 @@ async fn real_immich_recreated_file_recovery_preserves_asset_identity() {
     assert_eq!(api.asset_id_by_path(&old).await.unwrap(), Some(before));
     assert!(api.asset_id_by_path(&new).await.unwrap().is_some());
     assert!(root.join(run).join("recreated.png").is_file());
-    let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM scan_work")
-        .fetch_one(&state.db)
-        .await
-        .unwrap();
+    let remaining: i64 = retained(&state).await;
     assert_eq!(remaining, 0);
 }
 
@@ -827,10 +811,7 @@ async fn requests_during_a_run_and_restart_keep_their_scopes() {
         ]
     );
     assert_eq!(due_at(&state).await, None);
-    let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM scan_work")
-        .fetch_one(&state.db)
-        .await
-        .unwrap();
+    let remaining: i64 = retained(&state).await;
     assert_eq!(remaining, 0);
 }
 
@@ -867,6 +848,17 @@ async fn barrier_admission_between_claim_and_dispatch_defers_the_batch() {
         scan_bodies(&server).await,
         [json!({ "path": "/library/trip" })]
     );
+}
+
+/// Scoped work not yet acknowledged by a successful run.
+async fn retained(state: &AppState) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM scan_work w JOIN scan_schedule s ON s.library_id = w.library_id
+         WHERE w.id > s.acked_through",
+    )
+    .fetch_one(&state.db)
+    .await
+    .unwrap()
 }
 
 async fn wait_for_sync(state: &AppState) {
@@ -1035,4 +1027,197 @@ fn scopes_collapse_to_parents() {
         .map(str::to_owned)
         .collect();
     assert_eq!(collapse(&paths), ["a", "ab/x.jpg", "c/d.jpg"]);
+}
+
+fn file_work(path: &str, kind: scheduler::WorkKind) -> scheduler::Work {
+    scheduler::Work {
+        path: path.into(),
+        kind,
+    }
+}
+
+async fn stored_rows(state: &AppState) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM scan_work")
+        .fetch_one(&state.db)
+        .await
+        .unwrap()
+}
+
+async fn wait_for_cleanup(state: &AppState) {
+    for _ in 0..250 {
+        if stored_rows(state).await == 0 {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("acknowledged scan work was not cleaned up");
+}
+
+#[tokio::test]
+async fn repeated_changes_to_one_path_keep_the_backlog_bounded_and_exact() {
+    use scheduler::WorkKind::{Added, Removed};
+    let (_dir, state, server, _fake) = setup().await;
+    let path = "/library/trip/a.jpg";
+    for i in 0..500 {
+        let batch = [file_work(path, Added), file_work(path, Removed)];
+        scheduler::request_work_at(&state, "s1", "lib1", "change", &batch, i)
+            .await
+            .unwrap();
+        scheduler::request_work_at(&state, "s1", "lib1", "dup", &[folder_work("/library/x")], i)
+            .await
+            .unwrap();
+    }
+    scheduler::request_work_at(
+        &state,
+        "s1",
+        "lib1",
+        "change",
+        &[file_work(path, Added)],
+        500,
+    )
+    .await
+    .unwrap();
+    assert!(
+        stored_rows(&state).await <= 3,
+        "one file and one folder key"
+    );
+    scheduler::step(&state, i64::MAX / 2).await.unwrap();
+    wait_for_sync(&state).await;
+    // Removed then added amounts to a change, which only a folder scan reconciles.
+    let mut bodies = scan_bodies(&server).await;
+    bodies.sort_by_key(ToString::to_string);
+    assert_eq!(
+        bodies,
+        [
+            json!({ "path": "/library/trip" }),
+            json!({ "path": "/library/x" })
+        ]
+    );
+    assert_eq!(retained(&state).await, 0);
+    wait_for_cleanup(&state).await;
+}
+
+#[tokio::test]
+async fn large_batches_are_read_in_pages_acknowledged_once_and_cleaned_in_chunks() {
+    let (_dir, state, server, _fake) = setup().await;
+    let work: Vec<_> = (0..2_500)
+        .map(|i| {
+            file_work(
+                &format!("/library/trip/{i}.jpg"),
+                scheduler::WorkKind::Changed,
+            )
+        })
+        .collect();
+    scheduler::request_work_at(&state, "s1", "lib1", "import", &work, 0)
+        .await
+        .unwrap();
+    assert_eq!(stored_rows(&state).await, 2_500);
+    scheduler::step(&state, i64::MAX / 2).await.unwrap();
+    wait_for_sync(&state).await;
+    assert_eq!(
+        scan_bodies(&server).await,
+        [json!({ "path": "/library/trip" })]
+    );
+    assert_eq!(
+        retained(&state).await,
+        0,
+        "one acknowledgement covers the batch"
+    );
+    assert_eq!(due_at(&state).await, None);
+    wait_for_cleanup(&state).await;
+}
+
+#[tokio::test]
+async fn a_failed_claim_retries_with_later_arrivals_folded_exactly() {
+    use scheduler::WorkKind::{Added, Changed, Removed};
+    let (_dir, state, server, _fake) = setup().await;
+    let path = "/library/trip/a.jpg";
+    Mock::given(method("POST"))
+        .and(wiremock::matchers::path("/api/libraries/lib1/files/add"))
+        .respond_with(ResponseTemplate::new(500))
+        .with_priority(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    scheduler::request_work_at(&state, "s1", "lib1", "a", &[file_work(path, Added)], 0)
+        .await
+        .unwrap();
+    let guard = state.maintenance_lock.lock().await;
+    scheduler::step(&state, i64::MAX / 2).await.unwrap();
+    for (i, kind) in [Removed, Changed].into_iter().enumerate() {
+        scheduler::request_work_at(
+            &state,
+            "s1",
+            "lib1",
+            "b",
+            &[file_work(path, kind)],
+            i as i64,
+        )
+        .await
+        .unwrap();
+    }
+    drop(guard);
+    wait_for_sync(&state).await;
+    assert!(
+        scheduler::views(&state).await.unwrap()[0]
+            .last_error
+            .as_ref()
+            .unwrap()
+            .contains("500")
+    );
+    // Added, removed, changed amounts to a change: a folder scan, never another add.
+    scheduler::step(&state, i64::MAX / 2).await.unwrap();
+    wait_for_sync(&state).await;
+    assert_eq!(
+        scan_bodies(&server).await,
+        [json!({ "path": "/library/trip" })]
+    );
+    assert_eq!(scheduler::views(&state).await.unwrap()[0].last_error, None);
+    assert_eq!(retained(&state).await, 0);
+}
+
+#[tokio::test]
+async fn unkeyed_rows_from_before_coalescing_run_first_then_keyed_work_follows() {
+    let (_dir, state, server, _fake) = setup().await;
+    sqlx::query("INSERT INTO scan_schedule (library_id, server_id) VALUES ('lib1', 's1')")
+        .execute(&state.db)
+        .await
+        .unwrap();
+    sqlx::query(
+        r#"INSERT INTO scan_work (library_id, work_json) VALUES ('lib1', '{"path":"/library/trip","kind":"Folder"}')"#,
+    )
+    .execute(&state.db)
+    .await
+    .unwrap();
+    scheduler::request_work_at(
+        &state,
+        "s1",
+        "lib1",
+        "new",
+        &[folder_work("/library/other")],
+        0,
+    )
+    .await
+    .unwrap();
+    scheduler::step(&state, i64::MAX / 2).await.unwrap();
+    wait_for_sync(&state).await;
+    assert_eq!(
+        scan_bodies(&server).await,
+        [json!({ "path": "/library/trip" })]
+    );
+    assert!(
+        due_at(&state).await.is_some(),
+        "unclaimed keyed work is due again"
+    );
+    scheduler::step(&state, i64::MAX / 2).await.unwrap();
+    wait_for_sync(&state).await;
+    assert_eq!(
+        scan_bodies(&server).await,
+        [
+            json!({ "path": "/library/trip" }),
+            json!({ "path": "/library/other" }),
+        ]
+    );
+    assert_eq!(retained(&state).await, 0);
+    wait_for_cleanup(&state).await;
 }
