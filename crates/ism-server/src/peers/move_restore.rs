@@ -445,6 +445,29 @@ pub(crate) async fn restoration_plan_matches_locked(
     Ok(serde_json::to_value(current)? == serde_json::to_value(expected)?)
 }
 
+pub(crate) async fn restoration_resume_allowed_locked(
+    state: &AppState,
+    operation_id: &str,
+    expected: &str,
+) -> AppResult<bool> {
+    let plan: Restoration = serde_json::from_str(expected)?;
+    if plan.operation_id != operation_id
+        || !restoration_plan_matches_locked(state, operation_id, expected).await?
+    {
+        return Ok(false);
+    }
+    match &plan.conflict_id {
+        None => Ok(plan.generations.is_empty()),
+        Some(id) if !plan.generations.is_empty() => Ok(sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM conflicts WHERE id=? AND status='resolving')",
+        )
+        .bind(id)
+        .fetch_one(&state.db)
+        .await?),
+        Some(_) => Ok(false),
+    }
+}
+
 async fn bound_share(state: &AppState, plan: &Restoration) -> AppResult<Share> {
     let (principal, request): (String, String) =
         sqlx::query_as("SELECT principal,request_json FROM operations WHERE id=?")
@@ -842,6 +865,14 @@ pub(in crate::peers) async fn validate_current_manifest(
     state: &AppState,
     operation_id: &str,
 ) -> AppResult<()> {
+    validate_manifest_for_resume(state, operation_id).await?;
+    Ok(())
+}
+
+async fn validate_manifest_for_resume(
+    state: &AppState,
+    operation_id: &str,
+) -> AppResult<Restoration> {
     let mut plan = load(state, operation_id)
         .await?
         .ok_or_else(|| unverified("folder restoration manifest is missing"))?;
@@ -899,7 +930,7 @@ pub(in crate::peers) async fn validate_current_manifest(
         ));
     }
     if !plan.generations.is_empty() {
-        return Ok(());
+        return Ok(plan);
     }
     if current.location != plan.remote.location {
         // Only authenticated movement changes transport sources; frozen receiver targets and
@@ -941,11 +972,10 @@ pub(in crate::peers) async fn validate_current_manifest(
         .await?;
         tx.commit().await?;
     }
-    Ok(())
+    Ok(plan)
 }
 
 async fn process_one(state: &AppState, plan: &Restoration) -> AppResult<()> {
-    let share = bound_share(state, plan).await?;
     let completed: bool =
         sqlx::query_scalar("SELECT status='completed' FROM operations WHERE id=?")
             .bind(&plan.operation_id)
@@ -953,7 +983,9 @@ async fn process_one(state: &AppState, plan: &Restoration) -> AppResult<()> {
             .await?;
     if !completed {
         // No authenticated peer I/O may run under the local operation lock.
-        validate_current_manifest(state, &plan.operation_id).await?;
+        let verified_plan = validate_manifest_for_resume(state, &plan.operation_id).await?;
+        let plan = &verified_plan;
+        let share = bound_share(state, plan).await?;
         let pending: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM transfers WHERE restore_parent_operation_id=?)",
         )
@@ -1026,7 +1058,13 @@ async fn process_one(state: &AppState, plan: &Restoration) -> AppResult<()> {
         if plan.uploads.len() != plan.remote.files.len() {
             return Err(unverified("folder prerequisite transfers are incomplete"));
         }
-        if !crate::ops::exec::resume_recovered_folder_operation(state, &plan.operation_id).await? {
+        if !crate::ops::exec::resume_recovered_folder_operation_for_plan(
+            state,
+            &plan.operation_id,
+            &expected_plan,
+        )
+        .await?
+        {
             return Ok(());
         }
     }

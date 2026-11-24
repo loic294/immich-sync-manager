@@ -1779,11 +1779,35 @@ async fn recover_folder_prerequisite_upload_inner(
 }
 
 /// Completes the immutable original folder action, never a child borrowing its barrier.
+#[cfg(test)]
 pub(crate) async fn resume_recovered_folder_operation(
     state: &AppState,
     id: &str,
 ) -> AppResult<bool> {
+    resume_recovered_folder_operation_inner(state, id, None).await
+}
+
+pub(crate) async fn resume_recovered_folder_operation_for_plan(
+    state: &AppState,
+    id: &str,
+    expected_plan: &str,
+) -> AppResult<bool> {
+    resume_recovered_folder_operation_inner(state, id, Some(expected_plan)).await
+}
+
+async fn resume_recovered_folder_operation_inner(
+    state: &AppState,
+    id: &str,
+    expected_plan: Option<&str>,
+) -> AppResult<bool> {
     let _replication_guard = state.replication_operation_lock.lock().await;
+    if let Some(expected_plan) = expected_plan
+        && !crate::peers::admin::restoration_resume_allowed_locked(state, id, expected_plan).await?
+    {
+        return Err(recovery_changed(
+            "the restoration decision changed before the folder operation resumed",
+        ));
+    }
     let (principal, action, status, _) = folder_parent(state, id).await?;
     if status == OperationStatus::Completed {
         return Ok(true);

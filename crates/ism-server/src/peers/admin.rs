@@ -38,8 +38,8 @@ pub(super) use move_decisions::{
 };
 pub(super) use move_restore::validate_current_manifest as validate_folder_restore;
 pub(crate) use move_restore::{
-    VerifiedFolderRestore, restoration_plan_matches_locked, verified_folder_restore,
-    verified_restore_upload, verify_restored_folder_source,
+    VerifiedFolderRestore, restoration_plan_matches_locked, restoration_resume_allowed_locked,
+    verified_folder_restore, verified_restore_upload, verify_restored_folder_source,
 };
 #[cfg(test)]
 pub(super) use move_restore::{

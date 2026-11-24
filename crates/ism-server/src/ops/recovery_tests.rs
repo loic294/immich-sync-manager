@@ -396,6 +396,100 @@ impl Fixture {
 }
 
 #[tokio::test]
+async fn folder_resume_rejects_reopened_or_superseded_manifest_before_mutating() {
+    for empty in [false, true] {
+        let fixture = Fixture::new(true, false).await;
+        if empty {
+            fs::remove_file(fixture.base.join("album/nested/photo.jpg")).unwrap();
+            fs::remove_file(fixture.base.join("album/nested/photo.jpg.xmp")).unwrap();
+        }
+        let uploads = fixture.folder_restore(false).await;
+        assert_eq!(uploads.is_empty(), empty);
+        let before: String = sqlx::query_scalar(
+            "SELECT vv_json FROM pending_peer_ops WHERE operation_id='folder-restore:op-1'",
+        )
+        .fetch_one(&fixture.state.db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO conflicts(id,share_id,rel_path,kind,detail,local_json,remote_json,remote_vv_json,peer_id,status,created_at)
+             VALUES('cf-test','share-1','moved/album','folder_restore','Synthetic changed evidence','{}','{}','{}','peer-1','open',?)",
+        )
+        .bind(db::now())
+        .execute(&fixture.state.db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE pending_peer_ops SET conflict_id='cf-test',
+             vv_json=json_set(vv_json,'$.conflict_id','cf-test','$.evidence_generation',1,
+                '$.generations',json_array(json_object(
+                    'resolution','keep_both','remote',json_extract(vv_json,'$.remote'))))
+             WHERE operation_id='folder-restore:op-1'",
+        )
+        .execute(&fixture.state.db)
+        .await
+        .unwrap();
+        let reopened: String = sqlx::query_scalar(
+            "SELECT vv_json FROM pending_peer_ops WHERE operation_id='folder-restore:op-1'",
+        )
+        .fetch_one(&fixture.state.db)
+        .await
+        .unwrap();
+        for expected in [&before, &reopened] {
+            assert!(
+                resume_recovered_folder_operation_for_plan(&fixture.state, "op-1", expected)
+                    .await
+                    .is_err(),
+                "superseded or open evidence must not authorize resume; empty={empty}"
+            );
+            assert!(!fixture.base.join("album").exists());
+            assert!(!fixture.base.join("moved/album").exists());
+            let operation: String =
+                sqlx::query_scalar("SELECT status FROM operations WHERE id='op-1'")
+                    .fetch_one(&fixture.state.db)
+                    .await
+                    .unwrap();
+            assert_eq!(operation, "failed");
+        }
+        sqlx::query(
+            "UPDATE pending_peer_ops SET conflict_id=NULL,vv_json=? WHERE operation_id='folder-restore:op-1'",
+        )
+        .bind(&before)
+        .execute(&fixture.state.db)
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM conflicts WHERE id='cf-test'")
+            .execute(&fixture.state.db)
+            .await
+            .unwrap();
+        for upload in &uploads {
+            assert!(
+                recover_folder_prerequisite_upload_for_plan(
+                    &fixture.state,
+                    "op-1",
+                    upload,
+                    &before
+                )
+                .await
+                .unwrap()
+            );
+        }
+        assert!(
+            resume_recovered_folder_operation_for_plan(&fixture.state, "op-1", &before)
+                .await
+                .unwrap()
+        );
+        assert!(fixture.base.join("moved/album/nested/empty").is_dir());
+        if !empty {
+            assert_eq!(
+                fs::read(fixture.base.join("moved/album/nested/photo.jpg")).unwrap(),
+                b"synthetic photo"
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn authenticated_folder_prerequisites_resume_the_original_after_restart() {
     for retained_journal in [false, true] {
         let mut fixture = Fixture::new(true, false).await;
