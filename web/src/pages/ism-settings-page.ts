@@ -1,7 +1,6 @@
 import { html, nothing, type TemplateResult } from 'lit';
 import { live } from 'lit/directives/live.js';
 import { admin } from '@/api/admin';
-import type { ChangeType } from '@/api/events';
 import type { FileSettings } from '@/api/generated/FileSettings';
 import type { SettingsView } from '@/api/generated/SettingsView';
 import { IsmPage } from '@/base/ism-page';
@@ -101,8 +100,6 @@ export class IsmSettingsPage extends IsmPage {
   /** The form holds edits not saved yet: a reload keeps them. */
   declare dirty: boolean;
 
-  protected override reloadOn: readonly ChangeType[] = ['settings_changed'];
-
   constructor() {
     super();
     this.view = undefined;
@@ -113,7 +110,7 @@ export class IsmSettingsPage extends IsmPage {
   }
 
   protected override async load() {
-    const view = await admin.settings();
+    const view = await this.data.settings();
     this.view = view;
     if (!this.dirty) {
       this.name = view.instance_name;

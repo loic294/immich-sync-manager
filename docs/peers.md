@@ -280,6 +280,9 @@ the complete target and its own ready evidence or error; an unavailable file doe
 discard other results. Evidence-ready notifications retry unavailable comparisons without
 invalidating ready or in-flight reviews. Actual conflict changes still invalidate revisions.
 Selected targets on other pages continue preparing through the same bounded queue.
+If no files on the current page are eligible for another version decision, **Select multiple**
+explains why and offers **Show files needing review**, keeping the share/subfolder filters.
+Waiting, in-progress, and resolved files are not silently admitted for a new decision.
 
 The **Conflicts** page lists each conflict with both versions (size, checksum, time) and, for moves,
 the path the peer moved from. ISM records a conflict when:

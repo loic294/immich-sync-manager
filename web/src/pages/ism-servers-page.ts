@@ -30,7 +30,6 @@ export class IsmServersPage extends IsmPage {
   /** The server being edited; `null` while adding one. */
   declare editing: ImmichServerView | null;
   declare accountServer: ImmichServerView | undefined;
-  protected override reloadOn = ['maintenance_changed'] as const;
   private serverDialog = createRef<HTMLDialogElement>();
   private accountDialog = createRef<HTMLDialogElement>();
 
@@ -45,9 +44,9 @@ export class IsmServersPage extends IsmPage {
 
   protected override async load() {
     [this.servers, this.accounts, this.libraries] = await Promise.all([
-      admin.servers(),
-      admin.accounts(),
-      admin.libraries(),
+      this.data.servers(),
+      this.data.accounts(),
+      this.data.libraries(),
     ]);
   }
 

@@ -148,8 +148,6 @@ export class IsmRecoveryList extends IsmPage {
   declare issueType: string;
   declare status: string;
   declare kind: string;
-  protected override reloadOn = ['sync_changed', 'operation_updated', 'conflicts_changed'] as const;
-  protected override liveReloadInterval = 1000;
 
   constructor() {
     super();
@@ -186,7 +184,7 @@ export class IsmRecoveryList extends IsmPage {
   protected override async load() {
     const { limit, offset } = this;
     const filters = this.filterQuery();
-    const page = await admin.recoveryPage(limit, offset, filters);
+    const page = await this.data.recoveryPage(limit, offset, filters);
     if (
       limit !== this.limit ||
       offset !== this.offset ||

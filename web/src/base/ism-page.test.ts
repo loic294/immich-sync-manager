@@ -1,15 +1,16 @@
 import { html } from 'lit';
-import { afterEach, describe, expect, it, vi } from 'vitest';
-import { events } from '@/api/events';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { api } from '@/api/client';
+import { events, type Snapshot } from '@/api/events';
 import { IsmPage } from '@/base/ism-page';
 import { mount } from '@/test/helpers';
 
 class LivePage extends IsmPage {
-  protected override reloadOn = ['sync_changed'] as const;
   loads = 0;
   wait: Promise<void> = Promise.resolve();
   protected override async load() {
     this.loads++;
+    await this.data.sync();
     await this.wait;
   }
   protected override render() {
@@ -18,31 +19,37 @@ class LivePage extends IsmPage {
 }
 customElements.define('test-live-page', LivePage);
 
-class SlowLivePage extends IsmPage {
-  protected override reloadOn = ['operation_updated'] as const;
-  protected override liveReloadInterval = 1000;
-  loads = 0;
-  protected override async load() {
-    this.loads++;
-  }
-  protected override render() {
-    return html``;
-  }
-}
-customElements.define('test-slow-live-page', SlowLivePage);
-
 describe('live page loading', () => {
-  afterEach(() => vi.useRealTimers());
-  it('refreshes during continuous events rather than waiting until transfers stop', async () => {
+  let push: ((snapshot: Snapshot | Error) => void) | undefined;
+  beforeEach(() => {
+    vi.spyOn(api, 'get').mockResolvedValue({});
+    vi.spyOn(events, 'subscribe').mockImplementation((_url, handler) => {
+      push = handler;
+      return () => {
+        push = undefined;
+      };
+    });
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+  it('renders pushed state without making HTTP requests on notification bursts', async () => {
     vi.useFakeTimers();
     const page = await mount(new LivePage());
     await page.reload();
     const before = page.loads;
+    vi.mocked(api.get).mockClear();
     for (let i = 0; i < 10; i++) {
       events.emit({ type: 'sync_changed' });
       await vi.advanceTimersByTimeAsync(100);
     }
-    expect(page.loads - before).toBeGreaterThanOrEqual(3);
+    expect(page.loads).toBe(before);
+    expect(api.get).not.toHaveBeenCalled();
+    push?.({ status: 200, data: { allowed_now: true } });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(page.loads).toBe(before + 1);
+    expect(api.get).not.toHaveBeenCalled();
   });
 
   it('serializes refreshes and reloads again after an in-flight request', async () => {
@@ -61,15 +68,15 @@ describe('live page loading', () => {
     expect(page.loads).toBe(before + 2);
   });
 
-  it('limits expensive live pages during continuous progress bursts', async () => {
-    vi.useFakeTimers();
-    const page = await mount(new SlowLivePage());
+  it('retains an explicit live error until a pushed snapshot restores the view', async () => {
+    const page = await mount(new LivePage());
     await page.reload();
-    const before = page.loads;
-    for (let i = 0; i < 20; i++) {
-      events.emit({ type: 'operation_updated', operation_id: 'op1' });
-      await vi.advanceTimersByTimeAsync(50);
-    }
-    expect(page.loads - before).toBeLessThanOrEqual(2);
+    vi.mocked(api.get).mockClear();
+    push?.(new Error('Live connection lost'));
+    await vi.waitFor(() => expect(page.loadError).toBe('Live connection lost'));
+    expect(api.get).not.toHaveBeenCalled();
+    push?.({ status: 200, data: {} });
+    await vi.waitFor(() => expect(page.loadError).toBeUndefined());
+    expect(api.get).not.toHaveBeenCalled();
   });
 });

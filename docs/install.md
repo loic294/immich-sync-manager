@@ -113,6 +113,53 @@ Docker log history.
 | `ISM_SCAN_TIMEOUT_SECS` | `7200` | Longest wait for a library scan to finish. |
 | `ISM_SCAN_DELAY_SECS` | `120` | Library scans run this long after the last detected change. |
 
+## Live updates and reverse proxies
+
+Admin live data uses the authenticated WebSocket at `/api/admin/live`. The server pushes snapshots
+for the currently open views and dialogs. Event bursts are coalesced to at most one refresh per
+second per subscription, and unchanged snapshots are not sent. Time-based attention transitions
+are scheduled by the server. HTTP remains available for initial standalone loads, explicit reloads,
+mutations and media; there is no automatic HTTP polling fallback when live updates fail.
+
+To diagnose a connection, sign in and open the browser's developer tools, **Network → WS**:
+
+1. `/api/admin/live` should upgrade with **101 Switching Protocols** and remain connected.
+2. Messages should start with `{"type":"ready","protocol":1}`, followed by `subscribe` commands and
+   `snapshot` responses containing the actual data. Change notifications alone indicate an older
+   server; deploy the server and its matching web build together, then reload the browser.
+3. **401** means the administrator session is missing or expired: sign in again. An unauthenticated
+   command-line probe returning 401 is expected, not proof of a proxy failure. **403** can indicate
+   an Origin/Host mismatch: preserve the browser's original Host header, including its port.
+4. **400/426**, a failed upgrade, or repeated disconnections: enable WebSocket forwarding in the
+   reverse proxy. Allow idle connections for more than 30 seconds (the server sends ping frames).
+   For HTTPS pages the browser uses `wss://`; its certificate must be valid.
+
+For nginx, put this map in the `http` block and the location in the site's `server` block.
+Replace `ism.example:8080` with the reachable ISM upstream:
+
+```nginx
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    '' close;
+}
+
+location /api/admin/live {
+    proxy_pass http://ism.example:8080;
+    proxy_http_version 1.1;
+    proxy_set_header Host $http_host;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection $connection_upgrade;
+    proxy_read_timeout 75s;
+    proxy_send_timeout 75s;
+    proxy_buffering off;
+}
+```
+
+With live updates connected, progress changes should arrive as `snapshot` WebSocket messages,
+without repeated overview, sync, operation or attention HTTP GETs. If the connection cannot be
+restored, the UI keeps the last known data and displays an error; use explicit Refresh only as
+needed while correcting the connection.
+
 ## Debugging
 
 Use **Audit**, **Operations** and **Sync** for persistent history, and Docker/Container Manager logs

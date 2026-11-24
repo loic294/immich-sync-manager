@@ -3,6 +3,7 @@ import type { RequestOptions } from '@/api/client';
 import { api } from '@/api/client';
 import type { RecoveryTarget } from '@/api/generated/RecoveryTarget';
 import { VersionReview } from '@/components/version-review';
+import { mockLiveSnapshots } from '@/test/live';
 
 function batchTargets(input: RequestOptions | undefined): RecoveryTarget[] {
   if (!input?.body) throw new Error('Missing evidence batch body');
@@ -91,26 +92,18 @@ describe('VersionReview', () => {
       for (const finish of resolve.splice(0)) finish();
       await Promise.all([first, second]);
       expect(maximum).toBe(2);
+      review.hostDisconnected();
     } finally {
       get.mockRestore();
     }
   });
 
-  it('retries a failure when a readiness event races an in-flight request', async () => {
+  it('keeps pushed evidence when an obsolete initial HTTP failure arrives later', async () => {
+    const live = mockLiveSnapshots();
     let reject!: (reason: Error) => void;
     const get = vi
       .spyOn(api, 'post')
-      .mockImplementationOnce(() => new Promise((_, fail) => (reject = fail)))
-      .mockImplementationOnce(
-        async (_path, input) =>
-          ({
-            items: batchTargets(input).map((target) => ({
-              state: 'ready',
-              target,
-              versions: { revision: 'ready' },
-            })),
-          }) as never,
-      );
+      .mockImplementationOnce(() => new Promise((_, fail) => (reject = fail)));
     try {
       const review = new VersionReview({
         addController() {},
@@ -121,13 +114,17 @@ describe('VersionReview', () => {
       const target = { kind: 'conflict' as const, id: 'example', peer_id: null };
       const pending = review.compare([target]);
       await Promise.resolve();
-      review.retryUnavailable([target]);
+      live.push('/recovery/versions/batch', {
+        items: [{ state: 'ready', target, versions: { revision: 'ready' } }],
+      });
       reject(new Error('Still preparing'));
       await pending;
       await vi.waitFor(() => expect(review.has(target)).toBe(true));
-      expect(get).toHaveBeenCalledTimes(2);
+      expect(get).toHaveBeenCalledOnce();
+      expect(review.get(target)?.revision).toBe('ready');
+      review.hostDisconnected();
     } finally {
-      get.mockRestore();
+      vi.restoreAllMocks();
     }
   });
 

@@ -80,8 +80,6 @@ export class IsmConflictsPage extends IsmPage {
   declare folder: string;
   declare status: string;
   private readonly review = new VersionReview(this);
-  protected override reloadOn = ['conflicts_changed', 'sync_changed'] as const;
-  protected override liveReloadInterval = 1500;
 
   constructor() {
     super();
@@ -100,30 +98,9 @@ export class IsmConflictsPage extends IsmPage {
     this.status = '';
   }
 
-  protected override onChange(event: Parameters<IsmPage['onChange']>[0]) {
-    const conflicts = new Map(
-      [...this.selected.values(), ...this.conflicts]
-        .filter(canChoose)
-        .map((conflict) => [key(conflict), conflict]),
-    );
-    const targets = this.preparationTargets(this.conflicts);
-    const retained = new Set(targets.map(targetKey));
-    this.review.retain(targets);
-    if (event.type === 'resync' || event.type === 'conflicts_changed') {
-      for (const item of conflicts.values()) {
-        const recoveryTarget = target(item);
-        this.review.forget(recoveryTarget, retained.has(targetKey(recoveryTarget)));
-      }
-      if (targets.length) void this.review.compare(targets);
-    } else if (event.type === 'sync_changed') {
-      this.review.retryUnavailable(targets);
-    }
-    super.onChange(event);
-  }
-
   protected override async load() {
     const { limit, offset, includeResolved, share, folder, status } = this;
-    const page = await admin.conflicts(includeResolved, limit, offset, share, folder, status);
+    const page = await this.data.conflicts(includeResolved, limit, offset, share, folder, status);
     if (
       limit !== this.limit ||
       offset !== this.offset ||
@@ -434,7 +411,24 @@ export class IsmConflictsPage extends IsmPage {
     if (!this.selecting) return nothing;
     const open = this.open();
     const chosen = this.chosen();
-    if (!open.length && !chosen.length) return nothing;
+    if (!open.length && !chosen.length)
+      return html`<div role="status" class="alert alert-info alert-soft flex-none"
+        aria-label="Batch conflict decisions">
+        <span>${
+          this.includeResolved
+            ? 'Resolved files cannot receive another version decision.'
+            : 'Only files needing review can be selected. Waiting or in-progress files cannot receive a new version decision here.'
+        }</span>
+        ${
+          !this.includeResolved && this.status !== 'needs_decision'
+            ? html`<button type="button" class="btn btn-sm max-sm:min-h-11" @click=${() => {
+                this.status = 'needs_decision';
+                this.filtersOpen = true;
+                this.filter(this.share, this.folder);
+              }}>Show files needing review</button>`
+            : nothing
+        }
+      </div>`;
     const chosenHere = open.filter((conflict) => this.selected.has(key(conflict)));
     const reviewed = chosen.filter((c) => this.review.has(target(c))).length;
     const all = open.length > 0 && chosenHere.length === open.length;

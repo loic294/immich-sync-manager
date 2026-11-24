@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { api } from '@/api/client';
 import type { AttentionItem } from '@/api/generated/AttentionItem';
 import type { AttentionSnapshot } from '@/api/generated/AttentionSnapshot';
@@ -11,6 +11,7 @@ import {
   refreshAttention,
   startAttention,
 } from '@/stores/attention';
+import { mockLiveSnapshots } from '@/test/live';
 
 const row: AttentionItem = {
   id: 'peer:beta',
@@ -53,6 +54,10 @@ afterEach(() => {
 });
 
 describe('attention snapshots', () => {
+  let live: ReturnType<typeof mockLiveSnapshots>;
+  beforeEach(() => {
+    live = mockLiveSnapshots();
+  });
   it('links an operation gate wait to its operation list', () => {
     const [item] = buildAttention({
       ...snapshot,
@@ -77,12 +82,13 @@ describe('attention snapshots', () => {
     try {
       await vi.advanceTimersByTimeAsync(0);
       expect(blockers.value).toEqual([]);
-      get.mockResolvedValue({
+      live.push('/attention', {
         ...snapshot,
         items: [{ ...wait, attention: 'notice', blocks_work: true, recheck_at: null }],
       });
       await vi.advanceTimersByTimeAsync(2100);
       expect(blockers.value).toMatchObject([{ id: wait.id, action: 'View operations' }]);
+      expect(get).toHaveBeenCalledOnce();
     } finally {
       stop();
     }
@@ -226,12 +232,12 @@ describe('attention snapshots', () => {
     try {
       await vi.advanceTimersByTimeAsync(0);
       expect(get).toHaveBeenCalledTimes(1);
-      get.mockResolvedValue({ ...snapshot, items: [] });
+      live.push('/attention', { ...snapshot, items: [] });
       await vi.advanceTimersByTimeAsync(2100);
-      expect(get).toHaveBeenCalledTimes(2);
+      expect(get).toHaveBeenCalledOnce();
       expect(blockers.value).toEqual([]);
       await vi.advanceTimersByTimeAsync(60_000);
-      expect(get).toHaveBeenCalledTimes(2);
+      expect(get).toHaveBeenCalledOnce();
     } finally {
       stop();
     }
@@ -324,9 +330,9 @@ describe('attention snapshots', () => {
       await vi.advanceTimersByTimeAsync(0);
       expect(attentionError.value).toBe(true);
       expect(blockers.value).toHaveLength(1);
-      get.mockResolvedValue({ ...snapshot, items: [] });
+      live.push('/attention', { ...snapshot, items: [] });
       await vi.advanceTimersByTimeAsync(2100);
-      expect(get).toHaveBeenCalledTimes(2);
+      expect(get).toHaveBeenCalledOnce();
       expect(attentionError.value).toBe(false);
       expect(blockers.value).toEqual([]);
     } finally {
@@ -398,7 +404,7 @@ describe('attention snapshots', () => {
     }
   });
 
-  it('retains and marks previous blockers when refresh fails, then retries', async () => {
+  it('retains stale blockers when live refresh fails without polling and recovers on a push', async () => {
     vi.useFakeTimers();
     vi.spyOn(console, 'error').mockImplementation(() => undefined);
     const get = vi.spyOn(api, 'get').mockResolvedValue(snapshot);
@@ -409,7 +415,12 @@ describe('attention snapshots', () => {
       await refreshAttention();
       expect(attentionError.value).toBe(true);
       expect(blockers.value[0]).toMatchObject({ id: 'peer:beta', stale: true });
+      const calls = get.mock.calls.length;
       await vi.advanceTimersByTimeAsync(60_000);
+      expect(get).toHaveBeenCalledTimes(calls);
+      expect(attentionError.value).toBe(true);
+      live.push('/attention', snapshot);
+      await vi.advanceTimersByTimeAsync(0);
       expect(attentionError.value).toBe(false);
       expect(blockers.value[0]).not.toHaveProperty('stale');
     } finally {

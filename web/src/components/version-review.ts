@@ -1,7 +1,10 @@
 import { html, nothing, type ReactiveController, type ReactiveControllerHost } from 'lit';
 import { admin } from '@/api/admin';
+import { isAbortError } from '@/api/errors';
 import type { RecoveryTarget } from '@/api/generated/RecoveryTarget';
 import type { RecoveryVersions } from '@/api/generated/RecoveryVersions';
+import type { RecoveryVersionsBatch } from '@/api/generated/RecoveryVersionsBatch';
+import { LiveScope } from '@/api/live';
 import type { VersionChoices } from '@/components/ism-recovery-versions';
 import '@/components/ism-recovery-versions';
 
@@ -24,6 +27,7 @@ export class VersionReview implements ReactiveController {
   private readonly retryWhenSettled = new Set<string>();
   private readonly queue: { target: RecoveryTarget; resolve: () => void }[] = [];
   private active = 0;
+  private readonly scopes = new Map<string, LiveScope>();
   private pumpScheduled = false;
 
   constructor(private readonly host: ReactiveControllerHost) {
@@ -31,6 +35,10 @@ export class VersionReview implements ReactiveController {
   }
 
   hostConnected() {}
+
+  hostDisconnected() {
+    this.retain([]);
+  }
 
   get(target: RecoveryTarget) {
     return this.versions.get(targetKey(target));
@@ -47,6 +55,9 @@ export class VersionReview implements ReactiveController {
     const id = targetKey(target);
     this.stale.add(id);
     this.errors.delete(id);
+    const previous = this.scopes.get(id);
+    this.scopes.delete(id);
+    if (previous) this.disposeUnused([previous]);
     if (this.loading.has(id)) {
       this.invalidated.add(id);
       if (retry) this.retryWhenSettled.add(id);
@@ -56,6 +67,15 @@ export class VersionReview implements ReactiveController {
 
   retain(targets: readonly RecoveryTarget[]) {
     const retained = new Set(targets.map(targetKey));
+    const previous = new Set(this.scopes.values());
+    for (const [id] of this.scopes) {
+      if (retained.has(id)) continue;
+      this.scopes.delete(id);
+      this.stale.add(id);
+      this.invalidated.add(id);
+      this.retryWhenSettled.delete(id);
+    }
+    this.disposeUnused(previous);
     for (let i = this.queue.length - 1; i >= 0; i--) {
       const job = this.queue[i];
       const id = targetKey(job.target);
@@ -70,6 +90,11 @@ export class VersionReview implements ReactiveController {
 
   isLoading(target: RecoveryTarget) {
     return this.loading.has(targetKey(target));
+  }
+
+  private disposeUnused(scopes: Iterable<LiveScope>) {
+    const active = new Set(this.scopes.values());
+    for (const scope of scopes) if (!active.has(scope)) scope.dispose();
   }
 
   retryUnavailable(targets: readonly RecoveryTarget[]) {
@@ -121,33 +146,63 @@ export class VersionReview implements ReactiveController {
     }
   }
 
-  private async fetch(targets: RecoveryTarget[]) {
+  private readBatch(targets: RecoveryTarget[], scope: LiveScope) {
+    return scope.snapshot<RecoveryVersionsBatch>(
+      '/recovery/versions/batch',
+      () => admin.recoveryVersionsBatch(targets),
+      { targets, all: false, resolution: null },
+    );
+  }
+
+  private apply(targets: RecoveryTarget[], scope: LiveScope, current: RecoveryVersionsBatch) {
+    const items = new Map(current.items.map((item) => [targetKey(item.target), item]));
+    if (
+      current.items.length !== targets.length ||
+      items.size !== targets.length ||
+      targets.some((target) => !items.has(targetKey(target)))
+    )
+      throw new Error('The evidence batch did not match the requested files. Try again.');
+    for (const target of targets) {
+      const id = targetKey(target);
+      const item = items.get(id);
+      if (!item || this.invalidated.has(id) || this.scopes.get(id) !== scope) continue;
+      if (item.state === 'ready') {
+        this.versions.set(id, item.versions);
+        this.stale.delete(id);
+        this.errors.delete(id);
+      } else {
+        this.errors.set(id, item.message);
+      }
+    }
+  }
+
+  private failed(targets: RecoveryTarget[], scope: LiveScope, error: unknown) {
+    if (isAbortError(error)) return;
+    for (const target of targets) {
+      const id = targetKey(target);
+      if (!this.invalidated.has(id) && this.scopes.get(id) === scope)
+        this.errors.set(id, error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  private async refreshBatch(targets: RecoveryTarget[], scope: LiveScope) {
     try {
-      const current = await admin.recoveryVersionsBatch(targets);
-      const items = new Map(current.items.map((item) => [targetKey(item.target), item]));
-      if (
-        current.items.length !== targets.length ||
-        items.size !== targets.length ||
-        targets.some((target) => !items.has(targetKey(target)))
-      )
-        throw new Error('The evidence batch did not match the requested files. Try again.');
-      for (const target of targets) {
-        const id = targetKey(target);
-        const item = items.get(id);
-        if (!item || this.invalidated.has(id)) continue;
-        if (item.state === 'ready') {
-          this.versions.set(id, item.versions);
-          this.stale.delete(id);
-        } else {
-          this.errors.set(id, item.message);
-        }
-      }
+      this.apply(targets, scope, await this.readBatch(targets, scope));
     } catch (error) {
-      for (const target of targets) {
-        const id = targetKey(target);
-        if (!this.invalidated.has(id))
-          this.errors.set(id, error instanceof Error ? error.message : String(error));
-      }
+      this.failed(targets, scope, error);
+    }
+    this.host.requestUpdate();
+  }
+
+  private async fetch(targets: RecoveryTarget[]) {
+    const previous = new Set(this.scopes.values());
+    const scope = new LiveScope(() => void this.refreshBatch(targets, scope));
+    for (const target of targets) this.scopes.set(targetKey(target), scope);
+    this.disposeUnused(previous);
+    try {
+      this.apply(targets, scope, await this.readBatch(targets, scope));
+    } catch (error) {
+      this.failed(targets, scope, error);
     } finally {
       const retry: RecoveryTarget[] = [];
       for (const target of targets) {
@@ -177,7 +232,10 @@ export class VersionReview implements ReactiveController {
         error && !this.loading.has(id)
           ? html`<div role="alert" class="alert alert-error alert-soft mt-2 py-2 text-sm">
             <span class="break-all">Comparison failed: ${error}</span>
-            <button type="button" class="btn btn-xs max-sm:min-h-11" @click=${() => this.compare([target])}>Try again</button>
+            <button type="button" class="btn btn-xs max-sm:min-h-11" @click=${() => {
+              this.forget(target);
+              void this.compare([target]);
+            }}>Try again</button>
           </div>`
           : nothing
       }

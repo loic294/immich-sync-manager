@@ -133,8 +133,12 @@ More: [install](docs/install.md) · [Immich compatibility](docs/immich-compatibi
 ## Live activity
 
 The overview shows up to ten running or recently completed operations. **Sync** and **Operations**
-are the next two menu entries; their tables and open progress dialogs refresh over an authenticated
-WebSocket. Reverse proxies must forward WebSocket upgrades for `/api/admin/live`. The existing SSE
+are the next two menu entries. The overview counters, tables, attention state and open progress
+dialogs receive data snapshots over an authenticated WebSocket, rather than fetching HTTP data
+on each notification. Subscriptions end when their views close; relevant event bursts are coalesced
+and unchanged snapshots are not sent. Live connection failures show stale-data warnings, without
+HTTP polling fallback. See [WebSocket troubleshooting](docs/install.md#live-updates-and-reverse-proxies)
+for proxy configuration and connection checks. The existing SSE
 endpoints remain available to API clients.
 
 Sync has **Active & queued**, **Sync issues**, and **Completed syncs** tabs. Downloads currently

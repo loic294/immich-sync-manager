@@ -1,9 +1,10 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
-import { admin } from '@/api/admin';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { api } from '@/api/client';
 import { events } from '@/api/events';
 import type { BackgroundActivity } from '@/api/generated/BackgroundActivity';
 import type { BackgroundActivityPage } from '@/api/generated/BackgroundActivityPage';
 import { mount } from '@/test/helpers';
+import { mockLiveSnapshots } from '@/test/live';
 import '@/components/ism-background-activity';
 
 const task: BackgroundActivity = {
@@ -32,24 +33,29 @@ function snapshot(current: BackgroundActivity[] = [task]): BackgroundActivityPag
 }
 
 describe('background activity', () => {
+  let live: ReturnType<typeof mockLiveSnapshots>;
+  beforeEach(() => {
+    live = mockLiveSnapshots();
+  });
   afterEach(() => {
     vi.restoreAllMocks();
     vi.useRealTimers();
   });
 
   it('shows unknown totals honestly, refreshes measured progress, and keeps tasks across history pagination', async () => {
-    const get = vi.spyOn(admin, 'backgroundActivity').mockResolvedValue(snapshot());
+    const get = vi.spyOn(api, 'get').mockResolvedValue(snapshot());
     const page = await mount('ism-background-activity');
     await vi.waitFor(() => expect(page.textContent).toContain('41 files discovered'));
     expect(page.querySelector('progress')).toBeNull();
     expect(page.textContent).toContain('Elapsed');
-    get.mockResolvedValue(
-      snapshot([
-        { ...task, done: 15, total: 50, unit: 'files checked', phase: 'Reconciling files' },
-      ]),
-    );
-    events.emit({ type: 'activity_changed' });
+    const updated = snapshot([
+      { ...task, done: 15, total: 50, unit: 'files checked', phase: 'Reconciling files' },
+    ]);
+    get.mockResolvedValue(updated);
+    const calls = get.mock.calls.length;
+    live.push('/operations/background', updated);
     await vi.waitFor(() => expect(page.textContent).toContain('15 / 50 files checked'));
+    expect(get).toHaveBeenCalledTimes(calls);
     expect(page.querySelector('progress')?.value).toBe(30);
     expect(page.querySelector('progress')?.getAttribute('aria-label')).toBe(
       'Checking shared files: 30%',
@@ -57,7 +63,11 @@ describe('background activity', () => {
     page
       .querySelector('ism-pagination')
       ?.dispatchEvent(new CustomEvent('page-change', { detail: { limit: 25, offset: 25 } }));
-    await vi.waitFor(() => expect(get).toHaveBeenCalledWith(25, 25));
+    await vi.waitFor(() =>
+      expect(get).toHaveBeenCalledWith('/api/admin/operations/background', {
+        query: { limit: 25, offset: 25 },
+      }),
+    );
     expect(page.textContent).toContain('Checking shared files');
     expect(page.querySelector('a')?.getAttribute('href')).toBe('/peers');
   });
@@ -67,7 +77,7 @@ describe('background activity', () => {
     ['an invalid start time', 'not-a-date', null],
     ['an invalid finish time', task.started_at, 'not-a-date'],
   ])('does not invent an elapsed duration with %s', async (_label, started_at, finished_at) => {
-    vi.spyOn(admin, 'backgroundActivity').mockResolvedValue(
+    vi.spyOn(api, 'get').mockResolvedValue(
       snapshot([
         {
           ...task,
@@ -87,7 +97,7 @@ describe('background activity', () => {
   });
 
   it('groups bulk blockers into one row with reasons and examples, without a misleading progress bar', async () => {
-    vi.spyOn(admin, 'backgroundActivity').mockResolvedValue(
+    vi.spyOn(api, 'get').mockResolvedValue(
       snapshot([
         task,
         {
@@ -128,7 +138,7 @@ describe('background activity', () => {
   });
 
   it('links grouped conflict comparisons to Conflicts', async () => {
-    vi.spyOn(admin, 'backgroundActivity').mockResolvedValue(
+    vi.spyOn(api, 'get').mockResolvedValue(
       snapshot([
         {
           ...task,
@@ -150,7 +160,7 @@ describe('background activity', () => {
   });
 
   it('links remote blockers to the other instance without routing them locally', async () => {
-    vi.spyOn(admin, 'backgroundActivity').mockResolvedValue(
+    vi.spyOn(api, 'get').mockResolvedValue(
       snapshot([
         {
           ...task,
@@ -170,7 +180,7 @@ describe('background activity', () => {
   });
 
   it('takes version decisions to Conflicts instead of the sync queue', async () => {
-    vi.spyOn(admin, 'backgroundActivity').mockResolvedValue(
+    vi.spyOn(api, 'get').mockResolvedValue(
       snapshot([
         {
           ...task,
@@ -221,7 +231,7 @@ describe('background activity', () => {
       },
     ]);
     data.warnings = ['Some conflict comparison work has no verifiable worker or saved state.'];
-    vi.spyOn(admin, 'backgroundActivity').mockResolvedValue(data);
+    vi.spyOn(api, 'get').mockResolvedValue(data);
     const page = await mount('ism-background-activity');
     await vi.waitFor(() =>
       expect(page.textContent).toContain('Waiting for another file operation to finish'),
@@ -240,7 +250,7 @@ describe('background activity', () => {
   });
 
   it('explains dependent work and version conflicts without internal jargon', async () => {
-    vi.spyOn(admin, 'backgroundActivity').mockResolvedValue(
+    vi.spyOn(api, 'get').mockResolvedValue(
       snapshot([
         {
           ...task,
@@ -287,7 +297,7 @@ describe('background activity', () => {
   });
 
   it('explains saved transfer failures while preserving unknown details', async () => {
-    vi.spyOn(admin, 'backgroundActivity').mockResolvedValue(
+    vi.spyOn(api, 'get').mockResolvedValue(
       snapshot([
         {
           ...task,
@@ -341,7 +351,7 @@ describe('background activity', () => {
         reasons: [{ reason: '<item> changed on the receiver', count: 1 }],
       },
     ];
-    vi.spyOn(admin, 'backgroundActivity').mockResolvedValue(data);
+    vi.spyOn(api, 'get').mockResolvedValue(data);
     const page = await mount('ism-background-activity');
     await vi.waitFor(() => expect(page.textContent).toContain('Getting the list of files'));
     expect(page.textContent).toContain('Checking the contents of trip/photo.example.jpg');
@@ -356,7 +366,7 @@ describe('background activity', () => {
   });
 
   it('explains an Immich safety wait without internal terminology', async () => {
-    vi.spyOn(admin, 'backgroundActivity').mockResolvedValue(
+    vi.spyOn(api, 'get').mockResolvedValue(
       snapshot([
         {
           ...task,
@@ -375,7 +385,7 @@ describe('background activity', () => {
   });
 
   it('keeps interrupted work visible until a later outcome is known', async () => {
-    vi.spyOn(admin, 'backgroundActivity').mockResolvedValue(
+    vi.spyOn(api, 'get').mockResolvedValue(
       snapshot([
         {
           ...task,
@@ -400,7 +410,7 @@ describe('background activity', () => {
   });
 
   it('explains waiting and failed work, and opens related operations without unsupported actions', async () => {
-    vi.spyOn(admin, 'backgroundActivity').mockResolvedValue(
+    vi.spyOn(api, 'get').mockResolvedValue(
       snapshot([
         {
           ...task,
@@ -438,7 +448,7 @@ describe('background activity', () => {
   });
 
   it('preserves the last snapshot on errors and never presents a failed fetch as idle', async () => {
-    const get = vi.spyOn(admin, 'backgroundActivity').mockResolvedValue(snapshot());
+    const get = vi.spyOn(api, 'get').mockResolvedValue(snapshot());
     const page = await mount('ism-background-activity');
     await vi.waitFor(() => expect(page.textContent).toContain('Enumerating files'));
     await page.reload();
@@ -451,19 +461,25 @@ describe('background activity', () => {
     expect(page.textContent).not.toContain('ISM is idle');
   });
 
-  it('reports unknown activity on initial failure and polls independently of live updates', async () => {
+  it('reports unknown activity on failure without polling and recovers from a pushed snapshot', async () => {
     vi.useFakeTimers();
-    const get = vi.spyOn(admin, 'backgroundActivity').mockRejectedValue(new Error('unavailable'));
+    const get = vi.spyOn(api, 'get').mockRejectedValue(new Error('unavailable'));
     const page = await mount('ism-background-activity');
     await page.reload();
     await page.updateComplete;
     expect(page.textContent).toContain('Current activity is unknown');
     get.mockResolvedValue(snapshot([]));
-    await vi.advanceTimersByTimeAsync(10_000);
+    const calls = get.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(60_000);
     await page.updateComplete;
-    expect(page.textContent).toContain('ISM is idle');
+    expect(page.textContent).toContain('Current activity is unknown');
+    expect(get).toHaveBeenCalledTimes(calls);
     events.emit({ type: 'resync' });
     await vi.advanceTimersByTimeAsync(2000);
-    expect(get.mock.calls.length).toBeGreaterThan(2);
+    expect(get).toHaveBeenCalledTimes(calls);
+    live.push('/operations/background', snapshot([]));
+    await vi.advanceTimersByTimeAsync(0);
+    await page.updateComplete;
+    expect(page.textContent).toContain('ISM is idle');
   });
 });

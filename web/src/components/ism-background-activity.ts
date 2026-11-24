@@ -1,5 +1,4 @@
 import { html, nothing } from 'lit';
-import { admin } from '@/api/admin';
 import { events } from '@/api/events';
 import type { BackgroundActivity } from '@/api/generated/BackgroundActivity';
 import type { BackgroundActivityPage } from '@/api/generated/BackgroundActivityPage';
@@ -27,9 +26,6 @@ const PAGES: Record<string, string> = {
   '/peers': 'Open peers and shares',
   '/operations': 'Open operations',
 };
-// Polling only backs up live events, so it can be slow; the snapshot is stale after a few misses.
-const POLL_MS = 10_000;
-const STALE_MS = 35_000;
 
 function needsAttention(task: BackgroundActivity) {
   return task.status === 'failed' || task.status === 'blocked' || task.status === 'interrupted';
@@ -276,20 +272,7 @@ export class IsmBackgroundActivity extends IsmPage {
   declare filter: Filter | undefined;
   declare limit: number;
   declare offset: number;
-  protected override reloadOn = [
-    'activity_changed',
-    'operation_updated',
-    'operation_committed',
-    'maintenance_changed',
-    'sync_changed',
-    'watch_changed',
-    'library_scanned',
-    'settings_changed',
-    'conflicts_changed',
-  ] as const;
-  protected override liveReloadInterval = 2000;
   private timer: number | undefined;
-  private receivedAt = 0;
 
   constructor() {
     super();
@@ -302,8 +285,7 @@ export class IsmBackgroundActivity extends IsmPage {
     super.connectedCallback();
     this.timer = window.setInterval(() => {
       this.requestUpdate();
-      void this.reload();
-    }, POLL_MS);
+    }, 10_000);
   }
 
   override disconnectedCallback() {
@@ -313,10 +295,9 @@ export class IsmBackgroundActivity extends IsmPage {
 
   protected override async load() {
     const { limit, offset } = this;
-    const snapshot = await admin.backgroundActivity(limit, offset);
+    const snapshot = await this.data.backgroundActivity(limit, offset);
     if (limit !== this.limit || offset !== this.offset) return;
     this.snapshot = snapshot;
-    this.receivedAt = Date.now();
     if (offset > 0 && offset >= snapshot.total) {
       this.offset = Math.max(0, Math.ceil(snapshot.total / limit) - 1) * limit;
       void this.reload();
@@ -482,17 +463,16 @@ export class IsmBackgroundActivity extends IsmPage {
 
   private freshness(now: number) {
     const snapshot = this.snapshot;
-    const stale = this.receivedAt > 0 && now - this.receivedAt > STALE_MS;
     if (this.loadError)
       return html`<p role="alert" class="flex flex-wrap items-center gap-2 text-sm text-error">
         <ism-icon name="triangle-alert"></ism-icon>
         Couldn't refresh: ${this.loadError}. ${snapshot ? `Showing what was known ${ago(snapshot.observed_at, now)}.` : 'Current activity is unknown.'}
       </p>`;
     if (!snapshot) return nothing;
-    const live = events.connection.value === 'open' && !stale;
+    const live = events.connection.value === 'open';
     return html`<p role="status" class="flex items-center gap-2 text-sm ${live ? 'text-base-content/60' : 'text-warning'}">
       <span class="status ${live ? 'status-success' : 'status-warning'}" aria-hidden="true"></span>
-      ${live ? 'Live' : stale ? 'Not refreshed recently' : 'Live updates disconnected; checking every 10 sec'} · updated ${ago(snapshot.observed_at, now)}
+      ${live ? 'Live' : 'Live updates disconnected; showing last known data'} · updated ${ago(snapshot.observed_at, now)}
     </p>`;
   }
 

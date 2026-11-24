@@ -128,7 +128,7 @@ describe('ism-app', () => {
     });
     const app = await mount('ism-app', { routes });
     await until(() => expect(app.querySelector('ism-attention-bell')).not.toBeNull());
-    await vi.waitFor(() => expect(api.get).toHaveBeenCalledWith('/api/admin/attention'));
+    await vi.waitFor(() => expect(api.get).toHaveBeenCalledWith('/api/admin/attention', undefined));
     blockers.value = [
       {
         id: 'peer:example',

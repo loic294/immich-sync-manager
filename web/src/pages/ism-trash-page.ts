@@ -18,7 +18,6 @@ export class IsmTrashPage extends IsmPage {
   declare entries: TrashEntry[];
   declare mappings: MappingView[];
   declare rootId: string;
-  protected override reloadOn = ['operation_committed'] as const;
 
   constructor() {
     super();
@@ -29,8 +28,8 @@ export class IsmTrashPage extends IsmPage {
 
   protected override async load() {
     [this.entries, this.mappings] = await Promise.all([
-      admin.trash(this.rootId || undefined),
-      admin.mappings(),
+      this.data.trash(this.rootId || undefined),
+      this.data.mappings(),
     ]);
   }
 

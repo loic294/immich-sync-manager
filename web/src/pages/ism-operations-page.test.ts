@@ -1,8 +1,9 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { api } from '@/api/client';
 import { events } from '@/api/events';
 import type { OperationActivity } from '@/api/generated/OperationActivity';
 import { mount } from '@/test/helpers';
+import { mockLiveSnapshots } from '@/test/live';
 import '@/pages/ism-operations-page';
 
 vi.mock('@/components/confirm', () => ({
@@ -31,8 +32,12 @@ const BACKGROUND = {
 };
 
 describe('operations activity', () => {
+  let live: ReturnType<typeof mockLiveSnapshots>;
+  beforeEach(() => {
+    live = mockLiveSnapshots();
+  });
   afterEach(() => vi.restoreAllMocks());
-  it('paginates on the server, resets on status changes, and refreshes from live notifications', async () => {
+  it('paginates on the server, resets on status changes, and renders pushed progress without HTTP', async () => {
     const get = vi
       .spyOn(api, 'get')
       .mockImplementation(
@@ -79,7 +84,13 @@ describe('operations activity', () => {
             }) as never,
     );
     events.emit({ type: 'operation_updated', operation_id: 'op1' });
+    const calls = get.mock.calls.length;
+    live.push('/operations/page', {
+      rows: [{ ...OP, status: 'completed', progress: { done: 2, total: 2 } }],
+      total: 1,
+    });
     await vi.waitFor(() => expect(page.textContent).toContain('2/2'));
+    expect(get).toHaveBeenCalledTimes(calls);
   });
 
   it('shows live subtasks and queues recovery instead of manual acknowledgment', async () => {

@@ -19,8 +19,6 @@ export class IsmOperationDetail extends IsmPage {
   declare detail: OperationDetail | undefined;
   declare limit: number;
   declare offset: number;
-  protected override reloadOn = ['operation_updated', 'operation_committed'] as const;
-  protected override liveReloadInterval = 1000;
   private operationId: string | undefined;
   private dialog = createRef<HTMLDialogElement>();
   constructor() {
@@ -42,7 +40,7 @@ export class IsmOperationDetail extends IsmPage {
   protected override async load() {
     const id = this.operationId;
     if (!id) return;
-    const detail = await admin.operationDetail(id);
+    const detail = await this.data.operationDetail(id);
     if (this.operationId === id) this.detail = detail;
   }
   private async fix() {
@@ -82,6 +80,7 @@ export class IsmOperationDetail extends IsmPage {
     return html`<dialog class="modal" aria-labelledby="operation-detail-title" ${ref(this.dialog)}
       @close=${() => {
         this.operationId = undefined;
+        void this.reload();
       }}>
       <div class="modal-box max-w-5xl">
         <div class="flex items-start justify-between gap-3">

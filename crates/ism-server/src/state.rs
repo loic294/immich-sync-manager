@@ -12,7 +12,7 @@ use tokio::sync::{Mutex, Notify, Semaphore, broadcast, watch};
 use crate::config::Config;
 use crate::crypto::SecretBox;
 
-/// Live events for SSE subscribers.
+/// Change notifications for UI live snapshots and SSE subscribers.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerEvent {

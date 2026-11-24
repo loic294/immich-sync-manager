@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { api } from '@/api/client';
 import type { RecoveryView } from '@/api/generated/RecoveryView';
 import { mount } from '@/test/helpers';
+import { mockLiveSnapshots } from '@/test/live';
 import '@/components/ism-recovery-list';
 
 const ISSUE: RecoveryView = {
@@ -201,6 +202,7 @@ describe('sync recovery', () => {
         issue_types: [null, 'version_conflict', 'choose_version', 'constructor'],
       } as never;
     });
+
     const post = vi.spyOn(api, 'post').mockResolvedValue({ items: [ISSUE] } as never);
     const page = await mount('ism-recovery-list');
     await page.reload();
@@ -281,6 +283,42 @@ describe('sync recovery', () => {
     expect(page.issueType).toBe('');
     expect(page.status).toBe('');
     expect(page.kind).toBe('');
+  });
+
+  it('keeps the selected filters on live snapshots without polling', async () => {
+    const live = mockLiveSnapshots();
+    const filters = [{ share_name: 'Photos', folders: ['Trips'] }];
+    const get = vi.spyOn(api, 'get').mockResolvedValue({
+      rows: [ISSUE],
+      total: 2,
+      filters,
+      issue_types: ['peer_unreachable'],
+    } as never);
+    const page = await mount('ism-recovery-list');
+    await vi.waitFor(() => expect(page.textContent).toContain(ISSUE.title));
+    [...page.querySelectorAll<HTMLButtonElement>('button')]
+      .find((button) => button.textContent?.trim() === 'Filters')
+      ?.click();
+    await page.updateComplete;
+    const share = page.querySelector<HTMLSelectElement>('[aria-label="Filter by share"]');
+    if (!share) throw new Error('Share filter is missing');
+    share.value = 'Photos';
+    share.dispatchEvent(new Event('change'));
+    await vi.waitFor(() => expect(page.filtering).toBe(false));
+    const url = [...live.handlers.keys()].find((key) => key.includes('share=Photos'));
+    if (!url) throw new Error('Filtered live subscription is missing');
+    expect(live.handlers.size).toBe(1);
+    const calls = get.mock.calls.length;
+    live.push(url, {
+      rows: [{ ...ISSUE, title: 'Updated photo.jpg' }],
+      total: 1,
+      filters,
+      issue_types: ['peer_unreachable'],
+    });
+    await vi.waitFor(() => expect(page.textContent).toContain('Updated photo.jpg'));
+    expect(page.share).toBe('Photos');
+    expect(page.total).toBe(1);
+    expect(get).toHaveBeenCalledTimes(calls);
   });
 
   it('discards an old page while filters are changing and keeps Fix all disabled', async () => {

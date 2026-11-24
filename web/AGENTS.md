@@ -18,9 +18,13 @@ Work from `web/`. `src/api/generated/` is written by the Rust build (ts-rs): nev
 - One component per file; tag = file name (`ism-foo.ts` defines `<ism-foo>`); test beside it.
 
 ## Pages
-- Every admin page extends `IsmPage` (`src/base/ism-page.ts`): implement `load()`, set
-  `reloadOn` to the SSE change types that should refresh it, render through `frame()`, and run
+- Every admin page extends `IsmPage` (`src/base/ism-page.ts`): implement `load()` with `this.data`
+  for lifecycle-scoped WebSocket snapshot reads, render through `frame()`, and run
   mutations through `act(key, fn, successMessage)` so busy state, toasts and 401 handling are shared.
+- Live updates carry data over `/api/admin/live`; add read routes and event relevance in
+  `crates/ism-server/src/routes/live.rs` and `admin::live_reads`/`activity::live_reads`.
+  HTTP is for initial standalone loads, explicit reloads, mutations and media; live failures
+  retain stale data and report the connection error, without polling or notification-driven GETs.
 - The shell (`src/app/ism-app.ts`) owns the `<h1>`; pages use `<h2>`. Add pages to
   `src/app/routes.ts`.
 - Endpoints live in `src/api/admin.ts`. File changes (restore, purge, moves) go through

@@ -70,12 +70,6 @@ export class IsmSyncPage extends IsmPage {
   declare offset: number;
   declare progress: SyncProgress | undefined;
   declare warnings: string[];
-  private refreshTimer: number | undefined;
-  protected override reloadOn = [
-    'sync_changed',
-    'operation_updated',
-    'operation_committed',
-  ] as const;
   private overrideDialog = createRef<HTMLDialogElement>();
   private settingsDialog = createRef<HTMLDialogElement>();
   private detail = createRef<IsmSyncDetail>();
@@ -99,34 +93,21 @@ export class IsmSyncPage extends IsmPage {
     this.warnings = [];
   }
 
-  override connectedCallback() {
-    super.connectedCallback();
-    this.refreshTimer = window.setInterval(() => {
-      if (!document.hidden) void this.reload();
-    }, 5000);
-  }
-
-  override disconnectedCallback() {
-    window.clearInterval(this.refreshTimer);
-    this.refreshTimer = undefined;
-    super.disconnectedCallback();
-  }
-
   protected override async load() {
     const { view, limit, offset } = this;
     const [status, schedule, overrides, shares, peers, page] = await Promise.all([
-      admin.sync().catch((error: unknown) => {
+      this.data.sync().catch((error: unknown) => {
         if (isApiError(error) && error.code === 'invalid_schedule') return undefined;
         throw error;
       }),
-      admin.schedule().catch((error: unknown) => {
+      this.data.schedule().catch((error: unknown) => {
         if (isApiError(error) && error.code === 'invalid_schedule') return undefined;
         throw error;
       }),
-      admin.overrides(),
-      admin.shares(),
-      admin.peers(),
-      admin.syncPage(view === 'attention' ? 'active' : view, limit, offset),
+      this.data.overrides(),
+      this.data.shares(),
+      this.data.peers(),
+      this.data.syncPage(view === 'attention' ? 'active' : view, limit, offset),
     ]);
     this.status = status;
     this.scheduleInvalid = !schedule;

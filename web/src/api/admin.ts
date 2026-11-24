@@ -1,4 +1,4 @@
-import { api } from '@/api/client';
+import { type ApiClient, api } from '@/api/client';
 import type { AccountInput } from '@/api/generated/AccountInput';
 import type { AccountView } from '@/api/generated/AccountView';
 import type { AttentionSnapshot } from '@/api/generated/AttentionSnapshot';
@@ -56,145 +56,159 @@ export interface RecoveryFilters {
 }
 
 /** Typed wrappers over the administration API. */
-export const admin = {
-  backgroundActivity: (limit = 25, offset = 0) =>
-    api.get<BackgroundActivityPage>(`${A}/operations/background`, { query: { limit, offset } }),
-  setup: (body: { username: string; password: string; instance_name: string }) =>
-    api.post<void>(`${A}/setup`, { body }),
-  login: (body: { username: string; password: string }) => api.post<void>(`${A}/login`, { body }),
-  overview: () => api.get<Overview>(`${A}/overview`),
-  attention: () => api.get<AttentionSnapshot>(`${A}/attention`),
-  settings: () => api.get<SettingsView>(`${A}/settings`),
-  saveSettings: (body: SettingsInput) => api.put<SettingsView>(`${A}/settings`, { body }),
+export function createAdmin(read: Pick<ApiClient, 'get'> = api) {
+  return {
+    backgroundActivity: (limit = 25, offset = 0) =>
+      read.get<BackgroundActivityPage>(`${A}/operations/background`, { query: { limit, offset } }),
+    setup: (body: { username: string; password: string; instance_name: string }) =>
+      api.post<void>(`${A}/setup`, { body }),
+    login: (body: { username: string; password: string }) => api.post<void>(`${A}/login`, { body }),
+    overview: () => read.get<Overview>(`${A}/overview`),
+    attention: () => read.get<AttentionSnapshot>(`${A}/attention`),
+    settings: () => read.get<SettingsView>(`${A}/settings`),
+    saveSettings: (body: SettingsInput) => api.put<SettingsView>(`${A}/settings`, { body }),
 
-  servers: () => api.get<ImmichServerView[]>(`${A}/servers`),
-  createServer: (body: ImmichServerInput) => api.post<ImmichServerView>(`${A}/servers`, { body }),
-  updateServer: (id: string, body: ImmichServerInput) =>
-    api.put<ImmichServerView>(`${A}/servers/${enc(id)}`, { body }),
-  deleteServer: (id: string) => api.delete<void>(`${A}/servers/${enc(id)}`),
-  checkServer: (id: string) => api.post<ImmichServerView>(`${A}/servers/${enc(id)}/check`),
-  refreshLibraries: (id: string) =>
-    api.post<{ libraries: number }>(`${A}/servers/${enc(id)}/libraries/refresh`),
-  retryMaintenance: (id: string) => api.post<void>(`${A}/servers/${enc(id)}/maintenance/retry`),
-  resolveMaintenance: (id: string) => api.post<void>(`${A}/servers/${enc(id)}/maintenance/resolve`),
-  /** Turns Immich's file watcher and scheduled scan off again and clears the drift block. */
-  reapplyImmichSettings: (id: string) =>
-    api.post<void>(`${A}/servers/${enc(id)}/maintenance/reapply`),
+    servers: () => read.get<ImmichServerView[]>(`${A}/servers`),
+    createServer: (body: ImmichServerInput) => api.post<ImmichServerView>(`${A}/servers`, { body }),
+    updateServer: (id: string, body: ImmichServerInput) =>
+      api.put<ImmichServerView>(`${A}/servers/${enc(id)}`, { body }),
+    deleteServer: (id: string) => api.delete<void>(`${A}/servers/${enc(id)}`),
+    checkServer: (id: string) => api.post<ImmichServerView>(`${A}/servers/${enc(id)}/check`),
+    refreshLibraries: (id: string) =>
+      api.post<{ libraries: number }>(`${A}/servers/${enc(id)}/libraries/refresh`),
+    retryMaintenance: (id: string) => api.post<void>(`${A}/servers/${enc(id)}/maintenance/retry`),
+    resolveMaintenance: (id: string) =>
+      api.post<void>(`${A}/servers/${enc(id)}/maintenance/resolve`),
+    /** Turns Immich's file watcher and scheduled scan off again and clears the drift block. */
+    reapplyImmichSettings: (id: string) =>
+      api.post<void>(`${A}/servers/${enc(id)}/maintenance/reapply`),
 
-  accounts: () => api.get<AccountView[]>(`${A}/accounts`),
-  createAccount: (body: AccountInput) => api.post<AccountView>(`${A}/accounts`, { body }),
-  deleteAccount: (id: string) => api.delete<void>(`${A}/accounts/${enc(id)}`),
-  libraries: () => api.get<LibraryView[]>(`${A}/libraries`),
+    accounts: () => read.get<AccountView[]>(`${A}/accounts`),
+    createAccount: (body: AccountInput) => api.post<AccountView>(`${A}/accounts`, { body }),
+    deleteAccount: (id: string) => api.delete<void>(`${A}/accounts/${enc(id)}`),
+    libraries: () => read.get<LibraryView[]>(`${A}/libraries`),
 
-  mounts: (path?: string) => api.get<MountView[]>(`${A}/mounts`, { query: { path } }),
-  mappings: () => api.get<MappingView[]>(`${A}/mappings`),
-  createMapping: (body: MappingInput) => api.post<MappingView>(`${A}/mappings`, { body }),
-  updateMapping: (rootId: string, body: MappingInput) =>
-    api.put<MappingView>(`${A}/mappings/${enc(rootId)}`, { body }),
-  deleteMapping: (rootId: string) => api.delete<void>(`${A}/mappings/${enc(rootId)}`),
-  setMappingWatch: (rootId: string, body: WatchSettingsInput) =>
-    api.put<MappingView>(`${A}/mappings/${enc(rootId)}/watch`, { body }),
-  /** Forgets the change-detection snapshot after a pause the administrator checked. */
-  resetMappingWatch: (rootId: string) =>
-    api.post<MappingView>(`${A}/mappings/${enc(rootId)}/watch/reset`),
+    mounts: (path?: string) => read.get<MountView[]>(`${A}/mounts`, { query: { path } }),
+    mappings: () => read.get<MappingView[]>(`${A}/mappings`),
+    createMapping: (body: MappingInput) => api.post<MappingView>(`${A}/mappings`, { body }),
+    updateMapping: (rootId: string, body: MappingInput) =>
+      api.put<MappingView>(`${A}/mappings/${enc(rootId)}`, { body }),
+    deleteMapping: (rootId: string) => api.delete<void>(`${A}/mappings/${enc(rootId)}`),
+    setMappingWatch: (rootId: string, body: WatchSettingsInput) =>
+      api.put<MappingView>(`${A}/mappings/${enc(rootId)}/watch`, { body }),
+    /** Forgets the change-detection snapshot after a pause the administrator checked. */
+    resetMappingWatch: (rootId: string) =>
+      api.post<MappingView>(`${A}/mappings/${enc(rootId)}/watch/reset`),
 
-  tokens: () => api.get<ClientTokenView[]>(`${A}/tokens`),
-  createToken: (body: ClientTokenInput) => api.post<ClientTokenCreated>(`${A}/tokens`, { body }),
-  revokeToken: (id: string) => api.delete<void>(`${A}/tokens/${enc(id)}`),
+    tokens: () => read.get<ClientTokenView[]>(`${A}/tokens`),
+    createToken: (body: ClientTokenInput) => api.post<ClientTokenCreated>(`${A}/tokens`, { body }),
+    revokeToken: (id: string) => api.delete<void>(`${A}/tokens/${enc(id)}`),
 
-  operations: (status?: string) =>
-    api.get<Operation[]>(`${A}/operations`, { query: { status, limit: 200 } }),
-  operation: (id: string) => api.get<Operation>(`${A}/operations/${enc(id)}`),
-  cancelOperation: (id: string) => api.post<Operation>(`${A}/operations/${enc(id)}/cancel`),
-  resolveOperation: (id: string) => api.post<void>(`${A}/operations/${enc(id)}/resolve`),
-  recheckOperation: (id: string) => api.post<void>(`${A}/operations/${enc(id)}/recheck`),
-  retryOperationPublication: (id: string) =>
-    api.post<void>(`${A}/operations/${enc(id)}/retry-publication`),
-  operationPage: (status = '', limit = 250, offset = 0) =>
-    api.get<OperationPage>(`${A}/operations/page`, { query: { status, limit, offset } }),
-  operationDetail: (id: string) => api.get<OperationDetail>(`${A}/operations/${enc(id)}/detail`),
-  markOperationHandled: (id: string) => api.post<void>(`${A}/operations/${enc(id)}/handled`),
-  recoveryPage: (limit = 250, offset = 0, filters?: RecoveryFilters) =>
-    api.get<RecoveryPage>(`${A}/recovery/page`, { query: { limit, offset, ...filters } }),
-  fixIssues: (body: RecoveryBatchInput, filters?: RecoveryFilters) =>
-    api.post<RecoveryBatchResult>(`${A}/recovery`, {
-      body,
-      ...(filters ? { query: { ...filters } } : {}),
-    }),
-  decideIssues: (body: RecoveryDecisionInput) =>
-    api.post<RecoveryBatchResult>(`${A}/recovery/decisions`, { body }),
-  recoveryVersions: (target: RecoveryTarget) =>
-    api.get<RecoveryVersions>(`${A}/recovery/versions`, {
-      query: {
+    operations: (status?: string) =>
+      read.get<Operation[]>(`${A}/operations`, { query: { status, limit: 200 } }),
+    operation: (id: string) => read.get<Operation>(`${A}/operations/${enc(id)}`),
+    cancelOperation: (id: string) => api.post<Operation>(`${A}/operations/${enc(id)}/cancel`),
+    resolveOperation: (id: string) => api.post<void>(`${A}/operations/${enc(id)}/resolve`),
+    recheckOperation: (id: string) => api.post<void>(`${A}/operations/${enc(id)}/recheck`),
+    retryOperationPublication: (id: string) =>
+      api.post<void>(`${A}/operations/${enc(id)}/retry-publication`),
+    operationPage: (status = '', limit = 250, offset = 0) =>
+      read.get<OperationPage>(`${A}/operations/page`, { query: { status, limit, offset } }),
+    operationDetail: (id: string) => read.get<OperationDetail>(`${A}/operations/${enc(id)}/detail`),
+    markOperationHandled: (id: string) => api.post<void>(`${A}/operations/${enc(id)}/handled`),
+    recoveryPage: (limit = 250, offset = 0, filters?: RecoveryFilters) =>
+      read.get<RecoveryPage>(`${A}/recovery/page`, { query: { limit, offset, ...filters } }),
+    fixIssues: (body: RecoveryBatchInput, filters?: RecoveryFilters) =>
+      api.post<RecoveryBatchResult>(`${A}/recovery`, {
+        body,
+        ...(filters ? { query: { ...filters } } : {}),
+      }),
+    decideIssues: (body: RecoveryDecisionInput) =>
+      api.post<RecoveryBatchResult>(`${A}/recovery/decisions`, { body }),
+    recoveryVersions: (target: RecoveryTarget) =>
+      read.get<RecoveryVersions>(`${A}/recovery/versions`, {
+        query: {
+          kind: target.kind,
+          id: target.id,
+          ...(target.peer_id ? { peer_id: target.peer_id } : {}),
+        },
+      }),
+    recoveryPreview: (target: RecoveryTarget, revision: string, path: string, source: boolean) =>
+      `${A}/recovery/preview?${new URLSearchParams({
         kind: target.kind,
         id: target.id,
+        revision,
+        path,
+        source: String(source),
         ...(target.peer_id ? { peer_id: target.peer_id } : {}),
-      },
-    }),
-  recoveryVersionsBatch: (targets: readonly RecoveryTarget[]) =>
-    api.post<RecoveryVersionsBatch>(`${A}/recovery/versions/batch`, {
-      body: { targets, all: false, resolution: null },
-    }),
-  recoveryPreview: (target: RecoveryTarget, revision: string, path: string, source: boolean) =>
-    `${A}/recovery/preview?${new URLSearchParams({
-      kind: target.kind,
-      id: target.id,
-      revision,
-      path,
-      source: String(source),
-      ...(target.peer_id ? { peer_id: target.peer_id } : {}),
-    })}`,
-  /** Runs managed actions as the administrator (same endpoint as the client API). */
-  submit: (label: string, actions: OperationAction[]) =>
-    api.post<OperationAccepted>('/api/v1/operations', {
-      body: { label, actions, idempotency_key: crypto.randomUUID() },
-    }),
+      })}`,
+    recoveryVersionsBatch: (targets: readonly RecoveryTarget[]) =>
+      api.post<RecoveryVersionsBatch>(`${A}/recovery/versions/batch`, {
+        body: { targets, all: false, resolution: null },
+      }),
+    /** Runs managed actions as the administrator (same endpoint as the client API). */
+    submit: (label: string, actions: OperationAction[]) =>
+      api.post<OperationAccepted>('/api/v1/operations', {
+        body: { label, actions, idempotency_key: crypto.randomUUID() },
+      }),
 
-  trash: (rootId?: string) => api.get<TrashEntry[]>(`${A}/trash`, { query: { root_id: rootId } }),
+    trash: (rootId?: string) =>
+      read.get<TrashEntry[]>(`${A}/trash`, { query: { root_id: rootId } }),
 
-  peers: () => api.get<PeerView[]>(`${A}/peers`),
-  invite: () => api.post<PeerInvite>(`${A}/peers/invite`),
-  acceptInvite: (body: PeerAcceptInput) => api.post<PeerView>(`${A}/peers/accept`, { body }),
-  deletePeer: (id: string) => api.delete<void>(`${A}/peers/${enc(id)}`),
-  retryPeer: (id: string) => api.post<void>(`${A}/peers/${enc(id)}/retry`),
-  shares: () => api.get<ShareView[]>(`${A}/shares`),
-  createShare: (body: ShareInput) => api.post<ShareView>(`${A}/shares`, { body }),
-  updateShare: (id: string, body: ShareInput) =>
-    api.put<ShareView>(`${A}/shares/${enc(id)}`, { body }),
-  deleteShare: (id: string) => api.delete<void>(`${A}/shares/${enc(id)}`),
+    peers: () => read.get<PeerView[]>(`${A}/peers`),
+    invite: () => api.post<PeerInvite>(`${A}/peers/invite`),
+    acceptInvite: (body: PeerAcceptInput) => api.post<PeerView>(`${A}/peers/accept`, { body }),
+    deletePeer: (id: string) => api.delete<void>(`${A}/peers/${enc(id)}`),
+    retryPeer: (id: string) => api.post<void>(`${A}/peers/${enc(id)}/retry`),
+    shares: () => read.get<ShareView[]>(`${A}/shares`),
+    createShare: (body: ShareInput) => api.post<ShareView>(`${A}/shares`, { body }),
+    updateShare: (id: string, body: ShareInput) =>
+      api.put<ShareView>(`${A}/shares/${enc(id)}`, { body }),
+    deleteShare: (id: string) => api.delete<void>(`${A}/shares/${enc(id)}`),
 
-  sync: () => api.get<SyncStatus>(`${A}/sync`, { query: { summary: true } }),
-  syncPage: (status = 'active', limit = 250, offset = 0) =>
-    api.get<SyncPage>(`${A}/sync/page`, { query: { status, limit, offset } }),
-  syncTransfer: (id: string) => api.get<SyncPage>(`${A}/sync/page`, { query: { id, limit: 1 } }),
-  syncFiles: (share: string, path: string, peerId?: string) =>
-    api.get<SyncFileDetails>(`${A}/sync/files`, { query: { share, path, peer_id: peerId } }),
-  syncThumbnail: (share: string, path: string, peerId?: string) =>
-    `${A}/sync/thumbnail?${new URLSearchParams({ share, path, ...(peerId ? { peer_id: peerId } : {}) })}`,
-  schedule: () => api.get<ScheduleView>(`${A}/sync/schedule`),
-  saveSchedule: (body: ScheduleView) => api.put<ScheduleView>(`${A}/sync/schedule`, { body }),
-  overrides: () => api.get<OverrideView[]>(`${A}/sync/overrides`),
-  createOverride: (body: OverrideInput) => api.post<OverrideView>(`${A}/sync/overrides`, { body }),
-  revokeOverride: (id: string) => api.delete<void>(`${A}/sync/overrides/${enc(id)}`),
-  retryTransfer: (id: string) => api.post<void>(`${A}/sync/transfers/${enc(id)}/retry`),
-  cancelTransfer: (id: string) => api.post<void>(`${A}/sync/transfers/${enc(id)}/cancel`),
-  readdSyncOperation: (id: string, index: number) =>
-    api.post<void>(`${A}/sync/operations/${enc(id)}/${index}/readd`),
+    sync: () => read.get<SyncStatus>(`${A}/sync`, { query: { summary: true } }),
+    syncPage: (status = 'active', limit = 250, offset = 0) =>
+      read.get<SyncPage>(`${A}/sync/page`, { query: { status, limit, offset } }),
+    syncTransfer: (id: string) => read.get<SyncPage>(`${A}/sync/page`, { query: { id, limit: 1 } }),
+    syncFiles: (share: string, path: string, peerId?: string) =>
+      read.get<SyncFileDetails>(`${A}/sync/files`, { query: { share, path, peer_id: peerId } }),
+    syncThumbnail: (share: string, path: string, peerId?: string) =>
+      `${A}/sync/thumbnail?${new URLSearchParams({ share, path, ...(peerId ? { peer_id: peerId } : {}) })}`,
+    schedule: () => read.get<ScheduleView>(`${A}/sync/schedule`),
+    saveSchedule: (body: ScheduleView) => api.put<ScheduleView>(`${A}/sync/schedule`, { body }),
+    overrides: () => read.get<OverrideView[]>(`${A}/sync/overrides`),
+    createOverride: (body: OverrideInput) =>
+      api.post<OverrideView>(`${A}/sync/overrides`, { body }),
+    revokeOverride: (id: string) => api.delete<void>(`${A}/sync/overrides/${enc(id)}`),
+    retryTransfer: (id: string) => api.post<void>(`${A}/sync/transfers/${enc(id)}/retry`),
+    cancelTransfer: (id: string) => api.post<void>(`${A}/sync/transfers/${enc(id)}/cancel`),
+    readdSyncOperation: (id: string, index: number) =>
+      api.post<void>(`${A}/sync/operations/${enc(id)}/${index}/readd`),
 
-  conflicts: (resolvedOnly = false, limit = 50, offset = 0, share = '', folder = '', status = '') =>
-    api.get<ConflictPage>(`${A}/conflicts/page`, {
-      query: {
-        resolved_only: resolvedOnly,
-        limit,
-        offset,
-        share,
-        folder,
-        ...(status ? { status } : {}),
-      },
-    }),
-  resolveConflict: (id: string, resolution: ConflictResolution) =>
-    api.post<void>(`${A}/conflicts/${enc(id)}/resolve`, { body: { resolution } }),
+    conflicts: (
+      resolvedOnly = false,
+      limit = 50,
+      offset = 0,
+      share = '',
+      folder = '',
+      status = '',
+    ) =>
+      read.get<ConflictPage>(`${A}/conflicts/page`, {
+        query: {
+          resolved_only: resolvedOnly,
+          limit,
+          offset,
+          share,
+          folder,
+          ...(status ? { status } : {}),
+        },
+      }),
+    resolveConflict: (id: string, resolution: ConflictResolution) =>
+      api.post<void>(`${A}/conflicts/${enc(id)}/resolve`, { body: { resolution } }),
 
-  audit: (before?: number) =>
-    api.get<AuditEntry[]>(`${A}/audit`, { query: { before, limit: 200 } }),
-};
+    audit: (before?: number) =>
+      read.get<AuditEntry[]>(`${A}/audit`, { query: { before, limit: 200 } }),
+  };
+}
+
+export const admin = createAdmin();
