@@ -165,8 +165,14 @@ async fn request_choice(
         .evidence_generation
         .checked_add(1)
         .ok_or_else(|| unverified("restoration evidence generation exhausted"))?;
+    let local = if plan.conflict_id.is_none() {
+        let row = peers::row(state, &share.id, &plan.target).await?;
+        Some(peers::side(&state.instance_name().await, row.as_ref()))
+    } else {
+        None
+    };
+    let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
     if let Some(id) = &plan.conflict_id {
-        let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
         let (status, recovery_state): (String, Option<String>) = sqlx::query_as(
             "SELECT c.status,r.state FROM conflicts c
              LEFT JOIN sync_recovery r ON r.kind='conflict' AND r.target_id=c.id WHERE c.id=?",
@@ -208,13 +214,8 @@ async fn request_choice(
         if updated.rows_affected() != 1 {
             return Err(unverified("restoration disappeared while reopening"));
         }
-        tx.commit().await?;
     } else {
-        let local = peers::row(state, &share.id, &plan.target).await?;
-        let local = peers::side(&state.instance_name().await, local.as_ref());
-        let remote = context(plan, share.clone()).remote;
         let id = crate::crypto::new_id("cf");
-        let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
         let active: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM conflicts WHERE share_id=? AND rel_path=? AND status IN ('open','resolving'))",
         )
@@ -227,20 +228,26 @@ async fn request_choice(
                 "an existing conflict must be reviewed before restoration",
             ));
         }
-        sqlx::query(
-            "INSERT INTO conflicts(id,share_id,rel_path,kind,detail,local_json,remote_json,remote_vv_json,peer_id,status,created_at,remote_from)
-             VALUES(?,?,?,'folder_restore','Choose between the verified retained restoration and current peer files',?,?,?,?,'open',?,?)",
+        let input = peers::ConflictInput {
+            share: &share,
+            rel: &plan.target,
+            kind: "folder_restore",
+            detail: "Choose between the verified retained restoration and current peer files"
+                .into(),
+            remote: context(plan, share.clone()).remote,
+            remote_vv: &current.version,
+            peer_id: &plan.peer_id,
+            from: Some(&plan.source),
+        };
+        peers::write_conflict_in(
+            &mut tx,
+            &id,
+            &input,
+            local
+                .as_ref()
+                .ok_or_else(|| unverified("local conflict evidence is missing"))?,
         )
-        .bind(&id).bind(&plan.share_id).bind(&plan.target)
-        .bind(serde_json::to_string(&local)?).bind(serde_json::to_string(&remote)?)
-        .bind(serde_json::to_string(&current.version)?).bind(&plan.peer_id)
-        .bind(crate::db::now()).bind(&plan.source)
-        .execute(&mut *tx).await?;
-        sqlx::query("DELETE FROM transfers WHERE share_id=? AND rel_path=? AND status='queued'")
-            .bind(&plan.share_id)
-            .bind(&plan.target)
-            .execute(&mut *tx)
-            .await?;
+        .await?;
         plan.conflict_id = Some(id);
         let updated = sqlx::query(
             "UPDATE pending_peer_ops SET vv_json=?,conflict_id=? WHERE operation_id=? AND kind='folder_restore'",
@@ -252,21 +259,6 @@ async fn request_choice(
                 "restoration disappeared while requesting a decision",
             ));
         }
-        sqlx::query(
-            "INSERT OR IGNORE INTO sync_recovery_links(recovery_id,kind,target_id)
-             SELECT id,'conflict',? FROM sync_recovery WHERE kind='operation' AND target_id=?",
-        )
-        .bind(&plan.conflict_id)
-        .bind(&plan.operation_id)
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query(
-            "UPDATE sync_recovery SET state='needs_decision',code='choose_version',
-             detail='Peer tree changed; choose the retained version, current peer version, or both in ISM',updated_at=?
-             WHERE kind='operation' AND target_id=? AND state!='fixed'",
-        )
-        .bind(crate::db::now()).bind(&plan.operation_id).execute(&mut *tx).await?;
-        tx.commit().await?;
     }
     sqlx::query(
         "INSERT OR IGNORE INTO sync_recovery_links(recovery_id,kind,target_id)
@@ -274,7 +266,7 @@ async fn request_choice(
     )
     .bind(&plan.conflict_id)
     .bind(&plan.operation_id)
-    .execute(&state.db)
+    .execute(&mut *tx)
     .await?;
     sqlx::query(
         "UPDATE sync_recovery SET state='needs_decision',code='choose_version',
@@ -283,8 +275,9 @@ async fn request_choice(
     )
     .bind(crate::db::now())
     .bind(&plan.operation_id)
-    .execute(&state.db)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     state.emit(crate::state::ServerEvent::ConflictsChanged);
     Ok(())
 }

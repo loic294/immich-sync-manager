@@ -510,6 +510,18 @@ async fn interrupted_initial_restoration_conflict_is_reassociated_before_resume(
         .execute(&a.state.db)
         .await
         .unwrap();
+    sqlx::query("CREATE TABLE test_recovery_updates(id INTEGER PRIMARY KEY)")
+        .execute(&a.state.db)
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER test_recovery_updates AFTER UPDATE ON sync_recovery
+         WHEN NEW.kind='operation'
+         BEGIN INSERT INTO test_recovery_updates(id) VALUES(NULL); END",
+    )
+    .execute(&a.state.db)
+    .await
+    .unwrap();
     assert_eq!(
         admin::validate_folder_restore(&a.state, &operation)
             .await
@@ -517,6 +529,11 @@ async fn interrupted_initial_restoration_conflict_is_reassociated_before_resume(
             .code(),
         "choose_version"
     );
+    let updates: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM test_recovery_updates")
+        .fetch_one(&a.state.db)
+        .await
+        .unwrap();
+    assert_eq!(updates, 1, "the operation recovery is updated once");
     let conflict: String = sqlx::query_scalar(
         "SELECT id FROM conflicts WHERE kind='folder_restore' AND status='open'",
     )

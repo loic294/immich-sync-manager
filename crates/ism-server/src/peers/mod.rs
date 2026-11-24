@@ -1209,6 +1209,18 @@ pub async fn conflict(state: &AppState, c: ConflictInput<'_>) -> AppResult<()> {
     .fetch_optional(&state.db)
     .await?;
     let id = existing.unwrap_or_else(|| crate::crypto::new_id("cf"));
+    let mut conn = state.db.acquire().await?;
+    write_conflict_in(&mut conn, &id, &c, &local).await?;
+    state.emit(ServerEvent::ConflictsChanged);
+    Ok(())
+}
+
+async fn write_conflict_in(
+    conn: &mut sqlx::SqliteConnection,
+    id: &str,
+    c: &ConflictInput<'_>,
+    local: &ConflictSide,
+) -> AppResult<()> {
     sqlx::query(
         "INSERT INTO conflicts (id, share_id, rel_path, kind, detail, local_json, remote_json, remote_vv_json, peer_id, status, created_at, remote_from)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)
@@ -1216,7 +1228,7 @@ pub async fn conflict(state: &AppState, c: ConflictInput<'_>) -> AppResult<()> {
          remote_json = excluded.remote_json, remote_vv_json = excluded.remote_vv_json, peer_id = excluded.peer_id,
          remote_from = excluded.remote_from",
     )
-    .bind(&id)
+    .bind(id)
     .bind(&c.share.id)
     .bind(c.rel)
     .bind(c.kind)
@@ -1227,15 +1239,14 @@ pub async fn conflict(state: &AppState, c: ConflictInput<'_>) -> AppResult<()> {
     .bind(c.peer_id)
     .bind(db::now())
     .bind(c.from)
-    .execute(&state.db)
+    .execute(&mut *conn)
     .await?;
     // A conflicting path is not transferred until it is resolved.
     sqlx::query("DELETE FROM transfers WHERE share_id = ? AND rel_path = ? AND status = 'queued'")
         .bind(&c.share.id)
         .bind(c.rel)
-        .execute(&state.db)
+        .execute(&mut *conn)
         .await?;
-    state.emit(ServerEvent::ConflictsChanged);
     Ok(())
 }
 
