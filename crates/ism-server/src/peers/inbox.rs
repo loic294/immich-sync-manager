@@ -747,6 +747,18 @@ async fn record_error(state: &AppState, peer_id: &str, seq: i64, error: &str) ->
     Ok(updated.rows_affected() != 0)
 }
 
+/// A retry that passed its checks and is merely waiting must not keep an earlier reason.
+async fn clear_error(state: &AppState, peer_id: &str, seq: i64) -> AppResult<()> {
+    sqlx::query(
+        "UPDATE peer_inbox SET error = NULL WHERE peer_id = ? AND seq = ? AND error IS NOT NULL",
+    )
+    .bind(peer_id)
+    .bind(seq)
+    .execute(&state.db)
+    .await?;
+    Ok(())
+}
+
 async fn replay(
     state: &AppState,
     peer: &net::Peer,
@@ -845,7 +857,13 @@ async fn replay(
             apply_received(state, peer, &all, &event).await
         };
         match result {
-            Ok(done) => applied += usize::from(done),
+            Ok(true) => applied += 1,
+            Ok(false)
+                if status == "awaiting_content"
+                    && !all
+                        .iter()
+                        .any(|share| share.name == event.share && share.includes(&peer.id)) => {}
+            Ok(false) => clear_error(state, &peer.id, seq).await?,
             Err(error) => {
                 if record_error(state, &peer.id, seq, error.message()).await? {
                     tracing::warn!(peer = %peer.name, path = %event.data.path, "peer effect deferred: {}", error.message());

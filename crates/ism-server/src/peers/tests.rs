@@ -1665,6 +1665,77 @@ async fn repeated_peer_inbox_errors_are_recorded_and_warned_only_on_change() {
 }
 
 #[tokio::test]
+async fn content_wait_drops_a_footprint_error_once_the_footprint_is_released() {
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    write_old(&a.shared.join("photo.jpg"), b"remote photo");
+    scan(&a).await;
+    let peer = super::net::peers(&b.state).await.unwrap().remove(0);
+    super::pull(&b.state, &peer).await.unwrap();
+    let row = || {
+        sqlx::query_as::<_, (String, Option<String>)>(
+            "SELECT status, error FROM peer_inbox WHERE peer_id = ? AND status != 'done'",
+        )
+        .bind(&peer.id)
+        .fetch_one(&b.state.db)
+    };
+    assert_eq!(row().await.unwrap(), ("awaiting_content".into(), None));
+
+    sqlx::query(
+        "INSERT INTO operations (id,idempotency_key,principal,source,request_json,status,created_at)
+         VALUES ('overlap','overlap','admin:test','admin',
+           '{\"actions\":[{\"target\":{\"root_id\":\"photos\",\"path\":\"shared/photo.xmp\"}}]}',
+           'failed',?)",
+    )
+    .bind(crate::db::now())
+    .execute(&b.state.db)
+    .await
+    .unwrap();
+    assert!(
+        super::pull(&b.state, &peer)
+            .await
+            .unwrap_err()
+            .contains("unresolved managed operations")
+    );
+    assert_eq!(
+        row().await.unwrap(),
+        (
+            "awaiting_content".into(),
+            Some("peer footprint waits for unresolved managed operations".into())
+        )
+    );
+
+    sqlx::query("UPDATE shares SET enabled = 0 WHERE name = 'Family'")
+        .execute(&b.state.db)
+        .await
+        .unwrap();
+    assert_eq!(super::pull(&b.state, &peer).await.unwrap(), 0);
+    assert_eq!(
+        row().await.unwrap(),
+        (
+            "awaiting_content".into(),
+            Some("peer footprint waits for unresolved managed operations".into())
+        ),
+        "a disabled share cannot verify that the earlier error has cleared"
+    );
+    sqlx::query("UPDATE shares SET enabled = 1 WHERE name = 'Family'")
+        .execute(&b.state.db)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE operations SET recovery_resolved = 1 WHERE id = 'overlap'")
+        .execute(&b.state.db)
+        .await
+        .unwrap();
+    assert_eq!(super::pull(&b.state, &peer).await.unwrap(), 0);
+    assert_eq!(
+        row().await.unwrap(),
+        ("awaiting_content".into(), None),
+        "a row now waiting only for content must not keep the released footprint reason"
+    );
+}
+
+#[tokio::test]
 async fn recovery_batch_preserves_decisions_and_never_dismisses_unverified_work() {
     let (mut a, mut b) = pair().await;
     stop_workers(&mut a).await;
