@@ -38,12 +38,13 @@ pub(super) use move_decisions::{
 };
 pub(super) use move_restore::validate_current_manifest as validate_folder_restore;
 pub(crate) use move_restore::{
-    VerifiedFolderRestore, verified_folder_restore, verified_restore_upload,
-    verify_restored_folder_source,
+    VerifiedFolderRestore, restoration_plan_matches_locked, verified_folder_restore,
+    verified_restore_upload, verify_restored_folder_source,
 };
 #[cfg(test)]
 pub(super) use move_restore::{
     cleanup_snapshot, finish_generation_before_cleanup, finish_snapshot, snapshot_restoration,
+    stale_generation_probes, stale_reopen,
 };
 pub(super) use move_restore::{process as process_folder_restorations, restore_missing_folder};
 pub(super) use move_restore::{
@@ -1558,6 +1559,34 @@ pub(super) async fn resolve_reviewed(
     resolution: ConflictResolution,
     revision: Option<&str>,
 ) -> AppResult<()> {
+    resolve_reviewed_inner(state, actor, id, resolution, revision, None).await
+}
+
+pub(super) async fn resolve_restoration_child(
+    state: &AppState,
+    id: &str,
+    resolution: ConflictResolution,
+    expected_plan: &str,
+) -> AppResult<()> {
+    resolve_reviewed_inner(
+        state,
+        "restoration",
+        id,
+        resolution,
+        None,
+        Some(expected_plan),
+    )
+    .await
+}
+
+async fn resolve_reviewed_inner(
+    state: &AppState,
+    actor: &str,
+    id: &str,
+    resolution: ConflictResolution,
+    revision: Option<&str>,
+    expected_plan: Option<&str>,
+) -> AppResult<()> {
     if resolution == ConflictResolution::Skip {
         return Err(AppError::conflict(
             "recovery_not_exhausted",
@@ -1589,6 +1618,14 @@ pub(super) async fn resolve_reviewed(
         None
     };
     let _operation_guard = state.replication_operation_lock.lock().await;
+    if let Some(expected_plan) = expected_plan
+        && !move_restore::child_is_current_locked(state, expected_plan, id).await?
+    {
+        return Err(AppError::conflict(
+            "recovery_evidence_changed",
+            "the parent restoration changed before its child decision",
+        ));
+    }
     let mut c = load_conflict(state, id).await?;
     let reviewed_local = if let Some(revision) = revision {
         let moved_files: Vec<_> = evidence

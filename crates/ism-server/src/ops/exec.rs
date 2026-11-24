@@ -1589,12 +1589,38 @@ async fn create_folder_restore_directories(
 }
 
 /// Restores one authenticated prerequisite inside its original operation's maintenance window.
+#[cfg(test)]
 pub(crate) async fn recover_folder_prerequisite_upload(
     state: &AppState,
     id: &str,
     upload_id: &str,
 ) -> AppResult<bool> {
+    recover_folder_prerequisite_upload_inner(state, id, upload_id, None).await
+}
+
+pub(crate) async fn recover_folder_prerequisite_upload_for_plan(
+    state: &AppState,
+    id: &str,
+    upload_id: &str,
+    expected_plan: &str,
+) -> AppResult<bool> {
+    recover_folder_prerequisite_upload_inner(state, id, upload_id, Some(expected_plan)).await
+}
+
+async fn recover_folder_prerequisite_upload_inner(
+    state: &AppState,
+    id: &str,
+    upload_id: &str,
+    expected_plan: Option<&str>,
+) -> AppResult<bool> {
     let _replication_guard = state.replication_operation_lock.lock().await;
+    if let Some(expected_plan) = expected_plan
+        && !crate::peers::admin::restoration_plan_matches_locked(state, id, expected_plan).await?
+    {
+        return Err(recovery_changed(
+            "the restoration changed before recovering its prerequisite",
+        ));
+    }
     let _upload_guard = state.lock_upload(upload_id).await;
     if upload_id.is_empty()
         || !upload_id

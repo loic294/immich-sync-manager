@@ -536,6 +536,9 @@ async fn resolved_restoration_reopens_with_a_fresh_reviewed_decision_before_clea
     assert_eq!(retry.items[0].state, RecoveryState::Queued);
     super::super::recovery::tick(&a.state).await.unwrap();
     assert_eq!(status(&a, &conflict).await, "resolving");
+    let old_child_snapshot = admin::snapshot_restoration(&a.state, &operation)
+        .await
+        .unwrap();
     assert!(
         crate::ops::exec::resume_recovered_folder_operation(&a.state, &operation)
             .await
@@ -594,6 +597,17 @@ async fn resolved_restoration_reopens_with_a_fresh_reviewed_decision_before_clea
     reboot(&mut a).await;
     admin::process_folder_restorations(&a.state).await.unwrap();
     assert_eq!(status(&a, &conflict).await, "open");
+    let reopened_snapshot = admin::snapshot_restoration(&a.state, &operation)
+        .await
+        .unwrap();
+    admin::stale_reopen(&a.state, &old_snapshot).await.unwrap();
+    assert_eq!(
+        admin::snapshot_restoration(&a.state, &operation)
+            .await
+            .unwrap(),
+        reopened_snapshot,
+        "old evidence must not reopen over the refreshed generation"
+    );
     let second = super::super::versions::get(&a.state, &target)
         .await
         .unwrap();
@@ -641,6 +655,36 @@ async fn resolved_restoration_reopens_with_a_fresh_reviewed_decision_before_clea
         result.items[0]
     );
     super::super::recovery::tick(&a.state).await.unwrap();
+    assert_eq!(status(&a, &conflict).await, "resolving");
+    let new_snapshot = admin::snapshot_restoration(&a.state, &operation)
+        .await
+        .unwrap();
+    let children_before: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM conflicts WHERE detail='Explicit approved folder restoration generation'",
+    )
+    .fetch_one(&a.state.db)
+    .await
+    .unwrap();
+    admin::stale_generation_probes(&a.state, &old_child_snapshot)
+        .await
+        .unwrap();
+    let children_after: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM conflicts WHERE detail='Explicit approved folder restoration generation'",
+    )
+    .fetch_one(&a.state.db)
+    .await
+    .unwrap();
+    assert_eq!(
+        children_after, children_before,
+        "no obsolete child may be inserted"
+    );
+    assert_eq!(
+        admin::snapshot_restoration(&a.state, &operation)
+            .await
+            .unwrap(),
+        new_snapshot,
+        "stale work must not replace the new generation"
+    );
     assert_eq!(status(&a, &conflict).await, "resolving");
     assert!(
         !admin::finish_snapshot(&a.state, &old_snapshot)

@@ -29,6 +29,8 @@ struct Restoration {
     conflict_id: Option<String>,
     #[serde(default)]
     generations: Vec<Generation>,
+    #[serde(default)]
+    evidence_generation: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -141,15 +143,28 @@ async fn request_choice(
             .fetch_one(&state.db)
             .await?;
     if !completed {
+        let expected_plan = serde_json::to_string(&plan)?;
         for upload in plan.uploads.values() {
-            crate::ops::exec::recover_folder_prerequisite_upload(state, &plan.operation_id, upload)
-                .await?;
+            crate::ops::exec::recover_folder_prerequisite_upload_for_plan(
+                state,
+                &plan.operation_id,
+                upload,
+                &expected_plan,
+            )
+            .await?;
         }
     }
     let _guard = state.replication_operation_lock.lock().await;
-    *plan = load(state, &plan.operation_id)
+    let latest = load(state, &plan.operation_id)
         .await?
         .ok_or_else(|| unverified("restoration disappeared while refreshing evidence"))?;
+    if serde_json::to_value(&latest)? != serde_json::to_value(&*plan)? {
+        return Err(AppError::conflict(
+            "recovery_evidence_changed",
+            "the restoration changed while evidence was being refreshed",
+        ));
+    }
+    *plan = latest;
     if !force
         && plan.generations.last().is_some_and(|generation| {
             generation.remote.location == current.location
@@ -158,6 +173,10 @@ async fn request_choice(
     {
         return Ok(());
     }
+    plan.evidence_generation = plan
+        .evidence_generation
+        .checked_add(1)
+        .ok_or_else(|| unverified("restoration evidence generation exhausted"))?;
     if let Some(id) = &plan.conflict_id {
         let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
         let (status, recovery_state): (String, Option<String>) = sqlx::query_as(
@@ -191,6 +210,16 @@ async fn request_choice(
             .execute(&mut *tx)
             .await?;
         }
+        let updated = sqlx::query(
+            "UPDATE pending_peer_ops SET vv_json=? WHERE operation_id=? AND kind='folder_restore'",
+        )
+        .bind(serde_json::to_string(&plan)?)
+        .bind(format!("folder-restore:{}", plan.operation_id))
+        .execute(&mut *tx)
+        .await?;
+        if updated.rows_affected() != 1 {
+            return Err(unverified("restoration disappeared while reopening"));
+        }
         tx.commit().await?;
     } else {
         peers::conflict(
@@ -215,8 +244,8 @@ async fn request_choice(
         .bind(&plan.target)
         .fetch_optional(&state.db)
         .await?;
+        save(state, plan).await?;
     }
-    save(state, plan).await?;
     sqlx::query(
         "INSERT OR IGNORE INTO sync_recovery_links(recovery_id,kind,target_id)
          SELECT id,'conflict',? FROM sync_recovery WHERE kind='operation' AND target_id=?",
@@ -279,9 +308,16 @@ pub(in crate::peers) async fn approve(
         )
         .await?;
     }
-    let mut plan = load(state, &plan.operation_id)
+    let latest = load(state, &plan.operation_id)
         .await?
         .ok_or_else(|| unverified("restoration disappeared during approval"))?;
+    if serde_json::to_value(&latest)? != serde_json::to_value(&plan)? {
+        return Err(AppError::conflict(
+            "recovery_evidence_changed",
+            "the restoration changed while the decision was being verified",
+        ));
+    }
+    let mut plan = latest;
     let completed: bool =
         sqlx::query_scalar("SELECT status='completed' FROM operations WHERE id=?")
             .bind(&plan.operation_id)
@@ -395,6 +431,18 @@ async fn load(state: &AppState, id: &str) -> AppResult<Option<Restoration>> {
     .await?;
     raw.map(|raw| serde_json::from_str(&raw).map_err(Into::into))
         .transpose()
+}
+
+pub(crate) async fn restoration_plan_matches_locked(
+    state: &AppState,
+    operation_id: &str,
+    expected: &str,
+) -> AppResult<bool> {
+    let expected: Restoration = serde_json::from_str(expected)?;
+    let Some(current) = load(state, operation_id).await? else {
+        return Ok(false);
+    };
+    Ok(serde_json::to_value(current)? == serde_json::to_value(expected)?)
 }
 
 async fn bound_share(state: &AppState, plan: &Restoration) -> AppResult<Share> {
@@ -678,6 +726,7 @@ pub(in crate::peers) async fn restore_missing_folder(
         uploads: BTreeMap::new(),
         conflict_id: None,
         generations: Vec::new(),
+        evidence_generation: 0,
     };
     bound_share(state, &plan).await?;
     let _guard = state.replication_operation_lock.lock().await;
@@ -855,6 +904,16 @@ pub(in crate::peers) async fn validate_current_manifest(
     if current.location != plan.remote.location {
         // Only authenticated movement changes transport sources; frozen receiver targets and
         // expected bytes stay exactly the same.
+        let _guard = state.replication_operation_lock.lock().await;
+        let latest = load(state, &plan.operation_id)
+            .await?
+            .ok_or_else(|| unverified("restoration disappeared while refreshing its source"))?;
+        if serde_json::to_value(&latest)? != serde_json::to_value(&plan)? {
+            return Err(AppError::conflict(
+                "recovery_evidence_changed",
+                "the restoration changed while its source was being verified",
+            ));
+        }
         plan.remote = current;
         let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
         for file in &plan.remote.files {
@@ -901,15 +960,25 @@ async fn process_one(state: &AppState, plan: &Restoration) -> AppResult<()> {
         .bind(&plan.operation_id)
         .fetch_one(&state.db)
         .await?;
+        let expected_plan = serde_json::to_string(plan)?;
         for upload in plan.uploads.values() {
-            if crate::ops::exec::recover_folder_prerequisite_upload(
+            if crate::ops::exec::recover_folder_prerequisite_upload_for_plan(
                 state,
                 &plan.operation_id,
                 upload,
+                &expected_plan,
             )
             .await?
             {
                 let _guard = state.replication_operation_lock.lock().await;
+                if !restoration_plan_matches_locked(state, &plan.operation_id, &expected_plan)
+                    .await?
+                {
+                    return Err(AppError::conflict(
+                        "recovery_evidence_changed",
+                        "the restoration changed before recording its prerequisite",
+                    ));
+                }
                 let root = files::root(&state.db, &share.root_id).await?;
                 let request = verified_restore_upload(state, &plan.operation_id, upload).await?;
                 let target = request.target.path.clone();
@@ -1114,85 +1183,13 @@ async fn finish_generation(
                     "keep_both" => ConflictResolution::KeepBoth,
                     _ => return Err(unverified("unknown file decision")),
                 };
-                super::resolve(state, "restoration", child, resolution).await?;
+                super::resolve_restoration_child(state, child, resolution, &token).await?;
             }
             return Ok(false);
         }
     }
     if generation.children.len() < generation.remote.files.len() {
-        let remote = generation.remote.files[generation.children.len()].clone();
-        let _guard = state.replication_operation_lock.lock().await;
-        let local = files::replacement_fingerprint(&root.abs(&share.root_rel(&remote.path)?)?)?;
-        let chosen = if local.as_ref().is_some_and(|(_, sha)| *sha == remote.sha256) {
-            ConflictResolution::KeepLocal
-        } else if local.is_none() {
-            ConflictResolution::KeepRemote
-        } else {
-            generation.resolution
-        };
-        let goal = if chosen == ConflictResolution::KeepLocal {
-            local
-                .as_ref()
-                .map(|(_, sha)| sha.clone())
-                .ok_or_else(|| unverified("retained selected file disappeared"))?
-        } else {
-            remote.sha256.clone()
-        };
-        let child = crate::crypto::new_id("cf");
-        let local_row = peers::row(state, &share.id, &remote.path).await?;
-        let local_side = peers::side(&state.instance_name().await, local_row.as_ref());
-        let remote_side = ConflictSide {
-            instance: String::new(),
-            sha256: Some(remote.sha256),
-            size: Some(remote.size),
-            deleted: false,
-            modified_at: None,
-        };
-        let active: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM conflicts WHERE share_id=? AND rel_path=? AND status IN ('open','resolving'))",
-        ).bind(&share.id).bind(&remote.path).fetch_one(&state.db).await?;
-        if active {
-            return Err(unverified("another file conflict must be resolved first"));
-        }
-        let generation = plan
-            .generations
-            .last_mut()
-            .ok_or_else(|| unverified("approved generation disappeared"))?;
-        generation.goals.insert(remote.path.clone(), goal);
-        generation.children.push(child.clone());
-        let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
-        sqlx::query(
-            "INSERT INTO conflicts(id,share_id,rel_path,kind,detail,local_json,remote_json,remote_vv_json,peer_id,status,resolution,created_at)
-             VALUES(?,?,?,'content','Explicit approved folder restoration generation',?,?,?,?,'open',?,?)",
-        )
-        .bind(&child).bind(&share.id).bind(&remote.path)
-        .bind(serde_json::to_string(&local_side)?).bind(serde_json::to_string(&remote_side)?)
-        .bind(serde_json::to_string(&remote.vv)?).bind(&plan.peer_id)
-        .bind(match chosen {
-            ConflictResolution::KeepLocal => "keep_local",
-            ConflictResolution::KeepRemote => "keep_remote",
-            ConflictResolution::KeepBoth => "keep_both",
-            ConflictResolution::Skip => unreachable!(),
-        })
-        .bind(crate::db::now()).execute(&mut *tx).await?;
-        sqlx::query(
-            "UPDATE pending_peer_ops SET vv_json=? WHERE operation_id=? AND kind='folder_restore'",
-        )
-        .bind(serde_json::to_string(&plan)?)
-        .bind(format!("folder-restore:{operation_id}"))
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query(
-            "INSERT OR IGNORE INTO sync_recovery_links(recovery_id,kind,target_id)
-             SELECT id,'conflict',? FROM sync_recovery WHERE kind='operation' AND target_id=?",
-        )
-        .bind(&child)
-        .bind(operation_id)
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        state.emit(crate::state::ServerEvent::ConflictsChanged);
-        state.sync_wake.notify_waiters();
+        create_file_child(state, plan, &share, &root).await?;
         return Ok(false);
     }
     for (path, hash) in &generation.goals {
@@ -1208,6 +1205,100 @@ async fn finish_generation(
         return Ok(true);
     }
     Ok(false)
+}
+
+async fn create_file_child(
+    state: &AppState,
+    mut plan: Restoration,
+    share: &Share,
+    root: &files::Root,
+) -> AppResult<()> {
+    let generation = plan
+        .generations
+        .last()
+        .ok_or_else(|| unverified("approved generation disappeared"))?;
+    let remote = generation
+        .remote
+        .files
+        .get(generation.children.len())
+        .cloned()
+        .ok_or_else(|| unverified("approved file decision disappeared"))?;
+    let _guard = state.replication_operation_lock.lock().await;
+    if !plan_is_current_resolving(state, &plan).await? {
+        return Ok(());
+    }
+    let local = files::replacement_fingerprint(&root.abs(&share.root_rel(&remote.path)?)?)?;
+    let chosen = if local.as_ref().is_some_and(|(_, sha)| *sha == remote.sha256) {
+        ConflictResolution::KeepLocal
+    } else if local.is_none() {
+        ConflictResolution::KeepRemote
+    } else {
+        generation.resolution
+    };
+    let goal = if chosen == ConflictResolution::KeepLocal {
+        local
+            .as_ref()
+            .map(|(_, sha)| sha.clone())
+            .ok_or_else(|| unverified("retained selected file disappeared"))?
+    } else {
+        remote.sha256.clone()
+    };
+    let child = crate::crypto::new_id("cf");
+    let local_row = peers::row(state, &share.id, &remote.path).await?;
+    let local_side = peers::side(&state.instance_name().await, local_row.as_ref());
+    let remote_side = ConflictSide {
+        instance: String::new(),
+        sha256: Some(remote.sha256),
+        size: Some(remote.size),
+        deleted: false,
+        modified_at: None,
+    };
+    let active: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM conflicts WHERE share_id=? AND rel_path=? AND status IN ('open','resolving'))",
+    ).bind(&share.id).bind(&remote.path).fetch_one(&state.db).await?;
+    if active {
+        return Err(unverified("another file conflict must be resolved first"));
+    }
+    let generation = plan
+        .generations
+        .last_mut()
+        .ok_or_else(|| unverified("approved generation disappeared"))?;
+    generation.goals.insert(remote.path.clone(), goal);
+    generation.children.push(child.clone());
+    let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
+    sqlx::query(
+        "INSERT INTO conflicts(id,share_id,rel_path,kind,detail,local_json,remote_json,remote_vv_json,peer_id,status,resolution,created_at)
+         VALUES(?,?,?,'content','Explicit approved folder restoration generation',?,?,?,?,'open',?,?)",
+    )
+    .bind(&child).bind(&share.id).bind(&remote.path)
+    .bind(serde_json::to_string(&local_side)?).bind(serde_json::to_string(&remote_side)?)
+    .bind(serde_json::to_string(&remote.vv)?).bind(&plan.peer_id)
+    .bind(match chosen {
+        ConflictResolution::KeepLocal => "keep_local",
+        ConflictResolution::KeepRemote => "keep_remote",
+        ConflictResolution::KeepBoth => "keep_both",
+        ConflictResolution::Skip => unreachable!(),
+    })
+    .bind(crate::db::now()).execute(&mut *tx).await?;
+    sqlx::query(
+        "UPDATE pending_peer_ops SET vv_json=? WHERE operation_id=? AND kind='folder_restore'",
+    )
+    .bind(serde_json::to_string(&plan)?)
+    .bind(format!("folder-restore:{}", plan.operation_id))
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "INSERT OR IGNORE INTO sync_recovery_links(recovery_id,kind,target_id)
+         SELECT id,'conflict',? FROM sync_recovery WHERE kind='operation' AND target_id=?",
+    )
+    .bind(&child)
+    .bind(&plan.operation_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    state.emit(crate::state::ServerEvent::ConflictsChanged);
+    state.sync_wake.notify_waiters();
+    Ok(())
 }
 
 async fn finish_parent(state: &AppState, plan: &Restoration, id: &str) -> AppResult<bool> {
@@ -1237,6 +1328,40 @@ async fn finish_parent(state: &AppState, plan: &Restoration, id: &str) -> AppRes
         return Ok(true);
     }
     Ok(false)
+}
+
+async fn plan_is_current_resolving(state: &AppState, plan: &Restoration) -> AppResult<bool> {
+    let Some(current) = load(state, &plan.operation_id).await? else {
+        return Ok(false);
+    };
+    if serde_json::to_value(current)? != serde_json::to_value(plan)? {
+        return Ok(false);
+    }
+    let Some(id) = &plan.conflict_id else {
+        return Ok(false);
+    };
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM conflicts WHERE id=? AND status='resolving')",
+    )
+    .bind(id)
+    .fetch_one(&state.db)
+    .await?)
+}
+
+pub(super) async fn child_is_current_locked(
+    state: &AppState,
+    expected_plan: &str,
+    child: &str,
+) -> AppResult<bool> {
+    let plan: Restoration = serde_json::from_str(expected_plan)?;
+    if !plan
+        .generations
+        .last()
+        .is_some_and(|generation| generation.children.iter().any(|id| id == child))
+    {
+        return Ok(false);
+    }
+    plan_is_current_resolving(state, &plan).await
 }
 
 #[cfg(test)]
@@ -1275,6 +1400,34 @@ pub(in crate::peers) async fn cleanup_snapshot(
     snapshot: &str,
 ) -> AppResult<()> {
     cleanup_finished_plan(state, operation_id, snapshot).await
+}
+
+#[cfg(test)]
+pub(in crate::peers) async fn stale_generation_probes(
+    state: &AppState,
+    snapshot: &str,
+) -> AppResult<()> {
+    let mut plan: Restoration = serde_json::from_str(snapshot)?;
+    let share = bound_share(state, &plan).await?;
+    let root = files::root(&state.db, &share.root_id).await?;
+    create_file_child(state, serde_json::from_str(snapshot)?, &share, &root).await?;
+    if reviewed_local_tree_is_current(state, &mut plan, &share, None).await? {
+        return Err(unverified("superseded local tree was accepted"));
+    }
+    stale_reopen(state, snapshot).await
+}
+
+#[cfg(test)]
+pub(in crate::peers) async fn stale_reopen(state: &AppState, snapshot: &str) -> AppResult<()> {
+    let mut plan: Restoration = serde_json::from_str(snapshot)?;
+    let share = bound_share(state, &plan).await?;
+    let current =
+        move_decisions::evidence_at(state, &context(&plan, share), Some(&plan.remote)).await?;
+    match request_choice(state, &mut plan, &current, true).await {
+        Err(error) if error.code() == "recovery_evidence_changed" => Ok(()),
+        Err(error) => Err(error),
+        Ok(()) => Err(unverified("superseded evidence reopened the restoration")),
+    }
 }
 
 async fn finish_tree_generation(
@@ -1324,6 +1477,9 @@ async fn finish_tree_generation(
             || inventory(&current) != inventory(&generation.remote)
         {
             let guard = state.replication_operation_lock.lock().await;
+            if !plan_is_current_resolving(state, &plan).await? {
+                return Ok(false);
+            }
             let mut latest = load(state, &plan.operation_id)
                 .await?
                 .ok_or_else(|| unverified("restoration disappeared during decision"))?;
@@ -1336,6 +1492,9 @@ async fn finish_tree_generation(
         let root = files::root(&state.db, &share.root_id).await?;
         root.ensure_available()?;
         let _guard = state.replication_operation_lock.lock().await;
+        if !plan_is_current_resolving(state, &plan).await? {
+            return Ok(false);
+        }
         peers::inbox::require_move_choice_stable(
             state,
             &share,
@@ -1392,20 +1551,7 @@ async fn finish_tree_generation(
     let local = peers::side(&state.instance_name().await, None);
     let remote = context(&plan, share.clone()).remote;
     let _guard = state.replication_operation_lock.lock().await;
-    let latest = load(state, &plan.operation_id)
-        .await?
-        .ok_or_else(|| unverified("restoration disappeared during decision"))?;
-    let parent_status: String = sqlx::query_scalar("SELECT status FROM conflicts WHERE id=?")
-        .bind(&parent)
-        .fetch_one(&state.db)
-        .await?;
-    let same_generation = latest
-        .generations
-        .last()
-        .map(serde_json::to_value)
-        .transpose()?
-        == Some(serde_json::to_value(generation)?);
-    if parent_status != "resolving" || !same_generation {
+    if !plan_is_current_resolving(state, &plan).await? {
         return Ok(false);
     }
     plan.generations
@@ -1461,6 +1607,22 @@ async fn reviewed_local_tree_is_current(
     let mut latest = load(state, &plan.operation_id)
         .await?
         .ok_or_else(|| unverified("restoration disappeared during decision"))?;
+    if serde_json::to_value(&latest)? != serde_json::to_value(&*plan)? {
+        return Ok(false);
+    }
+    let parent = plan
+        .conflict_id
+        .as_deref()
+        .ok_or_else(|| unverified("approved generation has no conflict"))?;
+    let active: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM conflicts WHERE id=? AND status IN ('resolving','resolved'))",
+    )
+    .bind(parent)
+    .fetch_one(&state.db)
+    .await?;
+    if !active {
+        return Ok(false);
+    }
     let generation = latest
         .generations
         .last()
