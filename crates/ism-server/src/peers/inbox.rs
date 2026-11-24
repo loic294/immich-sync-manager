@@ -157,11 +157,7 @@ async fn backfill_reporting(
             }
         }
     }
-    task.waiting("Waiting for the replication-operation lock before applying inventory");
-    let _guard = state.replication_operation_lock.lock().await;
-    let all = shares(state).await.map_err(|e| e.message().to_owned())?;
-    task.phase("Applying inventory entries");
-    let applied = replay_inventory(state, peer, &all, task)
+    let applied = replay_inventory(state, peer, task)
         .await
         .map_err(|e| e.message().to_owned())?;
     if applied > 0 {
@@ -234,11 +230,10 @@ pub(super) async fn admit_inventory(
 async fn replay_inventory(
     state: &AppState,
     peer: &net::Peer,
-    all: &[Share],
     task: &crate::activity::Reporter,
 ) -> AppResult<usize> {
-    let rows: Vec<(String, String, String, Option<String>)> = sqlx::query_as(
-        "SELECT share_id, path, entry_json, operation_id FROM peer_backfill_inbox WHERE peer_id = ?
+    let keys: Vec<(String, String)> = sqlx::query_as(
+        "SELECT share_id, path FROM peer_backfill_inbox WHERE peer_id = ?
          ORDER BY attempted_at IS NOT NULL, attempted_at, share_id, path LIMIT ?",
     )
     .bind(&peer.id)
@@ -246,9 +241,27 @@ async fn replay_inventory(
     .fetch_all(&state.db)
     .await?;
     let mut applied = 0;
-    let total = rows.len() as u64;
-    for (done, (share_id, path, raw, operation)) in rows.into_iter().enumerate() {
+    let total = keys.len() as u64;
+    for (done, (share_id, path)) in keys.into_iter().enumerate() {
+        task.waiting("Waiting for the replication-operation lock before applying inventory");
+        // Admitted per entry, like event replay: recovery and queued managed operations must be
+        // able to claim the gate between entries. The row and shares are re-read under the guard.
+        let _guard = state.replication_operation_lock.lock().await;
+        task.phase("Applying inventory entries");
         task.progress(done as u64, Some(total), "inventory entries checked");
+        let row: Option<(String, Option<String>)> = sqlx::query_as(
+            "SELECT entry_json, operation_id FROM peer_backfill_inbox
+             WHERE peer_id = ? AND share_id = ? AND path = ?",
+        )
+        .bind(&peer.id)
+        .bind(&share_id)
+        .bind(&path)
+        .fetch_optional(&state.db)
+        .await?;
+        let Some((raw, operation)) = row else {
+            continue;
+        };
+        let all = shares(state).await?;
         sqlx::query("UPDATE peer_backfill_inbox SET attempted_at = ? WHERE peer_id = ? AND share_id = ? AND path = ?")
             .bind(db::now()).bind(&peer.id).bind(&share_id).bind(&path).execute(&state.db).await?;
         let result = if let Some(operation) = operation {

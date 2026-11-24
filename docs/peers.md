@@ -134,6 +134,10 @@ A restarted backfill has a new request generation, so a late page from an earlie
 advance it or insert entries. Changing the share's membership or enabled state restarts its pending
 backfills, even if the change is later reversed. This does not undo pages already admitted or make
 inventory a complete historical record.
+Retained inventory entries take operation admission one entry at a time, like incoming events, so
+queued operations and recovery work can run between entries. Each entry rereads its retained
+receipt and the share's current configuration once admitted; entries for a share that was disabled
+or no longer includes the peer are dropped without being applied.
 
 Incoming events likewise have separate **received** and **applied** positions. A page advances
 the receipt position only after its identities and payloads are validated and durably stored.

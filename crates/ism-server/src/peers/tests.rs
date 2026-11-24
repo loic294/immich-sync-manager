@@ -337,6 +337,196 @@ async fn backfill_rejects_an_http_page_after_other_membership_changes_and_revert
     assert!(applied);
 }
 
+/// Durable receipts for synthetic deleted files, as `admit_inventory` stores them.
+async fn seed_inventory(state: &AppState, peer_id: &str, share_id: &str, count: i64) {
+    let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await.unwrap();
+    for index in 0..count {
+        let entry = super::InventoryEntry {
+            path: format!("inventory-{index:04}.jpg"),
+            sha256: None,
+            size: 0,
+            mtime_ns: 0,
+            deleted: true,
+            vv: VersionVector::default(),
+        };
+        sqlx::query(
+            "INSERT INTO peer_backfill_inbox (peer_id, share_id, path, entry_json) VALUES (?, ?, ?, ?)",
+        )
+        .bind(peer_id)
+        .bind(share_id)
+        .bind(&entry.path)
+        .bind(serde_json::to_string(&entry).unwrap())
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    }
+    tx.commit().await.unwrap();
+}
+
+/// (receipts still in the inbox, synthetic tombstones applied, synthetic paths accounted for)
+async fn inventory_counts(state: &AppState, peer_id: &str, share_id: &str) -> (i64, i64, i64) {
+    sqlx::query_as(
+        "SELECT (SELECT COUNT(*) FROM peer_backfill_inbox WHERE peer_id = ?1),
+                (SELECT COUNT(*) FROM replica_files
+                 WHERE share_id = ?2 AND rel_path LIKE 'inventory-%' AND deleted = 1),
+                (SELECT COUNT(*) FROM (
+                    SELECT path FROM peer_backfill_inbox WHERE peer_id = ?1
+                    UNION SELECT rel_path FROM replica_files
+                    WHERE share_id = ?2 AND rel_path LIKE 'inventory-%' AND deleted = 1))",
+    )
+    .bind(peer_id)
+    .bind(share_id)
+    .fetch_one(&state.db)
+    .await
+    .unwrap()
+}
+
+async fn inventory_below(state: &AppState, peer_id: &str, share_id: &str, below: i64) {
+    while inventory_counts(state, peer_id, share_id).await.0 >= below {
+        tokio::task::yield_now().await;
+    }
+}
+
+#[tokio::test]
+async fn inventory_replay_admits_a_queued_operation_between_entries() {
+    const ENTRIES: i64 = 500;
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    let peer = super::net::peers(&b.state).await.unwrap().remove(0);
+    let share = super::shares(&b.state).await.unwrap().remove(0);
+    seed_inventory(&b.state, &peer.id, &share.id, ENTRIES).await;
+    write_old(
+        &b._dir.path().join("photos/unrelated/source.jpg"),
+        b"unrelated",
+    );
+
+    let replay = super::backfill(&b.state, &peer);
+    tokio::pin!(replay);
+    tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::select! {
+            result = &mut replay => panic!("replay finished before it was observed: {result:?}"),
+            () = inventory_below(&b.state, &peer.id, &share.id, ENTRIES) => {}
+        }
+        let accepted = crate::ops::submit(
+            &b.state,
+            &Principal::Admin {
+                username: "test".into(),
+            },
+            OperationRequest {
+                idempotency_key: "during-inventory-replay".into(),
+                label: None,
+                actions: vec![OperationAction::Move {
+                    source: loc("unrelated/source.jpg"),
+                    target: loc("unrelated/target.jpg"),
+                    expected_revision: None,
+                }],
+                allow_owner_transfer: false,
+                allow_partial: false,
+            },
+        )
+        .await
+        .unwrap();
+        let operation = crate::ops::exec::run_operation(&b.state, &accepted.operation_id);
+        tokio::pin!(operation);
+        tokio::select! {
+            biased;
+            result = &mut operation => result.unwrap(),
+            result = &mut replay => panic!("operation waited for the whole inventory replay: {result:?}"),
+        }
+        assert!(
+            inventory_counts(&b.state, &peer.id, &share.id).await.0 > 0,
+            "the operation must run while inventory receipts are still pending"
+        );
+        assert_eq!(
+            crate::ops::load(&b.state, &accepted.operation_id)
+                .await
+                .unwrap()
+                .0
+                .status,
+            ism_core::dto::OperationStatus::Completed
+        );
+        replay.await.unwrap();
+    })
+    .await
+    .expect("inventory replay and the queued operation must both make progress");
+
+    assert_eq!(
+        inventory_counts(&b.state, &peer.id, &share.id).await,
+        (0, ENTRIES, ENTRIES)
+    );
+    assert_eq!(
+        std::fs::read(b._dir.path().join("photos/unrelated/target.jpg")).unwrap(),
+        b"unrelated"
+    );
+}
+
+#[tokio::test]
+async fn inventory_replay_rereads_share_config_per_entry_and_survives_cancellation() {
+    const ENTRIES: i64 = 500;
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    let peer = super::net::peers(&b.state).await.unwrap().remove(0);
+    let share = super::shares(&b.state).await.unwrap().remove(0);
+    seed_inventory(&b.state, &peer.id, &share.id, ENTRIES).await;
+
+    // Cancelling between entries releases admission and loses no receipt.
+    let mut replay = Box::pin(super::backfill(&b.state, &peer));
+    tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::select! {
+            result = &mut replay => panic!("replay finished before it was cancelled: {result:?}"),
+            () = inventory_below(&b.state, &peer.id, &share.id, ENTRIES) => {}
+        }
+    })
+    .await
+    .expect("inventory replay must make progress");
+    drop(replay);
+    let guard = tokio::time::timeout(
+        Duration::from_secs(5),
+        b.state.replication_operation_lock.lock(),
+    )
+    .await
+    .expect("a cancelled replay must release admission");
+    let (cancelled_at, _, accounted) = inventory_counts(&b.state, &peer.id, &share.id).await;
+    assert!(cancelled_at > 0);
+    assert_eq!(accounted, ENTRIES);
+    drop(guard);
+
+    // A share disabled mid-replay stops the remaining receipts from being applied.
+    let replay = super::backfill(&b.state, &peer);
+    tokio::pin!(replay);
+    tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::select! {
+            result = &mut replay => panic!("replay finished before it was observed: {result:?}"),
+            () = inventory_below(&b.state, &peer.id, &share.id, cancelled_at) => {}
+        }
+        let gate = b.state.replication_operation_lock.lock();
+        tokio::pin!(gate);
+        let guard = tokio::select! {
+            biased;
+            guard = &mut gate => guard,
+            result = &mut replay => panic!("replay held admission until completion: {result:?}"),
+        };
+        sqlx::query("UPDATE shares SET enabled = 0 WHERE id = ?")
+            .bind(&share.id)
+            .execute(&b.state.db)
+            .await
+            .unwrap();
+        let (remaining, applied, _) = inventory_counts(&b.state, &peer.id, &share.id).await;
+        assert!(remaining > 0);
+        drop(guard);
+        replay.await.unwrap();
+        assert_eq!(
+            inventory_counts(&b.state, &peer.id, &share.id).await,
+            (0, applied, applied),
+            "receipts admitted after the share was disabled must not be applied"
+        );
+    })
+    .await
+    .expect("inventory replay must finish after the share is disabled");
+}
+
 #[tokio::test]
 async fn malformed_inventory_page_reports_error_and_replays_independent_receipts() {
     let (mut a, mut b) = pair().await;
