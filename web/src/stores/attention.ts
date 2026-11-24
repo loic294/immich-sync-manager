@@ -2,7 +2,6 @@ import { signal } from '@preact/signals-core';
 import { admin } from '@/api/admin';
 import { events } from '@/api/events';
 import type { AttentionCode } from '@/api/generated/AttentionCode';
-import type { AttentionCoverage } from '@/api/generated/AttentionCoverage';
 import type { AttentionOwner } from '@/api/generated/AttentionOwner';
 import type { AttentionSnapshot } from '@/api/generated/AttentionSnapshot';
 
@@ -39,7 +38,6 @@ export const notifications = signal<AttentionItem[]>([]);
 export const attentionError = signal(false);
 
 type Source = { code: string; owner: string; peerId?: string | null };
-type ScopedCoverage = AttentionCoverage & { peer_id?: string | null };
 let dismissed = new Map<string, Source | null>();
 let timer: number | undefined;
 let transitionTimer: number | undefined;
@@ -117,7 +115,7 @@ async function loadAttention(epoch: number) {
   const items = buildAttention(snapshot);
   const complete = snapshot.completeness === 'complete' && snapshot.warnings.length === 0;
   const observed = new Map(snapshot.items.map((entry) => [entry.id, entry]));
-  const coverage: readonly ScopedCoverage[] = snapshot.coverage;
+  const coverage = snapshot.coverage;
   const cleared = (id: string, source: Source | null) => {
     const current = observed.get(id);
     if (current) return current.completeness === 'complete' && current.attention === 'none';

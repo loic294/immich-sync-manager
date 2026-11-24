@@ -1,5 +1,7 @@
 //! Local conditions independent of whether a file transfer is already queued.
 
+use std::collections::HashSet;
+
 use ism_core::dto::{
     ActivityExample, AttentionCode, AttentionCompleteness, AttentionItem, AttentionLevel,
     AttentionOwner, AttentionState,
@@ -44,6 +46,13 @@ struct Scan {
     pending: i64,
 }
 
+pub(crate) struct Selection {
+    pub roots: HashSet<String>,
+    pub shares: HashSet<String>,
+    pub servers: HashSet<String>,
+    pub libraries: HashSet<String>,
+}
+
 fn base(state: &AppState, instance_name: &str, observed_at: &str) -> AttentionItem {
     AttentionItem {
         id: String::new(),
@@ -78,6 +87,24 @@ pub(crate) async fn snapshot(
     instance_name: &str,
     observed_at: &str,
 ) -> AppResult<(Vec<AttentionItem>, Vec<String>)> {
+    selected_snapshot(state, instance_name, observed_at, None).await
+}
+
+pub(crate) async fn selected_snapshot(
+    state: &AppState,
+    instance_name: &str,
+    observed_at: &str,
+    selection: Option<&Selection>,
+) -> AppResult<(Vec<AttentionItem>, Vec<String>)> {
+    let share_ids = selection
+        .map(|s| serde_json::to_string(&s.shares))
+        .transpose()?;
+    let root_ids = selection
+        .map(|s| serde_json::to_string(&s.roots))
+        .transpose()?;
+    let library_ids = selection
+        .map(|s| serde_json::to_string(&s.libraries))
+        .transpose()?;
     let mut items = Vec::new();
     let mut warnings = Vec::new();
     let template = base(state, instance_name, observed_at);
@@ -87,6 +114,9 @@ pub(crate) async fn snapshot(
     .fetch_all(&state.db)
     .await?;
     for server in servers {
+        if selection.is_some_and(|s| !s.servers.contains(&server.id)) {
+            continue;
+        }
         if !server.compatible {
             let mut item = template.clone();
             item.id = format!("compatibility:{}", server.id);
@@ -161,10 +191,13 @@ pub(crate) async fn snapshot(
                         PARTITION BY c.share_id,c.peer_id ORDER BY c.created_at,c.id
                     ) AS position
              FROM conflicts c JOIN shares s ON s.id=c.share_id WHERE c.status='open'
+                 AND (? IS NULL OR c.share_id IN (SELECT value FROM json_each(?)))
          )
          SELECT share_id,share_name,peer_id,rel_path,count FROM decisions
          WHERE position<=5 ORDER BY share_id,peer_id,position",
     )
+    .bind(&share_ids)
+    .bind(&share_ids)
     .fetch_all(&state.db)
     .await?;
     for conflict in conflicts {
@@ -194,7 +227,11 @@ pub(crate) async fn snapshot(
         }
     }
 
-    let roots = crate::files::load_roots(&state.db).await?;
+    let roots: Vec<_> = crate::files::load_roots(&state.db)
+        .await?
+        .into_iter()
+        .filter(|root| selection.is_none_or(|s| s.roots.contains(&root.mapping.root_id)))
+        .collect();
     let available = crate::queue_evidence::root_availability(
         state,
         roots
@@ -240,8 +277,11 @@ pub(crate) async fn snapshot(
         "SELECT m.root_id,m.name,w.last_pass_at FROM watch_status w
          JOIN mappings m ON m.root_id=w.root_id WHERE w.paused=1 AND
          (m.library_id IS NOT NULL OR EXISTS(SELECT 1 FROM shares s WHERE s.root_id=m.root_id))
+         AND (? IS NULL OR m.root_id IN (SELECT value FROM json_each(?)))
          ORDER BY m.root_id",
     )
+    .bind(&root_ids)
+    .bind(&root_ids)
     .fetch_all(&state.db)
     .await?;
     for watch in watches {
@@ -260,8 +300,12 @@ pub(crate) async fn snapshot(
         "SELECT s.library_id,l.name AS library_name,s.due_at,s.last_finished_at,s.last_error,
                 (SELECT COUNT(*) FROM scan_work w WHERE w.library_id=s.library_id) AS pending
          FROM scan_schedule s LEFT JOIN immich_libraries l ON l.id=s.library_id
-         WHERE s.running=0 AND s.last_error IS NOT NULL ORDER BY s.library_id",
+         WHERE s.running=0 AND s.last_error IS NOT NULL
+             AND (? IS NULL OR s.library_id IN (SELECT value FROM json_each(?)))
+         ORDER BY s.library_id",
     )
+    .bind(&library_ids)
+    .bind(&library_ids)
     .fetch_all(&state.db)
     .await?;
     for scan in scans {

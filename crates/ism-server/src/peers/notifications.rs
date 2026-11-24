@@ -158,12 +158,19 @@ pub(super) async fn run(state: &AppState, peer: &net::Peer) {
     };
     let consumer = async {
         let mut retry: Option<Option<Refresh>> = None;
+        let mut attention_poll = tokio::time::interval(super::attention::POLL);
+        attention_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             let hint = tokio::select! {
-                biased;
                 result = hints.changed() => {
                     if result.is_err() { break; }
                     hints.borrow_and_update().clone()
+                }
+                _ = attention_poll.tick() => {
+                    if let Err(error) = super::attention::refresh(state, peer).await {
+                        tracing::warn!(peer=%peer.id, code=%error.code(), "cannot refresh peer attention");
+                    }
+                    continue;
                 }
                 _ = tokio::time::sleep(RETRY), if retry.is_some() => Hint::Refresh(retry.take().flatten()),
             };
@@ -182,6 +189,9 @@ pub(super) async fn run(state: &AppState, peer: &net::Peer) {
                     }
                     if !success {
                         retry = Some(refresh);
+                    }
+                    if let Err(error) = super::attention::refresh(state, peer).await {
+                        tracing::warn!(peer=%peer.id, code=%error.code(), "cannot refresh peer attention");
                     }
                     // Hints received during a slow fetch collapse to one further refresh.
                     tokio::time::sleep(COALESCE).await;

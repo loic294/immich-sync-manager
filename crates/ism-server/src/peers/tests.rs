@@ -11,6 +11,9 @@ mod folder_decisions;
 #[path = "notification_tests.rs"]
 mod notifications;
 
+#[path = "attention_tests.rs"]
+mod attention;
+
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 

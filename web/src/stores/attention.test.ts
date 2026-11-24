@@ -146,7 +146,7 @@ describe('attention snapshots', () => {
         ...snapshot,
         completeness: 'partial',
         warnings: ['Remote status is unavailable.'],
-        coverage: [{ code: row.code, owner: 'local', completeness: 'complete' }],
+        coverage: [{ code: row.code, owner: 'local', peer_id: null, completeness: 'complete' }],
         items: [],
       });
       stop = startAttention();
@@ -157,7 +157,7 @@ describe('attention snapshots', () => {
       get.mockResolvedValue({
         ...snapshot,
         completeness: 'partial',
-        coverage: [{ code: row.code, owner: 'local', completeness: 'complete' }],
+        coverage: [{ code: row.code, owner: 'local', peer_id: null, completeness: 'complete' }],
         items: [],
       });
       await refreshAttention();
@@ -176,7 +176,7 @@ describe('attention snapshots', () => {
       get.mockResolvedValue({
         ...snapshot,
         completeness: 'partial',
-        coverage: [{ code: row.code, owner: row.owner, completeness: 'complete' }],
+        coverage: [{ code: row.code, owner: row.owner, peer_id: null, completeness: 'complete' }],
         items: [{ ...row, attention: 'none', completeness: 'unavailable', blocks_work: false }],
       });
       await refreshAttention();

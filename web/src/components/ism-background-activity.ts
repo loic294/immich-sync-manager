@@ -25,6 +25,7 @@ const PAGES: Record<string, string> = {
   '/servers': 'Open server maintenance',
   '/mappings': 'Open folder mappings',
   '/peers': 'Open peers and shares',
+  '/operations': 'Open operations',
 };
 // Polling only backs up live events, so it can be slow; the snapshot is stale after a few misses.
 const POLL_MS = 10_000;
@@ -391,11 +392,19 @@ export class IsmBackgroundActivity extends IsmPage {
       task.phase === 'peer effect waits for conflict resolution';
     const syncIssue = task.page === '/sync' && needsAttention(task);
     const href = conflictIssue ? '/conflicts' : syncIssue ? '/sync?view=attention' : task.page;
+    const remote =
+      task.task_key.startsWith('peer-attention:') && href && URL.canParse(href)
+        ? new URL(href)
+        : null;
+    const remoteLabel =
+      remote && ['http:', 'https:'].includes(remote.protocol)
+        ? Object.entries(PAGES).find(([path]) => remote.pathname.endsWith(path))?.[1]
+        : undefined;
     const label = conflictIssue
       ? 'Open conflicts'
       : syncIssue
         ? 'Review sync issues'
-        : task.page && PAGES[task.page];
+        : remoteLabel || (task.page && PAGES[task.page]);
     return html`<div class="grid gap-4 px-3 pb-4 pl-10 text-sm md:grid-cols-[minmax(0,3fr)_minmax(0,2fr)]">
       <div class="min-w-0 space-y-3">
         ${stalled ? html`<p class="text-warning">No progress reported for ${formatDuration((now - Date.parse(task.updated_at)) / 1000)}.</p>` : nothing}
@@ -436,7 +445,7 @@ export class IsmBackgroundActivity extends IsmPage {
         <dt class="text-base-content/60">Last update</dt><dd>${formatDate(task.updated_at)}</dd>
         <dd class="col-span-2 mt-2 flex flex-wrap gap-2">
           ${task.operation_id ? html`<button type="button" class="btn btn-sm" @click=${() => this.dispatchEvent(new CustomEvent('operation-open', { detail: task.operation_id, bubbles: true, composed: true }))}>Open related operation</button>` : nothing}
-          ${href && label ? html`<a class="btn btn-sm" href=${href}>${label}</a>` : nothing}
+          ${href && label ? html`<a class="btn btn-sm" href=${href} rel=${remoteLabel ? 'external' : nothing}>${label}</a>` : nothing}
         </dd>
       </dl>
     </div>`;

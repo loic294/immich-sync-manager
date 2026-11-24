@@ -7,4 +7,4 @@ export type AttentionCoverage = { code: AttentionCode, owner: AttentionOwner,
 /**
  * Complete means absence is authoritative for this code and owner, even in a partial snapshot.
  */
-completeness: AttentionCompleteness, };
+completeness: AttentionCompleteness, peer_id: string | null, };

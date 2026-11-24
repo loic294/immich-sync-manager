@@ -156,6 +156,34 @@ pub async fn get(state: &AppState) -> AppResult<(Vec<BackgroundActivity>, Vec<St
         row.next_at = item.next_at;
         out.push(row);
     }
+    let remote = crate::peers::attention::snapshot(state).await?;
+    warnings.extend(remote.warnings);
+    for item in remote.items {
+        let mut row = entry(
+            item.id,
+            &item.title,
+            item.share_name.map_or_else(
+                || item.instance_name.clone().unwrap_or_default(),
+                |share| {
+                    format!(
+                        "{} / {share}",
+                        item.instance_name.clone().unwrap_or_default()
+                    )
+                },
+            ),
+            item.message,
+            &item.href,
+        );
+        row.status = match item.state {
+            AttentionState::Blocked => BackgroundStatus::Blocked,
+            AttentionState::Failed => BackgroundStatus::Failed,
+            _ => BackgroundStatus::Waiting,
+        };
+        row.count = item.count;
+        row.updated_at = item.observed_at;
+        row.next_at = item.next_at;
+        out.push(row);
+    }
     for view in crate::watch::scheduler::views(state).await? {
         if view.due_at.is_none() && view.last_error.is_none() && !view.running {
             continue;

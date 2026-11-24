@@ -149,6 +149,26 @@ describe('background activity', () => {
     expect(page.querySelector('a[href="/conflicts"]')?.textContent).toContain('Open conflicts');
   });
 
+  it('links remote blockers to the other instance without routing them locally', async () => {
+    vi.spyOn(admin, 'backgroundActivity').mockResolvedValue(
+      snapshot([
+        {
+          ...task,
+          id: 'state:peer-attention:peer:conflict',
+          task_key: 'peer-attention:peer:conflict',
+          status: 'blocked',
+          page: 'https://peer.example/ism/conflicts',
+        },
+      ]),
+    );
+    const page = await mount('ism-background-activity');
+    await vi.waitFor(() => {
+      const link = page.querySelector('a[href="https://peer.example/ism/conflicts"]');
+      expect(link?.textContent).toContain('Open conflicts');
+      expect(link?.getAttribute('rel')).toBe('external');
+    });
+  });
+
   it('takes version decisions to Conflicts instead of the sync queue', async () => {
     vi.spyOn(admin, 'backgroundActivity').mockResolvedValue(
       snapshot([

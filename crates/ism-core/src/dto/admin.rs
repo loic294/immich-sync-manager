@@ -538,7 +538,7 @@ pub enum AttentionOwner {
     Receiver,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 #[ts(export)]
 pub enum AttentionCode {
@@ -551,6 +551,7 @@ pub enum AttentionCode {
     LibraryScanFailed,
     PeerOffline,
     PeerEvidenceUnavailable,
+    PeerAttentionUnavailable,
     TransferFailed,
     ReceiverTransferFailed,
     TransferScheduled,
@@ -608,6 +609,9 @@ pub struct AttentionCoverage {
     pub owner: AttentionOwner,
     /// Complete means absence is authoritative for this code and owner, even in a partial snapshot.
     pub completeness: AttentionCompleteness,
+    // None covers the owner globally; Some covers only this receiver peer.
+    #[serde(default)]
+    pub peer_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]

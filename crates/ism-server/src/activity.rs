@@ -1692,7 +1692,14 @@ mod tests {
             "{:?}",
             started.elapsed()
         );
-        assert_eq!(snapshot.current.len(), 3, "{:#?}", snapshot.current);
+        assert_eq!(snapshot.current.len(), 4, "{:#?}", snapshot.current);
+        assert!(
+            snapshot
+                .current
+                .iter()
+                .any(|activity| activity.task_key == "peer-attention:peer"
+                    && activity.status == BackgroundStatus::Waiting)
+        );
         let outgoing = snapshot
             .current
             .iter()

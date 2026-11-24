@@ -619,9 +619,6 @@ pub async fn snapshot(state: &AppState) -> AppResult<AttentionSnapshot> {
             examples: Vec::new(),
         });
     }
-    if !receiver.peers.is_empty() {
-        warnings.push("Paired instances report receiver transfers only; their other attention conditions are not available here.".into());
-    }
     for peer in receiver.peers {
         let peer_observed_at = peer
             .observed_at
@@ -737,6 +734,9 @@ pub async fn snapshot(state: &AppState) -> AppResult<AttentionSnapshot> {
             });
         }
     }
+    let remote = crate::peers::attention::snapshot(state).await?;
+    items.extend(remote.items);
+    warnings.extend(remote.warnings);
     let now = chrono::Utc::now();
     for item in &mut items {
         let next = item
@@ -774,6 +774,7 @@ pub async fn snapshot(state: &AppState) -> AppResult<AttentionSnapshot> {
         coverage.extend(codes.iter().map(|code| AttentionCoverage {
             code: *code,
             owner,
+            peer_id: None,
             completeness: if readable {
                 AttentionCompleteness::Complete
             } else {
@@ -867,6 +868,7 @@ pub async fn snapshot(state: &AppState) -> AppResult<AttentionSnapshot> {
         AttentionOwner::Receiver,
         receiver_readable,
     );
+    coverage.extend(remote.coverage);
     Ok(AttentionSnapshot {
         observed_at,
         completeness,

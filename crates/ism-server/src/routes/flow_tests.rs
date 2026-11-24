@@ -326,11 +326,16 @@ async fn attention_covers_standalone_local_conditions_and_clears_resolved_source
         assert_eq!(source["completeness"], "complete");
     }
     assert!(
-        !cleared["coverage"]
+        cleared["coverage"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|source| source["code"] == "maintenance_blocked" && source["owner"] == "receiver")
+            .any(|source| {
+                source["code"] == "maintenance_blocked"
+                    && source["owner"] == "receiver"
+                    && source["peer_id"] == "peer"
+                    && source["completeness"] == "unavailable"
+            })
     );
     sqlx::query("UPDATE immich_servers SET maintenance_json='unreadable'")
         .execute(&h.state.db)
@@ -534,13 +539,12 @@ async fn attention_rechecks_override_expiry_allowed_hours_and_retry_eligibility(
     assert!(item["next_at"].is_string());
     assert_eq!(item["recheck_at"], item["next_at"]);
     assert_eq!(retry["completeness"], "partial");
-    assert!(
-        retry["warnings"]
-            .as_array()
+    assert!(retry["warnings"].as_array().unwrap().iter().any(|warning| {
+        warning
+            .as_str()
             .unwrap()
-            .iter()
-            .any(|warning| warning.as_str().unwrap().contains("Paired instances"))
-    );
+            .contains("Shared-folder attention")
+    }));
 }
 
 #[tokio::test]

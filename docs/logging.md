@@ -76,8 +76,15 @@ synchronizations. Each points to the controls needed to resolve it; scheduled ma
 continue automatically. A chosen conflict resolution is not reported as another pending decision.
 Snapshot completeness reflects the available evidence: unchecked file dependencies, timed-out
 folder checks, unreadable maintenance, and missing remote conditions keep the report partial.
-Paired instances currently report receiver transfers, not their full attention state.
-Per-code and owner coverage separately identifies authoritative sources: a missing item from a
+Paired instances report receiver transfers and signed, share-authorized folder, maintenance,
+conflict, and observed operation-admission conditions. Other remote operation and worker conditions
+remain unsupported and keep the snapshot partial. Reports omit paths, root/server names, raw
+errors and operation IDs. Remote evidence is cached only in memory (at most 64 peers, with each
+accepted report limited to 256 KiB and 500 conditions/shares), expires after 40 seconds measured
+monotonically, and is refreshed periodically and on peer invalidations. Configuration or membership
+changes invalidate cached authority. A server restart, expired report, unavailable peer or older
+peer without this endpoint shows unavailable evidence, never a cleared blocker.
+Per-code, owner and optional receiver-peer coverage identifies authoritative sources: a missing item from a
 complete source can be cleared even if an unrelated source keeps the overall snapshot partial.
 Missing or partial source coverage cannot establish that a prior condition has cleared.
 Overlapping condition counts must not be added as distinct files. Library failure counts cover

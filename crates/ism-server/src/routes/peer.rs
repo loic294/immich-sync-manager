@@ -32,11 +32,19 @@ pub fn router() -> Router<AppState> {
         .route("/thumbnail", get(thumbnail))
         .route("/settings", get(settings))
         .route("/sync-activity", get(sync_activity))
+        .route("/attention", get(attention))
         .route("/recovery", get(recovery_page).post(recovery))
         .route("/recovery/file", get(recovery_file))
         .route("/recovery/versions", get(recovery_versions))
         .route("/recovery/preview", get(recovery_preview))
         .route("/recovery/decisions", post(recovery_decisions))
+}
+
+async fn attention(
+    State(state): State<AppState>,
+    PeerAuth(peer): PeerAuth,
+) -> AppResult<Json<peers::attention::Report>> {
+    Ok(Json(peers::attention::report(&state, &peer).await?))
 }
 
 async fn recovery_versions(

@@ -8,6 +8,7 @@
 
 pub mod activity;
 pub mod admin;
+pub(crate) mod attention;
 pub mod inbox;
 pub mod net;
 pub(crate) mod notifications;
