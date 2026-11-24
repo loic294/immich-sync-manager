@@ -641,6 +641,19 @@ async fn pull_reporting(
     }
 }
 
+async fn record_error(state: &AppState, peer_id: &str, seq: i64, error: &str) -> AppResult<bool> {
+    let updated = sqlx::query(
+        "UPDATE peer_inbox SET error = ? WHERE peer_id = ? AND seq = ? AND error IS NOT ?",
+    )
+    .bind(error)
+    .bind(peer_id)
+    .bind(seq)
+    .bind(error)
+    .execute(&state.db)
+    .await?;
+    Ok(updated.rows_affected() != 0)
+}
+
 async fn replay(
     state: &AppState,
     peer: &net::Peer,
@@ -671,12 +684,7 @@ async fn replay(
             .await?;
         if let Some(operation_id) = operation_id {
             if let Err(error) = operation_finished(state, &operation_id, &[]).await {
-                sqlx::query("UPDATE peer_inbox SET error = ? WHERE peer_id = ? AND seq = ?")
-                    .bind(error.message())
-                    .bind(&peer.id)
-                    .bind(seq)
-                    .execute(&state.db)
-                    .await?;
+                record_error(state, &peer.id, seq, error.message()).await?;
                 if first_error.is_none() {
                     first_error = Some(error);
                 }
@@ -684,20 +692,15 @@ async fn replay(
                 let failed: Option<String> = sqlx::query_scalar(
                     "SELECT status FROM operations WHERE id = ? AND status IN ('failed','partial','cancelled','recovery_required')",
                 ).bind(&operation_id).fetch_optional(&state.db).await?;
-                if let Some(status) = failed
-                    && first_error.is_none()
-                {
+                if let Some(status) = failed {
                     let error = AppError::conflict(
                         "recovery_required",
                         format!("peer operation {operation_id} needs attention ({status})"),
                     );
-                    sqlx::query("UPDATE peer_inbox SET error = ? WHERE peer_id = ? AND seq = ?")
-                        .bind(error.message())
-                        .bind(&peer.id)
-                        .bind(seq)
-                        .execute(&state.db)
-                        .await?;
-                    first_error = Some(error);
+                    record_error(state, &peer.id, seq, error.message()).await?;
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
                 }
             }
             continue;
@@ -709,12 +712,7 @@ async fn replay(
             && let Err(error) =
                 super::admin::accept_dominating_decision(state, peer, share, &event).await
         {
-            sqlx::query("UPDATE peer_inbox SET error=? WHERE peer_id=? AND seq=?")
-                .bind(error.message())
-                .bind(&peer.id)
-                .bind(seq)
-                .execute(&state.db)
-                .await?;
+            record_error(state, &peer.id, seq, error.message()).await?;
             if first_error.is_none() {
                 first_error = Some(error);
             }
@@ -740,13 +738,9 @@ async fn replay(
         match result {
             Ok(done) => applied += usize::from(done),
             Err(error) => {
-                sqlx::query("UPDATE peer_inbox SET error = ? WHERE peer_id = ? AND seq = ?")
-                    .bind(error.message())
-                    .bind(&peer.id)
-                    .bind(seq)
-                    .execute(&state.db)
-                    .await?;
-                tracing::warn!(peer = %peer.name, path = %event.data.path, "peer effect deferred: {}", error.message());
+                if record_error(state, &peer.id, seq, error.message()).await? {
+                    tracing::warn!(peer = %peer.name, path = %event.data.path, "peer effect deferred: {}", error.message());
+                }
                 if first_error.is_none() {
                     first_error = Some(error);
                 }

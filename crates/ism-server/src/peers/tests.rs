@@ -689,6 +689,125 @@ async fn recovery_automatically_finishes_local_bookkeeping_once() {
 }
 
 #[tokio::test]
+async fn repeated_peer_inbox_errors_are_recorded_and_warned_only_on_change() {
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+    use tracing::instrument::WithSubscriber;
+
+    struct LogWriter(Arc<Mutex<Vec<u8>>>);
+    impl Write for LogWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    write_old(&a.shared.join("photo.jpg"), b"alpha");
+    write_old(&b.shared.join("photo.jpg"), b"beta");
+    scan(&a).await;
+    scan(&b).await;
+    let peer = super::net::peers(&b.state).await.unwrap().remove(0);
+    for _ in 0..2 {
+        let _ = super::pull(&b.state, &peer).await;
+    }
+    sqlx::query("UPDATE peer_inbox SET error = NULL WHERE peer_id = ?")
+        .bind(&peer.id)
+        .execute(&b.state.db)
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE inbox_error_writes (id INTEGER)")
+        .execute(&b.state.db)
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE inbox_attempts (id INTEGER)")
+        .execute(&b.state.db)
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER count_inbox_attempts AFTER UPDATE OF attempted_at ON peer_inbox
+             BEGIN INSERT INTO inbox_attempts VALUES (1); END",
+    )
+    .execute(&b.state.db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER count_inbox_error AFTER UPDATE OF error ON peer_inbox
+         BEGIN INSERT INTO inbox_error_writes VALUES (1); END",
+    )
+    .execute(&b.state.db)
+    .await
+    .unwrap();
+    let logs = Arc::new(Mutex::new(Vec::new()));
+    let log_output = logs.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(move || LogWriter(log_output.clone()))
+        .finish();
+    async {
+        for _ in 0..6 {
+            let error = super::pull(&b.state, &peer).await.unwrap_err();
+            assert!(error.contains("conflict resolution"));
+        }
+        let writes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM inbox_error_writes")
+            .fetch_one(&b.state.db)
+            .await
+            .unwrap();
+        assert_eq!(writes, 1, "identical retries must not rewrite the error");
+        let attempts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM inbox_attempts")
+            .fetch_one(&b.state.db)
+            .await
+            .unwrap();
+        assert_eq!(attempts, 6, "every retry must still be attempted");
+        let error: String = sqlx::query_scalar("SELECT error FROM peer_inbox WHERE peer_id = ?")
+            .bind(&peer.id)
+            .fetch_one(&b.state.db)
+            .await
+            .unwrap();
+        assert!(error.contains("conflict resolution"));
+
+        sqlx::query("UPDATE peer_inbox SET error = 'earlier failure' WHERE peer_id = ?")
+            .bind(&peer.id)
+            .execute(&b.state.db)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM inbox_error_writes")
+            .execute(&b.state.db)
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            assert!(
+                super::pull(&b.state, &peer)
+                    .await
+                    .unwrap_err()
+                    .contains("conflict resolution")
+            );
+        }
+        let writes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM inbox_error_writes")
+            .fetch_one(&b.state.db)
+            .await
+            .unwrap();
+        assert_eq!(writes, 1, "a changed error must be recorded once");
+    }
+    .with_subscriber(subscriber)
+    .await;
+    let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+    assert_eq!(
+        logs.matches("peer effect deferred:").count(),
+        2,
+        "the first and changed errors must each produce a warning"
+    );
+}
+
+#[tokio::test]
 async fn recovery_batch_preserves_decisions_and_never_dismisses_unverified_work() {
     let (mut a, mut b) = pair().await;
     stop_workers(&mut a).await;
