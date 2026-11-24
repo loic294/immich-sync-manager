@@ -48,6 +48,7 @@ export class IsmConflictsPage extends IsmPage {
     limit: { state: true },
     offset: { state: true },
     selected: { state: true },
+    selecting: { state: true },
     activeId: { state: true },
   };
 
@@ -58,6 +59,7 @@ export class IsmConflictsPage extends IsmPage {
   declare offset: number;
   /** Selected conflicts, including selections on other pages. */
   declare selected: Map<string, ConflictPageRow>;
+  declare selecting: boolean;
   declare activeId: string | undefined;
   private readonly review = new VersionReview(this);
   protected override reloadOn = ['conflicts_changed', 'sync_changed'] as const;
@@ -71,6 +73,7 @@ export class IsmConflictsPage extends IsmPage {
     this.limit = 50;
     this.offset = 0;
     this.selected = new Map();
+    this.selecting = false;
     this.activeId = undefined;
   }
 
@@ -253,7 +256,7 @@ export class IsmConflictsPage extends IsmPage {
       <li class="border-b border-base-300 last:border-b-0">
         <div class=${`flex items-start gap-2 px-3 py-3 ${key(c) === this.activeId ? 'bg-primary/10' : ''}`}>
           ${
-            open
+            open && this.selecting
               ? html`<input
                   type="checkbox"
                   class="checkbox checkbox-sm mt-1"
@@ -327,6 +330,7 @@ export class IsmConflictsPage extends IsmPage {
   }
 
   private batch() {
+    if (!this.selecting) return nothing;
     const open = this.open();
     const chosen = this.chosen();
     if (!open.length && !chosen.length) return nothing;
@@ -393,6 +397,15 @@ export class IsmConflictsPage extends IsmPage {
                 </div>
               </section>`,
       html`<div class="flex flex-wrap items-center gap-3">
+        ${
+          this.conflicts.length || this.selected.size
+            ? html`<button type="button" class="btn btn-sm max-sm:min-h-11" aria-pressed=${this.selecting}
+                @click=${() => {
+                  this.selecting = !this.selecting;
+                }}>${this.selecting ? 'Done selecting' : 'Select multiple'}</button>
+                ${!this.selecting && this.selected.size ? html`<span role="status" class="text-sm">${this.selected.size} selected</span>` : nothing}`
+            : nothing
+        }
         <label class="label">
           <input
             type="checkbox"

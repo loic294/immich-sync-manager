@@ -73,6 +73,15 @@ const versions = {
   },
 };
 
+async function enableSelection(page: HTMLElementTagNameMap['ism-conflicts-page']) {
+  const toggle = [...page.querySelectorAll<HTMLButtonElement>('button')].find(
+    (button) => button.textContent?.trim() === 'Select multiple',
+  );
+  expect(toggle).toBeDefined();
+  toggle?.click();
+  await page.updateComplete;
+}
+
 describe('ism-conflicts-page', () => {
   afterEach(() => vi.restoreAllMocks());
 
@@ -137,6 +146,32 @@ describe('ism-conflicts-page', () => {
     );
   });
 
+  it('hides bulk controls by default and preserves selections when leaving and returning', async () => {
+    vi.spyOn(api, 'get').mockImplementation(async (path) =>
+      path.endsWith('/versions')
+        ? (versions as never)
+        : ({ rows: [{ owner: 'local', conflict }], total: 1 } as never),
+    );
+    const page = await mount('ism-conflicts-page');
+    await vi.waitFor(() => expect(page.textContent).toContain('Select multiple'));
+    expect(page.querySelector('[aria-label="Select photos:a.jpg"]')).toBeNull();
+    expect(page.querySelector('[aria-label="Batch conflict decisions"]')).toBeNull();
+    await enableSelection(page);
+    page.querySelector<HTMLInputElement>('[aria-label="Select photos:a.jpg"]')?.click();
+    await page.updateComplete;
+    [...page.querySelectorAll<HTMLButtonElement>('button')]
+      .find((button) => button.textContent?.trim() === 'Done selecting')
+      ?.click();
+    await page.updateComplete;
+    expect(page.querySelector('[aria-label="Select photos:a.jpg"]')).toBeNull();
+    expect(page.querySelector('[aria-label="Batch conflict decisions"]')).toBeNull();
+    expect(page.textContent).toContain('1 selected');
+    await enableSelection(page);
+    expect(
+      page.querySelector<HTMLInputElement>('[aria-label="Select photos:a.jpg"]')?.checked,
+    ).toBe(true);
+  });
+
   it('preserves selected conflicts when moving through pages', async () => {
     const second = {
       ...conflict,
@@ -153,6 +188,7 @@ describe('ism-conflicts-page', () => {
     });
     const page = await mount('ism-conflicts-page');
     await vi.waitFor(() => expect(page.querySelector('ism-recovery-versions')).not.toBeNull());
+    await enableSelection(page);
     page.querySelector<HTMLInputElement>('[aria-label="Select photos:a.jpg"]')?.click();
     await page.updateComplete;
 
@@ -186,6 +222,7 @@ describe('ism-conflicts-page', () => {
     } as never);
     const page = await mount('ism-conflicts-page');
     await vi.waitFor(() => expect(page.querySelector('ism-recovery-versions')).not.toBeNull());
+    await enableSelection(page);
     page.querySelector<HTMLInputElement>('[aria-label="Select photos:a.jpg"]')?.click();
     page.querySelector<HTMLButtonElement>('[aria-label="Next page"]')?.click();
     await vi.waitFor(() => expect(page.textContent).toContain('b.jpg'));
@@ -233,6 +270,7 @@ describe('ism-conflicts-page', () => {
     } as never);
     const page = await mount('ism-conflicts-page');
     await vi.waitFor(() => expect(page.querySelector('ism-recovery-versions')).not.toBeNull());
+    await enableSelection(page);
     page.querySelector<HTMLInputElement>('[aria-label="Select photos:a.jpg"]')?.click();
     page.querySelector<HTMLButtonElement>('[aria-label="Next page"]')?.click();
     await vi.waitFor(() => expect(page.textContent).toContain('b.jpg'));
@@ -304,6 +342,8 @@ describe('ism-conflicts-page', () => {
       } as never;
     });
     const page = await mount('ism-conflicts-page');
+    await vi.waitFor(() => expect(page.textContent).toContain('Select multiple'));
+    await enableSelection(page);
     await vi.waitFor(() =>
       expect(page.querySelectorAll('[aria-label^="Select photos:"]')).toHaveLength(50),
     );
@@ -369,6 +409,7 @@ describe('ism-conflicts-page', () => {
     } as never);
     const page = await mount('ism-conflicts-page');
     await vi.waitFor(() => expect(page.querySelector('ism-recovery-versions')).not.toBeNull());
+    await enableSelection(page);
     page.querySelector<HTMLInputElement>('[aria-label="Select photos:a.jpg"]')?.click();
     page.querySelector<HTMLButtonElement>('[aria-label="Next page"]')?.click();
     await vi.waitFor(() => expect(page.textContent).toContain('peer-photo.jpg'));
