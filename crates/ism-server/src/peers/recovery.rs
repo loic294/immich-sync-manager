@@ -3232,8 +3232,7 @@ mod policy_tests {
         assert_eq!(jobs[0].3, None);
     }
 
-    #[tokio::test]
-    async fn stalled_unattributed_operation_does_not_block_independent_operation() {
+    async fn unattributed_recovery_progresses_while_operation_gate_is_held(replacement: bool) {
         let dir = tempfile::tempdir().unwrap();
         let state = AppState::new(
             Config::for_tests(dir.path()),
@@ -3242,7 +3241,11 @@ mod policy_tests {
         )
         .await
         .unwrap();
-        for (id, status) in [("held", "recovery_required"), ("complete", "completed")] {
+        for (id, status) in [
+            ("held", "recovery_required"),
+            ("complete", if replacement { "failed" } else { "completed" }),
+            ("replacement", "completed"),
+        ] {
             sqlx::query("INSERT INTO operations(id,idempotency_key,principal,source,request_json,status,created_at) VALUES(?,?,'admin:test','test','{}',?,?)")
                 .bind(id).bind(id).bind(status).bind(db::now()).execute(&state.db).await.unwrap();
         }
@@ -3267,6 +3270,12 @@ mod policy_tests {
         .expect("first recovery was not claimed");
         sqlx::query("INSERT INTO sync_recovery(id,kind,target_id,state,created_at,updated_at) VALUES('operation:complete','operation','complete','queued',?,?)")
             .bind(db::now()).bind(db::now()).execute(&state.db).await.unwrap();
+        if replacement {
+            sqlx::query("INSERT INTO operation_items(operation_id,idx,kind,action_json,status) VALUES('complete',0,'create_folder','{}','failed')")
+                .execute(&state.db).await.unwrap();
+            sqlx::query("INSERT INTO sync_recovery_links(recovery_id,kind,target_id) VALUES('operation:complete','operation','replacement')")
+                .execute(&state.db).await.unwrap();
+        }
         let independent = tokio::time::timeout(Duration::from_secs(3), async {
             loop {
                 let status: String = sqlx::query_scalar(
@@ -3287,10 +3296,36 @@ mod policy_tests {
                 .fetch_one(&state.db)
                 .await
                 .unwrap();
+        if replacement && independent.is_ok() {
+            let operation: (String, i64) = sqlx::query_as(
+                "SELECT status,recovery_resolved FROM operations WHERE id='complete'",
+            )
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+            let item: String = sqlx::query_scalar(
+                "SELECT status FROM operation_items WHERE operation_id='complete' AND idx=0",
+            )
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+            assert_eq!(operation, ("completed".into(), 1));
+            assert_eq!(item, "done");
+        }
         worker.abort();
         drop(guard);
         assert!(independent.is_ok(), "independent recovery did not progress");
         assert_eq!(held, "fixing");
+    }
+
+    #[tokio::test]
+    async fn stalled_unattributed_operation_does_not_block_already_completed_recovery() {
+        unattributed_recovery_progresses_while_operation_gate_is_held(false).await;
+    }
+
+    #[tokio::test]
+    async fn stalled_unattributed_operation_does_not_block_verified_replacement_reconciliation() {
+        unattributed_recovery_progresses_while_operation_gate_is_held(true).await;
     }
 
     #[tokio::test]
