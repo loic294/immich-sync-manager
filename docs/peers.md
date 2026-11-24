@@ -8,6 +8,10 @@ root inside an Immich library they run under the write barrier and keep asset ID
 favorites (see [immich-compatibility.md](immich-compatibility.md)). Replaced or deleted files go to
 the ISM trash, never straight to deletion.
 
+Share paths are relative to each instance's configured share folder, not its root mapping.
+When a share is removed and recreated under the same name, its previous event history is not
+exported as changes in the new folder. Current contents catch up through inventory backfill.
+
 ## Pairing
 
 Use **Operations -> Background activity** to see peer connection checks, event processing,

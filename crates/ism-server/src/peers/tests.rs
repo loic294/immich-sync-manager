@@ -1446,6 +1446,142 @@ async fn stop_workers(instance: &mut Instance) {
 }
 
 #[tokio::test]
+async fn share_subfolders_scope_source_inventory_and_destination_paths() {
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    write_old(&a.shared.join("2009/07-July/13/outside.jpg"), b"outside");
+    scan(&a).await;
+    for me in [&a, &b] {
+        let share = super::shares(&me.state).await.unwrap().remove(0);
+        admin::delete_share(&me.state, &share.id).await.unwrap();
+        std::fs::create_dir_all(me.shared.join("2013/07-July")).unwrap();
+        let peer = super::net::peers(&me.state).await.unwrap().remove(0);
+        admin::create_share(
+            &me.state,
+            ShareInput {
+                name: "Family".into(),
+                location: Location {
+                    root_id: "photos".into(),
+                    path: "shared/2013/07-July".into(),
+                },
+                peer_ids: vec![peer.id],
+                enabled: true,
+            },
+        )
+        .await
+        .unwrap();
+    }
+    write_old(&a.shared.join("2013/07-July/13/inside.jpg"), b"inside");
+    scan(&a).await;
+    let source_share = super::shares(&a.state).await.unwrap().remove(0);
+    let paths: Vec<String> = sqlx::query_scalar(
+        "SELECT rel_path FROM replica_files WHERE share_id = ? ORDER BY rel_path",
+    )
+    .bind(&source_share.id)
+    .fetch_all(&a.state.db)
+    .await
+    .unwrap();
+    assert_eq!(paths, ["13/inside.jpg"]);
+    let source_peer = super::net::peers(&a.state).await.unwrap().remove(0);
+    let events = super::events_for(&a.state, &source_peer.id, &b.state.instance_id, 0)
+        .await
+        .unwrap();
+    let paths: Vec<&str> = events
+        .events
+        .iter()
+        .filter(|event| event.kind == "file_changed")
+        .map(|event| event.data.path.as_str())
+        .collect();
+    assert_eq!(paths, ["13/inside.jpg"]);
+    let peer = super::net::peers(&b.state).await.unwrap().remove(0);
+    super::pull(&b.state, &peer).await.unwrap();
+    super::backfill(&b.state, &peer).await.unwrap();
+    let paths: Vec<String> = sqlx::query_scalar("SELECT rel_path FROM transfers ORDER BY rel_path")
+        .fetch_all(&b.state.db)
+        .await
+        .unwrap();
+    assert_eq!(paths, ["13/inside.jpg"]);
+    let destination_share = super::shares(&b.state).await.unwrap().remove(0);
+    assert_eq!(
+        destination_share.location(&paths[0]).unwrap().path,
+        "shared/2013/07-July/13/inside.jpg"
+    );
+    b.tasks
+        .push(tokio::spawn(crate::ops::exec::run(b.state.clone())));
+    b.tasks
+        .push(tokio::spawn(super::transfer::run(b.state.clone())));
+    eventually("subfolder transfer publication", &[&b], || {
+        std::fs::read(b.shared.join("2013/07-July/13/inside.jpg"))
+            .is_ok_and(|bytes| bytes == b"inside")
+    })
+    .await;
+    assert!(!b.shared.join("2013/07-July/2009").exists());
+    assert!(!b.shared.join("2009").exists());
+}
+
+#[tokio::test]
+async fn recreated_share_preserves_event_history_and_advances_filtered_pages() {
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    let share = super::shares(&a.state).await.unwrap().remove(0);
+    let peer = super::net::peers(&a.state).await.unwrap().remove(0);
+    let mut tx = a.state.db.begin_with("BEGIN IMMEDIATE").await.unwrap();
+    for index in 0..super::EVENT_BATCH {
+        super::append_local_in(
+            &mut tx,
+            &a.state.instance_id,
+            &share.name,
+            "file_changed",
+            &super::EventData {
+                path: format!("old-{index}.jpg"),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    }
+    tx.commit().await.unwrap();
+    let old_last: i64 = sqlx::query_scalar("SELECT MAX(seq) FROM event_log")
+        .fetch_one(&a.state.db)
+        .await
+        .unwrap();
+    admin::delete_share(&a.state, &share.id).await.unwrap();
+    admin::create_share(
+        &a.state,
+        ShareInput {
+            name: share.name,
+            location: Location {
+                root_id: "photos".into(),
+                path: "shared".into(),
+            },
+            peer_ids: vec![peer.id.clone()],
+            enabled: true,
+        },
+    )
+    .await
+    .unwrap();
+    let page = super::events_for(&a.state, &peer.id, &b.state.instance_id, 0)
+        .await
+        .unwrap();
+    assert!(page.events.is_empty());
+    assert_eq!(page.next, super::EVENT_BATCH);
+    let page = super::events_for(&a.state, &peer.id, &b.state.instance_id, page.next)
+        .await
+        .unwrap();
+    assert_eq!(page.events.len(), 1);
+    assert_eq!(page.events[0].kind, super::SHARE_ENABLED);
+    assert!(page.events[0].seq > old_last);
+    let retained: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM event_log WHERE seq <= ?")
+        .bind(old_last)
+        .fetch_one(&a.state.db)
+        .await
+        .unwrap();
+    assert_eq!(retained, old_last);
+}
+
+#[tokio::test]
 async fn idle_peer_checks_coalesce_last_seen_writes() {
     let (mut a, mut b) = pair().await;
     stop_workers(&mut a).await;
