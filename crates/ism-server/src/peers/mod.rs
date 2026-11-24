@@ -1905,6 +1905,93 @@ pub async fn backfill(state: &AppState, peer: &net::Peer) -> Result<usize, Strin
 
 /// Finishes the replica bookkeeping of an operation that applied peer events or resolved a
 /// conflict. Returns false when the operation was a plain local one.
+/// The checksum and size a finished peer publication wrote. The upload must be the one the
+/// operation item published, belong to this operation only, and hold a single file at `to`.
+async fn published_upload(
+    state: &AppState,
+    operation_id: &str,
+    idx: i64,
+    share: &Share,
+    to: &str,
+) -> AppResult<(String, u64)> {
+    let unverifiable = |message: &str| AppError::conflict("recovery_required", message);
+    let action: String = sqlx::query_scalar(
+        "SELECT action_json FROM operation_items WHERE operation_id = ? AND idx = ?",
+    )
+    .bind(operation_id)
+    .bind(idx)
+    .fetch_one(&state.db)
+    .await?;
+    let OperationAction::PublishUpload { upload_id } = crate::ops::exec::parse_action(&action)?
+    else {
+        return Err(unverifiable(
+            "the peer publication is not an upload publication",
+        ));
+    };
+    let uploads: Vec<(String, String)> =
+        sqlx::query_as("SELECT id, request_json FROM uploads WHERE operation_id = ?")
+            .bind(operation_id)
+            .fetch_all(&state.db)
+            .await?;
+    let [(id, raw)] = uploads.as_slice() else {
+        return Err(unverifiable(
+            "the peer publication is not tied to exactly one upload",
+        ));
+    };
+    if *id != upload_id {
+        return Err(unverifiable(
+            "the peer publication upload does not match its operation",
+        ));
+    }
+    let request: ism_core::dto::CreateUpload = serde_json::from_str(raw)?;
+    let [spec] = request.files.as_slice() else {
+        return Err(unverifiable(
+            "the peer publication has no single verifiable file",
+        ));
+    };
+    let uploaded = RelPath::parse(&request.target.path)
+        .map_err(|e| AppError::invalid_location(e.to_string()))?
+        .join(&spec.name)
+        .map_err(|e| AppError::invalid_location(e.to_string()))?;
+    let at = share.rel_of(&Location {
+        root_id: request.target.root_id.clone(),
+        path: uploaded.as_str().to_owned(),
+    });
+    if at.as_deref() != Some(to) {
+        return Err(unverifiable(
+            "the peer publication upload targets a different path",
+        ));
+    }
+    Ok((spec.sha256.clone(), spec.size))
+}
+
+#[cfg(test)]
+pub(super) struct PublicationPause {
+    pub reached: tokio::sync::oneshot::Sender<()>,
+    pub resume: tokio::sync::oneshot::Receiver<()>,
+}
+
+/// Test-only pause between a peer publication's file write and its replica bookkeeping, keyed by
+/// share id so concurrently running tests do not interfere.
+#[cfg(test)]
+pub(super) static PUBLICATION_PAUSES: std::sync::Mutex<Vec<(String, PublicationPause)>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+async fn publication_bookkeeping_pause(share_id: &str) {
+    let pause = {
+        let mut pauses = PUBLICATION_PAUSES.lock().unwrap();
+        pauses
+            .iter()
+            .position(|(id, _)| id == share_id)
+            .map(|index| pauses.remove(index).1)
+    };
+    if let Some(pause) = pause {
+        let _ = pause.reached.send(());
+        let _ = pause.resume.await;
+    }
+}
+
 async fn finish_pending(state: &AppState, operation_id: &str) -> AppResult<bool> {
     type Pending = (
         i64,
@@ -2019,13 +2106,29 @@ async fn finish_pending(state: &AppState, operation_id: &str) -> AppResult<bool>
                 }
             }
             ("publish", true) => {
+                #[cfg(test)]
+                publication_bookkeeping_pause(&share.id).await;
+                let (published_sha, published_size) =
+                    published_upload(state, operation_id, idx, share, &to).await?;
                 let root = files::root(&state.db, &share.root_id).await?;
                 let path = root.abs(&share.root_rel(&to)?)?;
-                let (meta, sha256) = tokio::task::spawn_blocking(move || {
-                    std::io::Result::Ok((std::fs::metadata(&path)?, files::sha256_file(&path)?))
+                let (meta, fingerprint) = tokio::task::spawn_blocking(move || {
+                    std::io::Result::Ok((
+                        std::fs::metadata(&path)?,
+                        files::replacement_fingerprint(&path)?,
+                    ))
                 })
                 .await
                 .map_err(AppError::internal)??;
+                // Only the published bytes carry the peer's version. A local write that landed
+                // after publication stays unregistered here so the next scan records it as a
+                // local change (and peers see it as concurrent) instead of absorbing it.
+                let unchanged = fingerprint.as_ref().is_some_and(|(revision, sha)| {
+                    *revision == files::revision(&meta)
+                        && sha.eq_ignore_ascii_case(&published_sha)
+                        && meta.len() == published_size
+                });
+                let sha256 = published_sha;
                 let mut merged = row(state, &share.id, &to)
                     .await?
                     .map(|r| r.vv)
@@ -2037,8 +2140,8 @@ async fn finish_pending(state: &AppState, operation_id: &str) -> AppResult<bool>
                     &share.id,
                     &to,
                     &Row {
-                        size: meta.len() as i64,
-                        mtime_ns: files::mtime_ns(&meta),
+                        size: published_size as i64,
+                        mtime_ns: if unchanged { files::mtime_ns(&meta) } else { 0 },
                         sha256: Some(sha256.clone()),
                         deleted: false,
                         vv: merged.clone(),
@@ -2070,7 +2173,7 @@ async fn finish_pending(state: &AppState, operation_id: &str) -> AppResult<bool>
                         &EventData {
                             path: to.clone(),
                             sha256: Some(sha256),
-                            size: Some(meta.len()),
+                            size: Some(published_size),
                             vv: merged,
                             ..Default::default()
                         },
@@ -2084,6 +2187,10 @@ async fn finish_pending(state: &AppState, operation_id: &str) -> AppResult<bool>
                     .execute(&mut *tx)
                     .await?;
                 tx.commit().await?;
+                if !unchanged {
+                    let location = share.location(&to)?;
+                    rescan_shares_soon(state, std::slice::from_ref(share), &[&location]);
+                }
             }
             (_, true) => {}
             (_, false) if conflict_id.is_some() => {

@@ -3960,6 +3960,126 @@ async fn conflict_resolutions_skip_or_apply_the_peer_side() {
     assert_eq!(trash_count(&b), trashed + 1);
 }
 
+/// A local edit landing between a peer publication's file write and its replica bookkeeping
+/// must stay a local change: absorbing it under the peer's version would let a later peer move
+/// or edit overwrite it without a conflict.
+#[tokio::test]
+async fn local_edit_during_publication_bookkeeping_stays_a_local_change() {
+    let (a, b) = pair().await;
+    a.tasks[2].abort();
+    b.tasks[2].abort();
+    let share = super::shares(&b.state).await.unwrap().remove(0);
+    let peer = super::net::peers(&b.state).await.unwrap().remove(0);
+    let (reached_tx, mut reached) = tokio::sync::oneshot::channel();
+    let (resume, resume_rx) = tokio::sync::oneshot::channel();
+    super::PUBLICATION_PAUSES.lock().unwrap().push((
+        share.id.clone(),
+        super::PublicationPause {
+            reached: reached_tx,
+            resume: resume_rx,
+        },
+    ));
+    write_old(&a.shared.join("src.jpg"), b"original");
+    scan(&a).await;
+    super::pull(&b.state, &peer).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            tokio::select! {
+                result = &mut reached => break result.unwrap(),
+                () = tokio::time::sleep(Duration::from_millis(50)) => {
+                    b.state.sync_wake.notify_waiters();
+                    b.state.ops_wake.notify_waiters();
+                }
+            }
+        }
+    })
+    .await
+    .expect("the publication reaches its bookkeeping");
+    assert_eq!(
+        std::fs::read(b.shared.join("src.jpg")).unwrap(),
+        b"original"
+    );
+    write_old(&b.shared.join("src.jpg"), b"edited here");
+    resume.send(()).unwrap();
+    let mut status = String::new();
+    for _ in 0..400 {
+        status = sqlx::query_scalar("SELECT status FROM operations")
+            .fetch_one(&b.state.db)
+            .await
+            .unwrap();
+        if !matches!(status.as_str(), "queued" | "running") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(status, "completed", "the publication bookkeeping completes");
+    let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pending_peer_ops")
+        .fetch_one(&b.state.db)
+        .await
+        .unwrap();
+    assert_eq!(pending, 0);
+    let published = super::row(&b.state, &share.id, "src.jpg")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        published.sha256.as_deref(),
+        Some(crate::crypto::sha256_hex(b"original").as_str()),
+        "bookkeeping records the published bytes, not the later local edit"
+    );
+    // The publication's inbox event awaits content verification, which registers the disk.
+    super::pull(&b.state, &peer).await.unwrap();
+    scan(&b).await;
+    let local = super::row(&b.state, &share.id, "src.jpg")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        local.sha256.as_deref(),
+        Some(crate::crypto::sha256_hex(b"edited here").as_str())
+    );
+    assert_eq!(
+        local.vv.compare(&published.vv),
+        ism_core::version::Causality::Dominates
+    );
+    let announced: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM event_log WHERE origin = ? AND kind = 'file_changed' AND data_json LIKE '%src.jpg%'",
+    )
+    .bind(&b.state.instance_id)
+    .fetch_one(&b.state.db)
+    .await
+    .unwrap();
+    assert_eq!(announced, 1);
+
+    run_op(
+        &a,
+        "move-src",
+        vec![OperationAction::Move {
+            source: loc("shared/src.jpg"),
+            target: loc("shared/moved/src.jpg"),
+            expected_revision: None,
+        }],
+    )
+    .await;
+    let peer = super::net::peer(&b.state, &peer.id).await.unwrap();
+    // The move is the only pending effect, so the pull reports that it waits on the conflict.
+    if let Err(error) = super::pull(&b.state, &peer).await {
+        assert_eq!(error, "peer effect waits for conflict resolution");
+    }
+    assert!(
+        admin::list_conflicts(&b.state, false)
+            .await
+            .unwrap()
+            .iter()
+            .any(|c| c.kind == "move"),
+        "the peer move conflicts with the local edit"
+    );
+    assert_eq!(
+        std::fs::read(b.shared.join("src.jpg")).unwrap(),
+        b"edited here"
+    );
+}
+
 #[tokio::test]
 async fn keep_local_resolution_and_event_are_atomic() {
     let (mut a, mut b) = pair().await;
@@ -4387,6 +4507,142 @@ async fn recheck_finishes_only_verified_interrupted_peer_publication() {
         .unwrap();
     let expected_hash = crate::crypto::sha256_hex(b"remote photo");
     assert_eq!(row.sha256.as_deref(), Some(expected_hash.as_str()));
+}
+
+/// Publication bookkeeping records only the bytes of the upload its own operation published.
+/// If that upload can no longer be tied to the operation it fails closed, keeping the pending
+/// bookkeeping, and the recheck retry completes it once the tie is restored.
+#[tokio::test]
+async fn publication_bookkeeping_fails_closed_without_its_exact_upload() {
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    write_old(&a.shared.join("photo.jpg"), b"remote photo");
+    scan(&a).await;
+    let share = super::shares(&b.state).await.unwrap().remove(0);
+    let peer = super::net::peers(&b.state).await.unwrap().remove(0);
+    super::pull(&b.state, &peer).await.unwrap();
+    b.tasks
+        .push(tokio::spawn(super::transfer::run(b.state.clone())));
+    let operation_id = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let operation_id: Option<String> =
+                sqlx::query_scalar("SELECT operation_id FROM pending_peer_ops LIMIT 1")
+                    .fetch_optional(&b.state.db)
+                    .await
+                    .unwrap();
+            if let Some(operation_id) = operation_id {
+                break operation_id;
+            }
+            b.state.sync_wake.notify_waiters();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the download must reach publication");
+    b.tasks.pop().unwrap().abort();
+
+    let (reached_tx, reached) = tokio::sync::oneshot::channel();
+    let (resume, resume_rx) = tokio::sync::oneshot::channel();
+    super::PUBLICATION_PAUSES.lock().unwrap().push((
+        share.id.clone(),
+        super::PublicationPause {
+            reached: reached_tx,
+            resume: resume_rx,
+        },
+    ));
+    let running_state = b.state.clone();
+    let running_id = operation_id.clone();
+    let running =
+        tokio::spawn(
+            async move { crate::ops::exec::run_operation(&running_state, &running_id).await },
+        );
+    tokio::time::timeout(Duration::from_secs(15), reached)
+        .await
+        .expect("the publication reaches its bookkeeping")
+        .unwrap();
+    sqlx::query("UPDATE uploads SET operation_id = 'foreign-operation' WHERE operation_id = ?")
+        .bind(&operation_id)
+        .execute(&b.state.db)
+        .await
+        .unwrap();
+    resume.send(()).unwrap();
+    running.await.unwrap().unwrap();
+
+    let operation = crate::ops::load(&b.state, &operation_id).await.unwrap().0;
+    assert_eq!(
+        operation.status,
+        ism_core::dto::OperationStatus::RecoveryRequired
+    );
+    assert_eq!(
+        operation.items[0].error.as_ref().unwrap().code,
+        "peer_bookkeeping_failed"
+    );
+    assert_eq!(
+        std::fs::read(b.shared.join("photo.jpg")).unwrap(),
+        b"remote photo"
+    );
+    assert!(
+        super::row(&b.state, &share.id, "photo.jpg")
+            .await
+            .unwrap()
+            .is_none_or(|row| row.sha256.is_none()),
+        "no version is recorded without the exact upload"
+    );
+    let pending = || async {
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM pending_peer_ops WHERE operation_id = ?")
+            .bind(&operation_id)
+            .fetch_one(&b.state.db)
+            .await
+            .unwrap()
+    };
+    assert_eq!(pending().await, 1);
+
+    sqlx::query("UPDATE uploads SET operation_id = ? WHERE operation_id = 'foreign-operation'")
+        .bind(&operation_id)
+        .execute(&b.state.db)
+        .await
+        .unwrap();
+    let progress_json: String = sqlx::query_scalar(
+        "SELECT progress_json FROM operation_items WHERE operation_id = ? AND idx = 0",
+    )
+    .bind(&operation_id)
+    .fetch_one(&b.state.db)
+    .await
+    .unwrap();
+    let mut progress: serde_json::Value = serde_json::from_str(&progress_json).unwrap();
+    progress["steps"]
+        .as_array_mut()
+        .unwrap()
+        .last_mut()
+        .unwrap()["status"] = "running".into();
+    sqlx::query(
+        "UPDATE operation_items
+         SET error_code = NULL, error_message = NULL, progress_json = ?
+         WHERE operation_id = ? AND idx = 0",
+    )
+    .bind(progress.to_string())
+    .bind(&operation_id)
+    .execute(&b.state.db)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE operations SET recovery_resolved = 1 WHERE id = ?")
+        .bind(&operation_id)
+        .execute(&b.state.db)
+        .await
+        .unwrap();
+    super::transfer::recheck_publish_recovery(&b.state, &operation_id)
+        .await
+        .unwrap();
+    assert_eq!(pending().await, 0);
+    let row = super::row(&b.state, &share.id, "photo.jpg")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        row.sha256.as_deref(),
+        Some(crate::crypto::sha256_hex(b"remote photo").as_str())
+    );
 }
 
 #[tokio::test]

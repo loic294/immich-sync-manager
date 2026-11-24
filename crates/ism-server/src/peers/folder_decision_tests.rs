@@ -2883,6 +2883,22 @@ async fn overlapping_remote_choice_reopens_for_new_peer_changes_in_displaced_tre
                 .is_ok_and(|bytes| bytes == b"local source")
         })
         .await;
+        // Until the copy's content is verified, b's scans skip the path, so a change made there
+        // would not be versioned yet.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM peer_inbox WHERE status != 'done')",
+        )
+        .fetch_one(&b.state.db)
+        .await
+        .unwrap()
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "copy content is verified"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
         let state = b.state.clone();
         let guard = state.replication_operation_lock.lock().await;
         stop_workers(&mut b).await;
