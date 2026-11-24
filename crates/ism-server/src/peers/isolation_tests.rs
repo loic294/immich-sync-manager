@@ -503,15 +503,19 @@ async fn active_operation_without_a_registration_fails_scans_closed() {
     .await
     .unwrap();
     let id = accepted.operation_id;
-    // A row left running by a restart has no registration in this process.
-    sqlx::query("UPDATE operations SET status = 'running' WHERE id = ?")
-        .bind(&id)
-        .execute(&b.state.db)
-        .await
-        .unwrap();
-    let scan = tokio::time::timeout(Duration::from_secs(2), peers::scan_share(&b.state, &family));
-    let error = scan.await.expect("scan must not hang").unwrap_err();
-    assert_eq!(error.code(), "recovery_required", "{error:?}");
+    // Either active phase left behind by a restart has no registration in this process.
+    for status in ["waiting_maintenance", "running"] {
+        sqlx::query("UPDATE operations SET status = ? WHERE id = ?")
+            .bind(status)
+            .bind(&id)
+            .execute(&b.state.db)
+            .await
+            .unwrap();
+        let scan =
+            tokio::time::timeout(Duration::from_secs(2), peers::scan_share(&b.state, &family));
+        let error = scan.await.expect("scan must not hang").unwrap_err();
+        assert_eq!(error.code(), "recovery_required", "{status}: {error:?}");
+    }
 
     // A panic while running drops the registration but leaves the row active.
     let state = b.state.clone();
