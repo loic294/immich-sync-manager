@@ -1051,7 +1051,9 @@ pub async fn readd_sync_operation(state: &AppState, operation_id: &str, idx: i64
     .fetch_optional(&state.db)
     .await?;
     let Some((share_id, event_json, expected_cursor, peer_id)) = pending_event else {
-        return Err(AppError::not_found(
+        return Err(AppError::new(
+            axum::http::StatusCode::NOT_FOUND,
+            "sync_queue_entry_missing",
             "the failed item is no longer pending in the sync queue",
         ));
     };

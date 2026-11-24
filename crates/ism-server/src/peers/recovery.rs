@@ -3257,7 +3257,9 @@ const FORWARD_CONCURRENCY: usize = 4;
 type EligibleJob = (String, String, String, Option<String>);
 
 /// A job whose repair is already under way (a queued transfer or publication) completes on its
-/// own; rechecking it every 30 seconds only adds database writes.
+/// own; rechecking it every 30 seconds only adds database writes. A failed item whose sync queue
+/// entry is gone cannot change until new evidence arrives, so it uses the same slower recheck;
+/// Fix still requeues it at once.
 const AWAITING_COMPLETION_RECHECK: chrono::Duration = chrono::Duration::minutes(5);
 
 async fn eligible_jobs(
@@ -3312,7 +3314,8 @@ async fn eligible_jobs(
              FROM sync_recovery r
              WHERE (r.state='queued' OR (r.state='waiting'
                      AND COALESCE(r.code,'')!='recovery_archive_version_missing' AND r.updated_at <
-                     CASE WHEN r.code='awaiting_completion' THEN ? ELSE ? END)
+                     CASE WHEN r.code IN ('awaiting_completion','sync_queue_entry_missing')
+                         THEN ? ELSE ? END)
                  OR (r.state='needs_decision' AND EXISTS(SELECT 1 FROM sync_recovery_links l JOIN conflicts c ON l.kind='conflict' AND c.id=l.target_id
                      WHERE l.recovery_id=r.id AND c.status='resolved')))
                 AND (? IS NULL OR r.kind=?)
@@ -3368,7 +3371,8 @@ async fn run_job(state: &AppState, job: String, kind: String, id: String) -> App
         "UPDATE sync_recovery SET state='fixing',updated_at=?
          WHERE id=? AND (state='queued' OR (state='waiting'
                  AND COALESCE(code,'')!='recovery_archive_version_missing' AND updated_at <
-                 CASE WHEN code='awaiting_completion' THEN ? ELSE ? END)
+                 CASE WHEN code IN ('awaiting_completion','sync_queue_entry_missing')
+                     THEN ? ELSE ? END)
              OR (state='needs_decision' AND EXISTS(
                  SELECT 1 FROM sync_recovery_links l JOIN conflicts c
                  ON l.kind='conflict' AND c.id=l.target_id
@@ -3429,6 +3433,7 @@ async fn run_job(state: &AppState, job: String, kind: String, id: String) -> App
                         | "peer_share_changed"
                         | "recovery_evidence_missing"
                         | "recovery_archive_version_missing"
+                        | "sync_queue_entry_missing"
                         | "recovery_evidence_changed"
                         | "recovery_plan_unchanged"
                         | "revision_changed"
@@ -4638,6 +4643,110 @@ mod policy_tests {
                 ("conflict:waiting".into(), "waiting".into()),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn missing_sync_queue_entry_is_rechecked_slowly_until_fix() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new(
+            Config::for_tests(dir.path()),
+            crate::db::connect(dir.path()).await.unwrap(),
+            SecretBox::open_or_create(dir.path()).unwrap(),
+        )
+        .await
+        .unwrap();
+        let operation = serde_json::json!({
+            "idempotency_key": "upload:upl_gone",
+            "actions": [{"kind":"publish_upload","upload_id":"upl_gone"}],
+            "allow_owner_transfer": false,
+            "allow_partial": false
+        });
+        sqlx::query("INSERT INTO operations(id,idempotency_key,principal,source,request_json,status,created_at,finished_at) VALUES('gone','upload:upl_gone','peer:peer','peer',?,'failed',?,?)")
+            .bind(operation.to_string()).bind(db::now()).bind(db::now()).execute(&state.db).await.unwrap();
+        sqlx::query("INSERT INTO operation_items(operation_id,idx,kind,action_json,status,error_code) VALUES('gone',0,'publish_upload',?,'failed','immich_error')")
+            .bind(operation["actions"][0].to_string()).execute(&state.db).await.unwrap();
+        sqlx::query("INSERT INTO sync_recovery(id,kind,target_id,state,created_at,updated_at) VALUES('operation:gone','operation','gone','queued',?,?)")
+            .bind(db::now()).bind(db::now()).execute(&state.db).await.unwrap();
+        let ready = |state: AppState| async move {
+            eligible_jobs(&state, 50, None, None, &[], RECOVERY_CONCURRENCY_PER_PEER)
+                .await
+                .unwrap()
+                .iter()
+                .any(|(id, ..)| id == "operation:gone")
+        };
+        let age = |state: AppState, seconds: i64| async move {
+            sqlx::query("UPDATE sync_recovery SET updated_at=? WHERE id='operation:gone'")
+                .bind((chrono::Utc::now() - chrono::Duration::seconds(seconds)).to_rfc3339())
+                .execute(&state.db)
+                .await
+                .unwrap();
+        };
+        let run = |state: AppState| async move {
+            run_job(
+                &state,
+                "operation:gone".into(),
+                "operation".into(),
+                "gone".into(),
+            )
+            .await
+            .unwrap();
+            sqlx::query_as::<_, (String, Option<String>, i64)>(
+                "SELECT state,code,attempts FROM sync_recovery WHERE id='operation:gone'",
+            )
+            .fetch_one(&state.db)
+            .await
+            .unwrap()
+        };
+
+        assert_eq!(
+            run(state.clone()).await,
+            ("waiting".into(), Some("sync_queue_entry_missing".into()), 0)
+        );
+        let item = get(&state, RecoveryKind::Operation, "gone")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(item.state, RecoveryState::Waiting);
+        assert!(item.can_fix);
+
+        age(state.clone(), 31).await;
+        assert!(!ready(state.clone()).await);
+        assert_eq!(
+            run(state.clone()).await,
+            ("waiting".into(), Some("sync_queue_entry_missing".into()), 0)
+        );
+
+        age(state.clone(), 6 * 60).await;
+        assert!(ready(state.clone()).await);
+        assert_eq!(
+            run(state.clone()).await,
+            ("waiting".into(), Some("sync_queue_entry_missing".into()), 0)
+        );
+
+        let admitted = submit_one(
+            &state,
+            RecoveryTarget {
+                kind: RecoveryKind::Operation,
+                id: "gone".into(),
+                peer_id: None,
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(admitted[0].state, RecoveryState::Queued);
+        assert!(ready(state.clone()).await);
+        let created: i64 = sqlx::query_scalar(
+            "SELECT (SELECT count(*) FROM operations WHERE id!='gone')
+                  + (SELECT count(*) FROM pending_peer_ops)
+                  + (SELECT count(*) FROM pending_peer_events)
+                  + (SELECT count(*) FROM transfers)",
+        )
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+        assert_eq!(created, 0);
     }
 
     #[tokio::test]

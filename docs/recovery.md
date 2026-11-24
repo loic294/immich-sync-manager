@@ -116,6 +116,9 @@ slots before another peer arrives, three stalled unattributed jobs block other u
 and shared maintenance or path barriers still apply. Jobs are not cancelled to free slots. Waiting
 jobs retry after 30 seconds, except for legacy publication archives missing their original
 version vector as described below; interrupted claims are recovered before the affected queue resumes.
+Jobs waiting for a started repair to finish, and failed peer items that are no longer in the sync
+queue (`sync_queue_entry_missing`), are rechecked every 5 minutes without consuming an attempt; Fix
+rechecks them at once.
 
 Recovery checks retained complete staging, upload staging, local copies, and authenticated share
 peers' applicable trash inventories. It can transfer the exact verified file without restoring
