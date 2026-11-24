@@ -1498,6 +1498,8 @@ async fn readd_sync_operation(
 struct ConflictsQuery {
     #[serde(default)]
     include_resolved: bool,
+    #[serde(default)]
+    resolved_only: bool,
     limit: Option<i64>,
     offset: Option<i64>,
     #[serde(default)]
@@ -1533,7 +1535,8 @@ async fn conflicts_page(
             limit,
             offset,
             &peers::ConflictFilterQuery {
-                resolved_only: q.include_resolved,
+                include_resolved: q.include_resolved,
+                resolved_only: q.resolved_only,
                 share: q.share,
                 folder: q.folder,
             },

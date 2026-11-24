@@ -29,6 +29,95 @@ struct Reply {
 }
 
 #[tokio::test]
+async fn conflict_http_filters_preserve_include_resolved_and_support_resolved_only() {
+    let h = harness().await;
+    h.map_root().await;
+    sqlx::query(
+        "INSERT INTO shares(id,name,root_id,path,peer_ids_json,enabled)
+         VALUES ('share','Archive','photos','','[]',1)",
+    )
+    .execute(&h.state.db)
+    .await
+    .unwrap();
+    let side = json!({
+        "instance": "Example", "sha256": null, "size": null,
+        "modified_at": null, "deleted": false,
+    })
+    .to_string();
+    for (id, path, status) in [
+        ("open", "Trips/open.jpg", "open"),
+        ("resolved", "Archive/resolved.jpg", "resolved"),
+    ] {
+        sqlx::query(
+            "INSERT INTO conflicts(id,share_id,rel_path,kind,detail,local_json,remote_json,
+             remote_vv_json,peer_id,status,created_at)
+             VALUES (?,'share',?,'changed_on_both','synthetic conflict',?,?,'{}','former-peer',?,?)",
+        )
+        .bind(id)
+        .bind(path)
+        .bind(&side)
+        .bind(&side)
+        .bind(status)
+        .bind(crate::db::now())
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    }
+    let auth = [("cookie", h.cookie.as_str())];
+    for (query, expected, folders) in [
+        ("", vec!["open"], vec!["Trips"]),
+        ("?include_resolved=false", vec!["open"], vec!["Trips"]),
+        (
+            "?include_resolved=true",
+            vec!["open", "resolved"],
+            vec!["Archive", "Trips"],
+        ),
+        ("?resolved_only=true", vec!["resolved"], vec!["Archive"]),
+        (
+            "?include_resolved=true&resolved_only=true",
+            vec!["resolved"],
+            vec!["Archive"],
+        ),
+    ] {
+        let reply = send(
+            &h.app,
+            get(&format!("/api/admin/conflicts/page{query}"), &auth),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::OK, "{query}: {}", reply.json());
+        let page = reply.json();
+        let mut statuses = page["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["conflict"]["status"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        statuses.sort_unstable();
+        assert_eq!(statuses, expected, "{query}");
+        assert_eq!(page["total"], expected.len(), "{query}");
+        assert_eq!(page["filters"][0]["folders"], json!(folders), "{query}");
+    }
+    let list = send(
+        &h.app,
+        get("/api/admin/conflicts?include_resolved=true", &auth),
+    )
+    .await;
+    assert_eq!(list.status, StatusCode::OK);
+    assert_eq!(list.json().as_array().unwrap().len(), 2);
+    let last = send(
+        &h.app,
+        get(
+            "/api/admin/conflicts/page?include_resolved=true&limit=1&offset=1",
+            &auth,
+        ),
+    )
+    .await;
+    assert_eq!(last.status, StatusCode::OK);
+    assert_eq!(last.json()["total"], 2);
+    assert_eq!(last.json()["rows"][0]["conflict"]["status"], "open");
+}
+
+#[tokio::test]
 async fn watch_snapshot_ranges_keep_exact_paths_without_adjacent_prefixes_or_duplicates() {
     let h = harness().await;
     sqlx::query(

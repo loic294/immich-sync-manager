@@ -127,7 +127,7 @@ describe('ism-conflicts-page', () => {
     share.dispatchEvent(new Event('change'));
     await vi.waitFor(() =>
       expect(get).toHaveBeenCalledWith('/api/admin/conflicts/page', {
-        query: { include_resolved: false, limit: 50, offset: 0, share: 'Photos', folder: '' },
+        query: { resolved_only: false, limit: 50, offset: 0, share: 'Photos', folder: '' },
       }),
     );
     expect(page.selected.size).toBe(0);
@@ -144,7 +144,7 @@ describe('ism-conflicts-page', () => {
     await vi.waitFor(() =>
       expect(get).toHaveBeenCalledWith('/api/admin/conflicts/page', {
         query: {
-          include_resolved: false,
+          resolved_only: false,
           limit: 50,
           offset: 0,
           share: 'Photos',
@@ -166,7 +166,7 @@ describe('ism-conflicts-page', () => {
   it('shows only resolved results without fetching their version evidence', async () => {
     const get = vi.spyOn(api, 'get').mockImplementation(async (path, options) => {
       if (path.endsWith('/versions')) return versions as never;
-      const resolved = options?.query?.include_resolved === true;
+      const resolved = options?.query?.resolved_only === true;
       return {
         rows: [
           {
@@ -189,6 +189,11 @@ describe('ism-conflicts-page', () => {
     await vi.waitFor(() => expect(page.querySelector('ism-recovery-versions')).not.toBeNull());
     get.mockClear();
     page.querySelector<HTMLInputElement>('.toggle')?.click();
+    await vi.waitFor(() =>
+      expect(get).toHaveBeenCalledWith('/api/admin/conflicts/page', {
+        query: { resolved_only: true, limit: 50, offset: 0, share: '', folder: '' },
+      }),
+    );
     await vi.waitFor(() => expect(page.textContent).toContain('This conflict has been resolved.'));
     expect(page.textContent).toContain('resolved.jpg');
     expect(page.textContent).not.toContain('photos:a.jpg');

@@ -3095,6 +3095,7 @@ async fn conflict_page_paginates_local_and_peer_targets_without_a_cap() {
         share: share.name.clone(),
         folder: "Trips".into(),
         resolved_only: false,
+        include_resolved: false,
     };
     let filtered = super::admin::page_conflicts(&a.state, 1, 0, &filter)
         .await

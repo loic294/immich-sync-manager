@@ -164,9 +164,9 @@ export const admin = {
   readdSyncOperation: (id: string, index: number) =>
     api.post<void>(`${A}/sync/operations/${enc(id)}/${index}/readd`),
 
-  conflicts: (includeResolved = false, limit = 50, offset = 0, share = '', folder = '') =>
+  conflicts: (resolvedOnly = false, limit = 50, offset = 0, share = '', folder = '') =>
     api.get<ConflictPage>(`${A}/conflicts/page`, {
-      query: { include_resolved: includeResolved, limit, offset, share, folder },
+      query: { resolved_only: resolvedOnly, limit, offset, share, folder },
     }),
   resolveConflict: (id: string, resolution: ConflictResolution) =>
     api.post<void>(`${A}/conflicts/${enc(id)}/resolve`, { body: { resolution } }),

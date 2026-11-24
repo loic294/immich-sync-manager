@@ -1252,6 +1252,7 @@ pub async fn list_conflicts(
 
 #[derive(Default)]
 pub struct ConflictFilterQuery {
+    pub include_resolved: bool,
     pub resolved_only: bool,
     pub share: String,
     pub folder: String,
@@ -1348,9 +1349,11 @@ pub async fn page_conflicts(
 
     let scopes: Vec<(String, String)> = sqlx::query_as(
         "SELECT s.name,c.rel_path FROM conflicts c JOIN shares s ON s.id=c.share_id
-         WHERE (c.status='resolved')=? ORDER BY s.name,c.rel_path",
+         WHERE CASE WHEN ? THEN c.status='resolved' ELSE c.status!='resolved' OR ? END
+         ORDER BY s.name,c.rel_path",
     )
     .bind(filter.resolved_only)
+    .bind(filter.include_resolved)
     .fetch_all(&state.db)
     .await?;
     let matches = |share: &str, path: &str| {
@@ -1389,7 +1392,8 @@ pub async fn page_conflicts(
         )
     });
     let peer_total = i64::try_from(peer.len()).map_err(AppError::internal)?;
-    let mut local = local_conflicts_page(state, false, limit, offset, filter).await?;
+    let mut local =
+        local_conflicts_page(state, filter.include_resolved, limit, offset, filter).await?;
     for row in &mut local {
         row.recovery = super::recovery::get(state, RecoveryKind::Conflict, &row.id).await?;
     }

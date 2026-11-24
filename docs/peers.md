@@ -245,6 +245,10 @@ visible. **Newer** compares file modification times and **Larger** compares tota
 these badges are hints, not recommendations. Missing or invalid metadata does not establish
 a comparison, and equal values have no badge.
 
+Both conflict API endpoints retain `include_resolved=true` as open plus resolved results.
+The paginated endpoint also accepts `resolved_only=true`, used by **Show resolved**; it takes
+precedence when both flags are set.
+
 The **Conflicts** page lists each conflict with both versions (size, checksum, time) and, for moves,
 the path the peer moved from. ISM records a conflict when:
 - `changed_on_both`: both sides changed the file since they last agreed;
