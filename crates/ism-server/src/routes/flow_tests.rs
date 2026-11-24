@@ -117,13 +117,18 @@ async fn share_scan_failure_is_visible_in_attention_and_background_http() {
     assert!(!item.to_string().contains(&*h.root.to_string_lossy()));
     let background = send(&h.app, get("/api/admin/operations/background", &auth)).await;
     assert_eq!(background.status, StatusCode::OK);
+    let rows = background.json();
+    let rows = rows["current"].as_array().unwrap();
     assert!(
-        background.json()["current"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|item| item["task_key"] == format!("share-scan:{}", share.id))
+        rows.iter()
+            .any(|item| item["task_key"] == format!("share:{}", share.id))
     );
+    let evidence = rows
+        .iter()
+        .find(|item| item["task_key"] == format!("share-scan:{}", share.id))
+        .unwrap();
+    assert_eq!(evidence["phase"], item["message"]);
+    assert_eq!(evidence["page"], "/peers");
     std::fs::create_dir(h.root.join("2024")).unwrap();
     crate::peers::scan_share(&h.state, &share).await.unwrap();
     let recovered = send(&h.app, get("/api/admin/attention", &auth))

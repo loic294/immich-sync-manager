@@ -537,7 +537,12 @@ pub async fn scan_share(state: &AppState, share: &Share) -> AppResult<()> {
         |task| async move {
             task.waiting("Waiting for managed operations that are changing files");
             let _operation_guard = state.replication_operation_lock.lock_scan().await;
-            let result = scan_share_reporting(state, share, &task).await;
+            let Some(share) = shares(state).await?.into_iter()
+                .find(|current| current.id == share.id && current.enabled)
+            else {
+                return Ok(());
+            };
+            let result = scan_share_reporting(state, &share, &task).await;
             match &result {
                 Ok(true) => {
                     let cleared = sqlx::query(
@@ -550,6 +555,7 @@ pub async fn scan_share(state: &AppState, share: &Share) -> AppResult<()> {
                     }
                 }
                 Ok(false) => {}
+                Err(error) if error.code() == "recovery_required" => {}
                 Err(error) => {
                     let reason = if error.io_kind() == Some(std::io::ErrorKind::PermissionDenied)
                         || error.code() == "share_scan_permission_denied"

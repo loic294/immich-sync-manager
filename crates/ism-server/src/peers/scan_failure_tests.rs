@@ -280,3 +280,115 @@ async fn share_scan_failure_reports_persistence_failure_and_retries_saving() {
     );
     assert!(failure(&local.state, &share.id).await.is_some());
 }
+
+#[tokio::test]
+async fn share_scan_failure_does_not_publish_or_clear_after_disable_while_waiting() {
+    let (local, share) = fixture().await;
+    std::fs::remove_dir(&local.shared).unwrap();
+    assert!(
+        super::super::scan_share(&local.state, &share)
+            .await
+            .is_err()
+    );
+    std::fs::create_dir(&local.shared).unwrap();
+    write_old(&local.shared.join("later.jpg"), b"later");
+    let guard = local.state.replication_operation_lock.lock().await;
+    let scan = super::super::scan_share(&local.state, &share);
+    tokio::pin!(scan);
+    tokio::select! {
+        biased;
+        result = &mut scan => panic!("scan must wait for the configuration guard: {result:?}"),
+        () = tokio::task::yield_now() => {}
+    }
+    // This write represents the configuration transaction already holding the admission gate.
+    sqlx::query("UPDATE shares SET enabled=0 WHERE id=?")
+        .bind(&share.id)
+        .execute(&local.state.db)
+        .await
+        .unwrap();
+    drop(guard);
+    scan.await.unwrap();
+    assert!(
+        super::super::row(&local.state, &share.id, "later.jpg")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    sqlx::query("UPDATE shares SET enabled=1 WHERE id=?")
+        .bind(&share.id)
+        .execute(&local.state.db)
+        .await
+        .unwrap();
+    assert!(failure(&local.state, &share.id).await.is_some());
+    super::super::scan_share(&local.state, &share)
+        .await
+        .unwrap();
+    assert!(failure(&local.state, &share.id).await.is_none());
+    assert!(
+        super::super::row(&local.state, &share.id, "later.jpg")
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn share_scan_failure_does_not_misclassify_global_operation_recovery() {
+    let (local, share) = fixture().await;
+    let accepted = crate::ops::submit(
+        &local.state,
+        &Principal::Admin {
+            username: "test".into(),
+        },
+        OperationRequest {
+            idempotency_key: "scan-failure-global-recovery".into(),
+            label: None,
+            actions: vec![OperationAction::CreateFolder {
+                target: loc("shared/pending"),
+            }],
+            allow_owner_transfer: false,
+            allow_partial: false,
+        },
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE operations SET status='running' WHERE id=?")
+        .bind(&accepted.operation_id)
+        .execute(&local.state.db)
+        .await
+        .unwrap();
+    assert_eq!(
+        super::super::scan_share(&local.state, &share)
+            .await
+            .unwrap_err()
+            .code(),
+        "recovery_required"
+    );
+    assert!(failure(&local.state, &share.id).await.is_none());
+
+    sqlx::query("UPDATE operations SET status='failed' WHERE id=?")
+        .bind(&accepted.operation_id)
+        .execute(&local.state.db)
+        .await
+        .unwrap();
+    std::fs::remove_dir(&local.shared).unwrap();
+    assert!(
+        super::super::scan_share(&local.state, &share)
+            .await
+            .is_err()
+    );
+    let before = failure(&local.state, &share.id).await.unwrap();
+    sqlx::query("UPDATE operations SET status='running' WHERE id=?")
+        .bind(&accepted.operation_id)
+        .execute(&local.state.db)
+        .await
+        .unwrap();
+    assert_eq!(
+        super::super::scan_share(&local.state, &share)
+            .await
+            .unwrap_err()
+            .code(),
+        "recovery_required"
+    );
+    assert_eq!(failure(&local.state, &share.id).await.unwrap(), before);
+}
