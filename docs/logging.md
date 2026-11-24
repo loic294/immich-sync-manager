@@ -83,7 +83,11 @@ errors and operation IDs. Remote evidence is cached only in memory (at most 64 p
 accepted report limited to 256 KiB and 500 conditions/shares), expires after 40 seconds measured
 monotonically, and is refreshed periodically and on peer invalidations. Configuration or membership
 changes invalidate cached authority. A server restart, expired report, unavailable peer or older
-peer without this endpoint shows unavailable evidence, never a cleared blocker.
+peer without this endpoint shows unavailable evidence, never a cleared blocker. Attention-only
+notifications refresh independently of sync and recovery; newer hints and configuration changes
+invalidate in-flight reports before they can become authoritative. A failed notification stream
+also invalidates remote attention until it reconnects; unsupported streams use the legacy polling
+path instead.
 Per-code, owner and optional receiver-peer coverage identifies authoritative sources: a missing item from a
 complete source can be cleared even if an unrelated source keeps the overall snapshot partial.
 Missing or partial source coverage cannot establish that a prior condition has cleared.

@@ -191,6 +191,14 @@ struct Instance {
     snapshot_status: std::sync::Arc<std::sync::atomic::AtomicU16>,
     recovery_status: std::sync::Arc<std::sync::atomic::AtomicU16>,
     evidence_status: std::sync::Arc<std::sync::atomic::AtomicU16>,
+    attention_hold: std::sync::Arc<AttentionHold>,
+}
+
+#[derive(Default)]
+struct AttentionHold {
+    armed: std::sync::atomic::AtomicBool,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
 }
 
 impl Drop for Instance {
@@ -228,18 +236,21 @@ async fn instance(name: &str) -> Instance {
     let snapshot_status = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0));
     let recovery_status = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0));
     let evidence_status = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0));
+    let attention_hold = std::sync::Arc::new(AttentionHold::default());
     let app = crate::routes::router(state.clone()).layer(axum::middleware::from_fn({
         let requests = requests.clone();
         let status = notification_status.clone();
         let snapshot_status = snapshot_status.clone();
         let recovery_status = recovery_status.clone();
         let evidence_status = evidence_status.clone();
+        let attention_hold = attention_hold.clone();
         move |request: axum::extract::Request, next: axum::middleware::Next| {
             let requests = requests.clone();
             let status = status.clone();
             let snapshot_status = snapshot_status.clone();
             let recovery_status = recovery_status.clone();
             let evidence_status = evidence_status.clone();
+            let attention_hold = attention_hold.clone();
             async move {
                 let path = request.uri().path().to_owned();
                 *requests.lock().unwrap().entry(path.clone()).or_insert(0) += 1;
@@ -271,6 +282,16 @@ async fn instance(name: &str) -> Instance {
                         axum::http::StatusCode::from_u16(status).unwrap(),
                     );
                 }
+                if path == "/api/peer/v1/attention"
+                    && attention_hold
+                        .armed
+                        .swap(false, std::sync::atomic::Ordering::SeqCst)
+                {
+                    let response = next.run(request).await;
+                    attention_hold.entered.notify_one();
+                    attention_hold.release.notified().await;
+                    return response;
+                }
                 next.run(request).await
             }
         }
@@ -295,6 +316,7 @@ async fn instance(name: &str) -> Instance {
         snapshot_status,
         recovery_status,
         evidence_status,
+        attention_hold,
     }
 }
 
@@ -315,6 +337,10 @@ async fn scheduler_fixture(
     let app = axum::Router::new()
         .route(
             "/api/peer/v1/notifications",
+            axum::routing::get(|| async { axum::http::StatusCode::NOT_FOUND }),
+        )
+        .route(
+            "/api/peer/v1/attention",
             axum::routing::get(|| async { axum::http::StatusCode::NOT_FOUND }),
         )
         .fallback({

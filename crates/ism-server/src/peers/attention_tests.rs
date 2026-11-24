@@ -11,6 +11,11 @@ async fn remote_attention_is_signed_scoped_minimal_and_authoritative_per_peer() 
     stop_workers(&mut a).await;
     stop_workers(&mut b).await;
     let peer = net::peers(&b.state).await.unwrap().remove(0);
+    let owner = b.state.peer_attention.begin(&peer.id).unwrap();
+    b.state
+        .peer_attention
+        .change(&peer.id, owner, Some(true))
+        .unwrap();
     assert_eq!(
         b.state
             .http
@@ -127,7 +132,7 @@ async fn remote_attention_is_signed_scoped_minimal_and_authoritative_per_peer() 
             .any(|item| item["code"] == "transfer_dependency" && item["blocks_work"] == true)
     );
     drop(registration);
-    attention::refresh(&b.state, &peer).await.unwrap();
+    attention::refresh(&b.state, &peer, owner).await.unwrap();
     let snapshot = attention::snapshot(&b.state).await.unwrap();
     assert!(
         snapshot
@@ -226,7 +231,7 @@ async fn remote_attention_is_signed_scoped_minimal_and_authoritative_per_peer() 
     .execute(&b.state.db)
     .await
     .unwrap();
-    attention::refresh(&b.state, &peer).await.unwrap();
+    attention::refresh(&b.state, &peer, owner).await.unwrap();
     let cleared = attention::snapshot(&b.state).await.unwrap();
     assert!(
         !cleared
@@ -284,6 +289,11 @@ async fn remote_attention_rejects_old_invalid_oversized_and_changed_membership_e
     stop_workers(&mut a).await;
     stop_workers(&mut b).await;
     let peer = net::peers(&b.state).await.unwrap().remove(0);
+    let owner = b.state.peer_attention.begin(&peer.id).unwrap();
+    b.state
+        .peer_attention
+        .change(&peer.id, owner, Some(true))
+        .unwrap();
     std::fs::write(a.shared.parent().unwrap().join(".ism-root"), "wrong-root").unwrap();
     let mut report: Value = net::get_json(&b.state, &peer, PATH).await.unwrap();
     let server = MockServer::start().await;
@@ -304,7 +314,7 @@ async fn remote_attention_rejects_old_invalid_oversized_and_changed_membership_e
             .respond_with(response)
             .mount(&server)
             .await;
-        attention::refresh(&b.state, &peer).await.unwrap();
+        attention::refresh(&b.state, &peer, owner).await.unwrap();
         let unknown = attention::snapshot(&b.state).await.unwrap();
         assert!(
             unknown
@@ -315,6 +325,7 @@ async fn remote_attention_rejects_old_invalid_oversized_and_changed_membership_e
         );
         assert!(unknown.items.iter().all(|item| !item.blocks_work));
     }
+
     server.reset().await;
     report["instance_id"] = "wrong-instance".into();
     Mock::given(method("GET"))
@@ -322,7 +333,7 @@ async fn remote_attention_rejects_old_invalid_oversized_and_changed_membership_e
         .respond_with(ResponseTemplate::new(200).set_body_json(&report))
         .mount(&server)
         .await;
-    attention::refresh(&b.state, &peer).await.unwrap();
+    attention::refresh(&b.state, &peer, owner).await.unwrap();
     assert!(
         attention::snapshot(&b.state)
             .await
@@ -338,7 +349,7 @@ async fn remote_attention_rejects_old_invalid_oversized_and_changed_membership_e
         .respond_with(ResponseTemplate::new(200).set_body_json(&report))
         .mount(&server)
         .await;
-    attention::refresh(&b.state, &peer).await.unwrap();
+    attention::refresh(&b.state, &peer, owner).await.unwrap();
     assert!(
         attention::snapshot(&b.state)
             .await
@@ -359,5 +370,84 @@ async fn remote_attention_rejects_old_invalid_oversized_and_changed_membership_e
             .iter()
             .filter(|source| source.peer_id.as_deref() == Some(&peer.id))
             .all(|source| source.completeness != AttentionCompleteness::Complete)
+    );
+}
+
+#[tokio::test]
+async fn remote_attention_membership_aba_fences_held_response() {
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    let peer = net::peers(&b.state).await.unwrap().remove(0);
+    let owner = b.state.peer_attention.begin(&peer.id).unwrap();
+    b.state
+        .peer_attention
+        .change(&peer.id, owner, Some(true))
+        .unwrap();
+    std::fs::write(a.shared.parent().unwrap().join(".ism-root"), "wrong-root").unwrap();
+    attention::refresh(&b.state, &peer, owner).await.unwrap();
+    assert!(
+        attention::snapshot(&b.state)
+            .await
+            .unwrap()
+            .items
+            .iter()
+            .any(|item| item.blocks_work)
+    );
+
+    std::fs::write(a.shared.parent().unwrap().join(".ism-root"), "photos").unwrap();
+    a.attention_hold
+        .armed
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let state = b.state.clone();
+    let request_peer = peer.clone();
+    let request =
+        tokio::spawn(async move { attention::refresh(&state, &request_peer, owner).await });
+    tokio::time::timeout(Duration::from_secs(9), a.attention_hold.entered.notified())
+        .await
+        .expect("old response must be held");
+
+    let share = super::super::shares(&b.state).await.unwrap().remove(0);
+    let input = |peer_ids| ShareInput {
+        name: share.name.clone(),
+        location: Location {
+            root_id: share.root_id.clone(),
+            path: share.path.as_str().into(),
+        },
+        peer_ids,
+        enabled: true,
+    };
+    admin::update_share(&b.state, &share.id, input(Vec::new()))
+        .await
+        .unwrap();
+    admin::update_share(&b.state, &share.id, input(vec![peer.id.clone()]))
+        .await
+        .unwrap();
+    a.attention_hold.release.notify_one();
+    request.await.unwrap().unwrap();
+    let after = attention::snapshot(&b.state).await.unwrap();
+    assert!(after.items.iter().all(|item| !item.blocks_work));
+    assert!(
+        after
+            .coverage
+            .iter()
+            .filter(|source| source.peer_id.as_deref() == Some(&peer.id))
+            .all(|source| source.completeness == AttentionCompleteness::Unavailable)
+    );
+
+    std::fs::write(a.shared.parent().unwrap().join(".ism-root"), "wrong-root").unwrap();
+    let owner = b.state.peer_attention.begin(&peer.id).unwrap();
+    b.state
+        .peer_attention
+        .change(&peer.id, owner, Some(true))
+        .unwrap();
+    attention::refresh(&b.state, &peer, owner).await.unwrap();
+    assert!(
+        attention::snapshot(&b.state)
+            .await
+            .unwrap()
+            .items
+            .iter()
+            .any(|item| item.blocks_work)
     );
 }

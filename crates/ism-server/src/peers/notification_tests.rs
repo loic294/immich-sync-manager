@@ -7,6 +7,7 @@ use std::sync::atomic::Ordering;
 const NOTIFICATIONS: &str = "/api/peer/v1/notifications";
 const RECOVERY: &str = "/api/peer/v1/recovery";
 const PROGRESS: &str = "/api/peer/v1/sync-activity";
+const ATTENTION: &str = "/api/peer/v1/attention";
 
 fn count(instance: &Instance, path: &str) -> usize {
     instance
@@ -84,6 +85,140 @@ async fn failed_remote_operation(b: &Instance) {
     .await
     .unwrap();
     crate::peers::recovery::discover(&b.state).await.unwrap();
+}
+
+async fn remote_mapping(a: &Instance, peer: &net::Peer) -> (bool, bool) {
+    let snapshot = crate::peers::attention::snapshot(&a.state).await.unwrap();
+    let blocked = snapshot.items.iter().any(|item| {
+        item.code == ism_core::dto::AttentionCode::MappingUnavailable
+            && item.peer_id.as_deref() == Some(&peer.id)
+            && item.blocks_work
+    });
+    let complete = snapshot.coverage.iter().any(|source| {
+        source.code == ism_core::dto::AttentionCode::MappingUnavailable
+            && source.peer_id.as_deref() == Some(&peer.id)
+            && source.completeness == ism_core::dto::AttentionCompleteness::Complete
+    });
+    (blocked, complete)
+}
+
+#[tokio::test]
+async fn notification_client_attention_hold_does_not_block_updates_or_publish_stale_evidence() {
+    let (a, b, peer) = fixture(0).await;
+    wait("connected", || ready(&a, &peer)).await;
+    std::fs::write(b.shared.parent().unwrap().join(".ism-root"), "wrong-root").unwrap();
+    b.state.emit(crate::state::ServerEvent::WatchChanged);
+    wait("remote blocker", || async {
+        remote_mapping(&a, &peer).await == (true, true)
+    })
+    .await;
+
+    std::fs::write(b.shared.parent().unwrap().join(".ism-root"), "photos").unwrap();
+    b.attention_hold.armed.store(true, Ordering::SeqCst);
+    b.state.emit(crate::state::ServerEvent::WatchChanged);
+    tokio::time::timeout(Duration::from_secs(9), b.attention_hold.entered.notified())
+        .await
+        .expect("first attention response is held");
+    std::fs::write(b.shared.parent().unwrap().join(".ism-root"), "wrong-root").unwrap();
+    let progress = count(&b, PROGRESS);
+    let recovery = count(&b, RECOVERY);
+    b.state.emit(crate::state::ServerEvent::WatchChanged);
+    failed_remote_operation(&b).await;
+    wait("activity and recovery while attention is held", || async {
+        count(&b, PROGRESS) > progress
+            && count(&b, RECOVERY) > recovery
+            && sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM outgoing_recovery WHERE target_id='heartbeat-example')",
+            )
+            .fetch_one(&a.state.db)
+            .await
+            .unwrap()
+    })
+    .await;
+    assert_eq!(remote_mapping(&a, &peer).await, (false, false));
+
+    b.attention_hold.armed.store(true, Ordering::SeqCst);
+    b.attention_hold.release.notify_one();
+    tokio::time::timeout(Duration::from_secs(9), b.attention_hold.entered.notified())
+        .await
+        .expect("new hint schedules a fresh response");
+    assert_eq!(
+        remote_mapping(&a, &peer).await,
+        (false, false),
+        "the old clear response must not become authoritative"
+    );
+    b.attention_hold.release.notify_one();
+    wait("fresh blocker", || async {
+        remote_mapping(&a, &peer).await == (true, true)
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn notification_client_attention_only_changes_do_not_rewrite_sync_or_recovery() {
+    let (a, b, peer) = fixture(0).await;
+    wait("connected", || ready(&a, &peer)).await;
+    wait("initial attention", || async {
+        remote_mapping(&a, &peer).await.1
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    sqlx::query("CREATE TABLE write_audit (table_name TEXT NOT NULL)")
+        .execute(&a.state.db)
+        .await
+        .unwrap();
+    for table in [
+        "peer_sync_state",
+        "peer_recovery_state",
+        "outgoing_sync",
+        "outgoing_recovery",
+    ] {
+        for action in ["INSERT", "UPDATE", "DELETE"] {
+            let statement = format!(
+                "CREATE TRIGGER audit_{table}_{action} AFTER {action} ON {table} \
+                 BEGIN INSERT INTO write_audit VALUES ('{table}'); END"
+            );
+            sqlx::query(sqlx::AssertSqlSafe(statement))
+                .execute(&a.state.db)
+                .await
+                .unwrap();
+        }
+    }
+    let before = (
+        count(&b, ATTENTION),
+        count(&b, PROGRESS),
+        count(&b, RECOVERY),
+    );
+    b.state.emit(crate::state::ServerEvent::WatchChanged);
+    b.state.emit(crate::state::ServerEvent::MaintenanceChanged {
+        server_id: "example".into(),
+    });
+    wait("attention-only refresh", || async {
+        count(&b, ATTENTION) > before.0
+    })
+    .await;
+    wait("attention current", || async {
+        remote_mapping(&a, &peer).await.1
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(
+        (count(&b, PROGRESS), count(&b, RECOVERY)),
+        (before.1, before.2)
+    );
+    let writes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM write_audit")
+        .fetch_one(&a.state.db)
+        .await
+        .unwrap();
+    assert_eq!(
+        writes, 0,
+        "attention-only changes must not rewrite sync or recovery"
+    );
+    b.state.emit(crate::state::ServerEvent::SyncChanged);
+    wait("ordinary refresh still works", || async {
+        count(&b, PROGRESS) > before.1 && count(&b, RECOVERY) > before.2
+    })
+    .await;
 }
 
 async fn cache_available(a: &Instance, peer: &net::Peer) -> (bool, bool) {
@@ -208,6 +343,7 @@ async fn notification_client_failed_fetch_or_connection_never_extends_freshness(
         .unwrap()
     })
     .await;
+    wait("receiver snapshots verified", || ready(&a, &peer)).await;
     age_snapshots(&a).await;
     assert_eq!(cache_available(&a, &peer).await, (true, true));
 
@@ -271,6 +407,10 @@ async fn notification_client_failed_fetch_or_connection_never_extends_freshness(
     })
     .await;
     assert_eq!(cache_available(&a, &peer).await, (false, false));
+    wait("attention unavailable during disconnection", || async {
+        !remote_mapping(&a, &peer).await.1
+    })
+    .await;
     admin::delete_peer(&a.state, &peer.id).await.unwrap();
     tokio::time::sleep(Duration::from_millis(250)).await;
     assert_eq!(
@@ -438,6 +578,10 @@ async fn notification_client_legacy_fallback_and_configuration_reprobe() {
     for status in [404, 405, 501] {
         let (a, b, peer) = fixture(status).await;
         wait("legacy initial refresh", || ready(&a, &peer)).await;
+        wait("legacy attention remains available", || async {
+            remote_mapping(&a, &peer).await.1
+        })
+        .await;
         wait("legacy periodic refresh", || async {
             count(&b, PROGRESS) >= 2
         })

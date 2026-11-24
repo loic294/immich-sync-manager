@@ -12,7 +12,7 @@ use tokio::sync::{broadcast, watch};
 use super::peer::PeerAuth;
 use crate::error::{AppError, AppResult};
 use crate::peers::net;
-use crate::state::AppState;
+use crate::state::{AppState, PeerEvent};
 
 const COALESCE: Duration = Duration::from_millis(250);
 const KEEPALIVE: Duration = Duration::from_secs(15);
@@ -20,7 +20,7 @@ const KEEPALIVE: Duration = Duration::from_secs(15);
 struct Subscription {
     state: AppState,
     peer: net::Peer,
-    changes: broadcast::Receiver<()>,
+    changes: broadcast::Receiver<PeerEvent>,
     configuration: watch::Receiver<()>,
 }
 
@@ -51,15 +51,16 @@ pub(super) async fn notifications(
         return Err(AppError::unauthorized("peer configuration changed"));
     }
     let events = stream::unfold(subscription, |mut sub| async move {
-        let (mut catch_up, heartbeat) = tokio::select! {
+        let (mut catch_up, mut changed, heartbeat) = tokio::select! {
             biased;
             _ = sub.configuration.changed() => return None,
             event = sub.changes.recv() => match event {
-                Ok(()) => (false, false),
-                Err(broadcast::error::RecvError::Lagged(_)) => (true, false),
+                Ok(PeerEvent::Changed) => (false, true, false),
+                Ok(PeerEvent::Attention) => (false, false, false),
+                Err(broadcast::error::RecvError::Lagged(_)) => (true, true, false),
                 Err(broadcast::error::RecvError::Closed) => return None,
             },
-            () = tokio::time::sleep(KEEPALIVE) => (false, true),
+            () = tokio::time::sleep(KEEPALIVE) => (false, false, true),
         };
         if !heartbeat {
             tokio::select! {
@@ -70,7 +71,8 @@ pub(super) async fn notifications(
             // Bound draining even when producers on other threads keep publishing.
             for _ in 0..sub.changes.len() {
                 match sub.changes.try_recv() {
-                    Ok(()) => {}
+                    Ok(PeerEvent::Changed) => changed = true,
+                    Ok(PeerEvent::Attention) => {}
                     Err(broadcast::error::TryRecvError::Lagged(_)) => catch_up = true,
                     Err(broadcast::error::TryRecvError::Empty) => break,
                     Err(broadcast::error::TryRecvError::Closed) => return None,
@@ -93,7 +95,13 @@ pub(super) async fn notifications(
             Event::default().comment("keepalive")
         } else {
             Event::default()
-                .event(if catch_up { "catch_up" } else { "changed" })
+                .event(if catch_up {
+                    "catch_up"
+                } else if changed {
+                    "changed"
+                } else {
+                    "attention_changed"
+                })
                 .data("{}")
         };
         Some((Ok(event), sub))
@@ -316,6 +324,28 @@ mod tests {
         );
         peers::recovery::discover(&instance.state).await.unwrap();
         quiet(&mut response).await;
+    }
+
+    #[tokio::test]
+    async fn notification_http_distinguishes_attention_only_hints() {
+        let instance = Instance::new().await;
+        instance
+            .add_peer("remote-example", "http://peer.example")
+            .await;
+        let mut response = instance.subscribe().await;
+        instance.state.emit(ServerEvent::WatchChanged);
+        assert_eq!(
+            next(&mut response).await.as_deref(),
+            Some("event: attention_changed\ndata: {}\n\n")
+        );
+        instance.state.emit(ServerEvent::MaintenanceChanged {
+            server_id: "example".into(),
+        });
+        instance.state.emit(ServerEvent::SyncChanged);
+        assert_eq!(
+            next(&mut response).await.as_deref(),
+            Some("event: changed\ndata: {}\n\n")
+        );
     }
 
     #[tokio::test]

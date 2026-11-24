@@ -129,8 +129,43 @@ enum Hint {
     Error(String),
 }
 
+struct AttentionLease {
+    state: AppState,
+    peer_id: String,
+    owner: u64,
+}
+
+impl Drop for AttentionLease {
+    fn drop(&mut self) {
+        match self
+            .state
+            .peer_attention
+            .change(&self.peer_id, self.owner, Some(false))
+        {
+            Ok(true) => self.state.emit_ui(crate::state::ServerEvent::SyncChanged),
+            Ok(false) => {}
+            Err(error) => {
+                tracing::error!(peer=%self.peer_id, code=%error.code(), "cannot invalidate stopped peer attention")
+            }
+        }
+    }
+}
+
 pub(super) async fn run(state: &AppState, peer: &net::Peer) {
+    let owner = match state.peer_attention.begin(&peer.id) {
+        Ok(owner) => owner,
+        Err(error) => {
+            tracing::error!(peer=%peer.id, code=%error.code(), "cannot start peer attention");
+            return;
+        }
+    };
+    let _lease = AttentionLease {
+        state: state.clone(),
+        peer_id: peer.id.clone(),
+        owner,
+    };
     let (sender, mut hints) = watch::channel(Hint::Waiting);
+    let (attention_sender, mut attention_hints) = watch::channel(());
     let reader = async move {
         let client = match reqwest::Client::builder().connect_timeout(RETRY).build() {
             Ok(client) => client,
@@ -140,9 +175,14 @@ pub(super) async fn run(state: &AppState, peer: &net::Peer) {
             }
         };
         loop {
-            match subscribe(&client, state, peer, &sender).await {
+            match subscribe(&client, state, peer, &sender, &attention_sender, owner).await {
                 Ok(()) => {
                     state.peer_streams.legacy(&peer.id);
+                    if let Err(error) =
+                        attention_changed(state, peer, owner, Some(true), &attention_sender)
+                    {
+                        tracing::error!(peer=%peer.id, code=%error.code(), "cannot enable peer attention");
+                    }
                     // Older peers poll as before, but periodically probe for an upgrade.
                     for _ in 0..12 {
                         sender.send_replace(Hint::Refresh(None));
@@ -150,6 +190,11 @@ pub(super) async fn run(state: &AppState, peer: &net::Peer) {
                     }
                 }
                 Err(error) => {
+                    if let Err(error) =
+                        attention_changed(state, peer, owner, Some(false), &attention_sender)
+                    {
+                        tracing::error!(peer=%peer.id, code=%error.code(), "cannot invalidate peer attention");
+                    }
                     sender.send_replace(Hint::Error(error));
                     tokio::time::sleep(RETRY).await;
                 }
@@ -158,19 +203,11 @@ pub(super) async fn run(state: &AppState, peer: &net::Peer) {
     };
     let consumer = async {
         let mut retry: Option<Option<Refresh>> = None;
-        let mut attention_poll = tokio::time::interval(super::attention::POLL);
-        attention_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             let hint = tokio::select! {
                 result = hints.changed() => {
                     if result.is_err() { break; }
                     hints.borrow_and_update().clone()
-                }
-                _ = attention_poll.tick() => {
-                    if let Err(error) = super::attention::refresh(state, peer).await {
-                        tracing::warn!(peer=%peer.id, code=%error.code(), "cannot refresh peer attention");
-                    }
-                    continue;
                 }
                 _ = tokio::time::sleep(RETRY), if retry.is_some() => Hint::Refresh(retry.take().flatten()),
             };
@@ -190,9 +227,6 @@ pub(super) async fn run(state: &AppState, peer: &net::Peer) {
                     if !success {
                         retry = Some(refresh);
                     }
-                    if let Err(error) = super::attention::refresh(state, peer).await {
-                        tracing::warn!(peer=%peer.id, code=%error.code(), "cannot refresh peer attention");
-                    }
                     // Hints received during a slow fetch collapse to one further refresh.
                     tokio::time::sleep(COALESCE).await;
                 }
@@ -210,7 +244,38 @@ pub(super) async fn run(state: &AppState, peer: &net::Peer) {
             }
         }
     };
-    tokio::join!(reader, consumer);
+    let attention = async {
+        let mut poll = tokio::time::interval(super::attention::POLL);
+        poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                result = attention_hints.changed() => {
+                    if result.is_err() { break; }
+                    attention_hints.borrow_and_update();
+                }
+                _ = poll.tick() => {}
+            }
+            if let Err(error) = super::attention::refresh(state, peer, owner).await {
+                tracing::warn!(peer=%peer.id, code=%error.code(), "cannot refresh peer attention");
+            }
+            tokio::time::sleep(COALESCE).await;
+        }
+    };
+    tokio::join!(reader, consumer, attention);
+}
+
+fn attention_changed(
+    state: &AppState,
+    peer: &net::Peer,
+    owner: u64,
+    available: Option<bool>,
+    hints: &watch::Sender<()>,
+) -> crate::error::AppResult<()> {
+    if state.peer_attention.change(&peer.id, owner, available)? {
+        state.emit_ui(crate::state::ServerEvent::SyncChanged);
+        hints.send_replace(());
+    }
+    Ok(())
 }
 
 // Only an explicitly unsupported endpoint selects legacy polling.
@@ -219,6 +284,8 @@ async fn subscribe(
     state: &AppState,
     peer: &net::Peer,
     hints: &watch::Sender<Hint>,
+    attention_hints: &watch::Sender<()>,
+    owner: u64,
 ) -> Result<(), String> {
     let request = net::request_with_client(
         client,
@@ -249,6 +316,8 @@ async fn subscribe(
         return Err("peer notifications returned an invalid content type".into());
     }
     let connection = state.peer_streams.connect(&peer.id);
+    attention_changed(state, peer, owner, Some(true), attention_hints)
+        .map_err(|error| error.message().to_owned())?;
     hints.send_replace(Hint::Refresh(Some(connection.refresh())));
     let mut parser = Frames::default();
     loop {
@@ -257,7 +326,11 @@ async fn subscribe(
             .map_err(|_| "peer notification keepalive timed out".to_owned())?
             .map_err(|e| net::net_error(&e))?
             .ok_or_else(|| "peer notification connection closed".to_owned())?;
-        let (changed, heartbeat) = parser.push(&chunk)?;
+        let (changed, attention, heartbeat) = parser.push(&chunk)?;
+        if changed || attention {
+            attention_changed(state, peer, owner, None, attention_hints)
+                .map_err(|error| error.message().to_owned())?;
+        }
         if changed {
             hints.send_replace(Hint::Refresh(Some(connection.refresh())));
         } else if heartbeat {
@@ -275,8 +348,9 @@ struct Frames {
 }
 
 impl Frames {
-    fn push(&mut self, chunk: &[u8]) -> Result<(bool, bool), String> {
+    fn push(&mut self, chunk: &[u8]) -> Result<(bool, bool, bool), String> {
         let mut changed = false;
+        let mut attention = false;
         let mut heartbeat = false;
         for &byte in chunk {
             self.size += 1;
@@ -292,6 +366,7 @@ impl Frames {
                 .trim_end_matches('\r');
             if line.is_empty() {
                 changed |= matches!(self.event.as_str(), "changed" | "catch_up");
+                attention |= self.event == "attention_changed";
                 heartbeat |= self.keepalive;
                 self.event.clear();
                 self.keepalive = false;
@@ -303,7 +378,7 @@ impl Frames {
             }
             self.line.clear();
         }
-        Ok((changed, heartbeat))
+        Ok((changed, attention, heartbeat))
     }
 }
 
@@ -351,19 +426,26 @@ mod tests {
         let mut frames = Frames::default();
         assert_eq!(
             frames.push(b": keepalive\r\n\r\nevent: cha").unwrap(),
-            (false, true)
+            (false, false, true)
         );
         assert_eq!(
             frames
                 .push(b"nged\r\ndata: {}\r\n\r\nevent: catch_up\n\n")
                 .unwrap(),
-            (true, false)
+            (true, false, false)
         );
         assert_eq!(
             frames.push(b"event: unknown\n\n: keepalive\n\n").unwrap(),
-            (false, true)
+            (false, false, true)
         );
-        assert_eq!(frames.push(b"event: catch_up\n\n").unwrap(), (true, false));
+        assert_eq!(
+            frames.push(b"event: catch_up\n\n").unwrap(),
+            (true, false, false)
+        );
+        assert_eq!(
+            frames.push(b"event: attention_changed\n\n").unwrap(),
+            (false, true, false)
+        );
         assert!(frames.push(&[b'x'; 16 * 1024 + 1]).is_err());
     }
 }

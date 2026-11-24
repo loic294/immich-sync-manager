@@ -102,8 +102,60 @@ impl Observation {
     }
 }
 
+struct Slot {
+    owner: u64,
+    revision: u64,
+    available: bool,
+    touched: Instant,
+    observation: Option<Observation>,
+}
+
 #[derive(Default)]
-pub(crate) struct Cache(Mutex<HashMap<String, Observation>>);
+struct CacheState {
+    revision: u64,
+    peers: HashMap<String, Slot>,
+}
+
+impl CacheState {
+    fn next_revision(&mut self) -> AppResult<u64> {
+        self.revision = self
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| AppError::internal("peer attention revision exhausted"))?;
+        Ok(self.revision)
+    }
+
+    fn ensure(&mut self, peer: &str) -> AppResult<()> {
+        if self.peers.contains_key(peer) {
+            return Ok(());
+        }
+        if self.peers.len() >= MAX_CACHE_PEERS
+            && let Some(id) = self
+                .peers
+                .iter()
+                .min_by_key(|(_, value)| value.touched)
+                .map(|(id, _)| id.clone())
+        {
+            self.peers.remove(&id);
+            tracing::warn!("peer attention cache capacity reached; oldest evidence is unavailable");
+        }
+        let revision = self.next_revision()?;
+        self.peers.insert(
+            peer.into(),
+            Slot {
+                owner: revision,
+                revision,
+                available: false,
+                touched: Instant::now(),
+                observation: None,
+            },
+        );
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct Cache(Mutex<CacheState>);
 
 impl Cache {
     fn read(&self, peer: &str) -> AppResult<Option<Observation>> {
@@ -111,41 +163,101 @@ impl Cache {
             .0
             .lock()
             .map_err(|_| AppError::internal("peer attention cache lock poisoned"))?
+            .peers
             .get(peer)
-            .cloned())
+            .and_then(|slot| slot.observation.clone()))
     }
 
-    fn record(&self, peer: &str, mut observation: Observation) -> AppResult<()> {
+    pub(super) fn begin(&self, peer: &str) -> AppResult<u64> {
         let mut cache = self
             .0
             .lock()
             .map_err(|_| AppError::internal("peer attention cache lock poisoned"))?;
-        if observation.report.is_none() {
-            observation.report = cache
-                .get(peer)
-                .filter(|old| old.key == observation.key)
-                .and_then(|old| old.report.clone());
+        cache.ensure(peer)?;
+        let revision = cache.next_revision()?;
+        if let Some(slot) = cache.peers.get_mut(peer) {
+            slot.owner = revision;
+            slot.revision = revision;
+            slot.available = false;
+            slot.observation = None;
+            slot.touched = Instant::now();
         }
-        if !cache.contains_key(peer) && cache.len() >= MAX_CACHE_PEERS {
-            let oldest = cache
-                .iter()
-                .min_by_key(|(_, value)| value.checked)
-                .map(|(id, _)| id.clone());
-            if let Some(id) = oldest {
-                cache.remove(&id);
-                tracing::warn!(
-                    "peer attention cache capacity reached; oldest evidence is unavailable"
-                );
+        Ok(revision)
+    }
+
+    pub(super) fn change(
+        &self,
+        peer: &str,
+        owner: u64,
+        available: Option<bool>,
+    ) -> AppResult<bool> {
+        let mut cache = self
+            .0
+            .lock()
+            .map_err(|_| AppError::internal("peer attention cache lock poisoned"))?;
+        if cache.peers.get(peer).is_none_or(|slot| slot.owner != owner) {
+            return Ok(false);
+        }
+        let revision = cache.next_revision()?;
+        if let Some(slot) = cache.peers.get_mut(peer) {
+            slot.revision = revision;
+            slot.observation = None;
+            slot.touched = Instant::now();
+            if let Some(available) = available {
+                slot.available = available;
             }
         }
-        cache.insert(peer.into(), observation);
+        Ok(true)
+    }
+
+    pub(crate) fn invalidate_all(&self) -> AppResult<()> {
+        self.0
+            .lock()
+            .map_err(|_| AppError::internal("peer attention cache lock poisoned"))?
+            .peers
+            .clear();
         Ok(())
+    }
+
+    fn revision(&self, peer: &str, owner: u64) -> AppResult<Option<u64>> {
+        Ok(self
+            .0
+            .lock()
+            .map_err(|_| AppError::internal("peer attention cache lock poisoned"))?
+            .peers
+            .get(peer)
+            .filter(|slot| slot.owner == owner && slot.available)
+            .map(|slot| slot.revision))
+    }
+
+    fn record(
+        &self,
+        peer: &str,
+        owner: u64,
+        revision: u64,
+        observation: Observation,
+    ) -> AppResult<bool> {
+        let mut cache = self
+            .0
+            .lock()
+            .map_err(|_| AppError::internal("peer attention cache lock poisoned"))?;
+        let Some(slot) = cache
+            .peers
+            .get_mut(peer)
+            .filter(|slot| slot.owner == owner && slot.available && slot.revision == revision)
+        else {
+            return Ok(false);
+        };
+        slot.touched = observation.checked;
+        slot.observation = Some(observation);
+        Ok(true)
     }
 
     fn retain(&self, peers: &[CachedPeer]) -> AppResult<()> {
         self.0
             .lock()
             .map_err(|_| AppError::internal("peer attention cache lock poisoned"))?
+            .peers
             .retain(|id, _| peers.iter().any(|peer| peer.id == *id));
         Ok(())
     }
@@ -556,7 +668,10 @@ async fn fetch(state: &AppState, peer: &net::Peer, shares: &[Share]) -> AppResul
     Ok(Some(report))
 }
 
-pub(super) async fn refresh(state: &AppState, peer: &net::Peer) -> AppResult<()> {
+pub(super) async fn refresh(state: &AppState, peer: &net::Peer, owner: u64) -> AppResult<()> {
+    let Some(revision) = state.peer_attention.revision(&peer.id, owner)? else {
+        return Ok(());
+    };
     let shares = allowed_shares(state, peer).await?;
     let key = configuration_key(state, peer, &shares).await?;
     let result = fetch(state, peer, &shares).await;
@@ -573,16 +688,19 @@ pub(super) async fn refresh(state: &AppState, peer: &net::Peer) -> AppResult<()>
             (None, Some(error.code().to_owned()))
         }
     };
-    state.peer_attention.record(
+    if state.peer_attention.record(
         &peer.id,
+        owner,
+        revision,
         Observation {
             key,
             report,
             checked: Instant::now(),
             error,
         },
-    )?;
-    state.emit_ui(ServerEvent::SyncChanged);
+    )? {
+        state.emit_ui(ServerEvent::SyncChanged);
+    }
     Ok(())
 }
 
@@ -772,6 +890,12 @@ mod tests {
 
     use super::*;
 
+    fn enable(cache: &Cache, peer: &str) -> (u64, u64) {
+        let owner = cache.begin(peer).unwrap();
+        assert!(cache.change(peer, owner, Some(true)).unwrap());
+        (owner, cache.revision(peer, owner).unwrap().unwrap())
+    }
+
     #[tokio::test]
     async fn expired_snapshot_and_removed_peer_cannot_reuse_cache_authority() {
         let directory = tempfile::tempdir().unwrap();
@@ -807,9 +931,10 @@ mod tests {
             checked: Instant::now(),
             error: None,
         };
+        let (owner, revision) = enable(&state.peer_attention, "peer");
         state
             .peer_attention
-            .record("peer", observation.clone())
+            .record("peer", owner, revision, observation.clone())
             .unwrap();
         assert!(
             snapshot(&state)
@@ -823,6 +948,8 @@ mod tests {
             .peer_attention
             .record(
                 "peer",
+                owner,
+                revision,
                 Observation {
                     checked: Instant::now() - Duration::from_secs(FRESH_SECONDS as u64),
                     ..observation
@@ -865,9 +992,13 @@ mod tests {
         let cache = Cache::default();
         let start = Instant::now();
         for index in 0..=MAX_CACHE_PEERS {
+            let peer = format!("peer-{index}");
+            let (owner, revision) = enable(&cache, &peer);
             cache
                 .record(
-                    &format!("peer-{index}"),
+                    &peer,
+                    owner,
+                    revision,
                     Observation {
                         key: "configuration".into(),
                         report: None,
@@ -884,7 +1015,7 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
-        assert_eq!(cache.0.lock().unwrap().len(), MAX_CACHE_PEERS);
+        assert_eq!(cache.0.lock().unwrap().peers.len(), MAX_CACHE_PEERS);
         let observation = Observation {
             key: "configuration".into(),
             report: None,

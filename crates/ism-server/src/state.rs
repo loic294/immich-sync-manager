@@ -38,6 +38,12 @@ pub enum ServerEvent {
     SettingsChanged,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum PeerEvent {
+    Changed,
+    Attention,
+}
+
 pub struct Inner {
     pub activity: crate::activity::Registry,
     pub config: Config,
@@ -47,7 +53,7 @@ pub struct Inner {
     pub http: reqwest::Client,
     pub events: broadcast::Sender<ServerEvent>,
     /// Content-free invalidations for paired peers, separate from mirrored UI status.
-    pub peer_events: broadcast::Sender<()>,
+    pub(crate) peer_events: broadcast::Sender<PeerEvent>,
     /// Changing peer credentials or configuration revokes existing streams without polling.
     pub peer_configuration: watch::Sender<()>,
     pub peer_streams: crate::peers::notifications::Streams,
@@ -183,14 +189,14 @@ impl AppState {
         if matches!(event, ServerEvent::ConflictsChanged) {
             self.version_wake.notify_waiters();
         }
-        if matches!(
-            event,
-            ServerEvent::SyncChanged
-                | ServerEvent::ConflictsChanged
-                | ServerEvent::MaintenanceChanged { .. }
-                | ServerEvent::WatchChanged
-        ) {
-            let _ = self.peer_events.send(());
+        match event {
+            ServerEvent::SyncChanged | ServerEvent::ConflictsChanged => {
+                let _ = self.peer_events.send(PeerEvent::Changed);
+            }
+            ServerEvent::MaintenanceChanged { .. } | ServerEvent::WatchChanged => {
+                let _ = self.peer_events.send(PeerEvent::Attention);
+            }
+            _ => {}
         }
         self.emit_ui(event);
     }
@@ -202,6 +208,9 @@ impl AppState {
 
     /// Call immediately after committing peer credentials or share configuration changes.
     pub fn peer_configuration_changed(&self) {
+        if let Err(error) = self.peer_attention.invalidate_all() {
+            tracing::error!(code = %error.code(), "cannot invalidate peer attention");
+        }
         self.peer_streams.invalidate();
         self.peer_configuration.send_replace(());
     }
