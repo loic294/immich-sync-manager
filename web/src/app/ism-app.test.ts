@@ -73,7 +73,7 @@ describe('ism-app', () => {
       if (path === '/api/admin/session')
         return { ...BASE, authenticated: true, username: 'admin' } as never;
       if (path === '/api/admin/attention')
-        return { completeness: 'complete', warnings: [], items: [] } as never;
+        return { completeness: 'complete', warnings: [], coverage: [], items: [] } as never;
       if (path === '/api/admin/overview') return undefined as never;
       throw new Error(`unexpected GET ${path}`);
     });
@@ -100,6 +100,7 @@ describe('ism-app', () => {
           observed_at: '2026-01-01T00:00:00Z',
           completeness: 'complete',
           warnings: [],
+          coverage: [],
           items: [],
         } as never;
       if (path === '/api/admin/overview')
@@ -131,6 +132,8 @@ describe('ism-app', () => {
     blockers.value = [
       {
         id: 'peer:example',
+        code: 'peer_offline',
+        owner: 'local',
         title: 'Sync is waiting',
         detail: 'Reconnect the other instance.',
         href: '/peers',

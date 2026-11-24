@@ -42,6 +42,7 @@ const snapshot: AttentionSnapshot = {
   observed_at: '2026-01-01T00:00:00Z',
   completeness: 'complete',
   warnings: [],
+  coverage: [],
   items: [row],
 };
 
@@ -117,6 +118,74 @@ describe('attention snapshots', () => {
       expect(blockers.value).toEqual([]);
       await vi.advanceTimersByTimeAsync(60_000);
       expect(get).toHaveBeenCalledTimes(2);
+    } finally {
+      stop();
+    }
+  });
+
+  it('clears absent covered sources and their persisted dismissals without clearing unknown sources', async () => {
+    const remote = { ...row, id: 'receiver:beta', owner: 'receiver' as const };
+    const get = vi.spyOn(api, 'get').mockResolvedValue({
+      ...snapshot,
+      items: [row, remote],
+    });
+    let stop = startAttention();
+    try {
+      await refreshAttention();
+      dismissNotification(row.id);
+      stop();
+      get.mockResolvedValue({
+        ...snapshot,
+        completeness: 'partial',
+        warnings: ['Remote status is unavailable.'],
+        coverage: [{ code: row.code, owner: 'local', completeness: 'complete' }],
+        items: [],
+      });
+      stop = startAttention();
+      await refreshAttention();
+      get.mockResolvedValue({ ...snapshot, completeness: 'partial', items: [row, remote] });
+      await refreshAttention();
+      expect(notifications.value.map((entry) => entry.id)).toEqual([row.id, remote.id]);
+      get.mockResolvedValue({
+        ...snapshot,
+        completeness: 'partial',
+        coverage: [{ code: row.code, owner: 'local', completeness: 'complete' }],
+        items: [],
+      });
+      await refreshAttention();
+      expect(blockers.value).toMatchObject([{ id: remote.id, stale: true }]);
+    } finally {
+      stop();
+    }
+  });
+
+  it('keeps same-ID unavailable evidence and dismissals despite covered source absence', async () => {
+    const get = vi.spyOn(api, 'get').mockResolvedValue(snapshot);
+    const stop = startAttention();
+    try {
+      await refreshAttention();
+      dismissNotification(row.id);
+      get.mockResolvedValue({
+        ...snapshot,
+        completeness: 'partial',
+        coverage: [{ code: row.code, owner: row.owner, completeness: 'complete' }],
+        items: [{ ...row, attention: 'none', completeness: 'unavailable', blocks_work: false }],
+      });
+      await refreshAttention();
+      expect(blockers.value).toMatchObject([{ id: row.id, stale: true }]);
+      get.mockResolvedValue({ ...snapshot, completeness: 'partial' });
+      await refreshAttention();
+      expect(notifications.value).toEqual([]);
+      get.mockResolvedValue({
+        ...snapshot,
+        completeness: 'partial',
+        items: [{ ...row, attention: 'none', completeness: 'complete', blocks_work: false }],
+      });
+      await refreshAttention();
+      expect(blockers.value).toEqual([]);
+      get.mockResolvedValue({ ...snapshot, completeness: 'partial' });
+      await refreshAttention();
+      expect(notifications.value).toHaveLength(1);
     } finally {
       stop();
     }

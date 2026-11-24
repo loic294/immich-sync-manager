@@ -7,6 +7,8 @@ import '@/components/ism-blocker-banners';
 
 const item: AttentionItem = {
   id: 'conflicts:one',
+  code: 'recovery_decision',
+  owner: 'local',
   title: '1 file needs a choice',
   detail: 'Choose which version to keep.',
   href: '/conflicts',

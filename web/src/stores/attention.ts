@@ -1,12 +1,17 @@
 import { signal } from '@preact/signals-core';
 import { admin } from '@/api/admin';
 import { events } from '@/api/events';
+import type { AttentionCode } from '@/api/generated/AttentionCode';
+import type { AttentionOwner } from '@/api/generated/AttentionOwner';
 import type { AttentionSnapshot } from '@/api/generated/AttentionSnapshot';
 
-const DISMISSED_KEY = 'ism.dismissed-attention.v1';
+const DISMISSED_KEY = 'ism.dismissed-attention.v2';
+const LEGACY_DISMISSED_KEY = 'ism.dismissed-attention.v1';
 
 export interface AttentionItem {
   id: string;
+  code: AttentionCode;
+  owner: AttentionOwner;
   title: string;
   detail: string;
   href: string;
@@ -30,7 +35,8 @@ export const blockers = signal<AttentionItem[]>([]);
 export const notifications = signal<AttentionItem[]>([]);
 export const attentionError = signal(false);
 
-let dismissed = new Set<string>();
+type Source = { code: string; owner: string };
+let dismissed = new Map<string, Source | null>();
 let timer: number | undefined;
 let transitionTimer: number | undefined;
 let pending: Promise<void> | undefined;
@@ -39,21 +45,36 @@ let generation = 0;
 let running = false;
 let lastRefreshAt = 0;
 
-function readDismissed(): Set<string> {
+function readDismissed(): Map<string, Source | null> {
   try {
-    const stored: unknown = JSON.parse(localStorage.getItem(DISMISSED_KEY) ?? '[]');
-    return new Set(
-      Array.isArray(stored) ? stored.filter((id): id is string => typeof id === 'string') : [],
+    const stored: unknown = JSON.parse(
+      localStorage.getItem(DISMISSED_KEY) ?? localStorage.getItem(LEGACY_DISMISSED_KEY) ?? '[]',
     );
+    const result = new Map<string, Source | null>();
+    if (!Array.isArray(stored)) return result;
+    for (const entry of stored) {
+      if (typeof entry === 'string') result.set(entry, null);
+      else if (entry && typeof entry === 'object' && typeof entry.id === 'string') {
+        const source =
+          typeof entry.code === 'string' && typeof entry.owner === 'string'
+            ? { code: entry.code, owner: entry.owner }
+            : null;
+        result.set(entry.id, source);
+      }
+    }
+    return result;
   } catch (error) {
     console.warn('[attention] could not read dismissed notifications', error);
-    return new Set();
+    return new Map();
   }
 }
 
 function saveDismissed() {
   try {
-    localStorage.setItem(DISMISSED_KEY, JSON.stringify([...dismissed]));
+    localStorage.setItem(
+      DISMISSED_KEY,
+      JSON.stringify([...dismissed].map(([id, source]) => ({ id, ...source }))),
+    );
   } catch (error) {
     console.warn('[attention] could not save dismissed notifications', error);
   }
@@ -66,6 +87,8 @@ export function buildAttention(snapshot: AttentionSnapshot): AttentionItem[] {
       const path = entry.href.split('?')[0];
       return {
         id: entry.id,
+        code: entry.code,
+        owner: entry.owner,
         title: entry.title,
         detail: entry.message,
         href: entry.href,
@@ -81,20 +104,31 @@ async function loadAttention(epoch: number) {
   if (!running || epoch !== generation) return;
   const items = buildAttention(snapshot);
   const complete = snapshot.completeness === 'complete' && snapshot.warnings.length === 0;
-  if (complete) {
-    const ids = new Set(items.map((entry) => entry.id));
-    dismissed = new Set([...dismissed].filter((id) => ids.has(id)));
-    saveDismissed();
-  }
-  const seen = new Set(
-    snapshot.items
-      .filter((entry) => entry.completeness === 'complete' || entry.attention !== 'none')
-      .map((entry) => entry.id),
+  const observed = new Map(snapshot.items.map((entry) => [entry.id, entry]));
+  const covered = new Set(
+    snapshot.coverage
+      .filter((entry) => entry.completeness === 'complete')
+      .map((entry) => `${entry.code}\0${entry.owner}`),
   );
+  const cleared = (id: string, source: Source | null) => {
+    const current = observed.get(id);
+    if (current) return current.completeness === 'complete' && current.attention === 'none';
+    return complete || (source !== null && covered.has(`${source.code}\0${source.owner}`));
+  };
+  for (const [id, source] of dismissed) {
+    if (cleared(id, source)) dismissed.delete(id);
+    else {
+      const current = observed.get(id);
+      if (current && current.attention !== 'none')
+        dismissed.set(id, { code: current.code, owner: current.owner });
+    }
+  }
+  saveDismissed();
+  const seen = new Set(items.map((entry) => entry.id));
   const retain = (entries: AttentionItem[]) =>
-    complete
-      ? []
-      : entries.filter((entry) => !seen.has(entry.id)).map((entry) => ({ ...entry, stale: true }));
+    entries
+      .filter((entry) => !seen.has(entry.id) && !cleared(entry.id, entry))
+      .map((entry) => ({ ...entry, stale: true }));
   blockers.value = [...items.filter((entry) => entry.blocking), ...retain(blockers.value)];
   notifications.value = [
     ...items.filter((entry) => entry.notifiable && !dismissed.has(entry.id)),
@@ -179,13 +213,16 @@ export function startAttention(): () => void {
 }
 
 export function dismissNotification(id: string) {
-  dismissed.add(id);
+  const entry = notifications.value.find((item) => item.id === id);
+  if (!entry) return;
+  dismissed.set(id, { code: entry.code, owner: entry.owner });
   saveDismissed();
   notifications.value = notifications.value.filter((entry) => entry.id !== id);
 }
 
 export function dismissAllNotifications() {
-  for (const entry of notifications.value) dismissed.add(entry.id);
+  for (const entry of notifications.value)
+    dismissed.set(entry.id, { code: entry.code, owner: entry.owner });
   saveDismissed();
   notifications.value = [];
 }
