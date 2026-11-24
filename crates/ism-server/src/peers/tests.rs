@@ -9269,19 +9269,17 @@ async fn multiple_slow_conflicts_do_not_block_independent_recovery() {
     b.tasks.push(tokio::spawn(async move {
         super::recovery::run(state).await;
     }));
-    for _ in 0..3 {
-        tokio::time::timeout(Duration::from_secs(3), requests.recv())
-            .await
-            .expect("conflict never requested peer evidence")
-            .expect("stalled peer stopped");
-    }
+    tokio::time::timeout(Duration::from_secs(3), requests.recv())
+        .await
+        .expect("conflict never requested peer evidence")
+        .expect("stalled peer stopped");
     let active_conflicts: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM sync_recovery WHERE kind='conflict' AND state='fixing'",
     )
     .fetch_one(&b.state.db)
     .await
     .unwrap();
-    assert_eq!(active_conflicts, 3);
+    assert_eq!(active_conflicts, 1);
     let completed = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let status = crate::ops::load(&b.state, &operation.operation_id)
@@ -9315,24 +9313,28 @@ async fn multiple_slow_conflicts_do_not_block_independent_recovery() {
 }
 
 #[tokio::test]
-async fn slow_peer_conflicts_do_not_block_another_peers_conflict() {
+async fn two_slow_peers_do_not_block_another_peers_conflict() {
     let (mut a, mut b) = pair().await;
     stop_workers(&mut a).await;
     stop_workers(&mut b).await;
     let mut c = instance("Gamma").await;
     stop_workers(&mut c).await;
-    let invite = admin::create_invite(&b.state).await.unwrap();
-    admin::accept(
-        &c.state,
-        PeerAcceptInput {
-            name: String::new(),
-            url: b.url.clone(),
-            invite: invite.invite,
-            callback_url: c.url.clone(),
-        },
-    )
-    .await
-    .unwrap();
+    let mut d = instance("Delta").await;
+    stop_workers(&mut d).await;
+    for source in [&c, &d] {
+        let invite = admin::create_invite(&b.state).await.unwrap();
+        admin::accept(
+            &source.state,
+            PeerAcceptInput {
+                name: String::new(),
+                url: b.url.clone(),
+                invite: invite.invite,
+                callback_url: source.url.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    }
     let peers = super::net::peers(&b.state).await.unwrap();
     let a_peer = peers
         .iter()
@@ -9341,6 +9343,10 @@ async fn slow_peer_conflicts_do_not_block_another_peers_conflict() {
     let c_peer = peers
         .iter()
         .find(|peer| peer.instance_id.as_deref() == Some(&c.state.instance_id))
+        .unwrap();
+    let d_peer = peers
+        .iter()
+        .find(|peer| peer.instance_id.as_deref() == Some(&d.state.instance_id))
         .unwrap();
     let share = super::shares(&b.state).await.unwrap().remove(0);
     admin::update_share(
@@ -9355,33 +9361,46 @@ async fn slow_peer_conflicts_do_not_block_another_peers_conflict() {
     )
     .await
     .unwrap();
-    let c_back = super::net::peers(&c.state).await.unwrap().remove(0);
-    admin::create_share(
-        &c.state,
-        ShareInput {
-            name: share.name.clone(),
-            location: loc("shared"),
-            peer_ids: vec![c_back.id],
-            enabled: true,
-        },
-    )
-    .await
-    .unwrap();
+    for source in [&c, &d] {
+        let back = super::net::peers(&source.state).await.unwrap().remove(0);
+        admin::create_share(
+            &source.state,
+            ShareInput {
+                name: share.name.clone(),
+                location: loc("shared"),
+                peer_ids: vec![back.id],
+                enabled: true,
+            },
+        )
+        .await
+        .unwrap();
+    }
     for i in 0..4 {
         write_old(&a.shared.join(format!("slow-{i}.jpg")), b"slow source");
         write_old(&b.shared.join(format!("slow-{i}.jpg")), b"local");
+        write_old(&d.shared.join(format!("slow-d-{i}.jpg")), b"slow source");
+        write_old(&b.shared.join(format!("slow-d-{i}.jpg")), b"local");
     }
     write_old(&c.shared.join("independent.jpg"), b"fast source");
     write_old(&b.shared.join("independent.jpg"), b"local");
     scan(&a).await;
     scan(&b).await;
     scan(&c).await;
+    scan(&d).await;
     let share = super::shares(&b.state).await.unwrap().remove(0);
     for (source, peer, paths, bytes) in [
         (
             &a,
             a_peer,
             (0..4).map(|i| format!("slow-{i}.jpg")).collect::<Vec<_>>(),
+            b"slow source".as_slice(),
+        ),
+        (
+            &d,
+            d_peer,
+            (0..4)
+                .map(|i| format!("slow-d-{i}.jpg"))
+                .collect::<Vec<_>>(),
             b"slow source".as_slice(),
         ),
         (
@@ -9445,11 +9464,17 @@ async fn slow_peer_conflicts_do_not_block_another_peers_conflict() {
     )
     .await
     .unwrap();
-    sqlx::query("UPDATE sync_recovery SET updated_at='2024-01-01T00:00:00Z' WHERE kind='conflict' AND target_id!=?")
-        .bind(&independent)
-        .execute(&b.state.db)
-        .await
-        .unwrap();
+    sqlx::query(
+        "UPDATE sync_recovery SET updated_at=CASE
+        WHEN target_id IN (SELECT id FROM conflicts WHERE peer_id=?) THEN '2024-01-01T00:00:00Z'
+        ELSE '2024-01-02T00:00:00Z' END
+        WHERE kind='conflict' AND target_id!=?",
+    )
+    .bind(&a_peer.id)
+    .bind(&independent)
+    .execute(&b.state.db)
+    .await
+    .unwrap();
     let template = conflicts
         .iter()
         .find(|conflict| conflict.peer_id == a_peer.id)
@@ -9496,9 +9521,10 @@ async fn slow_peer_conflicts_do_not_block_another_peers_conflict() {
     b.tasks.push(tokio::spawn(async move {
         axum::serve(listener, stalled_peer).await.unwrap();
     }));
-    sqlx::query("UPDATE peers SET url=? WHERE id=?")
+    sqlx::query("UPDATE peers SET url=? WHERE id IN (?,?)")
         .bind(url)
         .bind(&a_peer.id)
+        .bind(&d_peer.id)
         .execute(&b.state.db)
         .await
         .unwrap();
@@ -9506,21 +9532,24 @@ async fn slow_peer_conflicts_do_not_block_another_peers_conflict() {
         .push(tokio::spawn(crate::ops::exec::run(b.state.clone())));
     b.tasks
         .push(tokio::spawn(super::recovery::run(b.state.clone())));
-    for _ in 0..3 {
+    for _ in 0..2 {
         tokio::time::timeout(Duration::from_secs(5), requests.recv())
             .await
             .unwrap()
             .unwrap();
     }
-    let active: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM sync_recovery r JOIN conflicts c ON c.id=r.target_id
-         WHERE r.kind='conflict' AND r.state='fixing' AND c.peer_id=?",
+    let active: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT c.peer_id,COUNT(*) FROM sync_recovery r JOIN conflicts c ON c.id=r.target_id
+         WHERE r.kind='conflict' AND r.state='fixing' AND c.peer_id IN (?,?)
+         GROUP BY c.peer_id ORDER BY c.peer_id",
     )
     .bind(&a_peer.id)
-    .fetch_one(&b.state.db)
+    .bind(&d_peer.id)
+    .fetch_all(&b.state.db)
     .await
     .unwrap();
-    assert_eq!(active, 3);
+    assert_eq!(active.len(), 2);
+    assert!(active.iter().all(|(_, count)| *count == 1));
     let completed = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let status: String = sqlx::query_scalar("SELECT status FROM conflicts WHERE id=?")
