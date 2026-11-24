@@ -82,6 +82,76 @@ pub fn json_vec(raw: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     #[tokio::test]
+    async fn share_scan_failure_migration_preserves_existing_replica_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = super::connect(dir.path()).await.unwrap();
+        sqlx::query("DROP TABLE share_scan_failures")
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM _sqlx_migrations WHERE version=21")
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO shares(id,name,root_id,path,peer_ids_json,enabled,last_scan_at)
+             VALUES('archive','Archive','photos','archive','[]',1,'2026-01-01')",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO replica_files(share_id,rel_path,size,mtime_ns,sha256,deleted,vv_json)
+             VALUES('archive','photo.jpg',5,123,'synthetic-checksum',0,'{}')",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        db.close().await;
+
+        let upgraded = super::connect(dir.path()).await.unwrap();
+        let row: (String, i64, String, i64, String) = sqlx::query_as(
+            "SELECT s.last_scan_at,r.size,r.sha256,r.deleted,r.vv_json
+             FROM shares s JOIN replica_files r ON r.share_id=s.id WHERE s.id='archive'",
+        )
+        .fetch_one(&upgraded)
+        .await
+        .unwrap();
+        assert_eq!(
+            row,
+            (
+                "2026-01-01".into(),
+                5,
+                "synthetic-checksum".into(),
+                0,
+                "{}".into()
+            )
+        );
+        let failures: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM share_scan_failures")
+            .fetch_one(&upgraded)
+            .await
+            .unwrap();
+        assert_eq!(
+            failures, 0,
+            "an upgrade cannot invent historical scan failures"
+        );
+        sqlx::query("INSERT INTO share_scan_failures VALUES('archive','permission','2026-01-02')")
+            .execute(&upgraded)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM shares WHERE id='archive'")
+            .execute(&upgraded)
+            .await
+            .unwrap();
+        let failures: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM share_scan_failures")
+            .fetch_one(&upgraded)
+            .await
+            .unwrap();
+        assert_eq!(failures, 0);
+        upgraded.close().await;
+    }
+
+    #[tokio::test]
     async fn upload_idempotency_migration_preserves_existing_uploads() {
         let dir = tempfile::tempdir().unwrap();
         let db = super::connect(dir.path()).await.unwrap();

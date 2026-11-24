@@ -36,7 +36,7 @@ impl Denied {
     fn new(path: &Path) -> Self {
         use std::os::unix::fs::PermissionsExt;
         let permissions = std::fs::metadata(path).unwrap().permissions();
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0)).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000)).unwrap();
         Self(path.to_owned(), permissions)
     }
 }
@@ -429,4 +429,42 @@ async fn share_scan_failure_does_not_misclassify_global_operation_recovery() {
         "recovery_required"
     );
     assert_eq!(failure(&local.state, &share.id).await.unwrap(), before);
+}
+
+#[tokio::test]
+async fn share_scan_failure_healthy_clear_performs_no_writes() {
+    let (local, share) = fixture().await;
+    super::super::scan_share(&local.state, &share)
+        .await
+        .unwrap();
+    let read_only = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(local._dir.path().join("ism.sqlite"))
+                .read_only(true),
+        )
+        .await
+        .unwrap();
+    let _guard = local.state.replication_operation_lock.lock_scan().await;
+    assert_eq!(
+        super::super::clear_scan_failure(&read_only, &share.id)
+            .await
+            .unwrap(),
+        0
+    );
+    let writes: i64 = sqlx::query_scalar("SELECT total_changes()")
+        .fetch_one(&read_only)
+        .await
+        .unwrap();
+    assert_eq!(writes, 0);
+    assert!(
+        sqlx::query("DELETE FROM share_scan_failures WHERE share_id=?")
+            .bind(&share.id)
+            .execute(&read_only)
+            .await
+            .is_err(),
+        "even a no-row DELETE is rejected, so this fixture detects an attempted write"
+    );
+    read_only.close().await;
 }

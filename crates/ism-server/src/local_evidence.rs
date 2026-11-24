@@ -185,30 +185,32 @@ pub(crate) async fn selected_snapshot(
         items.push(item);
     }
 
-    let share_scans: Vec<(String, String, String, String)> = sqlx::query_as(
-        "SELECT s.id,s.name,f.reason,f.observed_at FROM share_scan_failures f
+    if selection.is_none() {
+        let share_scans: Vec<(String, String, String, String)> = sqlx::query_as(
+            "SELECT s.id,s.name,f.reason,f.observed_at FROM share_scan_failures f
          JOIN shares s ON s.id=f.share_id WHERE s.enabled=1 ORDER BY s.id",
-    )
-    .fetch_all(&state.db)
-    .await?;
-    for (id, name, reason, at) in share_scans {
-        let mut item = template.clone();
-        item.id = format!("share-scan:{id}");
-        item.code = AttentionCode::ShareScanFailed;
-        item.state = AttentionState::Failed;
-        item.share_id = Some(id);
-        item.share_name = Some(name.clone());
-        item.title = format!("Shared files could not be checked: {name}");
-        item.message = if reason == "permission" {
+        )
+        .fetch_all(&state.db)
+        .await?;
+        for (id, name, reason, at) in share_scans {
+            let mut item = template.clone();
+            item.id = format!("share-scan:{id}");
+            item.code = AttentionCode::ShareScanFailed;
+            item.state = AttentionState::Failed;
+            item.share_id = Some(id);
+            item.share_name = Some(name.clone());
+            item.title = format!("Shared files could not be checked: {name}");
+            item.message = if reason == "permission" {
             "Give ISM permission to read this share's folders and files. Check its folder in Peers; ISM retries automatically."
         } else if reason == "other" {
             "Check this share's folder in Peers and review server logs. ISM retries automatically."
         } else {
             "The share scan failed. Check server logs; ISM retries automatically."
         }.into();
-        item.href = "/peers".into();
-        item.observed_at = at;
-        items.push(item);
+            item.href = "/peers".into();
+            item.observed_at = at;
+            items.push(item);
+        }
     }
 
     let conflicts: Vec<Conflict> = sqlx::query_as(

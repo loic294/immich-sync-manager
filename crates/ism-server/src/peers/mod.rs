@@ -545,12 +545,7 @@ pub async fn scan_share(state: &AppState, share: &Share) -> AppResult<()> {
             let result = scan_share_reporting(state, &share, &task).await;
             match &result {
                 Ok(true) => {
-                    let cleared = sqlx::query(
-                        "DELETE FROM share_scan_failures WHERE share_id=?
-                         AND EXISTS(SELECT 1 FROM shares WHERE id=share_id AND enabled=1)",
-                    )
-                        .bind(&share.id).execute(&state.db).await?;
-                    if cleared.rows_affected() > 0 {
+                    if clear_scan_failure(&state.db, &share.id).await? > 0 {
                         tracing::info!(share_id = %share.id, "share scan recovered after a complete scan");
                     }
                 }
@@ -595,6 +590,26 @@ pub async fn scan_share(state: &AppState, share: &Share) -> AppResult<()> {
         },
     )
     .await
+}
+
+async fn clear_scan_failure(db: &sqlx::SqlitePool, share_id: &str) -> AppResult<u64> {
+    let failed: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM share_scan_failures WHERE share_id=?)")
+            .bind(share_id)
+            .fetch_one(db)
+            .await?;
+    if !failed {
+        return Ok(0);
+    }
+    // The caller holds the scan gate across the read and conditional clear.
+    Ok(sqlx::query(
+        "DELETE FROM share_scan_failures WHERE share_id=?
+         AND EXISTS(SELECT 1 FROM shares WHERE id=share_id AND enabled=1)",
+    )
+    .bind(share_id)
+    .execute(db)
+    .await?
+    .rows_affected())
 }
 
 /// A successful partial scan can publish independent changes, but cannot clear an older failure.
