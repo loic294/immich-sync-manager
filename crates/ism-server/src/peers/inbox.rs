@@ -1530,12 +1530,7 @@ async fn require_unresolved_transfers_except(
     paths: &[&str],
     retained: &[String],
 ) -> AppResult<()> {
-    let failed: Vec<(String, String)> = sqlx::query_as(
-        "SELECT id,rel_path FROM transfers WHERE share_id = ? AND status IN ('failed','cancelled')",
-    )
-    .bind(&share.id)
-    .fetch_all(&state.db)
-    .await?;
+    let failed = unresolved_transfers(state, share).await?;
     if failed.iter().any(|(id, b)| {
         !retained.contains(id)
             && (paths.is_empty() || paths.iter().any(|p| *p != b && overlaps(p, b)))
@@ -1546,6 +1541,100 @@ async fn require_unresolved_transfers_except(
         ));
     }
     Ok(())
+}
+
+async fn unresolved_transfers(state: &AppState, share: &Share) -> AppResult<Vec<(String, String)>> {
+    Ok(sqlx::query_as(
+        "SELECT id,rel_path FROM transfers WHERE share_id = ? AND status IN ('failed','cancelled')",
+    )
+    .bind(&share.id)
+    .fetch_all(&state.db)
+    .await?)
+}
+
+/// Inbox effects that hold back publication in a share, as `(event_json, operation_id)`.
+async fn effect_events(
+    state: &AppState,
+    share: &Share,
+) -> AppResult<Vec<(String, Option<String>)>> {
+    Ok(sqlx::query_as(
+        "SELECT event_json,operation_id FROM peer_inbox WHERE share_name = ? AND status NOT IN ('done','awaiting_content')
+         AND (error IS NOT NULL OR operation_id IS NOT NULL)
+         AND NOT EXISTS(SELECT 1 FROM peer_inbox_dependencies d JOIN peer_inbox b
+             ON b.peer_id = d.depends_peer_id AND b.seq = d.depends_seq
+             WHERE d.peer_id = peer_inbox.peer_id AND d.seq = peer_inbox.seq AND b.status = 'awaiting_content')",
+    )
+    .bind(&share.name)
+    .fetch_all(&state.db)
+    .await?)
+}
+
+/// Share-wide evidence of the plain transfer gate ([`require_stable_transfer`] without a
+/// restoration parent or recovery links), read once so a scheduler pass need not re-read it for
+/// every queued row. It only identifies rows that this evidence holds back; every other row must
+/// still pass the full gate before it is claimed. Active operations are not part of it: the full
+/// gate checks them per row.
+pub(crate) struct TransferEvidence {
+    footprints: Vec<String>,
+    failed: Vec<String>,
+    root_available: bool,
+    /// Valid effects other than share enablement, in gate order, with a lazily read decision.
+    events: Vec<(PeerEvent, Option<bool>)>,
+}
+
+impl TransferEvidence {
+    pub(crate) async fn read(state: &AppState, share: &Share) -> AppResult<Self> {
+        let footprints = operation_footprints(state, share, &[]).await?;
+        let failed = unresolved_transfers(state, share)
+            .await?
+            .into_iter()
+            .map(|(_, path)| path)
+            .collect();
+        let root_available = files::root(&state.db, &share.root_id).await?.available();
+        let mut events = Vec::new();
+        for (raw, _) in effect_events(state, share).await? {
+            let event: PeerEvent = serde_json::from_str(&raw)?;
+            event_valid(&event)?;
+            if event.kind != SHARE_ENABLED {
+                events.push((event, None));
+            }
+        }
+        Ok(Self {
+            footprints,
+            failed,
+            root_available,
+            events,
+        })
+    }
+
+    /// Whether this evidence holds back a transfer of `path`. An error means only the full gate
+    /// can decide.
+    pub(crate) async fn holds_back(
+        &mut self,
+        state: &AppState,
+        share: &Share,
+        path: &str,
+    ) -> AppResult<bool> {
+        if self.footprints.iter().any(|b| overlaps(path, b))
+            || self.failed.iter().any(|b| path != b && overlaps(path, b))
+            || !self.root_available
+        {
+            return Ok(true);
+        }
+        for (event, decided) in &mut self.events {
+            if !self::paths(event).iter().any(|b| overlaps(path, b)) {
+                continue;
+            }
+            let decided = match *decided {
+                Some(decided) => decided,
+                None => *decided.insert(conflict_decision(state, share, event).await?.is_some()),
+            };
+            if !decided {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
 }
 
 /// Uncertain paths for scans, including inbox effects and queued downloads. An empty path
@@ -1647,16 +1736,7 @@ async fn require_stable_share_effects(
     files::root(&state.db, &share.root_id)
         .await?
         .ensure_available()?;
-    let events: Vec<(String,Option<String>)> = sqlx::query_as(
-        "SELECT event_json,operation_id FROM peer_inbox WHERE share_name = ? AND status NOT IN ('done','awaiting_content')
-         AND (error IS NOT NULL OR operation_id IS NOT NULL)
-         AND NOT EXISTS(SELECT 1 FROM peer_inbox_dependencies d JOIN peer_inbox b
-             ON b.peer_id = d.depends_peer_id AND b.seq = d.depends_seq
-             WHERE d.peer_id = peer_inbox.peer_id AND d.seq = peer_inbox.seq AND b.status = 'awaiting_content')",
-    )
-    .bind(&share.name)
-    .fetch_all(&state.db)
-    .await?;
+    let events = effect_events(state, share).await?;
     let mut transfers_checked = false;
     for (raw, operation) in events {
         if operation

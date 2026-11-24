@@ -515,24 +515,47 @@ pub(crate) async fn original_pending(
         return Ok(false);
     }
     let (stem, _) = ism_core::paths::split_ext(rel);
-    let paths: Vec<String> = sqlx::query_scalar(
+    let paths = pending_paths(state, share_id, Some(stem)).await?;
+    Ok(original_among(
+        paths.iter().map(String::as_str),
+        rel,
+        &extensions,
+    ))
+}
+
+/// Paths with queued or running transfers or active operation history in a share; with `stem`,
+/// only that stem and the paths it starts before a `.`.
+async fn pending_paths(
+    state: &AppState,
+    share_id: &str,
+    stem: Option<&str>,
+) -> AppResult<Vec<String>> {
+    Ok(sqlx::query_scalar(
         "SELECT rel_path FROM transfers
          WHERE share_id = ?1 AND status IN ('queued','running')
-           AND (rel_path = ?2 OR substr(rel_path, 1, length(?2) + 1) = ?2 || '.')
+           AND (?2 IS NULL OR rel_path = ?2 OR substr(rel_path, 1, length(?2) + 1) = ?2 || '.')
          UNION ALL
          SELECT h.rel_path FROM transfer_history h JOIN operations o ON o.id = h.operation_id
          WHERE h.share_id = ?1 AND o.status IN ('queued','waiting_maintenance','running')
-           AND (h.rel_path = ?2 OR substr(h.rel_path, 1, length(?2) + 1) = ?2 || '.')",
+           AND (?2 IS NULL OR h.rel_path = ?2 OR substr(h.rel_path, 1, length(?2) + 1) = ?2 || '.')",
     )
     .bind(share_id)
     .bind(stem)
     .fetch_all(&state.db)
-    .await?;
-    Ok(paths.iter().any(|path| {
-        !is_companion_name(path, &extensions)
+    .await?)
+}
+
+/// Whether any of the pending `paths` is the original that companion `rel` must wait for.
+fn original_among<'a>(
+    mut paths: impl Iterator<Item = &'a str>,
+    rel: &str,
+    extensions: &[String],
+) -> bool {
+    paths.any(|path| {
+        !is_companion_name(path, extensions)
             && std::path::Path::new(path).parent() == std::path::Path::new(rel).parent()
-            && !companions_of(path, &[rel.to_owned()], &extensions).is_empty()
-    }))
+            && !companions_of(path, &[rel.to_owned()], extensions).is_empty()
+    })
 }
 
 pub(crate) enum Eligibility {
@@ -597,11 +620,143 @@ pub(super) struct EligibilityPause {
     pub resume: tokio::sync::oneshot::Receiver<()>,
 }
 
+/// Evidence shared by the rows of one scheduler pass. It only passes over rows that this
+/// evidence holds back; a row it does not hold back still goes through the full [`eligibility`]
+/// check before it is returned, and [`run_one`] rechecks it under the operation gate. Evidence
+/// that changes during the pass can therefore only delay a row until the next pass.
+#[derive(Default)]
+struct PassEvidence {
+    linked: Option<std::collections::HashSet<String>>,
+    extensions: Option<Vec<String>>,
+    /// `None` when the share's evidence cannot be read; its rows get the full check.
+    shares: HashMap<String, Option<super::inbox::TransferEvidence>>,
+    allowed: HashMap<(String, String), bool>,
+    pending: HashMap<String, std::collections::BTreeSet<String>>,
+}
+
+impl PassEvidence {
+    /// Why the row waits according to this pass's evidence, or `None` when the full check must
+    /// decide.
+    #[allow(clippy::too_many_arguments)]
+    async fn waiting(
+        &mut self,
+        state: &AppState,
+        share: &super::Share,
+        peer: &str,
+        id: &str,
+        rel: &str,
+        attempts: i64,
+        updated: &str,
+        restore_parent: bool,
+    ) -> Option<Eligibility> {
+        if restore_parent {
+            return None;
+        }
+        self.read_waiting(state, share, peer, id, rel, attempts, updated)
+            .await
+            .ok()
+            .flatten()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn read_waiting(
+        &mut self,
+        state: &AppState,
+        share: &super::Share,
+        peer: &str,
+        id: &str,
+        rel: &str,
+        attempts: i64,
+        updated: &str,
+    ) -> AppResult<Option<Eligibility>> {
+        if self.linked.is_none() {
+            let linked: Vec<String> = sqlx::query_scalar(
+                "SELECT target_id FROM sync_recovery_links WHERE kind = 'transfer'",
+            )
+            .fetch_all(&state.db)
+            .await?;
+            self.linked = Some(linked.into_iter().collect());
+        }
+        if self
+            .linked
+            .as_ref()
+            .is_some_and(|linked| linked.contains(id))
+        {
+            return Ok(None);
+        }
+        if !self.shares.contains_key(&share.id) {
+            let evidence = super::inbox::TransferEvidence::read(state, share)
+                .await
+                .ok();
+            self.shares.insert(share.id.clone(), evidence);
+        }
+        let Some(evidence) = self.shares.get_mut(&share.id).and_then(Option::as_mut) else {
+            return Ok(None);
+        };
+        if evidence.holds_back(state, share, rel).await? {
+            return Ok(Some(Eligibility::Waiting {
+                reason: "Waiting for unresolved work that overlaps this file".into(),
+                next_at: None,
+                blocked: true,
+            }));
+        }
+        if let Some(at) = retry_at(attempts, updated) {
+            return Ok(Some(Eligibility::Waiting {
+                reason: "Retry backoff after a failed transfer".into(),
+                next_at: Some(db::ts(at)),
+                blocked: false,
+            }));
+        }
+        let key = (share.id.clone(), peer.to_owned());
+        let ok = match self.allowed.get(&key) {
+            Some(ok) => *ok,
+            None => {
+                let ok = allowed(state, &share.id, peer).await?.0;
+                self.allowed.insert(key, ok);
+                ok
+            }
+        };
+        if !ok {
+            return Ok(Some(Eligibility::Waiting {
+                reason: "Waiting for allowed file-transfer hours".into(),
+                next_at: None,
+                blocked: false,
+            }));
+        }
+        let extensions = self
+            .extensions
+            .get_or_insert_with(|| state.sidecar_extensions());
+        if !is_companion_name(rel, extensions) {
+            return Ok(None);
+        }
+        if !self.pending.contains_key(&share.id) {
+            let paths = pending_paths(state, &share.id, None).await?;
+            self.pending
+                .insert(share.id.clone(), paths.into_iter().collect());
+        }
+        let (stem, _) = ism_core::paths::split_ext(rel);
+        let candidates = self.pending[&share.id]
+            .range::<str, _>((std::ops::Bound::Included(stem), std::ops::Bound::Unbounded))
+            .take_while(|path| path.starts_with(stem))
+            .filter(|path| path.len() == stem.len() || path[stem.len()..].starts_with('.'))
+            .map(String::as_str);
+        if original_among(candidates, rel, extensions) {
+            return Ok(Some(Eligibility::Waiting {
+                reason: "Waiting for the original file before transferring its companion".into(),
+                next_at: None,
+                blocked: false,
+            }));
+        }
+        Ok(None)
+    }
+}
+
 async fn next(
     state: &AppState,
     #[cfg(test)] pause: &mut Option<EligibilityPause>,
 ) -> AppResult<Option<(Transfer, Option<String>)>> {
     let shares = super::shares(state).await?;
+    let mut pass = PassEvidence::default();
     type R = (
         String,
         String,
@@ -651,8 +806,22 @@ async fn next(
             let Some(share) = shares.iter().find(|share| share.id == share_id) else {
                 continue;
             };
-            let eligible =
-                eligibility(state, share, &peer_id, &id, &rel, attempts, &updated).await?;
+            let eligible = match pass
+                .waiting(
+                    state,
+                    share,
+                    &peer_id,
+                    &id,
+                    &rel,
+                    attempts,
+                    &updated,
+                    restore_parent.is_some(),
+                )
+                .await
+            {
+                Some(waiting) => waiting,
+                None => eligibility(state, share, &peer_id, &id, &rel, attempts, &updated).await?,
+            };
             #[cfg(test)]
             if matches!(eligible, Eligibility::Waiting { blocked: true, .. })
                 && let Some(pause) = pause.take()

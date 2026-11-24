@@ -179,7 +179,9 @@ including after a restart; unrelated events from the same peer and share can pro
   hours for a set time. Uploads and other writes by ISM schedule a rescan of the affected shares,
   so their content is announced without waiting for the full scan.
   Each receiving instance downloads three files concurrently by default, starting the next
-  eligible file as soon as a slot becomes free rather than waiting for a batch. Set
+  eligible file as soon as a slot becomes free rather than waiting for a batch. Each scheduling
+  pass reads a share's blocking evidence once to pass over files it shows waiting; the file it
+  picks is still checked in full before it starts. Set
   `ISM_PEER_TRANSFER_CONCURRENCY` to 1–32 to tune the global peer download limit; 6–8 is a
   reasonable starting point for high-latency links, provided both source and destination storage
   can sustain the extra I/O. Publication still runs through the serialized managed-operation
