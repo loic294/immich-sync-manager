@@ -38,8 +38,13 @@ errors close the stream. Credential/configuration writers must call
 `AppState::peer_configuration_changed` immediately after committing their change.
 Allow long-lived, unbuffered responses through reverse proxies. The peer progress/recovery client
 uses this stream instead of five-second refreshes when supported. It reads notifications independently
-of authoritative fetches and coalesces refreshes to at most once per second. Keepalives do not fetch
-state or create background task history. Closed, silent (45 seconds), or invalid streams report
+of authoritative fetches and coalesces refreshes to at most once per second. Routine successful
+refreshes do not create background task history; fetch errors are logged and remain visible in Sync.
+Keepalives do not fetch state or write heartbeat timestamps to the database. A connection-scoped
+in-memory heartbeat keeps unchanged snapshots current only after both progress and recovery fetches
+succeed for that connection and its latest hint. New hints, failures, disconnects and configuration
+changes invalidate that verification; keepalives alone never authorize failed or previous snapshots.
+Closed, silent (45 seconds), or invalid streams report
 availability errors and reconnect after five seconds, fetching state again on connection.
 Only HTTP 404, 405, or 501 selects legacy five-second polling; legacy peers are probed every minute
 for an upgrade. Authentication and server errors never silently select polling. Peer removal or
@@ -130,8 +135,12 @@ including after a restart; unrelated events from the same peer and share can pro
   substantial disk reads on large shares. Scans exclude queued transfers and uncertain operation
   or inbox footprints from hashing and deletion inference, while independent paths remain eligible.
   Unavailable roots never imply deletion. An unreadable subtree is excluded and the incomplete
-  scan is reported explicitly. To avoid recording half-completed managed operations,
-  each scan and managed operation runs exclusively of the other within this instance. A long scan
+  scan is reported explicitly. To avoid recording half-completed managed operations, a scan
+  never runs while a managed operation is changing files within this instance (or while an
+  operation is left active by a restart). Scans do run while an operation waits for its
+  maintenance barrier, since it has changed nothing yet; it then waits for any scan in progress
+  before its first change, which can lengthen the Immich job pause. Other bookkeeping, including
+  application of incoming events, still waits for every active operation. A long scan
   can therefore delay managed operations and application of incoming events, even though polling
   and scanning run separately. Peer connections are polled independently, so a slow peer does not
   prevent the others from being contacted. Each peer has at most one synchronization worker and
@@ -186,6 +195,11 @@ the path the peer moved from. ISM records a conflict when:
 - `folder_move`: a folder move cannot be applied the same way here;
 - `apply_failed`: an incoming change could not be applied.
 
+Conflict previews verify the complete original against the reviewed checksum before display.
+JPEG, PNG and WebP originals up to 64 MiB can be resized for preview, subject to a 60-megapixel
+and 12,000-pixel-per-side limit. AVIF previews retain their 4 MiB limit. Previewing a peer's
+contents follows the configured transfer hours.
+
 Resolutions:
 
 | Choice | Effect |
@@ -217,6 +231,8 @@ source, keeping local or both requires a refreshed in-app choice; already preser
 remain included in publication. If the current peer folder overlaps the original source, the
 comparison expands to their common ancestor on both instances, including sibling files and empty
 folders. Keeping both preserves the receiving instance's complete ancestor as a conflict copy.
+Recovery evidence is refused when its lineage overlaps an unresolved or later committed folder
+prune; unrelated paths remain available.
 
 If a failed incoming folder move has lost both local paths, ISM can restore its old source from
 the peer's complete current inventory, then finish the original managed move. Downloads retain

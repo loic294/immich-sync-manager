@@ -98,6 +98,7 @@ pub fn router() -> Router<AppState> {
             post(readd_sync_operation),
         )
         .route("/conflicts", get(list_conflicts))
+        .route("/conflicts/page", get(conflicts_page))
         .route("/conflicts/{id}/resolve", post(resolve_conflict))
         .route("/audit", get(audit))
         .route("/events", get(events))
@@ -1497,6 +1498,8 @@ async fn readd_sync_operation(
 struct ConflictsQuery {
     #[serde(default)]
     include_resolved: bool,
+    limit: Option<i64>,
+    offset: Option<i64>,
 }
 
 async fn list_conflicts(
@@ -1505,6 +1508,25 @@ async fn list_conflicts(
     Query(q): Query<ConflictsQuery>,
 ) -> AppResult<Response> {
     Ok(Json(peers::list_conflicts(&state, q.include_resolved).await?).into_response())
+}
+
+async fn conflicts_page(
+    State(state): State<AppState>,
+    Admin(_): Admin,
+    Query(q): Query<ConflictsQuery>,
+) -> AppResult<Response> {
+    let limit = q.limit.unwrap_or(50);
+    let offset = q.offset.unwrap_or(0);
+    if !(1..=5000).contains(&limit) || offset < 0 {
+        return Err(AppError::bad_request(
+            "invalid_page",
+            "limit must be 1-5000 and offset must be nonnegative",
+        ));
+    }
+    Ok(
+        Json(peers::page_conflicts(&state, q.include_resolved, limit, offset).await?)
+            .into_response(),
+    )
 }
 
 async fn resolve_conflict(

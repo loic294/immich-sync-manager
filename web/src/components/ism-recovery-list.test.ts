@@ -1,13 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { api } from '@/api/client';
-import type { RecoveryVersions } from '@/api/generated/RecoveryVersions';
 import type { RecoveryView } from '@/api/generated/RecoveryView';
 import { mount } from '@/test/helpers';
 import '@/components/ism-recovery-list';
-
-vi.mock('@/components/confirm', () => ({
-  confirmAction: vi.fn(async () => true),
-}));
 
 const ISSUE: RecoveryView = {
   target: { kind: 'transfer', id: 'transfer-1', peer_id: null },
@@ -18,13 +13,6 @@ const ISSUE: RecoveryView = {
   can_fix: true,
   can_dismiss: false,
   replacement_operation_id: null,
-};
-
-const VERSIONS: RecoveryVersions = {
-  share: 'Photos',
-  revision: 'a'.repeat(64),
-  receiving: [{ instance: 'Alpha', path: 'photo.xmp', state: 'file', files: [], directories: [] }],
-  source: { instance: 'Beta', path: 'photo.xmp', state: 'file', files: [], directories: [] },
 };
 
 describe('sync recovery', () => {
@@ -41,7 +29,7 @@ describe('sync recovery', () => {
     expect(page.querySelector('ism-pagination')?.limit).toBe(25);
   });
 
-  it('shows what each issue needs without making technical details the main explanation', async () => {
+  it('shows actionable guidance and directs version decisions to Conflicts', async () => {
     const rows: RecoveryView[] = [
       ISSUE,
       {
@@ -55,6 +43,21 @@ describe('sync recovery', () => {
         ...ISSUE,
         title: 'Different versions',
         target: { kind: 'conflict', id: 'conflict-1', peer_id: null },
+        state: 'needs_decision',
+        code: 'version_conflict',
+        can_fix: false,
+      },
+      {
+        ...ISSUE,
+        title: 'Related operation',
+        target: { kind: 'operation', id: 'operation-1', peer_id: null },
+        state: 'needs_decision',
+        can_fix: false,
+      },
+      {
+        ...ISSUE,
+        title: 'Version choice',
+        target: { kind: 'conflict', id: 'conflict-2', peer_id: null },
         state: 'needs_decision',
         code: 'choose_version',
         can_fix: false,
@@ -73,7 +76,8 @@ describe('sync recovery', () => {
         detail: 'Recovery stopped unexpectedly.',
       },
     ];
-    vi.spyOn(api, 'get').mockResolvedValue({ rows, total: rows.length } as never);
+    const get = vi.spyOn(api, 'get').mockResolvedValue({ rows, total: rows.length } as never);
+    const post = vi.spyOn(api, 'post');
     const page = await mount('ism-recovery-list');
     await page.reload();
     await page.updateComplete;
@@ -84,23 +88,41 @@ describe('sync recovery', () => {
     expect(rendered[1]?.querySelector('td:nth-child(2) > p')?.textContent).toContain(
       "can't read this saved issue",
     );
-    expect(rendered[2]?.querySelector('td:nth-child(2) > p')?.textContent).toContain(
-      'Compare the versions',
+    expect(rendered[2]?.textContent).toContain('Review them again on the Conflicts page');
+    expect(rendered[3]?.textContent).toContain('Find it on the Conflicts page');
+    expect(rendered[4]?.textContent).toContain(
+      'Choose which version to keep on the Conflicts page',
     );
-    expect(rendered[3]?.querySelector('td:nth-child(2) > p')?.textContent).toContain(
-      'Restore this file from a backup',
-    );
-    expect(rendered[4]?.querySelector('td:nth-child(2) > p')?.textContent).toContain(
-      'choose Fix selected to try again',
-    );
+    expect(rendered[5]?.textContent).toContain('Restore this file from a backup');
+    expect(rendered[6]?.textContent).toContain('choose Fix selected to try again');
     expect(rendered[1]?.querySelector('details')?.open).toBe(false);
+    expect(rendered[5]?.querySelector('button')).toBeNull();
+    for (const row of [rendered[2], rendered[3], rendered[4]]) {
+      expect(row?.querySelector('a')?.getAttribute('href')).toBe('/conflicts');
+      expect(row?.querySelector('a')?.textContent).toContain('Go to Conflicts');
+    }
+    rendered[2]?.querySelector<HTMLInputElement>('input')?.click();
+    await page.updateComplete;
+    expect(page.textContent).toContain('1 selected');
+    expect(page.querySelector('[aria-label="Batch conflict decisions"]')).toBeNull();
+    expect(page.querySelector('ism-recovery-versions')).toBeNull();
+    expect(page.textContent).not.toContain('Compare selected versions');
+    expect(page.textContent).not.toContain('Keep both');
+    expect(get.mock.calls.some(([path]) => path.endsWith('/versions'))).toBe(false);
+    expect(post).not.toHaveBeenCalled();
   });
 
-  it('keeps selection across pages and submits exact targets without claiming completion', async () => {
+  it('keeps selection across pages, permits removal, and submits exact targets', async () => {
     vi.spyOn(api, 'get').mockImplementation(async (_path, options) => {
       const offset = Number(options?.query?.offset ?? 0);
       return {
-        rows: [{ ...ISSUE, target: { ...ISSUE.target, id: `transfer-${offset + 1}` } }],
+        rows: [
+          {
+            ...ISSUE,
+            title: `Photo ${offset}`,
+            target: { ...ISSUE.target, id: `transfer-${offset + 1}` },
+          },
+        ],
         total: 501,
       } as never;
     });
@@ -119,23 +141,24 @@ describe('sync recovery', () => {
     page.querySelector<HTMLInputElement>('tbody input')?.click();
     await page.updateComplete;
     expect(page.textContent).toContain('2 selected');
+    const offPage = page.querySelector('[aria-label="Selected issues on other pages"]');
+    expect(offPage?.textContent).toContain('Photo 0');
+    offPage?.querySelector<HTMLButtonElement>('button')?.click();
+    await page.updateComplete;
+    expect(page.textContent).toContain('1 selected');
     [...page.querySelectorAll<HTMLButtonElement>('button')]
       .find((button) => button.textContent?.includes('Fix selected'))
       ?.click();
     await vi.waitFor(() =>
       expect(post).toHaveBeenCalledWith('/api/admin/recovery', {
         body: {
-          targets: [
-            { kind: 'transfer', id: 'transfer-1', peer_id: null },
-            { kind: 'transfer', id: 'transfer-251', peer_id: null },
-          ],
+          targets: [{ kind: 'transfer', id: 'transfer-251', peer_id: null }],
           all: false,
           resolution: null,
         },
       }),
     );
     await vi.waitFor(() => expect(page.textContent).toContain('0 fixed'));
-    expect(page.querySelector('details')?.hasAttribute('open')).toBe(false);
     expect(page.textContent).not.toContain('Mark handled');
   });
 
@@ -156,182 +179,23 @@ describe('sync recovery', () => {
     expect(page.textContent).toContain('Issues are handled per file');
   });
 
-  it('exposes selected version comparisons from other pages before a batch decision', async () => {
-    vi.spyOn(api, 'get').mockImplementation(async (path, options) => {
-      if (path.endsWith('/versions')) return VERSIONS as never;
-      const offset = Number(options?.query?.offset ?? 0);
-      return {
-        rows: [
-          {
-            ...ISSUE,
-            target: { kind: 'conflict', id: `choice-${offset}`, peer_id: null },
-            title: `Selected photo ${offset}`,
-            state: 'needs_decision',
-            can_fix: false,
-          },
-        ],
-        total: 501,
-      } as never;
-    });
-    const page = await mount('ism-recovery-list');
-    await page.reload();
-    await page.updateComplete;
-    page.querySelector<HTMLInputElement>('tbody input')?.click();
-    page
-      .querySelector('ism-pagination')
-      ?.dispatchEvent(new CustomEvent('page-change', { detail: { limit: 250, offset: 250 } }));
-    await page.reload();
-    await page.updateComplete;
-    page.querySelector<HTMLInputElement>('tbody input')?.click();
-    await page.updateComplete;
-    [...page.querySelectorAll<HTMLButtonElement>('button')]
-      .find((button) => button.textContent?.trim() === 'Compare selected versions')
-      ?.click();
-    await vi.waitFor(() => expect(page.querySelectorAll('ism-recovery-versions')).toHaveLength(2));
-    await page.updateComplete;
-    const review = page.querySelector('[aria-label="Selected conflicts on other pages"]');
-    expect(review?.textContent).toContain('Selected photo 0');
-    expect(review?.querySelector('ism-recovery-versions')).not.toBeNull();
-    expect(page.querySelectorAll('ism-recovery-versions')).toHaveLength(2);
-  });
-
-  it('queues explicit in-app batch decisions and exposes no retry for non-retryable work', async () => {
-    const conflict: RecoveryView = {
-      ...ISSUE,
-      target: { kind: 'conflict', id: 'conflict-1', peer_id: null },
-      state: 'needs_decision',
-      can_fix: false,
-    };
-    vi.spyOn(api, 'get').mockImplementation(async (path) =>
-      path.endsWith('/versions')
-        ? (VERSIONS as never)
-        : ({
-            rows: [conflict, { ...ISSUE, state: 'not_retryable', can_fix: false }],
-            total: 2,
-          } as never),
-    );
-    const post = vi.spyOn(api, 'post').mockResolvedValue({ items: [conflict] } as never);
-    const page = await mount('ism-recovery-list');
-    await page.reload();
-    await page.updateComplete;
-    expect(page.textContent).toContain("Can't fix automatically");
-    expect(page.querySelectorAll('tbody tr')[1]?.querySelectorAll('button')).toHaveLength(0);
-    page.querySelector<HTMLInputElement>('tbody input')?.click();
-    await page.updateComplete;
-    [...page.querySelectorAll<HTMLButtonElement>('button')]
-      .find((button) => button.textContent?.trim() === 'Compare selected versions')
-      ?.click();
-    await vi.waitFor(() => expect(page.querySelector('ism-recovery-versions')).not.toBeNull());
-    await vi.waitFor(() => expect(page.busy).toBeUndefined());
-    [...page.querySelectorAll<HTMLButtonElement>('button')]
-      .find((button) => button.textContent?.trim() === 'Keep both')
-      ?.click();
-    await vi.waitFor(() =>
-      expect(post).toHaveBeenCalledWith('/api/admin/recovery/decisions', {
-        body: {
-          decisions: [{ target: conflict.target, revision: VERSIONS.revision }],
-          resolution: 'keep_both',
-        },
-      }),
-    );
-  });
-
-  it('keeps successful comparisons and retries only the one that failed', async () => {
-    const rows = ['ok', 'locked'].map(
-      (id): RecoveryView => ({
-        ...ISSUE,
-        target: { kind: 'conflict', id, peer_id: null },
-        title: id,
-        state: 'needs_decision',
-        can_fix: false,
-      }),
-    );
-    let failing = true;
-    vi.spyOn(api, 'get').mockImplementation(async (path, options) => {
-      if (!path.endsWith('/versions')) return { rows, total: 2 } as never;
-      if (options?.query?.id === 'locked' && failing) throw new Error('database is locked');
-      return VERSIONS as never;
-    });
-    const page = await mount('ism-recovery-list');
-    await page.reload();
-    await page.updateComplete;
-    page.querySelector<HTMLInputElement>('thead input')?.click();
-    await page.updateComplete;
-    [...page.querySelectorAll<HTMLButtonElement>('button')]
-      .find((button) => button.textContent?.trim() === 'Compare selected versions')
-      ?.click();
-    await vi.waitFor(() => expect(page.querySelector('[role="alert"]')).not.toBeNull());
-    expect(page.querySelectorAll('ism-recovery-versions')).toHaveLength(1);
-    expect(page.querySelector('[role="alert"]')?.textContent).toContain('database is locked');
-    expect(page.busy).toBeUndefined();
-    failing = false;
-    [...page.querySelectorAll<HTMLButtonElement>('button')]
-      .find((button) => button.textContent?.trim() === 'Try again')
-      ?.click();
-    await vi.waitFor(() => expect(page.querySelectorAll('ism-recovery-versions')).toHaveLength(2));
-    expect(page.querySelector('[role="alert"]')).toBeNull();
-  });
-
-  it('submits the reviewed revision without refetching files before queueing', async () => {
-    const conflict: RecoveryView = {
-      ...ISSUE,
-      target: { kind: 'conflict', id: 'choice', peer_id: null },
-      state: 'needs_decision',
-      can_fix: false,
-    };
-    let revision = VERSIONS.revision;
-    const get = vi
-      .spyOn(api, 'get')
-      .mockImplementation(async (path) =>
-        path.endsWith('/versions')
-          ? ({ ...VERSIONS, revision } as never)
-          : ({ rows: [conflict], total: 1 } as never),
-      );
-    const post = vi.spyOn(api, 'post').mockResolvedValue({
-      items: [{ ...conflict, state: 'queued' }],
-    } as never);
-    const page = await mount('ism-recovery-list');
-    await page.reload();
-    await page.updateComplete;
-    [...page.querySelectorAll<HTMLButtonElement>('button')]
-      .find((button) => button.textContent?.trim() === 'Compare versions')
-      ?.click();
-    await vi.waitFor(() => expect(page.querySelector('ism-recovery-versions')).not.toBeNull());
-    await vi.waitFor(() => expect(page.busy).toBeUndefined());
-    revision = 'b'.repeat(64);
-    [...page.querySelectorAll<HTMLButtonElement>('button')]
-      .find((button) => button.textContent?.trim() === 'Keep both')
-      ?.click();
-    await vi.waitFor(() =>
-      expect(post).toHaveBeenCalledWith('/api/admin/recovery/decisions', {
-        body: {
-          decisions: [{ target: conflict.target, revision: VERSIONS.revision }],
-          resolution: 'keep_both',
-        },
-      }),
-    );
-    expect(get.mock.calls.filter(([path]) => path.endsWith('/versions'))).toHaveLength(1);
-  });
-
-  it('keeps selection but removes batch version decisions when receiver evidence becomes unavailable', async () => {
+  it('keeps selected issues updated when recovery eligibility changes', async () => {
     const conflict: RecoveryView = {
       ...ISSUE,
       target: { kind: 'conflict', id: 'conflict-1', peer_id: 'source-peer' },
       state: 'needs_decision',
       can_fix: false,
-      local_instance: 'Alpha',
-      peer_instance: 'Beta',
     };
     const get = vi.spyOn(api, 'get').mockResolvedValue({ rows: [conflict], total: 1 } as never);
-    const post = vi.spyOn(api, 'post');
     const page = await mount('ism-recovery-list');
     await page.reload();
     await page.updateComplete;
     page.querySelector<HTMLInputElement>('tbody input')?.click();
     await page.updateComplete;
-    expect(page.querySelector('[aria-label="Batch conflict decisions"]')?.textContent).toContain(
-      'Keep Alpha',
+    const fix = [...page.querySelectorAll<HTMLButtonElement>('button')].find((button) =>
+      button.textContent?.includes('Fix selected'),
     );
+    expect(fix?.disabled).toBe(true);
     get.mockResolvedValue({
       rows: [{ ...conflict, state: 'waiting', code: 'peer_recovery_unavailable', can_fix: true }],
       total: 1,
@@ -339,8 +203,7 @@ describe('sync recovery', () => {
     await page.reload();
     await page.updateComplete;
     expect(page.textContent).toContain('1 selected');
-    expect(page.querySelector('[aria-label="Batch conflict decisions"]')).toBeNull();
-    expect(page.textContent).not.toContain('Keep both');
-    expect(post).not.toHaveBeenCalled();
+    expect(fix?.disabled).toBe(false);
+    expect(page.querySelector('a[href="/conflicts"]')).toBeNull();
   });
 });

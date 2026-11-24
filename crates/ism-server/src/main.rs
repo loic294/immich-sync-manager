@@ -2,6 +2,7 @@
 
 mod activity;
 mod activity_blockers;
+mod admission;
 mod auth;
 mod config;
 mod crypto;

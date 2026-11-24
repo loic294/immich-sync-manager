@@ -21,6 +21,7 @@ chrono-tz = "0.10.4"
 futures-util = "0.3.34"
 hex = "0.4.3"
 hmac = "0.13.0"
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp"] }
 ism-core = { path = "crates/ism-core" }
 notify = { version = "8.2.2", default-features = false, features = ["macos_fsevent"] }
 rand = "0.10.3"

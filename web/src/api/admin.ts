@@ -6,8 +6,8 @@ import type { BackgroundActivityPage } from '@/api/generated/BackgroundActivityP
 import type { ClientTokenCreated } from '@/api/generated/ClientTokenCreated';
 import type { ClientTokenInput } from '@/api/generated/ClientTokenInput';
 import type { ClientTokenView } from '@/api/generated/ClientTokenView';
+import type { ConflictPage } from '@/api/generated/ConflictPage';
 import type { ConflictResolution } from '@/api/generated/ConflictResolution';
-import type { ConflictView } from '@/api/generated/ConflictView';
 import type { ImmichServerInput } from '@/api/generated/ImmichServerInput';
 import type { ImmichServerView } from '@/api/generated/ImmichServerView';
 import type { LibraryView } from '@/api/generated/LibraryView';
@@ -179,8 +179,10 @@ export const admin = {
   readdSyncOperation: (id: string, index: number) =>
     api.post<void>(`${A}/sync/operations/${enc(id)}/${index}/readd`),
 
-  conflicts: (includeResolved = false) =>
-    api.get<ConflictView[]>(`${A}/conflicts`, { query: { include_resolved: includeResolved } }),
+  conflicts: (includeResolved = false, limit = 50, offset = 0) =>
+    api.get<ConflictPage>(`${A}/conflicts/page`, {
+      query: { include_resolved: includeResolved, limit, offset },
+    }),
   resolveConflict: (id: string, resolution: ConflictResolution) =>
     api.post<void>(`${A}/conflicts/${enc(id)}/resolve`, { body: { resolution } }),
 

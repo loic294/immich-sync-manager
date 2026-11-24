@@ -50,6 +50,7 @@ pub struct Inner {
     pub peer_events: broadcast::Sender<()>,
     /// Changing peer credentials or configuration revokes existing streams without polling.
     pub peer_configuration: watch::Sender<()>,
+    pub peer_streams: crate::peers::notifications::Streams,
     /// Wakes the operation executor.
     pub ops_wake: Notify,
     /// Wakes the maintenance controller.
@@ -68,14 +69,17 @@ pub struct Inner {
     /// Serialises read-modify-write of the per-server maintenance state.
     pub maintenance_lock: Mutex<()>,
     /// Serializes replica bookkeeping with managed operations.
-    pub replication_operation_lock: Mutex<()>,
+    /// Operations stay registered while running and exclude scans only while changing files
+    /// (`admission.rs`).
+    pub replication_operation_lock: crate::admission::OperationGate,
     /// The shared file settings in force; replaced as a whole by `settings::update`.
     pub shared_settings: std::sync::RwLock<Arc<crate::settings::Snapshot>>,
     /// Serializes read-modify-write of the shared file settings.
     pub shared_settings_lock: Mutex<()>,
-    /// Recently reviewed version evidence, kept in memory so comparing never waits on writers.
-    pub version_snapshots:
-        std::sync::Mutex<HashMap<(String, String), crate::peers::versions::Snapshot>>,
+    /// Wakes the bounded conflict evidence workers.
+    pub version_wake: Notify,
+    pub version_event_wake: Notify,
+    pub version_scan_limit: Arc<tokio::sync::Semaphore>,
     request_locks: Mutex<HashMap<String, Weak<Mutex<()>>>>,
 }
 
@@ -117,6 +121,7 @@ impl AppState {
             events,
             peer_events,
             peer_configuration,
+            peer_streams: crate::peers::notifications::Streams::default(),
             ops_wake: Notify::new(),
             maintenance_wake: Notify::new(),
             sync_wake: Notify::new(),
@@ -126,12 +131,14 @@ impl AppState {
             share_wake: Notify::new(),
             pg_pools: Mutex::new(HashMap::new()),
             maintenance_lock: Mutex::new(()),
-            replication_operation_lock: Mutex::new(()),
+            replication_operation_lock: crate::admission::OperationGate::default(),
             shared_settings: std::sync::RwLock::new(Arc::new(crate::settings::Snapshot::new(
                 shared_settings,
             ))),
             shared_settings_lock: Mutex::new(()),
-            version_snapshots: std::sync::Mutex::new(HashMap::new()),
+            version_wake: Notify::new(),
+            version_event_wake: Notify::new(),
+            version_scan_limit: Arc::new(tokio::sync::Semaphore::new(2)),
             request_locks: Mutex::new(HashMap::new()),
         })))
     }
@@ -166,6 +173,9 @@ impl AppState {
     }
 
     pub fn emit(&self, event: ServerEvent) {
+        if matches!(event, ServerEvent::ConflictsChanged) {
+            self.version_wake.notify_waiters();
+        }
         if matches!(
             event,
             ServerEvent::SyncChanged | ServerEvent::ConflictsChanged
@@ -182,6 +192,7 @@ impl AppState {
 
     /// Call immediately after committing peer credentials or share configuration changes.
     pub fn peer_configuration_changed(&self) {
+        self.peer_streams.invalidate();
         self.peer_configuration.send_replace(());
     }
 

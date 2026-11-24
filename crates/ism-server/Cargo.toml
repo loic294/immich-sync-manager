@@ -21,6 +21,7 @@ chrono-tz.workspace = true
 futures-util.workspace = true
 hex.workspace = true
 hmac.workspace = true
+image.workspace = true
 ism-core.workspace = true
 notify.workspace = true
 rand.workspace = true
