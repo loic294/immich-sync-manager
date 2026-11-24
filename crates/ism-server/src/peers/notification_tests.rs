@@ -1332,6 +1332,237 @@ async fn measure_activity_page_discovery() {
     }
 }
 
+fn median(mut values: Vec<Duration>) -> Duration {
+    values.sort();
+    values[values.len() / 2]
+}
+
+/// Prints SQLx timings for an actual paired recovery refresh at the 5,000-row snapshot limit;
+/// run at the serialized Cargo gate with
+/// `cargo test -p ism-server measure_recovery_refresh_contention -- --ignored --nocapture`.
+/// Synthetic local evidence only: it does not characterize production load or lift the limit.
+#[tokio::test]
+#[ignore = "manual SQLx contention measurement"]
+async fn measure_recovery_refresh_contention() {
+    const ROWS: usize = 5000;
+    const RUNS: usize = 5;
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    let peer = net::peers(&a.state).await.unwrap().remove(0);
+    let remote_peer = net::peers(&b.state).await.unwrap().remove(0);
+    sqlx::query(
+        "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i < 4999)
+         INSERT INTO operations(id,idempotency_key,principal,source,request_json,status,created_at)
+         SELECT printf('measure-%04d',i),'measure-' || i,?,'peer','{}','failed',? FROM n",
+    )
+    .bind(format!("peer:{}", remote_peer.id))
+    .bind(crate::db::now())
+    .execute(&b.state.db)
+    .await
+    .unwrap();
+    crate::peers::recovery::discover(&b.state).await.unwrap();
+
+    // The GET alone, outside any transaction; refresh itself must finish it within 10 s.
+    let started = std::time::Instant::now();
+    let page: ism_core::dto::RecoveryPage =
+        net::get_json_within(&a.state, &peer, RECOVERY, Some(Duration::from_secs(60)))
+            .await
+            .unwrap();
+    let get = started.elapsed();
+    assert_eq!(page.rows.len(), ROWS, "receiver snapshot is at the limit");
+    assert!(
+        get < Duration::from_secs(10),
+        "GET took {get:?}; refresh would time out before reaching SQLite"
+    );
+    let mut expected: Vec<(String, String)> = page
+        .rows
+        .iter()
+        .map(|row| (row.target.id.clone(), serde_json::to_string(row).unwrap()))
+        .collect();
+    expected.sort();
+    println!("receiver GET of {ROWS} rows: {get:?}");
+
+    let state = a.state.clone();
+    let peer_id = peer.id.clone();
+    let mirrored = move || {
+        let state = state.clone();
+        let peer_id = peer_id.clone();
+        async move {
+            let rows: Vec<(String, String, String)> = sqlx::query_as(
+                "SELECT kind,target_id,view_json FROM outgoing_recovery WHERE peer_id=?
+                 ORDER BY target_id",
+            )
+            .bind(&peer_id)
+            .fetch_all(&state.db)
+            .await
+            .unwrap();
+            assert!(rows.iter().all(|(kind, _, _)| kind == "operation"));
+            rows.into_iter()
+                .map(|(_, id, json)| (id, json))
+                .collect::<Vec<_>>()
+        }
+    };
+
+    for contended in [false, true] {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let baseline = tokio::spawn(competing_writer(
+            a.state.clone(),
+            peer.id.clone(),
+            stop.clone(),
+        ));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        stop.store(true, Ordering::SeqCst);
+        let baseline = baseline.await.unwrap();
+        let label = if contended {
+            "competing writer every 2 ms"
+        } else {
+            "idle"
+        };
+        println!("[{label}] competing writer alone, no refresh: max wait {baseline:?}");
+        for scenario in ["5,000 inserted", "5,000 changed", "unchanged recent"] {
+            let mut totals = Vec::new();
+            let mut fetches = Vec::new();
+            let mut checks = Vec::new();
+            let mut waits = Vec::new();
+            let mut holds = Vec::new();
+            let mut competitor = Vec::new();
+            for _ in 0..RUNS {
+                match scenario {
+                    "5,000 inserted" => {
+                        sqlx::query("DELETE FROM outgoing_recovery WHERE peer_id=?")
+                            .bind(&peer.id)
+                            .execute(&a.state.db)
+                            .await
+                            .unwrap();
+                    }
+                    "5,000 changed" => {
+                        sqlx::query(
+                            "UPDATE outgoing_recovery SET view_json=json_object('stale',rowid)
+                             WHERE peer_id=?",
+                        )
+                        .bind(&peer.id)
+                        .execute(&a.state.db)
+                        .await
+                        .unwrap();
+                    }
+                    _ => {
+                        // Keep the 10 s recency window open so this measures the read-only path.
+                        sqlx::query("UPDATE peer_recovery_state SET updated_at=? WHERE peer_id=?")
+                            .bind(crate::db::now())
+                            .bind(&peer.id)
+                            .execute(&a.state.db)
+                            .await
+                            .unwrap();
+                    }
+                }
+                let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let writer = contended.then(|| {
+                    tokio::spawn(competing_writer(
+                        a.state.clone(),
+                        peer.id.clone(),
+                        stop.clone(),
+                    ))
+                });
+                if contended {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                let started = std::time::Instant::now();
+                crate::peers::recovery::refresh(&a.state, &peer)
+                    .await
+                    .unwrap();
+                totals.push(started.elapsed());
+                if let Some(writer) = writer {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    stop.store(true, Ordering::SeqCst);
+                    competitor.push(writer.await.unwrap());
+                }
+                let phases = crate::peers::recovery::refresh_timing::take(&peer.id).unwrap();
+                fetches.push(phases.fetch);
+                checks.push(phases.check);
+                assert_eq!(
+                    phases.hold.is_some(),
+                    scenario != "unchanged recent",
+                    "{scenario}: only changed snapshots take the writer lock"
+                );
+                if let (Some(wait), Some(hold)) = (phases.lock_wait, phases.hold) {
+                    waits.push(wait);
+                    holds.push(hold);
+                }
+                assert_eq!(mirrored().await, expected, "{scenario}: mirror matches GET");
+                let error: Option<String> =
+                    sqlx::query_scalar("SELECT error FROM peer_recovery_state WHERE peer_id=?")
+                        .bind(&peer.id)
+                        .fetch_one(&a.state.db)
+                        .await
+                        .unwrap();
+                assert_eq!(error, None);
+            }
+            let held = if holds.is_empty() {
+                "no writer lock".to_owned()
+            } else {
+                format!(
+                    "lock-wait={:?} write-tx={:?} (max {:?})",
+                    median(waits),
+                    median(holds.clone()),
+                    holds.iter().max().unwrap()
+                )
+            };
+            let competing = if competitor.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " competitor max-wait median={:?} worst={:?}",
+                    median(competitor.clone()),
+                    competitor.iter().max().unwrap()
+                )
+            };
+            println!(
+                "[{label}] {scenario}, median of {RUNS}: refresh={:?} get={:?} \
+                 prepare+read-check={:?} {held}{competing}",
+                median(totals),
+                median(fetches),
+                median(checks),
+            );
+        }
+    }
+
+    // Semantic write counts, measured after timing so audit triggers do not inflate it.
+    audit_writes(&a).await;
+    sqlx::query(
+        "UPDATE outgoing_recovery SET view_json=json_object('stale',rowid) WHERE peer_id=?",
+    )
+    .bind(&peer.id)
+    .execute(&a.state.db)
+    .await
+    .unwrap();
+    take_writes(&a).await;
+    crate::peers::recovery::refresh(&a.state, &peer)
+        .await
+        .unwrap();
+    let writes = take_writes(&a).await;
+    assert_eq!(
+        writes
+            .iter()
+            .filter(|(table, action)| table == "outgoing_recovery" && action == "UPDATE")
+            .count(),
+        ROWS
+    );
+    assert_eq!(
+        writes.len(),
+        ROWS + 1,
+        "only changed mirrors and the freshness row are written"
+    );
+    crate::peers::recovery::refresh(&a.state, &peer)
+        .await
+        .unwrap();
+    assert!(
+        take_writes(&a).await.is_empty(),
+        "unchanged recent refresh writes nothing"
+    );
+    assert_eq!(mirrored().await, expected);
+}
+
 #[tokio::test]
 async fn unchanged_peer_snapshots_do_not_rewrite_mirrors() {
     let (mut a, mut b) = pair().await;

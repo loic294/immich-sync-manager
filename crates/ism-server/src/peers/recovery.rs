@@ -609,6 +609,8 @@ pub async fn peer_page(state: &AppState, peer: &net::Peer) -> AppResult<Recovery
 }
 
 pub async fn refresh(state: &AppState, peer: &net::Peer) -> AppResult<()> {
+    #[cfg(test)]
+    let started = std::time::Instant::now();
     // Acceptances recorded after this point may postdate the receiver's snapshot.
     let generation: i64 =
         sqlx::query_scalar("SELECT acceptance_generation FROM peer_recovery_state WHERE peer_id=?")
@@ -624,6 +626,8 @@ pub async fn refresh(state: &AppState, peer: &net::Peer) -> AppResult<()> {
     )
     .await
     .map_err(|e| AppError::conflict("peer_recovery_unavailable", e))?;
+    #[cfg(test)]
+    let fetched = std::time::Instant::now();
     if page.rows.len() > 5000
         || usize::try_from(page.total).ok() != Some(page.rows.len())
         || page.rows.iter().any(|row| row.target.peer_id.is_some())
@@ -647,10 +651,16 @@ pub async fn refresh(state: &AppState, peer: &net::Peer) -> AppResult<()> {
     let mut read = state.db.begin().await?;
     let unchanged = recovery_unchanged(&mut *read, &peer.id, &snapshot, generation).await?;
     read.rollback().await?;
+    #[cfg(test)]
+    let checked = std::time::Instant::now();
     if unchanged {
+        #[cfg(test)]
+        refresh_timing::record(&peer.id, started, fetched, checked, None);
         return Ok(());
     }
     let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
+    #[cfg(test)]
+    let locked = std::time::Instant::now();
     let existing: Vec<(String, String, String)> =
         sqlx::query_as("SELECT kind,target_id,view_json FROM outgoing_recovery WHERE peer_id=?")
             .bind(&peer.id)
@@ -716,7 +726,59 @@ pub async fn refresh(state: &AppState, peer: &net::Peer) -> AppResult<()> {
         .await?;
     }
     tx.commit().await?;
+    #[cfg(test)]
+    refresh_timing::record(
+        &peer.id,
+        started,
+        fetched,
+        checked,
+        Some((locked, std::time::Instant::now())),
+    );
     Ok(())
+}
+
+/// Per-peer phase timings of the last successful `refresh`, for the ignored SQLx measurement.
+#[cfg(test)]
+pub(crate) mod refresh_timing {
+    use std::time::{Duration, Instant};
+
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) struct Phases {
+        /// Acceptance-generation read plus the HTTP GET and decode; no transaction is open.
+        pub fetch: Duration,
+        /// Serialization and the deferred read-only comparison.
+        pub check: Duration,
+        /// Time to acquire `BEGIN IMMEDIATE`; `None` when the read-only path returned.
+        pub lock_wait: Option<Duration>,
+        /// Writer-lock hold from acquisition through commit.
+        pub hold: Option<Duration>,
+    }
+
+    static LAST: std::sync::Mutex<Vec<(String, Phases)>> = std::sync::Mutex::new(Vec::new());
+
+    pub(super) fn record(
+        peer: &str,
+        started: Instant,
+        fetched: Instant,
+        checked: Instant,
+        write: Option<(Instant, Instant)>,
+    ) {
+        let phases = Phases {
+            fetch: fetched - started,
+            check: checked - fetched,
+            lock_wait: write.map(|(locked, _)| locked - checked),
+            hold: write.map(|(locked, committed)| committed - locked),
+        };
+        let mut last = LAST.lock().unwrap();
+        last.retain(|(id, _)| id != peer);
+        last.push((peer.to_owned(), phases));
+    }
+
+    pub(crate) fn take(peer: &str) -> Option<Phases> {
+        let mut last = LAST.lock().unwrap();
+        let at = last.iter().position(|(id, _)| id == peer)?;
+        Some(last.swap_remove(at).1)
+    }
 }
 
 async fn recovery_unchanged(
