@@ -95,6 +95,13 @@ describe('ism-app', () => {
     vi.spyOn(api, 'get').mockImplementation(async (path: string) => {
       if (path === '/api/admin/session')
         return { ...BASE, authenticated: true, username: 'admin' } as never;
+      if (path === '/api/admin/attention')
+        return {
+          observed_at: '2026-01-01T00:00:00Z',
+          completeness: 'complete',
+          warnings: [],
+          items: [],
+        } as never;
       if (path === '/api/admin/overview')
         return {
           instance_name: 'Instance A',
