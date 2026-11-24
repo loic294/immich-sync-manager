@@ -1,13 +1,18 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { api } from '@/api/client';
 import { ApiError } from '@/api/errors';
 import { events } from '@/api/events';
 import type { SyncActivity } from '@/api/generated/SyncActivity';
 import type { SyncProgress } from '@/api/generated/SyncProgress';
 import { mount } from '@/test/helpers';
+import { mockLiveSnapshots } from '@/test/live';
 import '@/pages/ism-sync-page';
 
 describe('ism-sync-page', () => {
+  let live: ReturnType<typeof mockLiveSnapshots>;
+  beforeEach(() => {
+    live = mockLiveSnapshots();
+  });
   afterEach(() => {
     vi.restoreAllMocks();
     vi.useRealTimers();
@@ -37,7 +42,7 @@ describe('ism-sync-page', () => {
     }
   });
 
-  it('refreshes transfer statistics every five seconds and stops when disconnected', async () => {
+  it('does not poll transfer statistics or refresh on notification-only events', async () => {
     vi.useFakeTimers();
     const get = vi.spyOn(api, 'get').mockImplementation(async (path) => {
       if (path === '/api/admin/sync') return { allowed_now: true, override_active: null } as never;
@@ -48,12 +53,9 @@ describe('ism-sync-page', () => {
     const page = await mount('ism-sync-page');
     await page.reload();
     get.mockClear();
-    await vi.advanceTimersByTimeAsync(4999);
+    for (let i = 0; i < 20; i++) events.emit({ type: 'sync_changed' });
+    await vi.advanceTimersByTimeAsync(60_000);
     expect(get).not.toHaveBeenCalled();
-    await vi.advanceTimersByTimeAsync(1);
-    expect(get).toHaveBeenCalledWith('/api/admin/sync/page', {
-      query: { status: 'active', limit: 250, offset: 0 },
-    });
     get.mockClear();
     page.remove();
     await vi.advanceTimersByTimeAsync(5000);
@@ -116,8 +118,10 @@ describe('ism-sync-page', () => {
       query: { status: 'active', limit: 250, offset: 0 },
     });
     done = 70;
-    events.emit({ type: 'sync_changed' });
+    const calls = get.mock.calls.length;
+    live.push('/sync/page', { rows: [{ ...transfer, bytes_done: done }], total: 501 });
     await vi.waitFor(() => expect(page.textContent).toContain('70%'));
+    expect(get).toHaveBeenCalledTimes(calls);
     page.querySelector<HTMLButtonElement>('#sync-tab-completed')?.click();
     await vi.waitFor(() =>
       expect(get).toHaveBeenCalledWith('/api/admin/sync/page', {

@@ -1,14 +1,15 @@
 import { html, nothing, type TemplateResult } from 'lit';
+import { createAdmin } from '@/api/admin';
 import { isApiError } from '@/api/errors';
-import { type ChangeEvent, type ChangeType, events } from '@/api/events';
+import { LiveScope } from '@/api/live';
 import { IsmElement } from '@/base/ism-element';
 import { toast } from '@/components/toast';
 import { refreshSession } from '@/stores/session';
 import '@/components/ism-icon';
 
 /**
- * A page that shows server data: `load()` fetches it on connect, again on every change event named
- * in `reloadOn` (and on `resync`), and `act()` runs an action with a busy flag and toasts.
+ * A page that shows server data: `data` owns its live snapshot subscriptions.
+ * `load()` renders pushed values; `act()` runs an action with a busy flag and toasts.
  * A 401 re-reads the session so the shell falls back to the login page.
  */
 export abstract class IsmPage extends IsmElement {
@@ -23,13 +24,10 @@ export abstract class IsmPage extends IsmElement {
   /** The key of the action in flight, or `undefined`. */
   declare busy: string | undefined;
 
-  /** Change events that make this page reload. `resync` always does. */
-  protected reloadOn: readonly ChangeType[] = [];
-  /** Minimum interval between event-driven refreshes for pages with expensive data loads. */
-  protected liveReloadInterval = 250;
-  private stopEvents: (() => void) | undefined;
-  private reloadTimer: number | undefined;
-  private lastLiveReload = 0;
+  private readonly live = new LiveScope(() => {
+    if (this.isConnected) void this.reload(true);
+  });
+  protected readonly data = createAdmin(this.live);
   private reloading: Promise<void> | undefined;
   private reloadAgain = false;
 
@@ -44,29 +42,16 @@ export abstract class IsmPage extends IsmElement {
 
   override connectedCallback() {
     super.connectedCallback();
-    this.stopEvents = events.on((event) => this.onChange(event));
     void this.reload();
   }
 
   override disconnectedCallback() {
     super.disconnectedCallback();
-    this.stopEvents?.();
-    window.clearTimeout(this.reloadTimer);
-    this.reloadTimer = undefined;
+    this.live.dispose();
   }
 
-  protected onChange(event: ChangeEvent) {
-    if (event.type !== 'resync' && !this.reloadOn.includes(event.type)) return;
-    if (this.reloadTimer !== undefined) return;
-    const delay = Math.max(0, this.liveReloadInterval - (Date.now() - this.lastLiveReload));
-    this.reloadTimer = window.setTimeout(() => {
-      this.reloadTimer = undefined;
-      this.lastLiveReload = Date.now();
-      void this.reload();
-    }, delay);
-  }
-
-  reload(): Promise<void> {
+  reload(pushed = false): Promise<void> {
+    if (!pushed) this.live.dispose();
     if (this.reloading) {
       this.reloadAgain = true;
       return this.reloading;

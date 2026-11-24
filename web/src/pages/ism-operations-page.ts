@@ -1,6 +1,5 @@
 import { html } from 'lit';
 import { createRef, ref } from 'lit/directives/ref.js';
-import { admin } from '@/api/admin';
 import type { OperationActivity } from '@/api/generated/OperationActivity';
 import { IsmPage } from '@/base/ism-page';
 import type { IsmOperationDetail } from '@/components/ism-operation-detail';
@@ -39,8 +38,6 @@ export class IsmOperationsPage extends IsmPage {
   declare total: number;
   declare limit: number;
   declare offset: number;
-  protected override reloadOn = ['operation_updated', 'operation_committed'] as const;
-  protected override liveReloadInterval = 1000;
   private detail = createRef<IsmOperationDetail>();
   constructor() {
     super();
@@ -52,7 +49,7 @@ export class IsmOperationsPage extends IsmPage {
   }
   protected override async load() {
     const { filter, limit, offset } = this;
-    const page = await admin.operationPage(filter, limit, offset);
+    const page = await this.data.operationPage(filter, limit, offset);
     if (filter !== this.filter || limit !== this.limit || offset !== this.offset) return;
     this.operations = page.rows;
     this.total = page.total;

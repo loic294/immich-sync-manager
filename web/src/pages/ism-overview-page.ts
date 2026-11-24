@@ -26,7 +26,6 @@ export class IsmOverviewPage extends IsmPage {
   /** Drives the scan countdowns. */
   declare now: number;
   declare operations: OperationActivity[];
-  protected override reloadOn = ['operation_updated', 'operation_committed'] as const;
   private detail = createRef<IsmOperationDetail>();
   private clock: number | undefined;
 
@@ -49,7 +48,10 @@ export class IsmOverviewPage extends IsmPage {
   }
 
   protected override async load() {
-    const [, page] = await Promise.all([refreshOverview(), admin.operationPage('recent', 10)]);
+    const [, page] = await Promise.all([
+      overview.value ? Promise.resolve() : refreshOverview(),
+      this.data.operationPage('recent', 10),
+    ]);
     this.operations = page.rows;
     if (!overview.value) throw new Error('Cannot load the overview.');
   }

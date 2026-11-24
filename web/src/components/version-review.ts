@@ -1,7 +1,9 @@
 import { html, nothing, type ReactiveController, type ReactiveControllerHost } from 'lit';
-import { admin } from '@/api/admin';
+import { createAdmin } from '@/api/admin';
+import { isAbortError } from '@/api/errors';
 import type { RecoveryTarget } from '@/api/generated/RecoveryTarget';
 import type { RecoveryVersions } from '@/api/generated/RecoveryVersions';
+import { LiveScope } from '@/api/live';
 import type { VersionChoices } from '@/components/ism-recovery-versions';
 import '@/components/ism-recovery-versions';
 
@@ -24,12 +26,17 @@ export class VersionReview implements ReactiveController {
   private readonly retryWhenSettled = new Set<string>();
   private readonly queue: { target: RecoveryTarget; resolve: () => void }[] = [];
   private active = 0;
+  private readonly scopes = new Map<string, LiveScope>();
 
   constructor(private readonly host: ReactiveControllerHost) {
     host.addController(this);
   }
 
   hostConnected() {}
+
+  hostDisconnected() {
+    this.retain([]);
+  }
 
   get(target: RecoveryTarget) {
     return this.versions.get(targetKey(target));
@@ -46,6 +53,8 @@ export class VersionReview implements ReactiveController {
     const id = targetKey(target);
     this.stale.add(id);
     this.errors.delete(id);
+    this.scopes.get(id)?.dispose();
+    this.scopes.delete(id);
     if (this.loading.has(id)) {
       this.invalidated.add(id);
       if (retry) this.retryWhenSettled.add(id);
@@ -55,6 +64,14 @@ export class VersionReview implements ReactiveController {
 
   retain(targets: readonly RecoveryTarget[]) {
     const retained = new Set(targets.map(targetKey));
+    for (const [id, scope] of this.scopes) {
+      if (retained.has(id)) continue;
+      scope.dispose();
+      this.scopes.delete(id);
+      this.stale.add(id);
+      this.invalidated.add(id);
+      this.retryWhenSettled.delete(id);
+    }
     for (let i = this.queue.length - 1; i >= 0; i--) {
       const job = this.queue[i];
       const id = targetKey(job.target);
@@ -69,16 +86,6 @@ export class VersionReview implements ReactiveController {
 
   isLoading(target: RecoveryTarget) {
     return this.loading.has(targetKey(target));
-  }
-
-  retryUnavailable(targets: readonly RecoveryTarget[]) {
-    const failed: RecoveryTarget[] = [];
-    for (const target of targets) {
-      const id = targetKey(target);
-      if (this.loading.has(id)) this.retryWhenSettled.add(id);
-      else if (this.errors.has(id)) failed.push(target);
-    }
-    if (failed.length) void this.compare(failed);
   }
 
   get busy() {
@@ -114,13 +121,27 @@ export class VersionReview implements ReactiveController {
 
   private async fetch(target: RecoveryTarget) {
     const id = targetKey(target);
+    let scope = this.scopes.get(id);
+    if (!scope) {
+      scope = new LiveScope(() => {
+        this.stale.add(id);
+        if (this.loading.has(id)) {
+          this.invalidated.add(id);
+          this.retryWhenSettled.add(id);
+        } else {
+          void this.compare([target]);
+        }
+      });
+      this.scopes.set(id, scope);
+    }
     try {
-      const current = await admin.recoveryVersions(target);
+      const current = await createAdmin(scope).recoveryVersions(target);
       if (!this.invalidated.has(id)) {
         this.versions.set(id, current);
         this.stale.delete(id);
       }
     } catch (error) {
+      if (isAbortError(error)) return;
       if (!this.invalidated.has(id))
         this.errors.set(id, error instanceof Error ? error.message : String(error));
     } finally {
@@ -149,7 +170,10 @@ export class VersionReview implements ReactiveController {
         error && !this.loading.has(id)
           ? html`<div role="alert" class="alert alert-error alert-soft mt-2 py-2 text-sm">
             <span class="break-all">Comparison failed: ${error}</span>
-            <button type="button" class="btn btn-xs max-sm:min-h-11" @click=${() => this.compare([target])}>Try again</button>
+            <button type="button" class="btn btn-xs max-sm:min-h-11" @click=${() => {
+              this.forget(target);
+              void this.compare([target]);
+            }}>Try again</button>
           </div>`
           : nothing
       }

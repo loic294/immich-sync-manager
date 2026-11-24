@@ -3,6 +3,7 @@
 pub mod activity;
 pub mod admin;
 pub mod client;
+mod live;
 pub mod peer;
 mod peer_events;
 

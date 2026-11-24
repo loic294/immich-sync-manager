@@ -34,8 +34,6 @@ export class IsmMappingsPage extends IsmPage {
     watching: { state: true },
   };
 
-  protected override reloadOn = ['watch_changed'] as const;
-
   declare mappings: MappingView[];
   declare mounts: MountView[];
   declare mountTrail: string[];
@@ -67,10 +65,10 @@ export class IsmMappingsPage extends IsmPage {
   protected override async load() {
     const path = this.mountTrail.at(-1);
     const [mappings, mounts, servers, libraries] = await Promise.all([
-      admin.mappings(),
-      admin.mounts(path),
-      admin.servers(),
-      admin.libraries(),
+      this.data.mappings(),
+      this.data.mounts(path),
+      this.data.servers(),
+      this.data.libraries(),
     ]);
     this.mappings = mappings;
     if (path === this.mountTrail.at(-1)) this.mounts = mounts;

@@ -19,11 +19,6 @@ export class IsmSyncDetail extends IsmPage {
   declare transfer: SyncActivity | undefined;
   declare files: SyncFileDetails | undefined;
   declare fileError: string | undefined;
-  protected override reloadOn = [
-    'sync_changed',
-    'operation_updated',
-    'operation_committed',
-  ] as const;
   private dialog = createRef<HTMLDialogElement>();
   private operation = createRef<IsmOperationDetail>();
   private selectedId: string | undefined;
@@ -51,7 +46,7 @@ export class IsmSyncDetail extends IsmPage {
   protected override async load() {
     const id = this.selectedId;
     if (!id) return;
-    const page = await admin.syncTransfer(id);
+    const page = await this.data.syncTransfer(id);
     if (id !== this.selectedId) return;
     const transfer = page.rows[0];
     if (!transfer)
@@ -65,6 +60,7 @@ export class IsmSyncDetail extends IsmPage {
     return html`<dialog class="modal" aria-labelledby="sync-detail-title" ${ref(this.dialog)}
       @close=${() => {
         this.selectedId = undefined;
+        void this.reload();
       }}>
       <div class="modal-box max-w-4xl">
         <div class="flex items-start justify-between gap-3">

@@ -104,6 +104,25 @@ pub fn router() -> Router<AppState> {
         .route("/events", get(events))
 }
 
+/// The live transport can only dispatch bounded JSON reads, never mutations or file streams.
+pub(super) fn live_reads() -> Router<AppState> {
+    Router::new()
+        .merge(super::activity::live_reads())
+        .route("/overview", get(overview))
+        .route("/settings", get(get_settings))
+        .route("/servers", get(list_servers))
+        .route("/accounts", get(list_accounts))
+        .route("/libraries", get(list_libraries))
+        .route("/mappings", get(list_mappings))
+        .route("/trash", get(trash))
+        .route("/peers", get(list_peers))
+        .route("/shares", get(list_shares))
+        .route("/sync", get(sync_status))
+        .route("/sync/schedule", get(get_schedule))
+        .route("/sync/overrides", get(list_overrides))
+        .route("/conflicts/page", get(conflicts_page))
+}
+
 fn actor(p: &Principal) -> String {
     p.key()
 }

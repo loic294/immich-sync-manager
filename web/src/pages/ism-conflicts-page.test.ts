@@ -1,9 +1,10 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { api } from '@/api/client';
 import { events } from '@/api/events';
 import type { ConflictView } from '@/api/generated/ConflictView';
 import { confirmAction } from '@/components/confirm';
 import { mount } from '@/test/helpers';
+import { mockLiveSnapshots } from '@/test/live';
 import '@/pages/ism-conflicts-page';
 
 vi.mock('@/components/confirm', () => ({
@@ -83,6 +84,10 @@ async function enableSelection(page: HTMLElementTagNameMap['ism-conflicts-page']
 }
 
 describe('ism-conflicts-page', () => {
+  let live: ReturnType<typeof mockLiveSnapshots>;
+  beforeEach(() => {
+    live = mockLiveSnapshots();
+  });
   afterEach(() => vi.restoreAllMocks());
 
   it('filters across pages by share and folder and resets pagination and selections', async () => {
@@ -415,7 +420,7 @@ describe('ism-conflicts-page', () => {
     page.querySelector<HTMLButtonElement>('[aria-label="Next page"]')?.click();
     await vi.waitFor(() => expect(page.textContent).toContain('b.jpg'));
     revision = 'd'.repeat(64);
-    events.emit({ type: 'conflicts_changed' });
+    live.push('/recovery/versions', { ...versions, revision });
     await page.updateComplete;
     await vi.waitFor(() => expect(page.textContent).toContain('1 of 1 ready'));
     [...page.querySelectorAll<HTMLButtonElement>('[aria-label="Batch conflict decisions"] button')]
@@ -431,21 +436,17 @@ describe('ism-conflicts-page', () => {
     );
   });
 
-  it('keeps unchanged previews mounted while refreshed evidence is loading', async () => {
-    let resolve!: (value: typeof versions) => void;
-    let refreshing = false;
+  it('keeps previews mounted but blocks decisions while the live evidence is unavailable', async () => {
     vi.spyOn(api, 'get').mockImplementation(async (path) => {
       if (!path.endsWith('/versions'))
         return { rows: [{ owner: 'local', conflict }], total: 1 } as never;
-      if (refreshing)
-        return (await new Promise<typeof versions>((done) => (resolve = done))) as never;
       return versions as never;
     });
     const page = await mount('ism-conflicts-page');
     await vi.waitFor(() => expect(page.querySelector('ism-recovery-versions')).not.toBeNull());
     const preview = page.querySelector('ism-recovery-versions');
-    refreshing = true;
-    events.emit({ type: 'conflicts_changed' });
+    live.fail('/recovery/versions', 'Live evidence unavailable');
+    await vi.waitFor(() => expect(page.textContent).toContain('Live evidence unavailable'));
     await page.updateComplete;
     expect(page.querySelector('ism-recovery-versions')).toBe(preview);
     expect(
@@ -453,7 +454,7 @@ describe('ism-conflicts-page', () => {
         (button) => button.textContent?.trim() === 'Keep both',
       )?.disabled,
     ).toBe(true);
-    resolve(versions);
+    live.push('/recovery/versions', versions);
     await vi.waitFor(() =>
       expect(
         [...page.querySelectorAll<HTMLButtonElement>('button')].find(
@@ -499,9 +500,12 @@ describe('ism-conflicts-page', () => {
       expect(get.mock.calls.filter(([path]) => path.endsWith('/versions'))).toHaveLength(101),
     );
     events.emit({ type: 'conflicts_changed' });
-    await vi.waitFor(() =>
-      expect(get.mock.calls.filter(([path]) => path.endsWith('/versions'))).toHaveLength(152),
-    );
+    live.push('/recovery/versions', versions);
+    expect(
+      [...live.handlers.keys()].filter((url) => url.startsWith('/recovery/versions')),
+    ).toHaveLength(51);
+    expect(get.mock.calls.filter(([path]) => path.endsWith('/versions'))).toHaveLength(101);
+    await vi.waitFor(() => expect(page.textContent).not.toContain('Comparing versions…'));
     await vi.waitFor(() => expect(page.textContent).toContain('50 of 100 ready'));
     expect(page.textContent).toContain('Revisit other pages to refresh remaining selections');
     expect(page.textContent).toContain('100 total selected');
@@ -634,7 +638,7 @@ describe('ism-conflicts-page', () => {
     const page = await mount('ism-conflicts-page');
     await vi.waitFor(() => expect(page.textContent).toContain('Temporary peer failure'));
     fail = false;
-    events.emit({ type: 'resync' });
+    live.push('/recovery/versions', versions);
     await vi.waitFor(() => expect(page.querySelector('ism-recovery-versions')).not.toBeNull());
   });
 
@@ -649,7 +653,7 @@ describe('ism-conflicts-page', () => {
     const page = await mount('ism-conflicts-page');
     await vi.waitFor(() => expect(page.textContent).toContain('Evidence is being prepared'));
     ready = true;
-    events.emit({ type: 'sync_changed' });
+    live.push('/recovery/versions', versions);
     await vi.waitFor(() => expect(page.querySelector('ism-recovery-versions')).not.toBeNull());
   });
 });

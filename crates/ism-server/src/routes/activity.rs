@@ -2,9 +2,8 @@
 
 use axum::Json;
 use axum::Router;
-use axum::extract::ws::{Message, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, header};
+use axum::http::header;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use ism_core::dto::{
@@ -13,9 +12,8 @@ use ism_core::dto::{
 };
 use serde::Deserialize;
 use sqlx::Row;
-use tokio::sync::broadcast::error::RecvError;
 
-use crate::auth::{Admin, session_user};
+use crate::auth::Admin;
 use crate::db;
 use crate::error::{AppError, AppResult};
 use crate::files;
@@ -26,7 +24,7 @@ use crate::state::{AppState, ServerEvent};
 
 pub fn router() -> Router<AppState> {
     Router::new()
-        .route("/live", get(live))
+        .route("/live", get(super::live::live))
         .route("/attention", get(attention))
         .route("/operations/page", get(operations))
         .route("/operations/background", get(background))
@@ -40,6 +38,17 @@ pub fn router() -> Router<AppState> {
         .route("/recovery/preview", get(recovery_preview))
         .route("/recovery/decisions", post(recovery_decisions))
         .route("/recovery", post(recover))
+}
+
+pub(super) fn live_reads() -> Router<AppState> {
+    Router::new()
+        .route("/attention", get(attention))
+        .route("/operations/page", get(operations))
+        .route("/operations/background", get(background))
+        .route("/operations/{id}/detail", get(operation_detail))
+        .route("/sync/page", get(sync))
+        .route("/recovery/page", get(recovery_page))
+        .route("/recovery/versions", get(recovery_versions))
 }
 
 #[derive(Default, Deserialize)]
@@ -593,60 +602,4 @@ async fn sync_thumbnail(
     }
     let location = shared_location(&state, None, &q).await?;
     thumbnail(&state, &location).await
-}
-
-async fn live(
-    State(state): State<AppState>,
-    Admin(_): Admin,
-    headers: HeaderMap,
-    ws: WebSocketUpgrade,
-) -> AppResult<Response> {
-    if let Some(origin) = headers.get(header::ORIGIN) {
-        let origin = origin
-            .to_str()
-            .ok()
-            .and_then(|s| reqwest::Url::parse(s).ok())
-            .ok_or_else(|| AppError::forbidden("invalid WebSocket origin"))?;
-        let host = headers
-            .get(header::HOST)
-            .and_then(|h| h.to_str().ok())
-            .unwrap_or_default();
-        let origin_host = origin.host().map(|h| h.to_string()).unwrap_or_default();
-        let authority = origin.port().map_or_else(
-            || origin_host.clone(),
-            |port| format!("{origin_host}:{port}"),
-        );
-        if !authority.eq_ignore_ascii_case(host) {
-            return Err(AppError::forbidden(
-                "cross-origin WebSocket connection refused",
-            ));
-        }
-    }
-    let mut rx = state.events.subscribe();
-    Ok(ws.on_upgrade(move |mut socket| async move {
-        let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
-        loop {
-            tokio::select! {
-                event = rx.recv() => {
-                    let value = match event {
-                        Ok(event) => match serde_json::to_string(&event) {
-                            Ok(value) => value,
-                            Err(error) => { tracing::error!("serialize live event: {error}"); break; }
-                        },
-                        Err(RecvError::Lagged(_)) => r#"{"type":"resync"}"#.into(),
-                        Err(RecvError::Closed) => break,
-                    };
-                    if socket.send(Message::Text(value.into())).await.is_err() { break; }
-                }
-                message = socket.recv() => match message {
-                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
-                    _ => {}
-                },
-                _ = tick.tick() => {
-                    if !matches!(session_user(&state, &headers).await, Ok(Some(_))) { break; }
-                    if socket.send(Message::Ping(Vec::new().into())).await.is_err() { break; }
-                }
-            }
-        }
-    }).into_response())
 }

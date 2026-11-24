@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { api } from '@/api/client';
 import { VersionReview } from '@/components/version-review';
+import { mockLiveSnapshots } from '@/test/live';
 
 describe('VersionReview', () => {
   it('limits overlapping comparisons globally and discards obsolete queued work', async () => {
@@ -39,17 +40,18 @@ describe('VersionReview', () => {
       for (const finish of resolve.splice(0)) finish();
       await Promise.all([first, second]);
       expect(maximum).toBe(4);
+      review.hostDisconnected();
     } finally {
       get.mockRestore();
     }
   });
 
-  it('retries a failure when a readiness event races an in-flight request', async () => {
+  it('keeps pushed evidence when an obsolete initial HTTP failure arrives later', async () => {
+    const live = mockLiveSnapshots();
     let reject!: (reason: Error) => void;
     const get = vi
       .spyOn(api, 'get')
-      .mockImplementationOnce(() => new Promise((_, fail) => (reject = fail)))
-      .mockResolvedValueOnce({ revision: 'ready' } as never);
+      .mockImplementationOnce(() => new Promise((_, fail) => (reject = fail)));
     try {
       const review = new VersionReview({
         addController() {},
@@ -59,13 +61,15 @@ describe('VersionReview', () => {
       });
       const target = { kind: 'conflict' as const, id: 'example', peer_id: null };
       const pending = review.compare([target]);
-      review.retryUnavailable([target]);
+      live.push('/recovery/versions', { revision: 'ready' });
       reject(new Error('Still preparing'));
       await pending;
       await vi.waitFor(() => expect(review.has(target)).toBe(true));
-      expect(get).toHaveBeenCalledTimes(2);
+      expect(get).toHaveBeenCalledOnce();
+      expect(review.get(target)?.revision).toBe('ready');
+      review.hostDisconnected();
     } finally {
-      get.mockRestore();
+      vi.restoreAllMocks();
     }
   });
 });

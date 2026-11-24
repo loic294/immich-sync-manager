@@ -32,7 +32,6 @@ export class IsmPeersPage extends IsmPage {
   declare mappings: MappingView[];
   declare invite: PeerInvite | undefined;
   declare editing: ShareView | null;
-  protected override reloadOn = ['sync_changed'] as const;
   private inviteDialog = createRef<HTMLDialogElement>();
   private acceptDialog = createRef<HTMLDialogElement>();
   private shareDialog = createRef<HTMLDialogElement>();
@@ -48,9 +47,9 @@ export class IsmPeersPage extends IsmPage {
 
   protected override async load() {
     [this.peers, this.shares, this.mappings] = await Promise.all([
-      admin.peers(),
-      admin.shares(),
-      admin.mappings(),
+      this.data.peers(),
+      this.data.shares(),
+      this.data.mappings(),
     ]);
   }
 

@@ -71,8 +71,6 @@ export class IsmConflictsPage extends IsmPage {
   declare share: string;
   declare folder: string;
   private readonly review = new VersionReview(this);
-  protected override reloadOn = ['conflicts_changed', 'sync_changed'] as const;
-  protected override liveReloadInterval = 1500;
 
   constructor() {
     super();
@@ -90,30 +88,9 @@ export class IsmConflictsPage extends IsmPage {
     this.folder = '';
   }
 
-  protected override onChange(event: Parameters<IsmPage['onChange']>[0]) {
-    const conflicts = new Map(
-      [...this.selected.values(), ...this.conflicts]
-        .filter(canChoose)
-        .map((conflict) => [key(conflict), conflict]),
-    );
-    const targets = this.preparationTargets(this.conflicts);
-    const retained = new Set(targets.map(targetKey));
-    this.review.retain(targets);
-    if (event.type === 'resync' || event.type === 'conflicts_changed') {
-      for (const item of conflicts.values()) {
-        const recoveryTarget = target(item);
-        this.review.forget(recoveryTarget, retained.has(targetKey(recoveryTarget)));
-      }
-      if (targets.length) void this.review.compare(targets);
-    } else if (event.type === 'sync_changed') {
-      this.review.retryUnavailable(targets);
-    }
-    super.onChange(event);
-  }
-
   protected override async load() {
     const { limit, offset, includeResolved, share, folder } = this;
-    const page = await admin.conflicts(includeResolved, limit, offset, share, folder);
+    const page = await this.data.conflicts(includeResolved, limit, offset, share, folder);
     if (
       limit !== this.limit ||
       offset !== this.offset ||

@@ -1,9 +1,10 @@
 import { signal } from '@preact/signals-core';
-import { admin } from '@/api/admin';
-import { events } from '@/api/events';
+import { createAdmin } from '@/api/admin';
+import { isAbortError } from '@/api/errors';
 import type { AttentionCode } from '@/api/generated/AttentionCode';
 import type { AttentionOwner } from '@/api/generated/AttentionOwner';
 import type { AttentionSnapshot } from '@/api/generated/AttentionSnapshot';
+import { LiveScope } from '@/api/live';
 
 const DISMISSED_KEY = 'ism.dismissed-attention.v2';
 const LEGACY_DISMISSED_KEY = 'ism.dismissed-attention.v1';
@@ -39,13 +40,11 @@ export const attentionError = signal(false);
 
 type Source = { code: string; owner: string; peerId?: string | null };
 let dismissed = new Map<string, Source | null>();
-let timer: number | undefined;
-let transitionTimer: number | undefined;
+let scope: LiveScope | undefined;
 let pending: Promise<void> | undefined;
 let refreshAgain = false;
 let generation = 0;
 let running = false;
-let lastRefreshAt = 0;
 
 function readDismissed(): Map<string, Source | null> {
   try {
@@ -113,7 +112,8 @@ export function buildAttention(snapshot: AttentionSnapshot): AttentionItem[] {
 }
 
 async function loadAttention(epoch: number) {
-  const snapshot = await admin.attention();
+  if (!scope) return;
+  const snapshot = await createAdmin(scope).attention();
   if (!running || epoch !== generation) return;
   const items = buildAttention(snapshot);
   const complete = snapshot.completeness === 'complete' && snapshot.warnings.length === 0;
@@ -157,25 +157,11 @@ async function loadAttention(epoch: number) {
     snapshot.warnings.length > 0 ||
     snapshot.completeness === 'unavailable' ||
     coverage.some((entry) => entry.completeness === 'unavailable');
-  window.clearTimeout(transitionTimer);
-  const next = snapshot.items
-    .map((entry) => {
-      const when = entry.recheck_at ?? entry.next_at;
-      return when && Date.parse(when);
-    })
-    .filter((at): at is number => typeof at === 'number' && Number.isFinite(at) && at > Date.now())
-    .sort((a, b) => a - b)[0];
-  const delay = next === undefined ? undefined : Math.max(1000, next - Date.now() + 100);
-  const recheck = complete ? delay : Math.min(delay ?? 60_000, 60_000);
-  if (recheck !== undefined)
-    transitionTimer = window.setTimeout(
-      () => void refreshAttention(),
-      Math.min(2_147_483_647, recheck),
-    );
 }
 
-export function refreshAttention(): Promise<void> {
+export function refreshAttention(pushed = false): Promise<void> {
   if (!running) return Promise.resolve();
+  if (!pushed) scope?.dispose();
   if (pending) {
     refreshAgain = true;
     return pending;
@@ -184,23 +170,21 @@ export function refreshAttention(): Promise<void> {
   pending = (async () => {
     do {
       refreshAgain = false;
-      lastRefreshAt = Date.now();
       try {
         await loadAttention(epoch);
       } catch (error) {
+        if (isAbortError(error)) continue;
         if (epoch === generation && running) {
           attentionError.value = true;
           blockers.value = blockers.value.map((entry) => ({ ...entry, stale: true }));
           notifications.value = notifications.value.map((entry) => ({ ...entry, stale: true }));
           console.error('[attention] could not refresh attention state', error);
-          window.clearTimeout(transitionTimer);
-          transitionTimer = window.setTimeout(() => void refreshAttention(), 60_000);
         }
       }
     } while (refreshAgain && epoch === generation && running);
   })().finally(() => {
     pending = undefined;
-    if (running && epoch !== generation) void refreshAttention();
+    if (running && epoch !== generation) void refreshAttention(true);
   });
   return pending;
 }
@@ -209,25 +193,15 @@ export function startAttention(): () => void {
   running = true;
   generation++;
   dismissed = readDismissed();
-  const stop = events.on(() => {
-    if (timer !== undefined) return;
-    timer = window.setTimeout(
-      () => {
-        timer = undefined;
-        void refreshAttention();
-      },
-      Math.max(500, 1500 - (Date.now() - lastRefreshAt)),
-    );
-  });
-  void refreshAttention();
+  scope?.dispose();
+  const current = new LiveScope(() => void refreshAttention(true));
+  scope = current;
+  void refreshAttention(true);
   return () => {
     running = false;
     generation++;
-    stop();
-    window.clearTimeout(timer);
-    window.clearTimeout(transitionTimer);
-    timer = undefined;
-    transitionTimer = undefined;
+    current.dispose();
+    if (scope === current) scope = undefined;
     blockers.value = [];
     notifications.value = [];
     attentionError.value = false;

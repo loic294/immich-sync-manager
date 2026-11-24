@@ -155,7 +155,10 @@ export class IsmApp extends IsmElement {
     return html`
       <div role="alert" class="alert alert-warning flex-none rounded-none">
         <ism-icon name="wifi-off"></ism-icon>
-        <span>Connection to the server lost. Reconnecting…</span>
+        <div>
+          <p>Live updates unavailable. Reconnecting… Displayed data may be stale; no polling fallback is used.</p>
+          <p class="text-sm">Ensure the reverse proxy forwards WebSocket upgrades for /api/admin/live, preserves Host, and allows idle connections for more than 30 seconds. If the session expired, sign in again.</p>
+        </div>
       </div>
     `;
   }

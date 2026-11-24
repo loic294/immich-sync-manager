@@ -1905,7 +1905,7 @@ async fn repeated_client_requests_do_not_write_token_usage_each_time() {
 
 #[tokio::test]
 async fn activity_websocket_requires_a_session_and_same_origin_and_streams_changes() {
-    use futures_util::StreamExt;
+    use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
     let h = harness().await;
@@ -1944,13 +1944,80 @@ async fn activity_websocket_requires_a_session_and_same_origin_and_streams_chang
         loop {
             let message = socket.next().await.unwrap().unwrap();
             if let tokio_tungstenite::tungstenite::Message::Text(text) = message {
-                break serde_json::from_str::<Value>(&text).unwrap();
+                let event: Value = serde_json::from_str(&text).unwrap();
+                if event["type"] != "ready" {
+                    break event;
+                }
             }
         }
     })
     .await
     .unwrap();
     assert_eq!(event["type"], "sync_changed");
+    socket
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            r#"{"type":"subscribe","id":1,"url":"/overview"}"#.into(),
+        ))
+        .await
+        .unwrap();
+    let next_snapshot = |mut socket: tokio_tungstenite::WebSocketStream<_>| async move {
+        let value = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let message = socket.next().await.unwrap().unwrap();
+                if let tokio_tungstenite::tungstenite::Message::Text(text) = message {
+                    let value: Value = serde_json::from_str(&text).unwrap();
+                    if value["type"] == "snapshot" {
+                        break value;
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+        (socket, value)
+    };
+    let (socket, snapshot) = next_snapshot(socket).await;
+    assert_eq!(snapshot["status"], 200);
+    assert_eq!(snapshot["data"]["instance_name"], "Test");
+    crate::db::set_setting(&h.state.db, "instance_name", "Live Example")
+        .await
+        .unwrap();
+    h.state.emit(crate::state::ServerEvent::SettingsChanged);
+    let (mut socket, snapshot) = next_snapshot(socket).await;
+    assert_eq!(snapshot["data"]["instance_name"], "Live Example");
+    // A burst with no counter change must not send redundant overview snapshots.
+    for _ in 0..100 {
+        h.state.emit(crate::state::ServerEvent::ActivityChanged);
+    }
+    let unchanged = tokio::time::timeout(Duration::from_millis(800), async {
+        loop {
+            if let tokio_tungstenite::tungstenite::Message::Text(text) =
+                socket.next().await.unwrap().unwrap()
+            {
+                let value: Value = serde_json::from_str(&text).unwrap();
+                if value["type"] == "snapshot" {
+                    break value;
+                }
+            }
+        }
+    })
+    .await;
+    assert!(
+        unchanged.is_err(),
+        "activity-only events must not reload overview"
+    );
+    socket
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            r#"{"type":"subscribe","id":2,"url":"/servers/example/check"}"#.into(),
+        ))
+        .await
+        .unwrap();
+    let (mut socket, snapshot) = next_snapshot(socket).await;
+    assert_eq!(snapshot["id"], 2);
+    assert_eq!(
+        snapshot["status"], 404,
+        "live transport must not expose mutations"
+    );
     socket.close(None).await.unwrap();
     server.abort();
 }

@@ -98,8 +98,6 @@ export class IsmRecoveryList extends IsmPage {
   declare offset: number;
   declare selected: Map<string, RecoveryView>;
   declare result: RecoveryBatchResult | undefined;
-  protected override reloadOn = ['sync_changed', 'operation_updated', 'conflicts_changed'] as const;
-  protected override liveReloadInterval = 1000;
 
   constructor() {
     super();
@@ -112,7 +110,7 @@ export class IsmRecoveryList extends IsmPage {
 
   protected override async load() {
     const { limit, offset } = this;
-    const page = await admin.recoveryPage(limit, offset);
+    const page = await this.data.recoveryPage(limit, offset);
     if (limit !== this.limit || offset !== this.offset) return;
     this.rows = page.rows;
     this.total = page.total;
