@@ -1217,6 +1217,10 @@ pub(in crate::peers) async fn event_decision(
 
 pub(in crate::peers) async fn process(state: &AppState) -> AppResult<()> {
     super::process_folder_restorations(state).await?;
+    process_pending_choices(state).await
+}
+
+pub(in crate::peers) async fn process_pending_choices(state: &AppState) -> AppResult<()> {
     let plans: Vec<(String, String)> = sqlx::query_as(
         "SELECT conflict_id,vv_json FROM pending_peer_ops WHERE kind='move_decision_wait'",
     )

@@ -29,11 +29,15 @@ pub(crate) const SCHEDULE_KEY: &str = "sync_schedule";
 mod move_decisions;
 #[path = "move_restore.rs"]
 mod move_restore;
+#[cfg(test)]
+pub(super) use move_decisions::process_pending_choices;
 pub(crate) use move_decisions::reviewed_trash_inventory;
 pub(super) use move_decisions::{
     content_decision, event_decision, finish_step, footprints as move_decision_footprints,
     process as process_move_decisions,
 };
+#[cfg(test)]
+pub(super) use move_restore::finish_generation_before_cleanup;
 pub(super) use move_restore::validate_current_manifest as validate_folder_restore;
 pub(crate) use move_restore::{
     VerifiedFolderRestore, verified_folder_restore, verified_restore_upload,

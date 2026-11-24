@@ -159,13 +159,39 @@ async fn request_choice(
         return Ok(());
     }
     if let Some(id) = &plan.conflict_id {
+        let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
+        let (status, recovery_state): (String, Option<String>) = sqlx::query_as(
+            "SELECT c.status,r.state FROM conflicts c
+             LEFT JOIN sync_recovery r ON r.kind='conflict' AND r.target_id=c.id WHERE c.id=?",
+        )
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if status != "open" && recovery_state.as_deref() == Some("fixing") {
+            return Err(AppError::conflict(
+                "recovery_decision_in_progress",
+                "the previous version decision is still executing",
+            ));
+        }
         sqlx::query(
-            "UPDATE conflicts SET status='open',resolution=NULL,remote_vv_json=? WHERE id=?",
+            "UPDATE conflicts SET status='open',resolution=NULL,resolved_at=NULL,remote_vv_json=? WHERE id=?",
         )
         .bind(serde_json::to_string(&current.version)?)
         .bind(id)
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await?;
+        if status != "open" {
+            sqlx::query(
+                "UPDATE sync_recovery SET state='needs_decision',resolution=NULL,decision_revision=NULL,
+                 code='choose_version',detail='Review the new version evidence in ISM',updated_at=?
+                 WHERE kind='conflict' AND target_id=?",
+            )
+            .bind(crate::db::now())
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
     } else {
         peers::conflict(
             state,
@@ -939,7 +965,20 @@ async fn process_one(state: &AppState, plan: &Restoration) -> AppResult<()> {
         return Ok(());
     }
     let sentinel = format!("folder-restore:{}", plan.operation_id);
+    let _guard = state.replication_operation_lock.lock().await;
     let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
+    let finished: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM pending_peer_ops p
+         LEFT JOIN conflicts c ON c.id=p.conflict_id
+         WHERE p.operation_id=? AND p.kind='folder_restore'
+         AND (p.conflict_id IS NULL OR c.status='resolved'))",
+    )
+    .bind(&sentinel)
+    .fetch_one(&mut *tx)
+    .await?;
+    if !finished {
+        return Ok(());
+    }
     sqlx::query("DELETE FROM sync_recovery_links WHERE kind='operation' AND target_id=?")
         .bind(&sentinel)
         .execute(&mut *tx)
@@ -1146,6 +1185,14 @@ async fn finish_generation(state: &AppState, operation_id: &str) -> AppResult<bo
     .await?;
     state.emit(crate::state::ServerEvent::ConflictsChanged);
     Ok(true)
+}
+
+#[cfg(test)]
+pub(in crate::peers) async fn finish_generation_before_cleanup(
+    state: &AppState,
+    operation_id: &str,
+) -> AppResult<bool> {
+    finish_generation(state, operation_id).await
 }
 
 async fn finish_tree_generation(

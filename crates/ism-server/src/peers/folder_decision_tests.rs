@@ -457,6 +457,190 @@ async fn recovery_missing_folder_reopens_choice_if_restored_tree_changes() {
     }
 }
 
+#[tokio::test]
+async fn resolved_restoration_reopens_with_a_fresh_reviewed_decision_before_cleanup() {
+    use ism_core::dto::{
+        RecoveryDecision, RecoveryDecisionInput, RecoveryKind, RecoveryState, RecoveryTarget,
+    };
+
+    let (mut a, b, operation) = missing_folder().await;
+    admin::restore_missing_folder(&a.state, &operation)
+        .await
+        .unwrap();
+    a.tasks
+        .push(tokio::spawn(super::super::transfer::run(a.state.clone())));
+    for _ in 0..200 {
+        let received: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM uploads WHERE status='receiving')")
+                .fetch_one(&a.state.db)
+                .await
+                .unwrap();
+        if received {
+            break;
+        }
+        a.state.sync_wake.notify_waiters();
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    stop_workers(&mut a).await;
+    write_old(
+        &b.shared.join("new/nested/photo.jpg"),
+        b"first peer generation",
+    );
+    scan(&b).await;
+    assert_eq!(
+        admin::validate_folder_restore(&a.state, &operation)
+            .await
+            .unwrap_err()
+            .code(),
+        "choose_version"
+    );
+    let conflict: String = sqlx::query_scalar(
+        "SELECT id FROM conflicts WHERE kind='folder_restore' AND status='open'",
+    )
+    .fetch_one(&a.state.db)
+    .await
+    .unwrap();
+    let target = RecoveryTarget {
+        kind: RecoveryKind::Conflict,
+        id: conflict.clone(),
+        peer_id: None,
+    };
+    let first = super::super::versions::get(&a.state, &target)
+        .await
+        .unwrap();
+    let result = super::super::recovery::submit_decisions(
+        &a.state,
+        RecoveryDecisionInput {
+            decisions: vec![RecoveryDecision {
+                target: target.clone(),
+                revision: first.revision.clone(),
+            }],
+            resolution: ConflictResolution::KeepBoth,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.items[0].state, RecoveryState::Queued);
+    let retry = super::super::recovery::submit_decisions(
+        &a.state,
+        RecoveryDecisionInput {
+            decisions: vec![RecoveryDecision {
+                target: target.clone(),
+                revision: first.revision.clone(),
+            }],
+            resolution: ConflictResolution::KeepBoth,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(retry.items[0].state, RecoveryState::Queued);
+    super::super::recovery::tick(&a.state).await.unwrap();
+    assert_eq!(status(&a, &conflict).await, "resolving");
+    assert!(
+        crate::ops::exec::resume_recovered_folder_operation(&a.state, &operation)
+            .await
+            .unwrap()
+    );
+    a.tasks.extend([
+        tokio::spawn(crate::maintenance::run(a.state.clone())),
+        tokio::spawn(crate::ops::exec::run(a.state.clone())),
+        tokio::spawn(super::super::transfer::run(a.state.clone())),
+    ]);
+    let mut finished = false;
+    for _ in 0..400 {
+        admin::process_pending_choices(&a.state).await.unwrap();
+        if admin::finish_generation_before_cleanup(&a.state, &operation)
+            .await
+            .unwrap()
+        {
+            finished = true;
+            break;
+        }
+        a.state.sync_wake.notify_waiters();
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(finished, "the first reviewed generation did not finish");
+    assert_eq!(status(&a, &conflict).await, "resolved");
+    let pending: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM pending_peer_ops WHERE kind='folder_restore' AND conflict_id=?)",
+    )
+    .bind(&conflict)
+    .fetch_one(&a.state.db)
+    .await
+    .unwrap();
+    assert!(pending, "exercise the real gap before restoration cleanup");
+    sqlx::query("UPDATE sync_recovery SET updated_at='2000-01-01T00:00:00Z' WHERE kind='conflict' AND target_id=?")
+        .bind(&conflict)
+        .execute(&a.state.db)
+        .await
+        .unwrap();
+    super::super::recovery::tick(&a.state).await.unwrap();
+    assert_eq!(
+        super::super::recovery::get(&a.state, RecoveryKind::Conflict, &conflict)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        RecoveryState::Fixed
+    );
+    write_old(
+        &b.shared.join("new/nested/photo.jpg"),
+        b"new peer generation",
+    );
+    scan(&b).await;
+    reboot(&mut a).await;
+    admin::process_folder_restorations(&a.state).await.unwrap();
+    assert_eq!(status(&a, &conflict).await, "open");
+    let second = super::super::versions::get(&a.state, &target)
+        .await
+        .unwrap();
+    assert_ne!(first.revision, second.revision);
+    let stale = super::super::recovery::submit_decisions(
+        &a.state,
+        RecoveryDecisionInput {
+            decisions: vec![RecoveryDecision {
+                target: target.clone(),
+                revision: first.revision,
+            }],
+            resolution: ConflictResolution::KeepBoth,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(stale.items[0].state, RecoveryState::Queued);
+    super::super::recovery::tick(&a.state).await.unwrap();
+    assert_eq!(status(&a, &conflict).await, "open");
+    let rejected = super::super::recovery::get(&a.state, RecoveryKind::Conflict, &conflict)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(rejected.state, RecoveryState::NeedsDecision);
+    assert_eq!(rejected.code.as_deref(), Some("version_conflict"));
+    let second = super::super::versions::get(&a.state, &target)
+        .await
+        .unwrap();
+    let result = super::super::recovery::submit_decisions(
+        &a.state,
+        RecoveryDecisionInput {
+            decisions: vec![RecoveryDecision {
+                target,
+                revision: second.revision,
+            }],
+            resolution: ConflictResolution::KeepRemote,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        result.items[0].state,
+        RecoveryState::Queued,
+        "a new reviewed choice must be queued: {:?}",
+        result.items[0]
+    );
+    super::super::recovery::tick(&a.state).await.unwrap();
+    assert_eq!(status(&a, &conflict).await, "resolving");
+}
+
 async fn restored_tree_change_choice(child_created: bool) {
     let (mut a, mut b, operation) = missing_folder().await;
     admin::restore_missing_folder(&a.state, &operation)
