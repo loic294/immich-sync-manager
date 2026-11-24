@@ -697,6 +697,9 @@ pub struct RecoveryView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub peer_instance: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub conflict_scope: Option<ConflictScope>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -907,7 +910,7 @@ pub struct ConflictView {
 #[ts(export)]
 pub enum ConflictPageRow {
     Local(Box<ConflictView>),
-    Peer(RecoveryView),
+    Peer(Box<RecoveryView>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -915,6 +918,22 @@ pub enum ConflictPageRow {
 pub struct ConflictPage {
     pub rows: Vec<ConflictPageRow>,
     pub total: i64,
+    pub filters: Vec<ConflictFilter>,
+}
+
+/// Share-relative location for conflict filtering, including peer-owned decisions.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct ConflictScope {
+    pub share_name: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct ConflictFilter {
+    pub share_name: String,
+    pub folders: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]

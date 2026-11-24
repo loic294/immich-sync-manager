@@ -318,7 +318,7 @@ async fn notification_client_healthy_stream_keeps_old_snapshots_available() {
         .execute(&a.state.db)
         .await
         .unwrap();
-    let conflicts = crate::peers::admin::page_conflicts(&a.state, false, 50, 0)
+    let conflicts = crate::peers::admin::page_conflicts(&a.state, 50, 0, &Default::default())
         .await
         .unwrap();
     assert!(matches!(

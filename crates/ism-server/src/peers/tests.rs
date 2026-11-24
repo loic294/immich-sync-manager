@@ -3049,12 +3049,12 @@ async fn conflict_page_paginates_local_and_peer_targets_without_a_cap() {
     .execute(&a.state.db)
     .await
     .unwrap();
-    let first = super::admin::page_conflicts(&a.state, false, 500, 0)
+    let first = super::admin::page_conflicts(&a.state, 500, 0, &Default::default())
         .await
         .unwrap();
     assert_eq!(first.total, 502);
     assert_eq!(first.rows.len(), 500);
-    let second = super::admin::page_conflicts(&a.state, false, 500, 500)
+    let second = super::admin::page_conflicts(&a.state, 500, 500, &Default::default())
         .await
         .unwrap();
     assert_eq!(second.total, 502);
@@ -3069,6 +3069,77 @@ async fn conflict_page_paginates_local_and_peer_targets_without_a_cap() {
         }
         _ => panic!("expected peer-owned conflict"),
     }
+    sqlx::query(
+        "UPDATE conflicts SET rel_path=CASE id
+         WHEN 'page-1' THEN 'Trips/Coast/a.jpg'
+         WHEN 'page-2' THEN 'Trips/b.jpg'
+         WHEN 'page-3' THEN 'Trips-extra/c.jpg'
+         WHEN 'page-4' THEN 'Trips/Coast/d.jpg' ELSE rel_path END,
+         status=CASE WHEN id='page-4' THEN 'resolved' ELSE status END",
+    )
+    .execute(&a.state.db)
+    .await
+    .unwrap();
+    let view = serde_json::json!({
+        "target": { "kind": "conflict", "id": "page-1", "peer_id": null },
+        "title": "peer-photo.jpg", "state": "needs_decision", "code": "choose_version",
+        "detail": null, "can_fix": false, "can_dismiss": false, "replacement_operation_id": null,
+        "conflict_scope": { "share_name": share.name, "path": "Trips/Coast/peer.jpg" }
+    });
+    sqlx::query("UPDATE outgoing_recovery SET view_json=? WHERE target_id='page-1'")
+        .bind(view.to_string())
+        .execute(&a.state.db)
+        .await
+        .unwrap();
+    let filter = super::admin::ConflictFilterQuery {
+        share: share.name.clone(),
+        folder: "Trips".into(),
+        resolved_only: false,
+    };
+    let filtered = super::admin::page_conflicts(&a.state, 1, 0, &filter)
+        .await
+        .unwrap();
+    assert_eq!(filtered.total, 3);
+    assert_eq!(filtered.rows.len(), 1);
+    assert!(filtered.filters.iter().any(
+        |f| f.share_name == share.name && f.folders == ["Trips", "Trips-extra", "Trips/Coast"]
+    ));
+    let last = super::admin::page_conflicts(&a.state, 1, 2, &filter)
+        .await
+        .unwrap();
+    assert_eq!(last.total, 3);
+    assert!(matches!(
+        last.rows[0],
+        ism_core::dto::ConflictPageRow::Peer(_)
+    ));
+    let resolved = super::admin::page_conflicts(
+        &a.state,
+        50,
+        0,
+        &super::admin::ConflictFilterQuery {
+            resolved_only: true,
+            ..filter
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(resolved.total, 1);
+    assert!(
+        matches!(&resolved.rows[0], ism_core::dto::ConflictPageRow::Local(c) if c.id == "page-4" && c.status == "resolved")
+    );
+    let missing = super::admin::page_conflicts(
+        &a.state,
+        50,
+        0,
+        &super::admin::ConflictFilterQuery {
+            share: "Other share".into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(missing.total, 0);
+    assert!(missing.rows.is_empty());
 }
 
 #[tokio::test]
@@ -3135,7 +3206,7 @@ async fn recovery_versions_are_current_owner_scoped_and_stale_decisions_do_not_e
     );
     let receiver = super::net::peers(&a.state).await.unwrap().remove(0);
     super::recovery::refresh(&a.state, &receiver).await.unwrap();
-    let page = super::admin::page_conflicts(&a.state, false, 1, 0)
+    let page = super::admin::page_conflicts(&a.state, 1, 0, &Default::default())
         .await
         .unwrap();
     assert_eq!(page.total, 1);
@@ -3143,10 +3214,13 @@ async fn recovery_versions_are_current_owner_scoped_and_stale_decisions_do_not_e
         ism_core::dto::ConflictPageRow::Peer(item) => {
             assert_eq!(item.target.id, target.id);
             assert_eq!(item.target.peer_id.as_deref(), Some(receiver.id.as_str()));
+            let scope = item.conflict_scope.as_ref().unwrap();
+            assert_eq!(scope.share_name, share.name);
+            assert_eq!(scope.path, "orphan.xmp");
         }
         _ => panic!("expected peer-owned conflict"),
     }
-    let after = super::admin::page_conflicts(&a.state, false, 1, 1)
+    let after = super::admin::page_conflicts(&a.state, 1, 1, &Default::default())
         .await
         .unwrap();
     assert_eq!(after.total, 1);
@@ -3177,6 +3251,9 @@ async fn recovery_versions_are_current_owner_scoped_and_stale_decisions_do_not_e
     .await
     .unwrap();
     assert_eq!(result.items[0].state, RecoveryState::Queued);
+    let scope = result.items[0].conflict_scope.as_ref().unwrap();
+    assert_eq!(scope.share_name, share.name);
+    assert_eq!(scope.path, "orphan.xmp");
     super::versions::expire(&b.state, &target.id).await;
     super::recovery::tick(&b.state).await.unwrap();
     assert_eq!(

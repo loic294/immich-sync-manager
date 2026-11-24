@@ -1240,7 +1240,21 @@ pub async fn list_conflicts(
     state: &AppState,
     include_resolved: bool,
 ) -> AppResult<Vec<ConflictView>> {
-    local_conflicts_page(state, include_resolved, 500, 0).await
+    local_conflicts_page(
+        state,
+        include_resolved,
+        500,
+        0,
+        &ConflictFilterQuery::default(),
+    )
+    .await
+}
+
+#[derive(Default)]
+pub struct ConflictFilterQuery {
+    pub resolved_only: bool,
+    pub share: String,
+    pub folder: String,
 }
 
 async fn local_conflicts_page(
@@ -1248,6 +1262,7 @@ async fn local_conflicts_page(
     include_resolved: bool,
     limit: i64,
     offset: i64,
+    filter: &ConflictFilterQuery,
 ) -> AppResult<Vec<ConflictView>> {
     type R = (
         String,
@@ -1263,10 +1278,20 @@ async fn local_conflicts_page(
         Option<String>,
     );
     let rows: Vec<R> = sqlx::query_as(
-        "SELECT id, share_id, rel_path, kind, detail, local_json, remote_json, peer_id, status, created_at, remote_from FROM conflicts
-         WHERE status != 'resolved' OR ? ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+        "SELECT c.id, c.share_id, c.rel_path, c.kind, c.detail, c.local_json, c.remote_json, c.peer_id, c.status, c.created_at, c.remote_from
+         FROM conflicts c JOIN shares s ON s.id=c.share_id
+         WHERE (CASE WHEN ? THEN c.status='resolved' ELSE c.status!='resolved' OR ? END)
+         AND (?='' OR s.name=?) AND (?='' OR c.rel_path=? OR substr(c.rel_path,1,length(?)+1)=? || '/')
+         ORDER BY c.created_at DESC, c.id DESC LIMIT ? OFFSET ?",
     )
+    .bind(filter.resolved_only)
     .bind(include_resolved)
+    .bind(&filter.share)
+    .bind(&filter.share)
+    .bind(&filter.folder)
+    .bind(&filter.folder)
+    .bind(&filter.folder)
+    .bind(&filter.folder)
     .bind(limit)
     .bind(offset)
     .fetch_all(&state.db)
@@ -1314,31 +1339,84 @@ async fn local_conflicts_page(
 
 pub async fn page_conflicts(
     state: &AppState,
-    include_resolved: bool,
     limit: i64,
     offset: i64,
+    filter: &ConflictFilterQuery,
 ) -> AppResult<ConflictPage> {
-    let local_total: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM conflicts WHERE status != 'resolved' OR ?")
-            .bind(include_resolved)
-            .fetch_one(&state.db)
-            .await?;
-    let mut local = local_conflicts_page(state, include_resolved, limit, offset).await?;
+    use ism_core::dto::ConflictFilter;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let scopes: Vec<(String, String)> = sqlx::query_as(
+        "SELECT s.name,c.rel_path FROM conflicts c JOIN shares s ON s.id=c.share_id
+         WHERE (c.status='resolved')=? ORDER BY s.name,c.rel_path",
+    )
+    .bind(filter.resolved_only)
+    .fetch_all(&state.db)
+    .await?;
+    let matches = |share: &str, path: &str| {
+        (filter.share.is_empty() || filter.share == share)
+            && (filter.folder.is_empty()
+                || path == filter.folder
+                || path.starts_with(&format!("{}/", filter.folder)))
+    };
+    let local_total = i64::try_from(
+        scopes
+            .iter()
+            .filter(|(share, path)| matches(share, path))
+            .count(),
+    )
+    .map_err(AppError::internal)?;
+    let mut peer = if filter.resolved_only {
+        Vec::new()
+    } else {
+        super::recovery::peer_conflicts(state).await?
+    };
+    let mut folders: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for (share, path) in scopes.iter().map(|(s, p)| (s.as_str(), p.as_str())).chain(
+        peer.iter()
+            .filter_map(|row| row.conflict_scope.as_ref())
+            .map(|scope| (scope.share_name.as_str(), scope.path.as_str())),
+    ) {
+        let entry = folders.entry(share.to_owned()).or_default();
+        for (index, _) in path.match_indices('/') {
+            entry.insert(path[..index].to_owned());
+        }
+    }
+    peer.retain(|row| {
+        row.conflict_scope.as_ref().map_or(
+            filter.share.is_empty() && filter.folder.is_empty(),
+            |scope| matches(&scope.share_name, &scope.path),
+        )
+    });
+    let peer_total = i64::try_from(peer.len()).map_err(AppError::internal)?;
+    let mut local = local_conflicts_page(state, false, limit, offset, filter).await?;
     for row in &mut local {
         row.recovery = super::recovery::get(state, RecoveryKind::Conflict, &row.id).await?;
     }
     let remaining = limit.saturating_sub(i64::try_from(local.len()).map_err(AppError::internal)?);
-    let peer =
-        super::recovery::peer_conflicts_page(state, remaining, offset.saturating_sub(local_total))
-            .await?;
+    let skip =
+        usize::try_from(offset.saturating_sub(local_total).max(0)).map_err(AppError::internal)?;
+    let remaining = usize::try_from(remaining).map_err(AppError::internal)?;
     let rows = local
         .into_iter()
         .map(|row| ConflictPageRow::Local(Box::new(row)))
-        .chain(peer.rows.into_iter().map(ConflictPageRow::Peer))
+        .chain(
+            peer.into_iter()
+                .skip(skip)
+                .take(remaining)
+                .map(|row| ConflictPageRow::Peer(Box::new(row))),
+        )
         .collect();
     Ok(ConflictPage {
         rows,
-        total: local_total + peer.total,
+        total: local_total + peer_total,
+        filters: folders
+            .into_iter()
+            .map(|(share_name, folders)| ConflictFilter {
+                share_name,
+                folders: folders.into_iter().collect(),
+            })
+            .collect(),
     })
 }
 

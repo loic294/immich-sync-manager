@@ -1,5 +1,6 @@
 import { html, nothing } from 'lit';
 import { admin } from '@/api/admin';
+import type { ConflictFilter } from '@/api/generated/ConflictFilter';
 import type { ConflictPageRow } from '@/api/generated/ConflictPageRow';
 import type { ConflictResolution } from '@/api/generated/ConflictResolution';
 import type { RecoveryTarget } from '@/api/generated/RecoveryTarget';
@@ -50,6 +51,10 @@ export class IsmConflictsPage extends IsmPage {
     selected: { state: true },
     selecting: { state: true },
     activeId: { state: true },
+    filters: { state: true },
+    filtersOpen: { state: true },
+    share: { state: true },
+    folder: { state: true },
   };
 
   declare conflicts: ConflictPageRow[];
@@ -61,6 +66,10 @@ export class IsmConflictsPage extends IsmPage {
   declare selected: Map<string, ConflictPageRow>;
   declare selecting: boolean;
   declare activeId: string | undefined;
+  declare filters: ConflictFilter[];
+  declare filtersOpen: boolean;
+  declare share: string;
+  declare folder: string;
   private readonly review = new VersionReview(this);
   protected override reloadOn = ['conflicts_changed', 'sync_changed'] as const;
   protected override liveReloadInterval = 1500;
@@ -75,6 +84,10 @@ export class IsmConflictsPage extends IsmPage {
     this.selected = new Map();
     this.selecting = false;
     this.activeId = undefined;
+    this.filters = [];
+    this.filtersOpen = false;
+    this.share = '';
+    this.folder = '';
   }
 
   protected override onChange(event: Parameters<IsmPage['onChange']>[0]) {
@@ -99,9 +112,17 @@ export class IsmConflictsPage extends IsmPage {
   }
 
   protected override async load() {
-    const { limit, offset } = this;
-    const page = await admin.conflicts(this.includeResolved, limit, offset);
-    if (limit !== this.limit || offset !== this.offset) return;
+    const { limit, offset, includeResolved, share, folder } = this;
+    const page = await admin.conflicts(includeResolved, limit, offset, share, folder);
+    if (
+      limit !== this.limit ||
+      offset !== this.offset ||
+      includeResolved !== this.includeResolved ||
+      share !== this.share ||
+      folder !== this.folder
+    )
+      return;
+    this.filters = page.filters;
     if (offset > 0 && offset >= page.total) {
       this.offset = Math.max(0, Math.ceil(page.total / limit) - 1) * limit;
       void this.reload();
@@ -150,6 +171,54 @@ export class IsmConflictsPage extends IsmPage {
     this.limit = change.limit;
     this.offset = change.offset;
     void this.reload();
+  }
+
+  private filter(share: string, folder = '') {
+    this.share = share;
+    this.folder = folder;
+    this.offset = 0;
+    this.selected = new Map();
+    this.activeId = undefined;
+    void this.reload();
+  }
+
+  private filterControls() {
+    if (!this.filtersOpen) return nothing;
+    const folders = this.filters?.find((filter) => filter.share_name === this.share)?.folders ?? [];
+    return html`<div id="conflict-filters" class="flex w-full flex-wrap items-end gap-3 rounded-box border border-base-300 bg-base-100 p-3">
+      <label class="flex min-w-0 flex-1 flex-col gap-1 text-sm">
+        Share
+        <select class="select select-sm w-full" aria-label="Filter by share"
+          @change=${(e: Event) => this.filter((e.target as HTMLSelectElement).value)}>
+          <option value="" ?selected=${!this.share}>All shares</option>
+          ${(this.filters ?? []).map(
+            (filter) => html`<option value=${filter.share_name}
+            ?selected=${filter.share_name === this.share}>${filter.share_name}</option>`,
+          )}
+          ${
+            this.share && !this.filters?.some((filter) => filter.share_name === this.share)
+              ? html`<option value=${this.share} selected>${this.share}</option>`
+              : nothing
+          }
+        </select>
+      </label>
+      <label class="flex min-w-0 flex-1 flex-col gap-1 text-sm">
+        Subfolder
+        <select class="select select-sm w-full" aria-label="Filter by subfolder" ?disabled=${!this.share}
+          @change=${(e: Event) => this.filter(this.share, (e.target as HTMLSelectElement).value)}>
+          <option value="" ?selected=${!this.folder}>All folders</option>
+          ${folders.map((folder) => html`<option value=${folder} ?selected=${folder === this.folder}>${folder}</option>`)}
+          ${
+            this.folder && !folders.includes(this.folder)
+              ? html`<option value=${this.folder} selected>${this.folder}</option>`
+              : nothing
+          }
+        </select>
+      </label>
+      <button type="button" class="btn btn-ghost btn-sm max-sm:min-h-11"
+        ?disabled=${!this.share && !this.folder} @click=${() => this.filter('')}>Clear filters</button>
+      <p class="w-full text-xs text-base-content/70">Folders include their subfolders. Changing filters clears the selection.</p>
+    </div>`;
   }
 
   private open() {
@@ -337,7 +406,7 @@ export class IsmConflictsPage extends IsmPage {
     const chosenHere = open.filter((conflict) => this.selected.has(key(conflict)));
     const reviewed = chosen.filter((c) => this.review.has(target(c))).length;
     const all = open.length > 0 && chosenHere.length === open.length;
-    return html`<div class="flex flex-wrap items-center gap-2" aria-label="Batch conflict decisions">
+    return html`<div class="flex flex-none flex-wrap items-center gap-2" aria-label="Batch conflict decisions">
       <label class="inline-flex items-center gap-2 max-sm:min-h-11">
         <input type="checkbox" class="checkbox checkbox-sm" aria-label="Select all open conflicts"
           ?disabled=${open.length === 0} .checked=${all} .indeterminate=${chosenHere.length > 0 && !all}
@@ -367,19 +436,25 @@ export class IsmConflictsPage extends IsmPage {
         this.conflicts.length === 0
           ? html`<div class="card card-border bg-base-100"><div class="card-body items-center text-center">
               <ism-icon name="circle-check" size="xl" class="text-success"></ism-icon>
-              <h2 class="card-title">No conflicts</h2>
-              <p class="text-sm text-base-content/70">No conflicts have been recorded.</p>
+              <h2 class="card-title">${this.includeResolved ? 'No resolved conflicts' : 'No conflicts'}</h2>
+              <p class="text-sm text-base-content/70">${
+                this.share || this.folder
+                  ? 'No conflicts match these filters. Choose another folder or clear the filters.'
+                  : this.includeResolved
+                    ? 'Resolved conflicts will appear here.'
+                    : 'No conflicts need review.'
+              }</p>
             </div></div>${this.batch()}`
           : html`${this.batch()}
-              <section class="grid min-h-[32rem] min-w-0 grid-cols-1 overflow-hidden rounded-box border border-base-300 bg-base-100 lg:grid-cols-[minmax(16rem,20rem)_minmax(0,1fr)]">
+              <section class="grid min-h-0 min-w-0 grid-cols-1 overflow-hidden rounded-box border border-base-300 bg-base-100 lg:flex-1 lg:grid-cols-[minmax(16rem,20rem)_minmax(0,1fr)] lg:grid-rows-[minmax(0,1fr)]">
                 <aside class="flex min-h-0 flex-col border-b border-base-300 lg:border-b-0 lg:border-r">
-                  <div class="flex items-center justify-between gap-2 border-b border-base-300 px-3 py-3">
+                  <div class="flex flex-none items-center justify-between gap-2 border-b border-base-300 px-3 py-3">
                     <h2 class="font-semibold">Review queue</h2>
                     <span class="badge badge-ghost">${this.total}</span>
                   </div>
                   <ul tabindex="0" aria-label="Conflicts on this page" aria-describedby=${this.conflicts.length > 1 ? 'queue-scroll-hint' : nothing} class="max-h-24 min-h-0 flex-1 overflow-y-auto lg:max-h-none">${this.conflicts.map((c) => this.queueItem(c))}</ul>
                   ${this.conflicts.length > 1 ? html`<p id="queue-scroll-hint" class="px-3 py-1 text-xs text-base-content/70 lg:hidden">Scroll to see other conflicts on this page.</p>` : nothing}
-                  <div class="border-t border-base-300 p-2">
+                  <div class="flex-none border-t border-base-300 p-2">
                     <ism-pagination
                       .total=${this.total}
                       .limit=${this.limit}
@@ -388,7 +463,7 @@ export class IsmConflictsPage extends IsmPage {
                     ></ism-pagination>
                   </div>
                 </aside>
-                <div class="min-w-0">
+                <div class="min-h-0 min-w-0 lg:overflow-y-auto" aria-label="Conflict details" tabindex="0">
                   ${
                     active
                       ? this.detail(active)
@@ -397,6 +472,13 @@ export class IsmConflictsPage extends IsmPage {
                 </div>
               </section>`,
       html`<div class="flex flex-wrap items-center gap-3">
+        <button type="button" class="btn btn-sm max-sm:min-h-11" aria-expanded=${this.filtersOpen}
+          aria-controls="conflict-filters" @click=${() => {
+            this.filtersOpen = !this.filtersOpen;
+          }}>
+          <ism-icon name="list-filter" size="sm"></ism-icon>
+          Filters${this.share ? html`<span class="badge badge-primary badge-sm">${this.folder ? 2 : 1}</span>` : nothing}
+        </button>
         ${
           this.conflicts.length || this.selected.size
             ? html`<button type="button" class="btn btn-sm max-sm:min-h-11" aria-pressed=${this.selecting}
@@ -413,13 +495,13 @@ export class IsmConflictsPage extends IsmPage {
             .checked=${this.includeResolved}
             @change=${(e: Event) => {
               this.includeResolved = (e.target as HTMLInputElement).checked;
-              this.offset = 0;
-              void this.reload();
+              this.filter(this.share, this.folder);
             }}
           />
           Show resolved
         </label>
-      </div>`,
+      </div>${this.filterControls()}`,
+      true,
     );
   }
 }

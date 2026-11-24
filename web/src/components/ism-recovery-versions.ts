@@ -289,8 +289,15 @@ export class IsmRecoveryVersions extends IsmElement {
     const target = this.target;
     const versions = this.versions;
     if (!target || !versions) return nothing;
+    const other = source ? versions.receiving : [versions.source];
+    const newer = largerThan(version, other, modificationTime);
+    const larger = largerThan(version, other, totalSize);
     return html`<section class="min-w-0">
-      <h3 class="font-semibold">${version.instance}</h3>
+      <div class="flex flex-wrap items-center gap-2">
+        <h3 class="font-semibold">${version.instance}</h3>
+        ${newer ? html`<span class="badge badge-info badge-soft badge-sm" title="More recently modified than the other instance">Newer</span>` : nothing}
+        ${larger ? html`<span class="badge badge-warning badge-soft badge-sm" title="More total file bytes than the other instance">Larger</span>` : nothing}
+      </div>
       <p class="break-all text-sm text-base-content/70">${version.path}</p>
       ${
         version.state === 'absent' || version.state === 'deleted'
@@ -395,6 +402,42 @@ function latest(version: RecoveryVersion) {
     if (!file.modified_at) return newest;
     return !newest || Date.parse(file.modified_at) > Date.parse(newest) ? file.modified_at : newest;
   }, undefined);
+}
+
+function modificationTime(version: RecoveryVersion): number | undefined {
+  if (
+    !version.files.length ||
+    version.files.some(
+      (file) => !file.modified_at || !Number.isFinite(Date.parse(file.modified_at)),
+    )
+  )
+    return undefined;
+  return Math.max(...version.files.map((file) => Date.parse(file.modified_at ?? '')));
+}
+
+function totalSize(version: RecoveryVersion): number | undefined {
+  if (!version.files.length || version.files.some((file) => file.size === null)) return undefined;
+  const total = version.files.reduce((sum, file) => sum + (file.size ?? 0), 0);
+  return Number.isSafeInteger(total) ? total : undefined;
+}
+
+function largerThan(
+  version: RecoveryVersion,
+  other: readonly RecoveryVersion[],
+  measure: (version: RecoveryVersion) => number | undefined,
+): boolean {
+  if (!['file', 'folder'].includes(version.state)) return false;
+  const value = measure(version);
+  return (
+    value !== undefined &&
+    other.length > 0 &&
+    other.every((side) => {
+      const comparison = measure(side);
+      return (
+        ['file', 'folder'].includes(side.state) && comparison !== undefined && value > comparison
+      );
+    })
+  );
 }
 
 declare global {

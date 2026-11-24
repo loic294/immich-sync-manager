@@ -236,6 +236,15 @@ endpoint are skipped.
 
 ## Conflicts
 
+Use **Filters** to choose a share and then a subfolder from the conflict queue, across all pages.
+Folder filters include descendants and clear bulk selections when changed. **Show resolved**
+shows only resolved conflicts, not the active queue. Peer-owned filters require location metadata
+from an upgraded peer; older peers' conflicts remain visible in the unfiltered queue.
+In the desktop split view, the queue and comparison scroll independently while pagination stays
+visible. **Newer** compares file modification times and **Larger** compares total file bytes;
+these badges are hints, not recommendations. Missing or invalid metadata does not establish
+a comparison, and equal values have no badge.
+
 The **Conflicts** page lists each conflict with both versions (size, checksum, time) and, for moves,
 the path the peer moved from. ISM records a conflict when:
 - `changed_on_both`: both sides changed the file since they last agreed;

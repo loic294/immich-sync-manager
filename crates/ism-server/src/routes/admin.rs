@@ -1500,6 +1500,10 @@ struct ConflictsQuery {
     include_resolved: bool,
     limit: Option<i64>,
     offset: Option<i64>,
+    #[serde(default)]
+    share: String,
+    #[serde(default)]
+    folder: String,
 }
 
 async fn list_conflicts(
@@ -1523,10 +1527,20 @@ async fn conflicts_page(
             "limit must be 1-5000 and offset must be nonnegative",
         ));
     }
-    Ok(
-        Json(peers::page_conflicts(&state, q.include_resolved, limit, offset).await?)
-            .into_response(),
+    Ok(Json(
+        peers::page_conflicts(
+            &state,
+            limit,
+            offset,
+            &peers::ConflictFilterQuery {
+                resolved_only: q.include_resolved,
+                share: q.share,
+                folder: q.folder,
+            },
+        )
+        .await?,
     )
+    .into_response())
 }
 
 async fn resolve_conflict(

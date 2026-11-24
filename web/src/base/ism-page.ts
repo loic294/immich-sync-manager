@@ -119,11 +119,15 @@ export abstract class IsmPage extends IsmElement {
   }
 
   /** A spinner while the first load runs, the load error, else `content()`. */
-  protected frame(content: () => TemplateResult, actions?: TemplateResult): TemplateResult {
+  protected frame(
+    content: () => TemplateResult,
+    actions?: TemplateResult,
+    split = false,
+  ): TemplateResult {
     return html`
-      <div class="h-full overflow-y-auto">
-        <div class="mx-auto flex max-w-6xl flex-col gap-4 p-4">
-          ${actions ? html`<div class="flex flex-wrap items-center justify-end gap-2">${actions}</div>` : nothing}
+      <div class=${split ? 'h-full min-h-0 overflow-y-auto lg:overflow-hidden' : 'h-full overflow-y-auto'}>
+        <div class=${split ? 'mx-auto flex max-w-6xl flex-col gap-4 p-4 lg:h-full lg:min-h-0' : 'mx-auto flex max-w-6xl flex-col gap-4 p-4'}>
+          ${actions ? html`<div class="flex flex-none flex-wrap items-center justify-end gap-2">${actions}</div>` : nothing}
           ${
             this.loadError
               ? html`<div role="alert" class="alert alert-error alert-soft">

@@ -9,6 +9,90 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+it.each([
+  [10, 20, '2024-01-01T00:00:00Z', '2024-01-02T00:00:00Z', [], ['Newer', 'Larger']],
+  [20, 10, '2024-01-02T00:00:00Z', '2024-01-01T00:00:00Z', ['Newer', 'Larger'], []],
+  [20, 10, '2024-01-01T00:00:00Z', '2024-01-02T00:00:00Z', ['Larger'], ['Newer']],
+  [10, 10, '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z', [], []],
+  [null, 10, null, 'invalid', [], []],
+])(
+  'compares verified size and modification metadata without guessing for ties or missing values',
+  async (receivingSize, sourceSize, receivingTime, sourceTime, receivingBadges, sourceBadges) => {
+    const side = (instance: string, size: number | null, modified_at: string | null) => ({
+      instance,
+      state: 'file' as const,
+      path: 'photo.xmp',
+      directories: [],
+      files: [{ path: 'photo.xmp', role: 'sidecar', sha256: instance, size, modified_at }],
+    });
+    const page = await mount('ism-recovery-versions', {
+      target: { kind: 'conflict', id: 'choice', peer_id: null },
+      versions: {
+        share: 'Photos',
+        revision: 'revision',
+        receiving: [side('Alpha', receivingSize, receivingTime)],
+        source: side('Beta', sourceSize, sourceTime),
+      },
+    });
+    const sections = [...page.querySelectorAll('section')];
+    const badges = (section: Element) =>
+      [...section.querySelectorAll('.badge')].map((badge) => badge.textContent?.trim());
+    expect(badges(sections[0])).toEqual(receivingBadges);
+    expect(badges(sections[1])).toEqual(sourceBadges);
+  },
+);
+
+it('compares the complete folder even when only the first files are displayed', async () => {
+  const file = {
+    path: 'folder/photo.xmp',
+    role: 'sidecar',
+    sha256: 'a',
+    size: 1,
+    modified_at: '2024-01-01T00:00:00Z',
+  };
+  const side = {
+    instance: 'Alpha',
+    path: 'folder',
+    state: 'folder' as const,
+    directories: ['folder'],
+    files: [file],
+  };
+  const page = await mount('ism-recovery-versions', {
+    limit: 1,
+    target: { kind: 'conflict', id: 'choice', peer_id: null },
+    versions: {
+      share: 'Photos',
+      revision: 'revision',
+      receiving: [side],
+      source: {
+        ...side,
+        instance: 'Beta',
+        files: [
+          file,
+          {
+            ...file,
+            path: 'folder/extra.xmp',
+            size: 10,
+            modified_at: '2024-01-02T00:00:00Z',
+          },
+        ],
+      },
+    },
+  });
+  expect([...page.querySelectorAll('section')][1].querySelectorAll('.badge')).toHaveLength(2);
+  const versions = page.versions;
+  if (!versions) throw new Error('Version evidence is missing');
+  page.versions = {
+    ...versions,
+    source: {
+      ...versions.source,
+      files: [file, { ...file, size: null, modified_at: null }],
+    },
+  };
+  await page.updateComplete;
+  expect(page.querySelectorAll('.badge')).toHaveLength(0);
+});
+
 it('uses the receiving owner for previews and preserves sidecar roles without requiring an original', async () => {
   vi.stubGlobal('IntersectionObserver', undefined);
   const fetchPreview = vi

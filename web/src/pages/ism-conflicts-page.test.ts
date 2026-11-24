@@ -85,6 +85,141 @@ async function enableSelection(page: HTMLElementTagNameMap['ism-conflicts-page']
 describe('ism-conflicts-page', () => {
   afterEach(() => vi.restoreAllMocks());
 
+  it('filters across pages by share and folder and resets pagination and selections', async () => {
+    const filters = [
+      { share_name: 'Photos', folders: ['Trips', 'Trips/Coast'] },
+      { share_name: 'Scans', folders: ['Archive'] },
+    ];
+    const get = vi.spyOn(api, 'get').mockImplementation(async (path) =>
+      path.endsWith('/versions')
+        ? (versions as never)
+        : ({
+            rows: [{ owner: 'local', conflict }],
+            total: 501,
+            filters,
+          } as never),
+    );
+    const page = await mount('ism-conflicts-page');
+    await vi.waitFor(() => expect(page.textContent).toContain('Review queue'));
+    const buttons = [...page.querySelectorAll<HTMLButtonElement>('button')];
+    const filterButton = buttons.find((button) => button.textContent?.trim() === 'Filters');
+    expect(buttons.indexOf(filterButton as HTMLButtonElement)).toBeLessThan(
+      buttons.findIndex((button) => button.textContent?.trim() === 'Select multiple'),
+    );
+    filterButton?.click();
+    await page.updateComplete;
+    expect(
+      page.querySelector<HTMLSelectElement>('[aria-label="Filter by subfolder"]')?.disabled,
+    ).toBe(true);
+    await enableSelection(page);
+    page.querySelector<HTMLInputElement>('[aria-label="Select photos:a.jpg"]')?.click();
+    page.querySelector<HTMLButtonElement>('[aria-label="Next page"]')?.click();
+    await vi.waitFor(() => expect(page.offset).toBe(50));
+
+    const share = page.querySelector<HTMLSelectElement>('[aria-label="Filter by share"]');
+    if (!share) throw new Error('Share filter is missing');
+    expect([...share.options].map((option) => option.textContent)).toEqual([
+      'All shares',
+      'Photos',
+      'Scans',
+    ]);
+    share.value = 'Photos';
+    share.dispatchEvent(new Event('change'));
+    await vi.waitFor(() =>
+      expect(get).toHaveBeenCalledWith('/api/admin/conflicts/page', {
+        query: { include_resolved: false, limit: 50, offset: 0, share: 'Photos', folder: '' },
+      }),
+    );
+    expect(page.selected.size).toBe(0);
+    await page.updateComplete;
+    const folder = page.querySelector<HTMLSelectElement>('[aria-label="Filter by subfolder"]');
+    if (!folder) throw new Error('Folder filter is missing');
+    expect([...folder.options].map((option) => option.textContent)).toEqual([
+      'All folders',
+      'Trips',
+      'Trips/Coast',
+    ]);
+    folder.value = 'Trips/Coast';
+    folder.dispatchEvent(new Event('change'));
+    await vi.waitFor(() =>
+      expect(get).toHaveBeenCalledWith('/api/admin/conflicts/page', {
+        query: {
+          include_resolved: false,
+          limit: 50,
+          offset: 0,
+          share: 'Photos',
+          folder: 'Trips/Coast',
+        },
+      }),
+    );
+    await page.updateComplete;
+    share.value = 'Scans';
+    share.dispatchEvent(new Event('change'));
+    await vi.waitFor(() => expect(page.folder).toBe(''));
+    await page.updateComplete;
+    expect([...folder.options].map((option) => option.textContent)).toEqual([
+      'All folders',
+      'Archive',
+    ]);
+  });
+
+  it('shows only resolved results without fetching their version evidence', async () => {
+    const get = vi.spyOn(api, 'get').mockImplementation(async (path, options) => {
+      if (path.endsWith('/versions')) return versions as never;
+      const resolved = options?.query?.include_resolved === true;
+      return {
+        rows: [
+          {
+            owner: 'local',
+            conflict: resolved
+              ? {
+                  ...conflict,
+                  id: 'resolved',
+                  status: 'resolved',
+                  location: { root_id: 'photos', path: 'resolved.jpg' },
+                }
+              : conflict,
+          },
+        ],
+        total: 1,
+        filters: [],
+      } as never;
+    });
+    const page = await mount('ism-conflicts-page');
+    await vi.waitFor(() => expect(page.querySelector('ism-recovery-versions')).not.toBeNull());
+    get.mockClear();
+    page.querySelector<HTMLInputElement>('.toggle')?.click();
+    await vi.waitFor(() => expect(page.textContent).toContain('This conflict has been resolved.'));
+    expect(page.textContent).toContain('resolved.jpg');
+    expect(page.textContent).not.toContain('photos:a.jpg');
+    expect(page.querySelector('ism-recovery-versions')).toBeNull();
+    expect(get.mock.calls.some(([path]) => path.endsWith('/versions'))).toBe(false);
+  });
+
+  it('discards stale results when filters change during a request', async () => {
+    let release: ((value: unknown) => void) | undefined;
+    vi.spyOn(api, 'get').mockImplementation(async (path, options) => {
+      if (path.endsWith('/versions')) return versions as never;
+      if (options?.query?.share === 'Photos')
+        return {
+          rows: [],
+          total: 0,
+          filters: [{ share_name: 'Photos', folders: [] }],
+        } as never;
+      return (await new Promise<unknown>((resolve) => {
+        release = resolve;
+      })) as never;
+    });
+    const page = await mount('ism-conflicts-page');
+    page.share = 'Photos';
+    void page.reload();
+    release?.({ rows: [{ owner: 'local', conflict }], total: 501, filters: [] });
+    await vi.waitFor(() => expect(page.loading).toBe(false));
+    expect(page.total).toBe(0);
+    expect(page.conflicts).toEqual([]);
+    expect(page.textContent).toContain('No conflicts match these filters');
+  });
+
   it('loads cached previews automatically and keeps the queue paginated', async () => {
     const get = vi
       .spyOn(api, 'get')

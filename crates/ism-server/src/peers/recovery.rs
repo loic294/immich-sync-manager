@@ -202,6 +202,7 @@ fn view(row: ViewRow) -> AppResult<RecoveryView> {
         detail,
         replacement_operation_id,
         local_instance: None,
+        conflict_scope: None,
         peer_instance: None,
     })
 }
@@ -310,6 +311,16 @@ pub(super) async fn outgoing(
 
 async fn decorate(state: &AppState, mut item: RecoveryView) -> AppResult<RecoveryView> {
     item.local_instance = Some(state.instance_name().await);
+    if item.target.kind == RecoveryKind::Conflict {
+        let scope: Option<(String, String)> = sqlx::query_as(
+            "SELECT s.name,c.rel_path FROM conflicts c JOIN shares s ON s.id=c.share_id WHERE c.id=?",
+        )
+        .bind(&item.target.id)
+        .fetch_optional(&state.db)
+        .await?;
+        item.conflict_scope =
+            scope.map(|(share_name, path)| ism_core::dto::ConflictScope { share_name, path });
+    }
     let peer:Option<String>=match item.target.kind {
         RecoveryKind::Operation=>sqlx::query_scalar::<_,String>("SELECT principal FROM operations WHERE id=?")
             .bind(&item.target.id).fetch_optional(&state.db).await?
@@ -523,21 +534,9 @@ pub async fn page(state: &AppState, limit: i64, offset: i64) -> AppResult<Recove
     Ok(RecoveryPage { total, rows: items })
 }
 
-pub(super) async fn peer_conflicts_page(
-    state: &AppState,
-    limit: i64,
-    offset: i64,
-) -> AppResult<RecoveryPage> {
+pub(super) async fn peer_conflicts(state: &AppState) -> AppResult<Vec<RecoveryView>> {
     type OutgoingRow = (String, String, String, Option<String>, Option<String>, bool);
     let mut tx = state.db.begin().await?;
-    let total: i64 = sqlx::query_scalar(
-        "SELECT (SELECT COUNT(*) FROM outgoing_recovery_requests WHERE kind='conflict') +
-         (SELECT COUNT(*) FROM outgoing_recovery r WHERE r.kind='conflict'
-          AND NOT EXISTS(SELECT 1 FROM outgoing_recovery_requests q
-              WHERE q.peer_id=r.peer_id AND q.kind=r.kind AND q.target_id=r.target_id))",
-    )
-    .fetch_one(&mut *tx)
-    .await?;
     let rows: Vec<OutgoingRow> = sqlx::query_as(
         "SELECT q.peer_id,q.target_id,q.view_json,s.error,q.updated_at,q.state!='accepted' AS pending
          FROM outgoing_recovery_requests q LEFT JOIN peer_recovery_state s ON s.peer_id=q.peer_id
@@ -546,10 +545,8 @@ pub(super) async fn peer_conflicts_page(
          LEFT JOIN peer_recovery_state s ON s.peer_id=r.peer_id
          WHERE r.kind='conflict' AND NOT EXISTS(SELECT 1 FROM outgoing_recovery_requests q
              WHERE q.peer_id=r.peer_id AND q.kind=r.kind AND q.target_id=r.target_id)
-         ORDER BY 1,2 LIMIT ? OFFSET ?",
+         ORDER BY 1,2",
     )
-    .bind(limit)
-    .bind(offset)
     .fetch_all(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -562,7 +559,7 @@ pub(super) async fn peer_conflicts_page(
             outgoing_view(peer, &json, error, updated, pending, fresh)
         })
         .collect::<AppResult<Vec<_>>>()?;
-    Ok(RecoveryPage { rows, total })
+    Ok(rows)
 }
 
 async fn exists(state: &AppState, target: &RecoveryTarget) -> AppResult<bool> {
@@ -880,6 +877,7 @@ pub async fn submit(state: &AppState, input: RecoveryBatchInput) -> AppResult<Re
                     can_dismiss: false,
                     replacement_operation_id: None,
                     local_instance: None,
+                    conflict_scope: None,
                     peer_instance: None,
                 });
             }
@@ -1045,12 +1043,14 @@ async fn queue_local_decisions(
         Option<String>,
         Option<String>,
         Option<String>,
+        Option<String>,
     );
     let rows: Vec<AdmissionRow> = sqlx::query_as(
-        "SELECT c.rel_path,c.status,p.name,r.resolution,r.state,r.decision_revision
+        "SELECT c.rel_path,c.status,p.name,r.resolution,r.state,r.decision_revision,s.name
          FROM json_each(?) d
          LEFT JOIN conflicts c ON c.id=json_extract(d.value,'$.target.id')
          LEFT JOIN peers p ON p.id=c.peer_id
+         LEFT JOIN shares s ON s.id=c.share_id
          LEFT JOIN sync_recovery r ON r.kind='conflict' AND r.target_id=c.id
          ORDER BY CAST(d.key AS INTEGER)",
     )
@@ -1060,8 +1060,10 @@ async fn queue_local_decisions(
     let mut items = Vec::new();
     let mut accepted = Vec::new();
     let mut positions = std::collections::HashMap::new();
-    for (decision, (title, status, peer_instance, prior, prior_state, prior_revision)) in
-        decisions.iter().zip(rows)
+    for (
+        decision,
+        (title, status, peer_instance, prior, prior_state, prior_revision, share_name),
+    ) in decisions.iter().zip(rows)
     {
         let error = if status.is_none() {
             Some(("not_found", "recovery target not found"))
@@ -1080,6 +1082,14 @@ async fn queue_local_decisions(
         } else {
             None
         };
+        let conflict_scope =
+            title
+                .as_ref()
+                .zip(share_name)
+                .map(|(path, share_name)| ism_core::dto::ConflictScope {
+                    share_name,
+                    path: path.clone(),
+                });
         let mut item = RecoveryView {
             target: decision.target.clone(),
             title: title.unwrap_or_else(|| decision.target.id.clone()),
@@ -1090,6 +1100,7 @@ async fn queue_local_decisions(
             can_dismiss: false,
             replacement_operation_id: None,
             local_instance: Some(local_instance.clone()),
+            conflict_scope,
             peer_instance,
         };
         if let Some((code, detail)) = error {
@@ -1228,6 +1239,7 @@ pub async fn submit_decisions(
                     can_dismiss: false,
                     replacement_operation_id: None,
                     local_instance: None,
+                    conflict_scope: None,
                     peer_instance: None,
                 });
                 item.state = if error.code() == "version_conflict" {
@@ -3335,6 +3347,7 @@ mod policy_tests {
             detail: None,
             replacement_operation_id: None,
             local_instance: None,
+            conflict_scope: None,
             peer_instance: None,
         };
         sqlx::query("INSERT INTO outgoing_recovery_requests(peer_id,kind,target_id,state,view_json,updated_at) VALUES('peer','transfer','missing',?,?,?)")
@@ -3692,6 +3705,7 @@ mod policy_tests {
                 detail: None,
                 replacement_operation_id: None,
                 local_instance: None,
+                conflict_scope: None,
                 peer_instance: None,
             };
             sqlx::query("INSERT INTO outgoing_recovery_requests(peer_id,kind,target_id,state,view_json,updated_at) VALUES(?,'transfer',?,'queued',?,?)")
@@ -3776,6 +3790,7 @@ mod policy_tests {
             detail: None,
             replacement_operation_id: None,
             local_instance: None,
+            conflict_scope: None,
             peer_instance: None,
         };
         sqlx::query("INSERT INTO outgoing_recovery_requests(peer_id,kind,target_id,state,view_json,updated_at) VALUES('peer','transfer','missing','queued',?,?)")
@@ -3855,6 +3870,7 @@ mod policy_tests {
             detail: None,
             replacement_operation_id: None,
             local_instance: Some("Beta".into()),
+            conflict_scope: None,
             peer_instance: Some("Alpha".into()),
         };
         let json = serde_json::to_string(&item).unwrap();
