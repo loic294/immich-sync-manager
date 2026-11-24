@@ -81,7 +81,7 @@ describe('ism-app', () => {
     expect(events.start).toHaveBeenCalledOnce();
   });
 
-  it('opens sync issues from an activity link through the app router', async () => {
+  it('opens sync issues from background activity and navigates to Conflicts', async () => {
     const activity: BackgroundActivity = {
       id: 'blocked-transfer',
       task_key: 'transfer:example',
@@ -117,6 +117,21 @@ describe('ism-app', () => {
         } as never;
       if (path === '/api/admin/sync') return { allowed_now: true, override_active: null } as never;
       if (path === '/api/admin/sync/schedule') return { timezone: 'UTC', windows: [] } as never;
+      if (path === '/api/admin/recovery/page')
+        return {
+          rows: [
+            {
+              target: { kind: 'conflict', id: 'conflict-1', peer_id: null },
+              title: 'photo.jpg',
+              state: 'needs_decision',
+              code: 'choose_version',
+              detail: null,
+              can_fix: false,
+            },
+          ],
+          total: 1,
+        } as never;
+      if (path === '/api/admin/conflicts') return [] as never;
       if (path.endsWith('/page')) return { rows: [], total: 0 } as never;
       if (
         path === '/api/admin/sync/overrides' ||
@@ -135,5 +150,11 @@ describe('ism-app', () => {
     );
     expect(window.location.pathname + window.location.search).toBe('/sync?view=attention');
     expect(app.querySelector('ism-recovery-list')).not.toBeNull();
+    await until(() =>
+      expect(app.querySelector('ism-recovery-list a[href="/conflicts"]')).not.toBeNull(),
+    );
+    app.querySelector<HTMLAnchorElement>('ism-recovery-list a[href="/conflicts"]')?.click();
+    await until(() => expect(app.querySelector('ism-conflicts-page')).not.toBeNull());
+    expect(window.location.pathname).toBe('/conflicts');
   });
 });

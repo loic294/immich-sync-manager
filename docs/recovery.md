@@ -30,6 +30,18 @@ decision. Folder comparisons include empty
 directories; changed content or directory structure requires a refreshed decision. Preview
 availability does not determine whether repair can proceed.
 
+ISM prepares version evidence automatically when it detects a conflict and stores it across
+restarts. Preparation uses bounded workers and retries when a peer or filesystem is unavailable;
+reconnecting a peer wakes its pending work. Supported JPEG, PNG, WebP and AVIF files up to 4 MiB
+can be previewed from the relevant instance after checking the saved revision; other files do not
+currently have a conflict preview. Peer preview bytes observe the applicable file-transfer
+schedule and overrides; local previews and evidence remain available outside transfer hours.
+Saved comparisons are not permission to change files: ISM
+verifies current evidence again before carrying out a decision. Folder evidence is limited to
+10,000 entries; larger folders require intervention rather than an unbounded background scan.
+Lineage lookup uses bounded pages, but a very slow peer or unusually long history can exceed the
+evidence deadline. ISM reports the failure and retries; a retry currently starts that lookup again.
+
 Independent paths, shares, and servers continue syncing. Overlapping paths and causally dependent
 events wait, and an unresolved Immich maintenance barrier still protects that server. A replacement
 transfer may pass its own failed parent's path gate, but never that parent's unresolved maintenance

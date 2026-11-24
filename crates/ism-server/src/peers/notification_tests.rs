@@ -128,6 +128,26 @@ async fn notification_client_healthy_stream_keeps_old_snapshots_available() {
     .await;
     tokio::time::sleep(Duration::from_secs(2)).await;
     age_snapshots(&a).await;
+    let conflict = serde_json::json!({
+        "target": { "kind": "conflict", "id": "heartbeat-conflict", "peer_id": null },
+        "title": "example.jpg", "state": "needs_decision", "code": "choose_version",
+        "detail": null, "can_fix": false, "can_dismiss": false, "replacement_operation_id": null
+    });
+    sqlx::query("INSERT INTO outgoing_recovery(peer_id,kind,target_id,view_json) VALUES (?, 'conflict', 'heartbeat-conflict', ?)")
+        .bind(&peer.id)
+        .bind(conflict.to_string())
+        .execute(&a.state.db)
+        .await
+        .unwrap();
+    let conflicts = crate::peers::admin::page_conflicts(&a.state, false, 50, 0)
+        .await
+        .unwrap();
+    assert!(matches!(
+        conflicts.rows.first(),
+        Some(ism_core::dto::ConflictPageRow::Peer(item))
+            if item.target.id == "heartbeat-conflict"
+                && item.code.as_deref() == Some("choose_version")
+    ));
     assert_eq!(
         count(&b, NOTIFICATIONS),
         1,

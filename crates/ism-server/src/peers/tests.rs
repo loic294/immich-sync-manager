@@ -36,6 +36,7 @@ struct Instance {
     notification_status: std::sync::Arc<std::sync::atomic::AtomicU16>,
     snapshot_status: std::sync::Arc<std::sync::atomic::AtomicU16>,
     recovery_status: std::sync::Arc<std::sync::atomic::AtomicU16>,
+    evidence_status: std::sync::Arc<std::sync::atomic::AtomicU16>,
 }
 
 impl Drop for Instance {
@@ -72,16 +73,19 @@ async fn instance(name: &str) -> Instance {
     let notification_status = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0));
     let snapshot_status = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0));
     let recovery_status = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0));
+    let evidence_status = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0));
     let app = crate::routes::router(state.clone()).layer(axum::middleware::from_fn({
         let requests = requests.clone();
         let status = notification_status.clone();
         let snapshot_status = snapshot_status.clone();
         let recovery_status = recovery_status.clone();
+        let evidence_status = evidence_status.clone();
         move |request: axum::extract::Request, next: axum::middleware::Next| {
             let requests = requests.clone();
             let status = status.clone();
             let snapshot_status = snapshot_status.clone();
             let recovery_status = recovery_status.clone();
+            let evidence_status = evidence_status.clone();
             async move {
                 let path = request.uri().path().to_owned();
                 *requests.lock().unwrap().entry(path.clone()).or_insert(0) += 1;
@@ -93,6 +97,12 @@ async fn instance(name: &str) -> Instance {
                 }
                 let status = snapshot_status.load(std::sync::atomic::Ordering::SeqCst);
                 let recovery_status = recovery_status.load(std::sync::atomic::Ordering::SeqCst);
+                let evidence_status = evidence_status.load(std::sync::atomic::Ordering::SeqCst);
+                if path == "/api/peer/v1/recovery/file" && evidence_status != 0 {
+                    return axum::response::IntoResponse::into_response(
+                        axum::http::StatusCode::from_u16(evidence_status).unwrap(),
+                    );
+                }
                 if path == "/api/peer/v1/recovery" && recovery_status != 0 {
                     return axum::response::IntoResponse::into_response(
                         axum::http::StatusCode::from_u16(recovery_status).unwrap(),
@@ -130,6 +140,7 @@ async fn instance(name: &str) -> Instance {
         notification_status,
         snapshot_status,
         recovery_status,
+        evidence_status,
     }
 }
 
@@ -689,6 +700,125 @@ async fn recovery_automatically_finishes_local_bookkeeping_once() {
 }
 
 #[tokio::test]
+async fn repeated_peer_inbox_errors_are_recorded_and_warned_only_on_change() {
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+    use tracing::instrument::WithSubscriber;
+
+    struct LogWriter(Arc<Mutex<Vec<u8>>>);
+    impl Write for LogWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    write_old(&a.shared.join("photo.jpg"), b"alpha");
+    write_old(&b.shared.join("photo.jpg"), b"beta");
+    scan(&a).await;
+    scan(&b).await;
+    let peer = super::net::peers(&b.state).await.unwrap().remove(0);
+    for _ in 0..2 {
+        let _ = super::pull(&b.state, &peer).await;
+    }
+    sqlx::query("UPDATE peer_inbox SET error = NULL WHERE peer_id = ?")
+        .bind(&peer.id)
+        .execute(&b.state.db)
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE inbox_error_writes (id INTEGER)")
+        .execute(&b.state.db)
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE inbox_attempts (id INTEGER)")
+        .execute(&b.state.db)
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER count_inbox_attempts AFTER UPDATE OF attempted_at ON peer_inbox
+             BEGIN INSERT INTO inbox_attempts VALUES (1); END",
+    )
+    .execute(&b.state.db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER count_inbox_error AFTER UPDATE OF error ON peer_inbox
+         BEGIN INSERT INTO inbox_error_writes VALUES (1); END",
+    )
+    .execute(&b.state.db)
+    .await
+    .unwrap();
+    let logs = Arc::new(Mutex::new(Vec::new()));
+    let log_output = logs.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(move || LogWriter(log_output.clone()))
+        .finish();
+    async {
+        for _ in 0..6 {
+            let error = super::pull(&b.state, &peer).await.unwrap_err();
+            assert!(error.contains("conflict resolution"));
+        }
+        let writes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM inbox_error_writes")
+            .fetch_one(&b.state.db)
+            .await
+            .unwrap();
+        assert_eq!(writes, 1, "identical retries must not rewrite the error");
+        let attempts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM inbox_attempts")
+            .fetch_one(&b.state.db)
+            .await
+            .unwrap();
+        assert_eq!(attempts, 6, "every retry must still be attempted");
+        let error: String = sqlx::query_scalar("SELECT error FROM peer_inbox WHERE peer_id = ?")
+            .bind(&peer.id)
+            .fetch_one(&b.state.db)
+            .await
+            .unwrap();
+        assert!(error.contains("conflict resolution"));
+
+        sqlx::query("UPDATE peer_inbox SET error = 'earlier failure' WHERE peer_id = ?")
+            .bind(&peer.id)
+            .execute(&b.state.db)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM inbox_error_writes")
+            .execute(&b.state.db)
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            assert!(
+                super::pull(&b.state, &peer)
+                    .await
+                    .unwrap_err()
+                    .contains("conflict resolution")
+            );
+        }
+        let writes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM inbox_error_writes")
+            .fetch_one(&b.state.db)
+            .await
+            .unwrap();
+        assert_eq!(writes, 1, "a changed error must be recorded once");
+    }
+    .with_subscriber(subscriber)
+    .await;
+    let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+    assert_eq!(
+        logs.matches("peer effect deferred:").count(),
+        2,
+        "the first and changed errors must each produce a warning"
+    );
+}
+
+#[tokio::test]
 async fn recovery_batch_preserves_decisions_and_never_dismisses_unverified_work() {
     let (mut a, mut b) = pair().await;
     stop_workers(&mut a).await;
@@ -1181,6 +1311,305 @@ async fn reviewed_batch_admission_queues_without_contacting_the_peer() {
 }
 
 #[tokio::test]
+async fn authenticated_evidence_follows_bounded_ordered_move_lineage() {
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    let share = super::shares(&b.state).await.unwrap().remove(0);
+    let peer = super::net::peers(&b.state).await.unwrap().remove(0);
+    let initial = VersionVector([("synthetic".into(), 1)].into());
+    let events = [
+        (
+            "file_changed",
+            serde_json::json!({"path":"old/nested/photo.jpg","vv":{"synthetic":1}}),
+        ),
+        (
+            "folder_moved",
+            serde_json::json!({"path":"new","from":"old","vv":{}}),
+        ),
+        (
+            "folder_moved",
+            serde_json::json!({"path":"new/moved","from":"new/nested","vv":{}}),
+        ),
+        (
+            "file_moved",
+            serde_json::json!({"path":"final/photo.jpg","from":"new/moved/photo.jpg","vv":{"synthetic":2}}),
+        ),
+    ];
+    for (index, (kind, data)) in events.into_iter().enumerate() {
+        if index == 1 {
+            sqlx::query(
+                "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<1200)
+                 INSERT INTO event_log(origin,origin_seq,share_name,kind,data_json,at)
+                 SELECT 'unrelated',i,?,'file_moved',
+                        json_object('path','other/'||i,'from','elsewhere/'||i,'vv',json_object()),?
+                 FROM n",
+            )
+            .bind(&share.name)
+            .bind(crate::db::now())
+            .execute(&a.state.db)
+            .await
+            .unwrap();
+            sqlx::query(
+                "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<1200)
+                 INSERT INTO event_log(origin,origin_seq,share_name,kind,data_json,at)
+                 SELECT 'later-versions',i,?,'file_changed',
+                        json_object('path','old/nested/photo.jpg',
+                                    'vv',json_object('other',i)),?
+                 FROM n",
+            )
+            .bind(&share.name)
+            .bind(crate::db::now())
+            .execute(&a.state.db)
+            .await
+            .unwrap();
+        }
+        sqlx::query("INSERT INTO event_log(origin,origin_seq,share_name,kind,data_json,at) VALUES('lineage',?,?,?,?,?)")
+            .bind(index as i64 + 1)
+            .bind(&share.name)
+            .bind(kind)
+            .bind(data.to_string())
+            .bind(crate::db::now())
+            .execute(&a.state.db).await.unwrap();
+    }
+    let evidence =
+        super::recovery::remote_evidence(&b.state, &peer, &share, "old/nested/photo.jpg", &initial)
+            .await
+            .unwrap();
+    assert_eq!(evidence.path, "final/photo.jpg");
+    assert!(evidence.last_move_seq.is_some());
+    let version = serde_json::to_string(&initial).unwrap();
+    let query = reqwest::Url::parse_with_params(
+        "http://ism.example",
+        [
+            ("share", share.name.as_str()),
+            ("path", "old/nested/photo.jpg"),
+            ("vv", version.as_str()),
+            ("origin", "lineage"),
+            ("origin_seq", "1"),
+        ],
+    )
+    .unwrap();
+    let anchored: super::recovery::FileEvidence = super::net::get_json(
+        &b.state,
+        &peer,
+        &format!("/api/peer/v1/recovery/file?{}", query.query().unwrap()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(anchored.path, "final/photo.jpg");
+
+    let local_share = super::shares(&a.state).await.unwrap().remove(0);
+    assert_eq!(
+        super::recovery::current_path(
+            &a.state,
+            &local_share,
+            "old/nested/photo.jpg",
+            &VersionVector::default()
+        )
+        .await
+        .unwrap(),
+        "old/nested/photo.jpg",
+        "folder moves without an authenticated anchor must not be inferred"
+    );
+    sqlx::query("INSERT INTO event_log(origin,origin_seq,share_name,kind,data_json,at) VALUES('bad',1,?,'file_moved','not json',?)")
+        .bind(&share.name).bind(crate::db::now()).execute(&a.state.db).await.unwrap();
+    assert_eq!(
+        super::recovery::current_path(&a.state, &local_share, "old/nested/photo.jpg", &initial)
+            .await
+            .unwrap_err()
+            .code(),
+        "recovery_evidence_missing"
+    );
+    sqlx::query("UPDATE event_log SET data_json='{}' WHERE origin='bad'")
+        .execute(&a.state.db)
+        .await
+        .unwrap();
+    assert_eq!(
+        super::recovery::current_path(&a.state, &local_share, "old/nested/photo.jpg", &initial)
+            .await
+            .unwrap_err()
+            .code(),
+        "recovery_evidence_missing"
+    );
+}
+
+#[tokio::test]
+async fn conflict_evidence_is_prepared_retried_and_survives_restart() {
+    use ism_core::dto::{RecoveryKind, RecoveryTarget};
+    use std::sync::atomic::Ordering;
+
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    write_old(&a.shared.join("prepared.jpg"), b"source");
+    write_old(&b.shared.join("prepared.jpg"), b"receiver");
+    scan(&a).await;
+    scan(&b).await;
+    let source_peer = super::net::peers(&b.state).await.unwrap().remove(0);
+    super::pull(&b.state, &source_peer).await.unwrap_err();
+    let id: String = sqlx::query_scalar("SELECT id FROM conflicts WHERE rel_path='prepared.jpg'")
+        .fetch_one(&b.state.db)
+        .await
+        .unwrap();
+
+    a.evidence_status.store(503, Ordering::SeqCst);
+    b.tasks
+        .push(tokio::spawn(super::versions::run(b.state.clone())));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let error: Option<String> =
+                sqlx::query_scalar("SELECT error FROM conflict_evidence_jobs WHERE target_id=?")
+                    .bind(&id)
+                    .fetch_one(&b.state.db)
+                    .await
+                    .unwrap();
+            if error.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("unavailable peer should leave a retryable evidence job");
+    super::net::mark(&b.state, &source_peer.id, Err("offline".into())).await;
+    a.evidence_status.store(0, Ordering::SeqCst);
+    super::net::mark(&b.state, &source_peer.id, Ok(())).await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let status: String =
+                sqlx::query_scalar("SELECT state FROM conflict_evidence_jobs WHERE target_id=?")
+                    .bind(&id)
+                    .fetch_one(&b.state.db)
+                    .await
+                    .unwrap();
+            if status == "ready" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("reconnected peer should prepare evidence");
+
+    let target = RecoveryTarget {
+        kind: RecoveryKind::Conflict,
+        id: id.clone(),
+        peer_id: None,
+    };
+    let before = a
+        .requests
+        .lock()
+        .unwrap()
+        .get("/api/peer/v1/recovery/file")
+        .copied()
+        .unwrap_or(0);
+    let reviewed = super::versions::get_bounded(&b.state, &target)
+        .await
+        .unwrap();
+    let after = a
+        .requests
+        .lock()
+        .unwrap()
+        .get("/api/peer/v1/recovery/file")
+        .copied()
+        .unwrap_or(0);
+    assert_eq!(
+        before, after,
+        "prepared evidence should not query the peer again"
+    );
+    let receiver = super::net::peers(&a.state).await.unwrap().remove(0);
+    let query = reqwest::Url::parse_with_params(
+        "http://ism.example",
+        [("kind", "conflict"), ("id", id.as_str())],
+    )
+    .unwrap();
+    let response: ism_core::dto::RecoveryVersions = super::net::get_json(
+        &a.state,
+        &receiver,
+        &format!("/api/peer/v1/recovery/versions?{}", query.query().unwrap()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.revision, reviewed.revision);
+
+    stop_workers(&mut b).await;
+    let restarted = AppState::new(
+        Config::for_tests(b._dir.path()),
+        b.state.db.clone(),
+        SecretBox::open_or_create(b._dir.path()).unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        super::versions::get_bounded(&restarted, &target)
+            .await
+            .unwrap()
+            .revision,
+        reviewed.revision
+    );
+    sqlx::query("UPDATE conflict_evidence_jobs SET state='running' WHERE target_id=?")
+        .bind(&id)
+        .execute(&b.state.db)
+        .await
+        .unwrap();
+    b.tasks
+        .push(tokio::spawn(super::versions::run(restarted.clone())));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let status: String =
+                sqlx::query_scalar("SELECT state FROM conflict_evidence_jobs WHERE target_id=?")
+                    .bind(&id)
+                    .fetch_one(&b.state.db)
+                    .await
+                    .unwrap();
+            if status == "ready" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("restart should resume interrupted preparation");
+    stop_workers(&mut b).await;
+    write_old(&b.shared.join("prepared.jpg"), b"changed");
+    let preview = super::versions::PreviewQuery {
+        target: super::versions::Query {
+            kind: target.kind,
+            id: id.clone(),
+            peer_id: None,
+        },
+        revision: reviewed.revision.clone(),
+        path: "prepared.jpg".into(),
+        source: false,
+    };
+    assert_eq!(
+        super::versions::preview(&restarted, &preview)
+            .await
+            .unwrap_err()
+            .code(),
+        "preview_changed"
+    );
+    assert_eq!(
+        admin::resolve_reviewed(
+            &restarted,
+            "test",
+            &id,
+            ConflictResolution::KeepRemote,
+            Some(&reviewed.revision),
+        )
+        .await
+        .unwrap_err()
+        .code(),
+        "version_conflict"
+    );
+    assert_eq!(
+        std::fs::read(b.shared.join("prepared.jpg")).unwrap(),
+        b"changed"
+    );
+}
+
+#[tokio::test]
 async fn recovery_previews_are_owner_scoped_current_and_independent_of_immich_indexing() {
     use ism_core::dto::{RecoveryKind, RecoveryTarget};
 
@@ -1280,7 +1709,7 @@ async fn recovery_previews_are_owner_scoped_current_and_independent_of_immich_in
         target: super::versions::Query {
             kind: target.kind,
             id: target.id.clone(),
-            peer_id: Some(receiver.id),
+            peer_id: Some(receiver.id.clone()),
         },
         revision: reviewed.revision.clone(),
         path: "preview.jpg".into(),
@@ -1309,6 +1738,122 @@ async fn recovery_previews_are_owner_scoped_current_and_independent_of_immich_in
         .unwrap();
     assert_eq!(image::load_from_memory(&bytes).unwrap().width(), 1024);
     query.source = false;
+    let restricted = || ism_core::dto::ScheduleView {
+        timezone: "UTC".into(),
+        windows: vec![ism_core::schedule::Window {
+            days: vec![],
+            start: "00:00".into(),
+            end: "00:00".into(),
+        }],
+    };
+    admin::set_schedule(&b.state, restricted()).await.unwrap();
+    let local_query = super::versions::PreviewQuery {
+        target: super::versions::Query {
+            kind: target.kind,
+            id: target.id.clone(),
+            peer_id: None,
+        },
+        revision: reviewed.revision.clone(),
+        path: "preview.jpg".into(),
+        source: false,
+    };
+    assert!(
+        super::versions::preview(&b.state, &local_query)
+            .await
+            .is_ok()
+    );
+    let source_query = super::versions::PreviewQuery {
+        source: true,
+        ..local_query
+    };
+    let before = a
+        .requests
+        .lock()
+        .unwrap()
+        .get("/api/peer/v1/content")
+        .copied()
+        .unwrap_or(0);
+    assert_eq!(
+        super::versions::preview(&b.state, &source_query)
+            .await
+            .unwrap_err()
+            .code(),
+        "preview_outside_transfer_hours"
+    );
+    assert_eq!(
+        a.requests
+            .lock()
+            .unwrap()
+            .get("/api/peer/v1/content")
+            .copied()
+            .unwrap_or(0),
+        before
+    );
+    assert_eq!(
+        super::versions::preview(&a.state, &query)
+            .await
+            .unwrap_err()
+            .code(),
+        "preview_outside_transfer_hours"
+    );
+    let evidence_query = reqwest::Url::parse_with_params(
+        "http://ism.example",
+        [("kind", "conflict"), ("id", target.id.as_str())],
+    )
+    .unwrap();
+    let _: ism_core::dto::RecoveryVersions = super::net::get_json(
+        &a.state,
+        &receiver,
+        &format!(
+            "/api/peer/v1/recovery/versions?{}",
+            evidence_query.query().unwrap()
+        ),
+    )
+    .await
+    .unwrap();
+    let share = super::shares(&b.state).await.unwrap().remove(0);
+    let source = super::net::peers(&b.state).await.unwrap().remove(0);
+    let override_view = admin::create_override(
+        &b.state,
+        ism_core::dto::OverrideInput {
+            share_id: Some(share.id),
+            peer_id: Some(source.id),
+            minutes: 1,
+            reason: "test".into(),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(super::versions::preview(&a.state, &query).await.is_ok());
+    admin::revoke_override(&b.state, &override_view.id)
+        .await
+        .unwrap();
+    admin::set_schedule(
+        &b.state,
+        ism_core::dto::ScheduleView {
+            timezone: "UTC".into(),
+            windows: vec![],
+        },
+    )
+    .await
+    .unwrap();
+    admin::set_schedule(&a.state, restricted()).await.unwrap();
+    assert_eq!(
+        super::versions::preview(&a.state, &query)
+            .await
+            .unwrap_err()
+            .code(),
+        "preview_outside_transfer_hours"
+    );
+    admin::set_schedule(
+        &a.state,
+        ism_core::dto::ScheduleView {
+            timezone: "UTC".into(),
+            windows: vec![],
+        },
+    )
+    .await
+    .unwrap();
     query.target.peer_id = None;
     query.path = "../outside.jpg".into();
     assert_eq!(
@@ -1344,7 +1889,7 @@ async fn recovery_previews_are_owner_scoped_current_and_independent_of_immich_in
         std::fs::read(b.shared.join("preview.jpg")).unwrap(),
         b"changed after review"
     );
-    super::versions::expire(&b.state, &target.id);
+    super::versions::expire(&b.state, &target.id).await;
     assert_eq!(
         super::versions::preview(&b.state, &query)
             .await
@@ -1448,6 +1993,68 @@ async fn recovery_outgoing_fix_is_persisted_offline_and_replayed_after_restart()
 }
 
 #[tokio::test]
+async fn conflict_page_paginates_local_and_peer_targets_without_a_cap() {
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    let share = super::shares(&a.state).await.unwrap().remove(0);
+    let peer = super::net::peers(&a.state).await.unwrap().remove(0);
+    let side = serde_json::to_string(&ConflictSide {
+        instance: "Example".into(),
+        sha256: None,
+        size: None,
+        deleted: false,
+        modified_at: None,
+    })
+    .unwrap();
+    sqlx::query(
+        "WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n<501)
+         INSERT INTO conflicts(id,share_id,rel_path,kind,detail,local_json,remote_json,remote_vv_json,peer_id,status,created_at)
+         SELECT 'page-' || n,?, 'photo-' || n || '.jpg','changed_on_both','',?,?,'{}',?,'open','2026-01-01T00:00:00Z' FROM seq",
+    )
+    .bind(&share.id)
+    .bind(&side)
+    .bind(&side)
+    .bind(&peer.id)
+    .execute(&a.state.db)
+    .await
+    .unwrap();
+    let view = serde_json::json!({
+        "target": { "kind": "conflict", "id": "page-1", "peer_id": null },
+        "title": "peer-photo.jpg", "state": "needs_decision", "code": "choose_version",
+        "detail": null, "can_fix": false, "can_dismiss": false, "replacement_operation_id": null
+    });
+    sqlx::query(
+        "INSERT INTO outgoing_recovery(peer_id,kind,target_id,view_json) VALUES (?, 'conflict', 'page-1', ?)",
+    )
+    .bind(&peer.id)
+    .bind(view.to_string())
+    .execute(&a.state.db)
+    .await
+    .unwrap();
+    let first = super::admin::page_conflicts(&a.state, false, 500, 0)
+        .await
+        .unwrap();
+    assert_eq!(first.total, 502);
+    assert_eq!(first.rows.len(), 500);
+    let second = super::admin::page_conflicts(&a.state, false, 500, 500)
+        .await
+        .unwrap();
+    assert_eq!(second.total, 502);
+    assert!(matches!(
+        second.rows.first(),
+        Some(ism_core::dto::ConflictPageRow::Local(_))
+    ));
+    match second.rows.last().unwrap() {
+        ism_core::dto::ConflictPageRow::Peer(item) => {
+            assert_eq!(item.target.id, "page-1");
+            assert_eq!(item.target.peer_id.as_deref(), Some(peer.id.as_str()));
+        }
+        _ => panic!("expected peer-owned conflict"),
+    }
+}
+
+#[tokio::test]
 async fn recovery_versions_are_current_owner_scoped_and_stale_decisions_do_not_execute() {
     use ism_core::dto::{
         RecoveryDecision, RecoveryDecisionInput, RecoveryKind, RecoveryState, RecoveryTarget,
@@ -1511,6 +2118,22 @@ async fn recovery_versions_are_current_owner_scoped_and_stale_decisions_do_not_e
     );
     let receiver = super::net::peers(&a.state).await.unwrap().remove(0);
     super::recovery::refresh(&a.state, &receiver).await.unwrap();
+    let page = super::admin::page_conflicts(&a.state, false, 1, 0)
+        .await
+        .unwrap();
+    assert_eq!(page.total, 1);
+    match &page.rows[0] {
+        ism_core::dto::ConflictPageRow::Peer(item) => {
+            assert_eq!(item.target.id, target.id);
+            assert_eq!(item.target.peer_id.as_deref(), Some(receiver.id.as_str()));
+        }
+        _ => panic!("expected peer-owned conflict"),
+    }
+    let after = super::admin::page_conflicts(&a.state, false, 1, 1)
+        .await
+        .unwrap();
+    assert_eq!(after.total, 1);
+    assert!(after.rows.is_empty());
     let forwarded = super::versions::get(
         &a.state,
         &RecoveryTarget {
@@ -1537,7 +2160,7 @@ async fn recovery_versions_are_current_owner_scoped_and_stale_decisions_do_not_e
     .await
     .unwrap();
     assert_eq!(result.items[0].state, RecoveryState::Queued);
-    super::versions::expire(&b.state, &target.id);
+    super::versions::expire(&b.state, &target.id).await;
     super::recovery::tick(&b.state).await.unwrap();
     assert_eq!(
         super::recovery::get(&b.state, target.kind, &target.id)

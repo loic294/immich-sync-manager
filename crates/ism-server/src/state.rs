@@ -74,9 +74,10 @@ pub struct Inner {
     pub shared_settings: std::sync::RwLock<Arc<crate::settings::Snapshot>>,
     /// Serializes read-modify-write of the shared file settings.
     pub shared_settings_lock: Mutex<()>,
-    /// Recently reviewed version evidence, kept in memory so comparing never waits on writers.
-    pub version_snapshots:
-        std::sync::Mutex<HashMap<(String, String), crate::peers::versions::Snapshot>>,
+    /// Wakes the bounded conflict evidence workers.
+    pub version_wake: Notify,
+    pub version_event_wake: Notify,
+    pub version_scan_limit: Arc<tokio::sync::Semaphore>,
     request_locks: Mutex<HashMap<String, Weak<Mutex<()>>>>,
 }
 
@@ -133,7 +134,9 @@ impl AppState {
                 shared_settings,
             ))),
             shared_settings_lock: Mutex::new(()),
-            version_snapshots: std::sync::Mutex::new(HashMap::new()),
+            version_wake: Notify::new(),
+            version_event_wake: Notify::new(),
+            version_scan_limit: Arc::new(tokio::sync::Semaphore::new(2)),
             request_locks: Mutex::new(HashMap::new()),
         })))
     }
@@ -168,6 +171,9 @@ impl AppState {
     }
 
     pub fn emit(&self, event: ServerEvent) {
+        if matches!(event, ServerEvent::ConflictsChanged) {
+            self.version_wake.notify_waiters();
+        }
         if matches!(
             event,
             ServerEvent::SyncChanged | ServerEvent::ConflictsChanged

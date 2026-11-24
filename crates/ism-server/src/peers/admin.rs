@@ -4,9 +4,10 @@ use axum::http::HeaderMap;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ism_core::dto::{
-    ConflictResolution, ConflictSide, ConflictView, CreateUpload, Location, OperationAction,
-    OperationRequest, OverrideInput, OverrideView, PeerAcceptInput, PeerInvite, PeerView,
-    ScheduleView, ShareInput, ShareView, SyncStatus, TransferView,
+    ConflictPage, ConflictPageRow, ConflictResolution, ConflictSide, ConflictView, CreateUpload,
+    Location, OperationAction, OperationRequest, OverrideInput, OverrideView, PeerAcceptInput,
+    PeerInvite, PeerView, RecoveryKind, ScheduleView, ShareInput, ShareView, SyncStatus,
+    TransferView,
 };
 use ism_core::schedule::Schedule;
 use ism_core::version::VersionVector;
@@ -1227,6 +1228,15 @@ pub async fn list_conflicts(
     state: &AppState,
     include_resolved: bool,
 ) -> AppResult<Vec<ConflictView>> {
+    local_conflicts_page(state, include_resolved, 500, 0).await
+}
+
+async fn local_conflicts_page(
+    state: &AppState,
+    include_resolved: bool,
+    limit: i64,
+    offset: i64,
+) -> AppResult<Vec<ConflictView>> {
     type R = (
         String,
         String,
@@ -1242,13 +1252,16 @@ pub async fn list_conflicts(
     );
     let rows: Vec<R> = sqlx::query_as(
         "SELECT id, share_id, rel_path, kind, detail, local_json, remote_json, peer_id, status, created_at, remote_from FROM conflicts
-         WHERE status != 'resolved' OR ? ORDER BY created_at DESC LIMIT 500",
+         WHERE status != 'resolved' OR ? ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
     )
     .bind(include_resolved)
+    .bind(limit)
+    .bind(offset)
     .fetch_all(&state.db)
     .await?;
     let shares = super::shares(state).await?;
-    rows.into_iter()
+    let rows = rows
+        .into_iter()
         .map(
             |(
                 id,
@@ -1279,10 +1292,42 @@ pub async fn list_conflicts(
                     status,
                     created_at,
                     moved_from: from.map(|f| super::display(share, &f)),
+                    recovery: None,
                 })
             },
         )
-        .collect()
+        .collect::<AppResult<Vec<_>>>()?;
+    Ok(rows)
+}
+
+pub async fn page_conflicts(
+    state: &AppState,
+    include_resolved: bool,
+    limit: i64,
+    offset: i64,
+) -> AppResult<ConflictPage> {
+    let local_total: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM conflicts WHERE status != 'resolved' OR ?")
+            .bind(include_resolved)
+            .fetch_one(&state.db)
+            .await?;
+    let mut local = local_conflicts_page(state, include_resolved, limit, offset).await?;
+    for row in &mut local {
+        row.recovery = super::recovery::get(state, RecoveryKind::Conflict, &row.id).await?;
+    }
+    let remaining = limit.saturating_sub(i64::try_from(local.len()).map_err(AppError::internal)?);
+    let peer =
+        super::recovery::peer_conflicts_page(state, remaining, offset.saturating_sub(local_total))
+            .await?;
+    let rows = local
+        .into_iter()
+        .map(|row| ConflictPageRow::Local(Box::new(row)))
+        .chain(peer.rows.into_iter().map(ConflictPageRow::Peer))
+        .collect();
+    Ok(ConflictPage {
+        rows,
+        total: local_total + peer.total,
+    })
 }
 
 async fn mark_resolved(state: &AppState, id: &str, resolution: &str) -> AppResult<()> {

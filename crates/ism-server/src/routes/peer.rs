@@ -55,7 +55,7 @@ async fn recovery_versions(
         },
     )
     .await?;
-    Ok(Json(peers::versions::get(&state, &target).await?))
+    Ok(Json(peers::versions::get_bounded(&state, &target).await?))
 }
 
 async fn recovery_preview(
@@ -73,7 +73,8 @@ async fn recovery_preview(
         },
     )
     .await?;
-    peers::versions::preview(&state, &query).await
+    peers::versions::authorize_peer_preview(&state, &query, &peer.id).await?;
+    peers::versions::peer_preview(&state, &query, &peer.id).await
 }
 
 async fn recovery_decisions(

@@ -433,6 +433,46 @@ pub async fn page(state: &AppState, limit: i64, offset: i64) -> AppResult<Recove
     Ok(RecoveryPage { total, rows: items })
 }
 
+pub(super) async fn peer_conflicts_page(
+    state: &AppState,
+    limit: i64,
+    offset: i64,
+) -> AppResult<RecoveryPage> {
+    type OutgoingRow = (String, String, String, Option<String>, Option<String>, bool);
+    let mut tx = state.db.begin().await?;
+    let total: i64 = sqlx::query_scalar(
+        "SELECT (SELECT COUNT(*) FROM outgoing_recovery_requests WHERE kind='conflict') +
+         (SELECT COUNT(*) FROM outgoing_recovery r WHERE r.kind='conflict'
+          AND NOT EXISTS(SELECT 1 FROM outgoing_recovery_requests q
+              WHERE q.peer_id=r.peer_id AND q.kind=r.kind AND q.target_id=r.target_id))",
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+    let rows: Vec<OutgoingRow> = sqlx::query_as(
+        "SELECT q.peer_id,q.target_id,q.view_json,s.error,q.updated_at,q.state!='accepted' AS pending
+         FROM outgoing_recovery_requests q LEFT JOIN peer_recovery_state s ON s.peer_id=q.peer_id
+         WHERE q.kind='conflict'
+         UNION ALL SELECT r.peer_id,r.target_id,r.view_json,s.error,s.updated_at,0 FROM outgoing_recovery r
+         LEFT JOIN peer_recovery_state s ON s.peer_id=r.peer_id
+         WHERE r.kind='conflict' AND NOT EXISTS(SELECT 1 FROM outgoing_recovery_requests q
+             WHERE q.peer_id=r.peer_id AND q.kind=r.kind AND q.target_id=r.target_id)
+         ORDER BY 1,2 LIMIT ? OFFSET ?",
+    )
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    let rows = rows
+        .into_iter()
+        .map(|(peer, _, json, error, updated, pending)| {
+            let fresh = state.peer_streams.fresh(&peer);
+            outgoing_view(peer, &json, error, updated, pending, fresh)
+        })
+        .collect::<AppResult<Vec<_>>>()?;
+    Ok(RecoveryPage { rows, total })
+}
+
 async fn exists(state: &AppState, target: &RecoveryTarget) -> AppResult<bool> {
     let sql = match target.kind {
         RecoveryKind::Operation => "SELECT EXISTS(SELECT 1 FROM operations WHERE id = ?)",
@@ -1039,32 +1079,40 @@ async fn path_after_event(
     event: Option<(&str, i64)>,
 ) -> AppResult<(String, Option<i64>)> {
     RelPath::parse(rel).map_err(|e| AppError::invalid_location(e.to_string()))?;
+    const LINEAGE_PAGE: usize = 128;
     let mut tx = state.db.begin().await?;
-    let events: Vec<(i64, String, String)> = sqlx::query_as(
-        "SELECT seq,kind,data_json FROM event_log
-         WHERE share_name = ? AND kind IN ('file_changed','file_moved','folder_created','folder_moved','folder_pruned') ORDER BY seq",
+    let watermark: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(seq),0) FROM event_log")
+        .fetch_one(&mut *tx)
+        .await?;
+    let invalid: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM event_log WHERE share_name=?
+         AND kind IN ('file_changed','file_moved','folder_created','folder_moved','folder_pruned')
+         AND CASE WHEN json_valid(data_json) THEN
+             json_type(data_json) IS NOT 'object'
+             OR json_type(data_json,'$.path') IS NOT 'text'
+             OR (json_type(data_json,'$.from') IS NOT NULL
+                 AND json_type(data_json,'$.from') NOT IN ('text','null'))
+             OR (json_type(data_json,'$.vv') IS NOT NULL
+                 AND json_type(data_json,'$.vv') IS NOT 'object')
+             ELSE 1 END
+         AND seq<=?)",
     )
     .bind(&share.name)
-    .fetch_all(&mut *tx)
+    .bind(watermark)
+    .fetch_one(&mut *tx)
     .await?;
-    let pending: Vec<String> = sqlx::query_scalar(
-        "SELECT event_json FROM peer_inbox
-         WHERE share_name = ? AND status != 'done' AND json_extract(event_json, '$.kind') = ?",
-    )
-    .bind(&share.name)
-    .bind(super::FOLDER_PRUNED)
-    .fetch_all(&mut *tx)
-    .await?;
-    let pending: Vec<super::PeerEvent> = pending
-        .into_iter()
-        .map(|raw| serde_json::from_str(&raw))
-        .collect::<Result<_, _>>()?;
+    if invalid {
+        return Err(AppError::conflict(
+            "recovery_evidence_missing",
+            "the share contains an invalid committed event",
+        ));
+    }
     let mut path = rel.to_owned();
     let mut lineage = version.clone();
     let mut anchor = None;
     if let Some((origin, seq)) = event {
-        anchor=sqlx::query_scalar("SELECT seq FROM event_log WHERE share_name=? AND origin=? AND origin_seq=? AND json_extract(data_json,'$.path')=?")
-            .bind(&share.name).bind(origin).bind(seq).bind(rel).fetch_optional(&mut *tx).await?;
+        anchor=sqlx::query_scalar("SELECT seq FROM event_log WHERE share_name=? AND origin=? AND origin_seq=? AND json_extract(data_json,'$.path')=? AND seq<=?")
+            .bind(&share.name).bind(origin).bind(seq).bind(rel).bind(watermark).fetch_optional(&mut *tx).await?;
         if anchor.is_none() {
             return Err(AppError::conflict(
                 "recovery_evidence_missing",
@@ -1072,38 +1120,81 @@ async fn path_after_event(
             ));
         }
     }
-    for (seq, kind, data) in &events {
-        if matches!(kind.as_str(), "file_changed" | "file_moved")
-            && event.is_none()
-            && *version != VersionVector::default()
-        {
-            let event: super::EventData = serde_json::from_str(data)?;
-            if event.path == rel && event.vv == *version {
-                anchor = Some(*seq);
+    if event.is_none() && *version != VersionVector::default() {
+        let mut before = watermark;
+        loop {
+            let candidates: Vec<(i64, String)> = sqlx::query_as(
+                "SELECT seq,data_json FROM event_log WHERE share_name=?
+                 AND kind IN ('file_changed','file_moved') AND json_valid(data_json)
+                 AND json_extract(data_json,'$.path')=? AND seq<=?
+                 ORDER BY seq DESC LIMIT ?",
+            )
+            .bind(&share.name)
+            .bind(rel)
+            .bind(before)
+            .bind(LINEAGE_PAGE as i64)
+            .fetch_all(&mut *tx)
+            .await?;
+            for (seq, data) in &candidates {
+                let candidate: super::EventData = serde_json::from_str(data)?;
+                if candidate.vv == *version {
+                    anchor = Some(*seq);
+                    break;
+                }
             }
+            if anchor.is_some() || candidates.len() < LINEAGE_PAGE {
+                break;
+            }
+            let Some((last, _)) = candidates.last() else {
+                break;
+            };
+            if *last == i64::MIN {
+                break;
+            }
+            before = last - 1;
+            tokio::task::yield_now().await;
         }
     }
-    tx.commit().await?;
-    let check_pending = |path: &str| -> AppResult<()> {
-        if pending
-            .iter()
-            .any(|event| super::inbox::overlaps(path, &event.data.path))
-        {
-            return Err(AppError::conflict(
-                "recovery_evidence_incomplete",
-                "folder prune prevents verifying this recovery lineage",
-            ));
-        }
-        Ok(())
-    };
-    check_pending(&path)?;
+    reject_pending_prunes(&mut tx, &share.name, &path).await?;
     let mut last_move_seq = anchor;
-    for (seq, kind, data) in events {
-        if matches!(kind.as_str(), "file_changed" | "folder_created")
-            || anchor.is_some_and(|anchor| seq <= anchor)
-        {
-            continue;
+    let mut after = anchor.unwrap_or(0);
+    let mut examined: usize = 0;
+    loop {
+        let mut ancestors = vec![path.clone()];
+        ancestors.extend(
+            path.match_indices('/')
+                .map(|(index, _)| path[..index].to_owned()),
+        );
+        let next: Option<(i64, String, String)> = sqlx::query_as(
+            "SELECT seq,kind,data_json FROM event_log
+             WHERE share_name=?1 AND kind IN ('file_moved','folder_moved') AND json_valid(data_json)
+               AND seq>?2 AND seq<=?6 AND kind='file_moved' AND json_extract(data_json,'$.from')=?3
+             UNION ALL
+             SELECT seq,kind,data_json FROM event_log
+             WHERE share_name=?1 AND kind IN ('file_moved','folder_moved') AND json_valid(data_json)
+               AND seq>?2 AND seq<=?6 AND ?5 AND kind='folder_moved' AND json_extract(data_json,'$.from')
+                   IN (SELECT value FROM json_each(?4))
+             UNION ALL
+             SELECT seq,kind,data_json FROM event_log
+             WHERE share_name=?1 AND kind='folder_pruned' AND seq>?2 AND seq<=?6
+             ORDER BY seq LIMIT 1",
+        )
+        .bind(&share.name)
+        .bind(after)
+        .bind(&path)
+        .bind(serde_json::to_string(&ancestors)?)
+        .bind(anchor.is_some())
+        .bind(watermark)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((seq, kind, data)) = next else {
+            break;
+        };
+        examined += 1;
+        if examined.is_multiple_of(LINEAGE_PAGE) {
+            tokio::task::yield_now().await;
         }
+        after = seq;
         let event: super::EventData = serde_json::from_str(&data)?;
         if kind == super::FOLDER_PRUNED {
             if super::inbox::overlaps(&path, &event.path) {
@@ -1137,12 +1228,51 @@ async fn path_after_event(
             };
             RelPath::parse(&candidate).map_err(|e| AppError::invalid_location(e.to_string()))?;
             path = candidate;
-            check_pending(&path)?;
+            reject_pending_prunes(&mut tx, &share.name, &path).await?;
             lineage.merge(&event.vv);
             last_move_seq = Some(seq);
         }
     }
+    tx.commit().await?;
     Ok((path, last_move_seq))
+}
+
+async fn reject_pending_prunes(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    share: &str,
+    path: &str,
+) -> AppResult<()> {
+    let mut cursor: Option<(String, i64)> = None;
+    loop {
+        let rows: Vec<(String, i64, String)> = sqlx::query_as(
+            "SELECT peer_id,seq,event_json FROM peer_inbox
+             WHERE share_name=? AND status != 'done' AND json_extract(event_json,'$.kind')=?
+               AND (? IS NULL OR peer_id>? OR (peer_id=? AND seq>?))
+             ORDER BY peer_id,seq LIMIT 128",
+        )
+        .bind(share)
+        .bind(super::FOLDER_PRUNED)
+        .bind(cursor.as_ref().map(|(peer, _)| peer))
+        .bind(cursor.as_ref().map(|(peer, _)| peer))
+        .bind(cursor.as_ref().map(|(peer, _)| peer))
+        .bind(cursor.as_ref().map(|(_, seq)| seq))
+        .fetch_all(&mut **tx)
+        .await?;
+        for (_, _, raw) in &rows {
+            let event: super::PeerEvent = serde_json::from_str(raw)?;
+            if super::inbox::overlaps(path, &event.data.path) {
+                return Err(AppError::conflict(
+                    "recovery_evidence_incomplete",
+                    "folder prune prevents verifying this recovery lineage",
+                ));
+            }
+        }
+        if rows.len() < 128 {
+            return Ok(());
+        }
+        cursor = rows.last().map(|(peer, seq, _)| (peer.clone(), *seq));
+        tokio::task::yield_now().await;
+    }
 }
 
 pub async fn evidence(
@@ -1172,15 +1302,40 @@ pub async fn evidence_at_event(
     root.ensure_available()?;
     let (path, last_move_seq) = path_after_event(state, &share, rel, version, event).await?;
     let abs = root.abs(&share.root_rel(&path)?)?;
+    let permit = state
+        .version_scan_limit
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(AppError::internal)?;
     match std::fs::symlink_metadata(&abs) {
         Ok(metadata) if metadata.is_dir() => {
-            let inventory = crate::ops::plan::folder_inventory(&abs)?;
-            if files::revision(&std::fs::symlink_metadata(&abs)?) != files::revision(&metadata) {
-                return Err(AppError::conflict(
-                    "revision_changed",
-                    "folder changed during verification",
-                ));
-            }
+            let folder = abs.clone();
+            let inventory = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                let inventory = crate::ops::plan::folder_inventory_bounded(&folder, 10_000)
+                    .map_err(|error| {
+                        if error.kind() == std::io::ErrorKind::InvalidData {
+                            AppError::conflict(
+                                "version_evidence_too_large",
+                                "folder exceeds the 10,000-entry version evidence limit",
+                            )
+                        } else {
+                            error.into()
+                        }
+                    })?;
+                if files::revision(&std::fs::symlink_metadata(&folder)?)
+                    != files::revision(&metadata)
+                {
+                    return Err(AppError::conflict(
+                        "revision_changed",
+                        "folder changed during verification",
+                    ));
+                }
+                Ok(inventory)
+            })
+            .await
+            .map_err(AppError::internal)??;
             return Ok(FileEvidence {
                 path,
                 sha256: None,
@@ -1197,10 +1352,12 @@ pub async fn evidence_at_event(
         Err(e) => return Err(e.into()),
     }
     let fingerprint_path = abs.clone();
-    let fingerprint =
-        tokio::task::spawn_blocking(move || files::replacement_fingerprint(&fingerprint_path))
-            .await
-            .map_err(AppError::internal)??;
+    let fingerprint = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        files::replacement_fingerprint(&fingerprint_path)
+    })
+    .await
+    .map_err(AppError::internal)??;
     let row = super::row(state, &share.id, &path).await?;
     if let Some((_, hash)) = &fingerprint
         && row
@@ -2297,6 +2454,9 @@ pub async fn tick(state: &AppState) -> AppResult<()> {
                 )
             }
         };
+        if kind == "conflict" && status == "needs_decision" {
+            super::versions::reprepare(state, &id).await?;
+        }
         sqlx::query(
             "UPDATE sync_recovery SET state=?,code=?,detail=?,updated_at=?,attempts=attempts+?
              WHERE id=? AND state='fixing'",
@@ -2772,6 +2932,36 @@ mod policy_tests {
                 .await
                 .is_err(),
             "an unresolved prune at the relocated destination blocks lineage"
+        );
+        sqlx::query("DELETE FROM peer_inbox WHERE peer_id = 'peer'")
+            .execute(&state.db)
+            .await
+            .unwrap();
+        let mut tx = state.db.begin().await.unwrap();
+        for seq in 1..=129 {
+            let mut item = pending.clone();
+            item.seq = seq;
+            item.origin_seq = seq;
+            item.data.path = if seq == 129 { "new" } else { "unrelated" }.into();
+            sqlx::query(
+                "INSERT INTO peer_inbox(peer_id,seq,origin,origin_seq,share_name,event_json)
+                 VALUES ('peer',?,?,?,?,?)",
+            )
+            .bind(seq)
+            .bind(&item.origin)
+            .bind(item.origin_seq)
+            .bind(&item.share)
+            .bind(serde_json::to_string(&item).unwrap())
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        }
+        tx.commit().await.unwrap();
+        assert!(
+            current_path(&state, &share, "old/photo.jpg", &version)
+                .await
+                .is_err(),
+            "an overlapping prune beyond the first page must block lineage"
         );
         sqlx::query("DELETE FROM peer_inbox WHERE peer_id = 'peer'")
             .execute(&state.db)
