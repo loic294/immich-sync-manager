@@ -932,8 +932,10 @@ async fn due_scans_wait_for_the_write_barrier() {
             .any(|a| a.phase == "Waiting for the Immich maintenance barrier")
     );
     assert!(activity.current.iter().any(|a| {
-        a.phase
-            .contains("managed operations hold the write barrier")
+        a.task_key == "maintenance:s1"
+            && a.status == ism_core::dto::BackgroundStatus::Waiting
+            && a.phase
+                .contains("Library scans are paused for file operations")
     }));
     assert!(
         server.received_requests().await.unwrap().is_empty(),

@@ -38,6 +38,7 @@ pub(crate) struct QueueGroup {
     pub backoff_count: u64,
     pub unclassified_backoff: u64,
     pub next_retry: Option<String>,
+    pub recheck_at: Option<String>,
     pub schedule: ScheduleState,
 }
 
@@ -84,6 +85,13 @@ struct FailedRow {
     count: i64,
 }
 
+#[derive(FromRow)]
+struct Override {
+    share_id: Option<String>,
+    peer_id: Option<String>,
+    until: String,
+}
+
 async fn root_available(
     state: &AppState,
     root_id: String,
@@ -128,6 +136,23 @@ async fn root_available(
     }
 }
 
+pub(crate) async fn root_availability(
+    state: &AppState,
+    roots: HashMap<String, Option<String>>,
+) -> HashMap<String, Option<bool>> {
+    let deadline = tokio::time::Instant::now() + ROOT_PROBE_TIMEOUT;
+    stream::iter(roots.into_iter().map(|(root_id, path)| async move {
+        let available = match path {
+            Some(path) => root_available(state, root_id.clone(), path, deadline).await,
+            None => Some(false),
+        };
+        (root_id, available)
+    }))
+    .buffer_unordered(ROOT_PROBE_LIMIT)
+    .collect()
+    .await
+}
+
 pub(crate) async fn snapshot(state: &AppState) -> AppResult<Snapshot> {
     let now = chrono::Utc::now();
     let now_string = db::ts(now);
@@ -136,23 +161,25 @@ pub(crate) async fn snapshot(state: &AppState) -> AppResult<Snapshot> {
         .bind(crate::peers::admin::SCHEDULE_KEY)
         .fetch_optional(&mut *tx)
         .await?;
-    let schedule = match crate::peers::admin::parse_schedule(raw) {
+    let (schedule, schedule_transition) = match crate::peers::admin::parse_schedule(raw) {
         Ok(view) => {
             let schedule =
                 Schedule::new(&view.timezone, &view.windows).map_err(AppError::internal)?;
-            if schedule.is_allowed(now) {
+            let transition = schedule.next_transition(now).map(db::ts);
+            let status = if schedule.is_allowed(now) {
                 ScheduleState::Allowed
             } else {
                 ScheduleState::Closed {
-                    next_at: schedule.next_allowed(now).map(db::ts),
+                    next_at: transition.clone(),
                 }
-            }
+            };
+            (status, transition)
         }
-        Err(error) if error.code() == "invalid_schedule" => ScheduleState::Invalid,
+        Err(error) if error.code() == "invalid_schedule" => (ScheduleState::Invalid, None),
         Err(error) => return Err(error),
     };
-    let overrides: Vec<(Option<String>, Option<String>)> = sqlx::query_as(
-        "SELECT share_id,peer_id FROM overrides WHERE revoked_at IS NULL AND until > ?",
+    let overrides: Vec<Override> = sqlx::query_as(
+        "SELECT share_id,peer_id,until FROM overrides WHERE revoked_at IS NULL AND until > ?",
     )
     .bind(&now_string)
     .fetch_all(&mut *tx)
@@ -209,29 +236,31 @@ pub(crate) async fn snapshot(state: &AppState) -> AppResult<Snapshot> {
         .iter()
         .map(|row| (row.root_id.clone(), row.root_path.clone()))
         .collect();
-    let deadline = tokio::time::Instant::now() + ROOT_PROBE_TIMEOUT;
-    let roots: HashMap<String, Option<bool>> =
-        stream::iter(roots.into_iter().map(|(root_id, path)| async move {
-            let available = match path {
-                Some(path) => root_available(state, root_id.clone(), path, deadline).await,
-                None => Some(false),
-            };
-            (root_id, available)
-        }))
-        .buffer_unordered(ROOT_PROBE_LIMIT)
-        .collect()
-        .await;
+    let roots = root_availability(state, roots).await;
     let queued = rows
         .into_iter()
         .map(|row| {
             let root_configured = row.root_path.is_some();
             let root_available = roots.get(&row.root_id).copied().flatten();
-            let override_active = overrides.iter().any(|(share, peer)| {
-                share
-                    .as_deref()
-                    .is_none_or(|id| id == row.share_id.as_str())
-                    && peer.as_deref().is_none_or(|id| id == row.peer_id.as_str())
-            });
+            let matching_overrides: Vec<_> = overrides
+                .iter()
+                .filter(|entry| {
+                    entry
+                        .share_id
+                        .as_deref()
+                        .is_none_or(|id| id == row.share_id.as_str())
+                        && entry
+                            .peer_id
+                            .as_deref()
+                            .is_none_or(|id| id == row.peer_id.as_str())
+                })
+                .collect();
+            let override_active = !matching_overrides.is_empty();
+            let recheck_at = matching_overrides
+                .iter()
+                .filter_map(|entry| db::parse_ts(&entry.until).map(db::ts))
+                .chain(schedule_transition.clone())
+                .min();
             QueueGroup {
                 peer_id: row.peer_id,
                 peer_name: row.peer_name,
@@ -248,6 +277,7 @@ pub(crate) async fn snapshot(state: &AppState) -> AppResult<Snapshot> {
                 backoff_count: row.backoff_count.max(0) as u64,
                 unclassified_backoff: row.unclassified_backoff.max(0) as u64,
                 next_retry: row.next_retry,
+                recheck_at,
                 schedule: if override_active {
                     ScheduleState::Allowed
                 } else {
