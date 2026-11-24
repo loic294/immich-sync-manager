@@ -10,6 +10,11 @@ or version decisions; related operation links open existing recovery details. In
 run records are diagnostic history, not permission to bypass a barrier or automatically retry a
 file operation.
 
+Recovery retries retain separate background activity outcomes, including repeated equivalent
+failures and changed errors. A later finished run moves earlier failures into history; persistence
+does not rewrite already-resolved failures. History still follows the normal retention limits.
+This reporting does not change recovery eligibility, retry delays, or durable attempt accounting.
+
 | Recovery state | Meaning |
 | --- | --- |
 | **Queued / Fixing** | Recovery is admitted or running, not yet complete. |
