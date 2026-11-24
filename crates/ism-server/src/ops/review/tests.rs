@@ -33,6 +33,69 @@ fn limit() -> Arc<Semaphore> {
 }
 
 #[tokio::test]
+async fn public_review_api_checks_mount_and_owner_before_serving_or_verifying() {
+    let (dir, pool, location, path) = setup().await;
+    std::fs::write(dir.path().join(files::SENTINEL), "photos").unwrap();
+    std::fs::write(path.join("a.jpg"), b"photo").unwrap();
+    let state = AppState::new(
+        crate::config::Config::for_tests(dir.path()),
+        pool,
+        crypto::SecretBox::open_or_create(dir.path()).unwrap(),
+    )
+    .await
+    .unwrap();
+    let owner = Principal::Admin {
+        username: "example".into(),
+    };
+    let manifest = capture(&state, &owner, &location).await.unwrap();
+    let first = page(
+        &state,
+        &owner,
+        &location,
+        &manifest.id,
+        &manifest.revision,
+        None,
+        1,
+    )
+    .await
+    .unwrap();
+    assert_eq!(first.entries.len(), 1);
+    assert_eq!(first.next_after.as_deref(), Some(""));
+    verify(&state, &owner, &location, &manifest.id, &manifest.revision)
+        .await
+        .unwrap();
+    let sender = Principal::Peer {
+        peer_id: "sender".into(),
+    };
+    assert!(capture(&state, &sender, &location).await.is_err());
+    assert!(
+        verify(&state, &sender, &location, &manifest.id, &manifest.revision)
+            .await
+            .is_err()
+    );
+    std::fs::remove_file(dir.path().join(files::SENTINEL)).unwrap();
+    assert!(
+        page(
+            &state,
+            &owner,
+            &location,
+            &manifest.id,
+            &manifest.revision,
+            first.next_after.as_deref(),
+            1,
+        )
+        .await
+        .is_err()
+    );
+    assert!(
+        verify(&state, &owner, &location, &manifest.id, &manifest.revision)
+            .await
+            .is_err()
+    );
+    state.db.close().await;
+}
+
+#[tokio::test]
 async fn large_tree_pages_survive_restart_and_stay_bound_to_one_revision() {
     let (dir, pool, location, path) = setup().await;
     std::fs::create_dir(path.join("empty")).unwrap();
@@ -308,6 +371,36 @@ fn streaming_traversal_rejects_concurrent_changes() {
         Ok(())
     });
     assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn expired_preparation_cannot_publish_or_be_used_as_evidence() {
+    let (_dir, pool, location, path) = setup().await;
+    sqlx::query(
+        "INSERT INTO folder_review_manifests(id,owner,root_id,path,state,expires_at)
+         VALUES ('expired',?,'photos','photos','building','2000-01-01')",
+    )
+    .bind(OWNER)
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert!(
+        build_entries(&pool, "expired", &location, path, limit())
+            .await
+            .is_err()
+    );
+    let state: (String, Option<String>) =
+        sqlx::query_as("SELECT state,revision FROM folder_review_manifests WHERE id='expired'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(state, ("building".into(), None));
+    assert!(
+        read_page(&pool, OWNER, &location, "expired", "", None, 500)
+            .await
+            .is_err()
+    );
+    pool.close().await;
 }
 
 #[cfg(unix)]
