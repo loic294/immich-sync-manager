@@ -503,6 +503,24 @@ async fn active_operation_without_a_registration_fails_scans_closed() {
     .await
     .unwrap();
     let id = accepted.operation_id;
+    sqlx::query("UPDATE operations SET status = 'running' WHERE id = ?")
+        .bind(&id)
+        .execute(&b.state.db)
+        .await
+        .unwrap();
+    let task_key = format!("share:{}", family.id);
+    let rows = crate::activity_blockers::get(&b.state).await.unwrap();
+    assert!(!rows.iter().any(|row| row.task_key == task_key));
+    b.state
+        .share_changes
+        .lock()
+        .unwrap()
+        .insert(family.id.clone(), std::time::Instant::now());
+    let rows = crate::activity_blockers::get(&b.state).await.unwrap();
+    let queued = rows.iter().find(|row| row.task_key == task_key).unwrap();
+    assert_eq!(queued.phase, "Share inventory rescan is queued");
+    b.state.share_changes.lock().unwrap().remove(&family.id);
+
     // Either active phase left behind by a restart has no registration in this process.
     for status in ["waiting_maintenance", "running"] {
         sqlx::query("UPDATE operations SET status = ? WHERE id = ?")
