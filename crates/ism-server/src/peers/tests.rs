@@ -3960,6 +3960,126 @@ async fn conflict_resolutions_skip_or_apply_the_peer_side() {
     assert_eq!(trash_count(&b), trashed + 1);
 }
 
+/// A local edit landing between a peer publication's file write and its replica bookkeeping
+/// must stay a local change: absorbing it under the peer's version would let a later peer move
+/// or edit overwrite it without a conflict.
+#[tokio::test]
+async fn local_edit_during_publication_bookkeeping_stays_a_local_change() {
+    let (a, b) = pair().await;
+    a.tasks[2].abort();
+    b.tasks[2].abort();
+    let share = super::shares(&b.state).await.unwrap().remove(0);
+    let peer = super::net::peers(&b.state).await.unwrap().remove(0);
+    let (reached_tx, mut reached) = tokio::sync::oneshot::channel();
+    let (resume, resume_rx) = tokio::sync::oneshot::channel();
+    super::PUBLICATION_PAUSES.lock().unwrap().push((
+        share.id.clone(),
+        super::PublicationPause {
+            reached: reached_tx,
+            resume: resume_rx,
+        },
+    ));
+    write_old(&a.shared.join("src.jpg"), b"original");
+    scan(&a).await;
+    super::pull(&b.state, &peer).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            tokio::select! {
+                result = &mut reached => break result.unwrap(),
+                () = tokio::time::sleep(Duration::from_millis(50)) => {
+                    b.state.sync_wake.notify_waiters();
+                    b.state.ops_wake.notify_waiters();
+                }
+            }
+        }
+    })
+    .await
+    .expect("the publication reaches its bookkeeping");
+    assert_eq!(
+        std::fs::read(b.shared.join("src.jpg")).unwrap(),
+        b"original"
+    );
+    write_old(&b.shared.join("src.jpg"), b"edited here");
+    resume.send(()).unwrap();
+    let mut status = String::new();
+    for _ in 0..400 {
+        status = sqlx::query_scalar("SELECT status FROM operations")
+            .fetch_one(&b.state.db)
+            .await
+            .unwrap();
+        if !matches!(status.as_str(), "queued" | "running") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(status, "completed", "the publication bookkeeping completes");
+    let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pending_peer_ops")
+        .fetch_one(&b.state.db)
+        .await
+        .unwrap();
+    assert_eq!(pending, 0);
+    let published = super::row(&b.state, &share.id, "src.jpg")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        published.sha256.as_deref(),
+        Some(crate::crypto::sha256_hex(b"original").as_str()),
+        "bookkeeping records the published bytes, not the later local edit"
+    );
+    // The publication's inbox event awaits content verification, which registers the disk.
+    super::pull(&b.state, &peer).await.unwrap();
+    scan(&b).await;
+    let local = super::row(&b.state, &share.id, "src.jpg")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        local.sha256.as_deref(),
+        Some(crate::crypto::sha256_hex(b"edited here").as_str())
+    );
+    assert_eq!(
+        local.vv.compare(&published.vv),
+        ism_core::version::Causality::Dominates
+    );
+    let announced: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM event_log WHERE origin = ? AND kind = 'file_changed' AND data_json LIKE '%src.jpg%'",
+    )
+    .bind(&b.state.instance_id)
+    .fetch_one(&b.state.db)
+    .await
+    .unwrap();
+    assert_eq!(announced, 1);
+
+    run_op(
+        &a,
+        "move-src",
+        vec![OperationAction::Move {
+            source: loc("shared/src.jpg"),
+            target: loc("shared/moved/src.jpg"),
+            expected_revision: None,
+        }],
+    )
+    .await;
+    let peer = super::net::peer(&b.state, &peer.id).await.unwrap();
+    // The move is the only pending effect, so the pull reports that it waits on the conflict.
+    if let Err(error) = super::pull(&b.state, &peer).await {
+        assert_eq!(error, "peer effect waits for conflict resolution");
+    }
+    assert!(
+        admin::list_conflicts(&b.state, false)
+            .await
+            .unwrap()
+            .iter()
+            .any(|c| c.kind == "move"),
+        "the peer move conflicts with the local edit"
+    );
+    assert_eq!(
+        std::fs::read(b.shared.join("src.jpg")).unwrap(),
+        b"edited here"
+    );
+}
+
 #[tokio::test]
 async fn keep_local_resolution_and_event_are_atomic() {
     let (mut a, mut b) = pair().await;
@@ -4387,6 +4507,142 @@ async fn recheck_finishes_only_verified_interrupted_peer_publication() {
         .unwrap();
     let expected_hash = crate::crypto::sha256_hex(b"remote photo");
     assert_eq!(row.sha256.as_deref(), Some(expected_hash.as_str()));
+}
+
+/// Publication bookkeeping records only the bytes of the upload its own operation published.
+/// If that upload can no longer be tied to the operation it fails closed, keeping the pending
+/// bookkeeping, and the recheck retry completes it once the tie is restored.
+#[tokio::test]
+async fn publication_bookkeeping_fails_closed_without_its_exact_upload() {
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    write_old(&a.shared.join("photo.jpg"), b"remote photo");
+    scan(&a).await;
+    let share = super::shares(&b.state).await.unwrap().remove(0);
+    let peer = super::net::peers(&b.state).await.unwrap().remove(0);
+    super::pull(&b.state, &peer).await.unwrap();
+    b.tasks
+        .push(tokio::spawn(super::transfer::run(b.state.clone())));
+    let operation_id = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let operation_id: Option<String> =
+                sqlx::query_scalar("SELECT operation_id FROM pending_peer_ops LIMIT 1")
+                    .fetch_optional(&b.state.db)
+                    .await
+                    .unwrap();
+            if let Some(operation_id) = operation_id {
+                break operation_id;
+            }
+            b.state.sync_wake.notify_waiters();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the download must reach publication");
+    b.tasks.pop().unwrap().abort();
+
+    let (reached_tx, reached) = tokio::sync::oneshot::channel();
+    let (resume, resume_rx) = tokio::sync::oneshot::channel();
+    super::PUBLICATION_PAUSES.lock().unwrap().push((
+        share.id.clone(),
+        super::PublicationPause {
+            reached: reached_tx,
+            resume: resume_rx,
+        },
+    ));
+    let running_state = b.state.clone();
+    let running_id = operation_id.clone();
+    let running =
+        tokio::spawn(
+            async move { crate::ops::exec::run_operation(&running_state, &running_id).await },
+        );
+    tokio::time::timeout(Duration::from_secs(15), reached)
+        .await
+        .expect("the publication reaches its bookkeeping")
+        .unwrap();
+    sqlx::query("UPDATE uploads SET operation_id = 'foreign-operation' WHERE operation_id = ?")
+        .bind(&operation_id)
+        .execute(&b.state.db)
+        .await
+        .unwrap();
+    resume.send(()).unwrap();
+    running.await.unwrap().unwrap();
+
+    let operation = crate::ops::load(&b.state, &operation_id).await.unwrap().0;
+    assert_eq!(
+        operation.status,
+        ism_core::dto::OperationStatus::RecoveryRequired
+    );
+    assert_eq!(
+        operation.items[0].error.as_ref().unwrap().code,
+        "peer_bookkeeping_failed"
+    );
+    assert_eq!(
+        std::fs::read(b.shared.join("photo.jpg")).unwrap(),
+        b"remote photo"
+    );
+    assert!(
+        super::row(&b.state, &share.id, "photo.jpg")
+            .await
+            .unwrap()
+            .is_none_or(|row| row.sha256.is_none()),
+        "no version is recorded without the exact upload"
+    );
+    let pending = || async {
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM pending_peer_ops WHERE operation_id = ?")
+            .bind(&operation_id)
+            .fetch_one(&b.state.db)
+            .await
+            .unwrap()
+    };
+    assert_eq!(pending().await, 1);
+
+    sqlx::query("UPDATE uploads SET operation_id = ? WHERE operation_id = 'foreign-operation'")
+        .bind(&operation_id)
+        .execute(&b.state.db)
+        .await
+        .unwrap();
+    let progress_json: String = sqlx::query_scalar(
+        "SELECT progress_json FROM operation_items WHERE operation_id = ? AND idx = 0",
+    )
+    .bind(&operation_id)
+    .fetch_one(&b.state.db)
+    .await
+    .unwrap();
+    let mut progress: serde_json::Value = serde_json::from_str(&progress_json).unwrap();
+    progress["steps"]
+        .as_array_mut()
+        .unwrap()
+        .last_mut()
+        .unwrap()["status"] = "running".into();
+    sqlx::query(
+        "UPDATE operation_items
+         SET error_code = NULL, error_message = NULL, progress_json = ?
+         WHERE operation_id = ? AND idx = 0",
+    )
+    .bind(progress.to_string())
+    .bind(&operation_id)
+    .execute(&b.state.db)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE operations SET recovery_resolved = 1 WHERE id = ?")
+        .bind(&operation_id)
+        .execute(&b.state.db)
+        .await
+        .unwrap();
+    super::transfer::recheck_publish_recovery(&b.state, &operation_id)
+        .await
+        .unwrap();
+    assert_eq!(pending().await, 0);
+    let row = super::row(&b.state, &share.id, "photo.jpg")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        row.sha256.as_deref(),
+        Some(crate::crypto::sha256_hex(b"remote photo").as_str())
+    );
 }
 
 #[tokio::test]
@@ -5178,6 +5434,248 @@ async fn unsupported_peer_events_are_not_silently_acknowledged() {
         super::net::peer(&b.state, &peer.id).await.unwrap().cursor,
         peer.cursor
     );
+}
+
+#[tokio::test]
+async fn received_folder_prunes_are_retained_without_stalling_unrelated_events() {
+    let (a, mut b) = pair().await;
+    stop_workers(&mut b).await;
+    for task in a.tasks.iter().skip(1) {
+        task.abort();
+    }
+    // Gamma is paired only with Beta: a transitive peer that still has both folders.
+    let mut c = instance("Gamma").await;
+    stop_workers(&mut c).await;
+    let invite = admin::create_invite(&b.state).await.unwrap();
+    admin::accept(
+        &c.state,
+        PeerAcceptInput {
+            name: String::new(),
+            url: b.url.clone(),
+            invite: invite.invite,
+            callback_url: c.url.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    let b_share = super::shares(&b.state).await.unwrap().remove(0);
+    let shared = |peer_ids: Vec<String>| ShareInput {
+        name: "Family".into(),
+        location: loc("shared"),
+        peer_ids,
+        enabled: true,
+    };
+    let b_peers = admin::list_peers(&b.state)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|peer| peer.id)
+        .collect();
+    admin::update_share(&b.state, &b_share.id, shared(b_peers))
+        .await
+        .unwrap();
+    let c_peer = admin::list_peers(&c.state).await.unwrap().remove(0);
+    admin::create_share(&c.state, shared(vec![c_peer.id.clone()]))
+        .await
+        .unwrap();
+    for dir in ["gone", "kept"] {
+        std::fs::create_dir(c.shared.join(dir)).unwrap();
+    }
+    std::fs::create_dir(b.shared.join("kept")).unwrap();
+
+    let share = super::shares(&a.state).await.unwrap().remove(0);
+    for (kind, path) in [
+        (super::FOLDER_PRUNED, "gone"),
+        (super::FOLDER_PRUNED, "kept"),
+        ("folder_created", "later"),
+        ("folder_created", "gone/inner"),
+    ] {
+        super::append_local(
+            &a.state,
+            &share.name,
+            kind,
+            &super::EventData {
+                path: path.into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    }
+    let last: i64 = sqlx::query_scalar("SELECT MAX(seq) FROM event_log")
+        .fetch_one(&a.state.db)
+        .await
+        .unwrap();
+    let peer = super::net::peers(&b.state)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|peer| peer.name == "Alpha")
+        .unwrap();
+    let inbox = |state: AppState| async move {
+        sqlx::query_as::<_, (String, String, String, Option<String>)>(
+            "SELECT json_extract(event_json, '$.kind'), json_extract(event_json, '$.data.path'),
+                 status, error FROM peer_inbox WHERE status != 'done' ORDER BY seq",
+        )
+        .fetch_all(&state.db)
+        .await
+        .unwrap()
+    };
+    let count = |state: AppState, sql: &'static str| async move {
+        sqlx::query_scalar::<_, i64>(sql)
+            .fetch_one(&state.db)
+            .await
+            .unwrap()
+    };
+
+    // Two pulls: the second replays the retained receipts without duplicating or deleting.
+    // Unrelated work is queued rather than applied inline, so each pull also reports the
+    // retained, actionable error.
+    for _ in 0..2 {
+        let error = super::pull(&b.state, &peer).await.unwrap_err();
+        assert!(error.contains("future ISM update"));
+        assert!(b.shared.join("kept").is_dir());
+        let rows = inbox(b.state.clone()).await;
+        assert_eq!(
+            rows.iter()
+                .map(|r| (r.0.as_str(), r.1.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("folder_pruned", "gone"),
+                ("folder_pruned", "kept"),
+                ("folder_created", "later"),
+                ("folder_created", "gone/inner"),
+            ]
+        );
+        assert!(rows[0].3.as_deref().unwrap().contains("future ISM update"));
+        assert!(rows[1].3.as_deref().unwrap().contains("future ISM update"));
+        assert_eq!(
+            rows[3].2, "received",
+            "held behind the overlapping prune, never attempted"
+        );
+        assert!(rows[3].3.is_none());
+    }
+    let received: i64 = sqlx::query_scalar("SELECT received_cursor FROM peers WHERE id = ?")
+        .bind(&peer.id)
+        .fetch_one(&b.state.db)
+        .await
+        .unwrap();
+    assert_eq!(received, last);
+    assert_eq!(
+        count(
+            b.state.clone(),
+            "SELECT COUNT(*) FROM peer_event_receipts WHERE kind = 'folder_pruned'"
+        )
+        .await,
+        2
+    );
+    assert_eq!(
+        count(
+            b.state.clone(),
+            "SELECT COUNT(*) FROM event_log WHERE kind = 'folder_pruned'"
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        count(b.state.clone(), "SELECT COUNT(*) FROM conflicts").await,
+        0
+    );
+
+    // Gamma must not receive complete recovery evidence through a retained prune on Beta.
+    let c_to_b = super::net::peers(&c.state).await.unwrap().remove(0);
+    let error = super::net::get_json::<super::recovery::FileEvidence>(
+        &c.state,
+        &c_to_b,
+        "/api/peer/v1/recovery/file?share=Family&path=kept&vv=%7B%7D",
+    )
+    .await
+    .unwrap_err();
+    assert!(error.starts_with("HTTP 409:"));
+    assert!(error.contains("recovery_evidence_incomplete"));
+    assert!(error.contains("folder prune prevents verifying"));
+    std::fs::create_dir(b.shared.join("independent")).unwrap();
+    let evidence = super::net::get_json::<super::recovery::FileEvidence>(
+        &c.state,
+        &c_to_b,
+        "/api/peer/v1/recovery/file?share=Family&path=independent&vv=%7B%7D",
+    )
+    .await
+    .unwrap();
+    assert_eq!(evidence.path, "independent");
+    let error = super::net::get_json::<super::recovery::FileEvidence>(
+        &b.state,
+        &peer,
+        "/api/peer/v1/recovery/file?share=Family&path=kept&vv=%7B%7D",
+    )
+    .await
+    .unwrap_err();
+    assert!(error.starts_with("HTTP 409:"));
+    assert!(error.contains("recovery_evidence_incomplete"));
+
+    // The unrelated later event proceeds independently and reaches the transitive peer.
+    let operation_id: String = sqlx::query_scalar("SELECT operation_id FROM pending_peer_events")
+        .fetch_one(&b.state.db)
+        .await
+        .unwrap();
+    crate::ops::exec::run_operation(&b.state, &operation_id)
+        .await
+        .unwrap();
+    assert!(b.shared.join("later").is_dir());
+    let c_net = super::net::peer(&c.state, &c_peer.id).await.unwrap();
+    let _ = super::pull(&c.state, &c_net).await;
+    assert_eq!(
+        count(
+            c.state.clone(),
+            "SELECT COUNT(*) FROM peer_event_receipts
+             WHERE kind = 'folder_created' AND json_extract(data_json, '$.path') = 'later'"
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        count(
+            c.state.clone(),
+            "SELECT COUNT(*) FROM peer_event_receipts WHERE kind = 'folder_pruned'"
+        )
+        .await,
+        0
+    );
+    assert!(c.shared.join("gone").is_dir() && c.shared.join("kept").is_dir());
+
+    // After a restart both prunes remain recoverable on Beta, holding only their own paths.
+    let restarted = AppState::new(
+        Config::for_tests(b._dir.path()),
+        b.state.db.clone(),
+        SecretBox::open_or_create(b._dir.path()).unwrap(),
+    )
+    .await
+    .unwrap();
+    crate::maintenance::recover_after_restart(&restarted)
+        .await
+        .unwrap();
+    super::pull(&restarted, &peer).await.unwrap_err();
+    assert!(b.shared.join("kept").is_dir());
+    assert!(!b.shared.join("gone").exists());
+    assert_eq!(
+        inbox(restarted.clone())
+            .await
+            .iter()
+            .map(|r| r.1.as_str())
+            .collect::<Vec<_>>(),
+        ["gone", "kept", "gone/inner"]
+    );
+    let retained: Vec<String> = sqlx::query_scalar(
+        "SELECT event_json FROM peer_inbox WHERE json_extract(event_json, '$.kind') = 'folder_pruned'",
+    )
+    .fetch_all(&restarted.db)
+    .await
+    .unwrap();
+    for raw in retained {
+        let event: super::PeerEvent = serde_json::from_str(&raw).unwrap();
+        assert_eq!(event.origin, a.state.instance_id);
+    }
+    assert!(super::net::peer(&restarted, &peer.id).await.unwrap().cursor < last);
 }
 
 #[tokio::test]

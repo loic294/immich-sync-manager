@@ -1039,19 +1039,32 @@ async fn path_after_event(
     event: Option<(&str, i64)>,
 ) -> AppResult<(String, Option<i64>)> {
     RelPath::parse(rel).map_err(|e| AppError::invalid_location(e.to_string()))?;
+    let mut tx = state.db.begin().await?;
     let events: Vec<(i64, String, String)> = sqlx::query_as(
         "SELECT seq,kind,data_json FROM event_log
-         WHERE share_name = ? AND kind IN ('file_changed','file_moved','folder_created','folder_moved') ORDER BY seq",
+         WHERE share_name = ? AND kind IN ('file_changed','file_moved','folder_created','folder_moved','folder_pruned') ORDER BY seq",
     )
     .bind(&share.name)
-    .fetch_all(&state.db)
+    .fetch_all(&mut *tx)
     .await?;
+    let pending: Vec<String> = sqlx::query_scalar(
+        "SELECT event_json FROM peer_inbox
+         WHERE share_name = ? AND status != 'done' AND json_extract(event_json, '$.kind') = ?",
+    )
+    .bind(&share.name)
+    .bind(super::FOLDER_PRUNED)
+    .fetch_all(&mut *tx)
+    .await?;
+    let pending: Vec<super::PeerEvent> = pending
+        .into_iter()
+        .map(|raw| serde_json::from_str(&raw))
+        .collect::<Result<_, _>>()?;
     let mut path = rel.to_owned();
     let mut lineage = version.clone();
     let mut anchor = None;
     if let Some((origin, seq)) = event {
         anchor=sqlx::query_scalar("SELECT seq FROM event_log WHERE share_name=? AND origin=? AND origin_seq=? AND json_extract(data_json,'$.path')=?")
-            .bind(&share.name).bind(origin).bind(seq).bind(rel).fetch_optional(&state.db).await?;
+            .bind(&share.name).bind(origin).bind(seq).bind(rel).fetch_optional(&mut *tx).await?;
         if anchor.is_none() {
             return Err(AppError::conflict(
                 "recovery_evidence_missing",
@@ -1070,6 +1083,20 @@ async fn path_after_event(
             }
         }
     }
+    tx.commit().await?;
+    let check_pending = |path: &str| -> AppResult<()> {
+        if pending
+            .iter()
+            .any(|event| super::inbox::overlaps(path, &event.data.path))
+        {
+            return Err(AppError::conflict(
+                "recovery_evidence_incomplete",
+                "folder prune prevents verifying this recovery lineage",
+            ));
+        }
+        Ok(())
+    };
+    check_pending(&path)?;
     let mut last_move_seq = anchor;
     for (seq, kind, data) in events {
         if matches!(kind.as_str(), "file_changed" | "folder_created")
@@ -1078,6 +1105,15 @@ async fn path_after_event(
             continue;
         }
         let event: super::EventData = serde_json::from_str(&data)?;
+        if kind == super::FOLDER_PRUNED {
+            if super::inbox::overlaps(&path, &event.path) {
+                return Err(AppError::conflict(
+                    "recovery_evidence_incomplete",
+                    "folder prune prevents verifying this recovery lineage",
+                ));
+            }
+            continue;
+        }
         // Folder events have no file version vector. Their committed ordering after the
         // matching content announcement supplies the lineage; an unanchored guess is refused.
         if !(kind == "folder_moved" && anchor.is_some()
@@ -1101,6 +1137,7 @@ async fn path_after_event(
             };
             RelPath::parse(&candidate).map_err(|e| AppError::invalid_location(e.to_string()))?;
             path = candidate;
+            check_pending(&path)?;
             lineage.merge(&event.vv);
             last_move_seq = Some(seq);
         }
@@ -2646,6 +2683,121 @@ mod policy_tests {
             .unwrap(),
             "current/photo.jpg",
             "an empty file version must not anchor folder ordering",
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_lineage_rejects_later_overlapping_prunes() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new(
+            Config::for_tests(dir.path()),
+            crate::db::connect(dir.path()).await.unwrap(),
+            SecretBox::open_or_create(dir.path()).unwrap(),
+        )
+        .await
+        .unwrap();
+        let share = Share {
+            id: "family".into(),
+            name: "Family".into(),
+            root_id: "photos".into(),
+            path: RelPath::parse("shared").unwrap(),
+            peer_ids: Vec::new(),
+            enabled: true,
+            junk: state.junk_rules(),
+        };
+        let mut version = VersionVector::default();
+        version.increment("source");
+        for (kind, path, from, vv) in [
+            (
+                super::super::FOLDER_PRUNED,
+                "old",
+                None,
+                VersionVector::default(),
+            ),
+            ("file_changed", "old/photo.jpg", None, version.clone()),
+            ("folder_moved", "new", Some("old"), VersionVector::default()),
+        ] {
+            super::super::append_local(
+                &state,
+                &share.name,
+                kind,
+                &super::super::EventData {
+                    path: path.into(),
+                    from: from.map(str::to_owned),
+                    vv,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(
+            current_path(&state, &share, "old/photo.jpg", &version)
+                .await
+                .unwrap(),
+            "new/photo.jpg"
+        );
+        sqlx::query(
+            "INSERT INTO peers(id,name,url,secret_enc,status,created_at)
+             VALUES ('peer','Peer','https://peer.example','synthetic','online',?)",
+        )
+        .bind(db::now())
+        .execute(&state.db)
+        .await
+        .unwrap();
+        let pending = super::super::PeerEvent {
+            seq: 1,
+            origin: "peer-instance".into(),
+            origin_seq: 1,
+            share: share.name.clone(),
+            kind: super::super::FOLDER_PRUNED.into(),
+            data: super::super::EventData {
+                path: "new".into(),
+                ..Default::default()
+            },
+        };
+        sqlx::query(
+            "INSERT INTO peer_inbox(peer_id,seq,origin,origin_seq,share_name,event_json)
+             VALUES ('peer',1,?,?,?,?)",
+        )
+        .bind(&pending.origin)
+        .bind(pending.origin_seq)
+        .bind(&pending.share)
+        .bind(serde_json::to_string(&pending).unwrap())
+        .execute(&state.db)
+        .await
+        .unwrap();
+        assert!(
+            current_path(&state, &share, "old/photo.jpg", &version)
+                .await
+                .is_err(),
+            "an unresolved prune at the relocated destination blocks lineage"
+        );
+        sqlx::query("DELETE FROM peer_inbox WHERE peer_id = 'peer'")
+            .execute(&state.db)
+            .await
+            .unwrap();
+        super::super::append_local(
+            &state,
+            &share.name,
+            super::super::FOLDER_PRUNED,
+            &super::super::EventData {
+                path: "new".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            current_path(&state, &share, "old/photo.jpg", &version)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            current_path(&state, &share, "other/photo.jpg", &version)
+                .await
+                .unwrap(),
+            "other/photo.jpg"
         );
     }
 
