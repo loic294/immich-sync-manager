@@ -882,26 +882,36 @@ async fn activity_repeated_updates_coalesce_and_preserve_paging_and_deletion() {
     stop_workers(&mut a).await;
     stop_workers(&mut b).await;
     let peer = net::peers(&a.state).await.unwrap().remove(0);
+    let before: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(seq),0) FROM sync_changes")
+        .fetch_one(&b.state.db)
+        .await
+        .unwrap();
     let (transfer, remote_peer) = running_transfer(&b, 1000).await;
     for done in [100, 200] {
         activity::record_progress(&b.state, &transfer, &remote_peer, done, 100)
             .await
             .unwrap();
     }
-    let events: Vec<(i64, String)> =
-        sqlx::query_as("SELECT seq,transfer_id FROM sync_changes WHERE peer_id=? ORDER BY seq")
-            .bind(&remote_peer)
-            .fetch_all(&b.state.db)
-            .await
-            .unwrap();
+    let events: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT seq,transfer_id FROM sync_changes WHERE peer_id=? AND seq>? ORDER BY seq",
+    )
+    .bind(&remote_peer)
+    .bind(before)
+    .fetch_all(&b.state.db)
+    .await
+    .unwrap();
     assert_eq!(
         events.len(),
         1,
         "triggers coalesce repeated transfer updates"
     );
     let cursor = events[0].0;
-    let page =
-        serde_json::to_value(activity::changes(&b.state, &remote_peer, 0).await.unwrap()).unwrap();
+    let page = serde_json::to_value(
+        activity::changes(&b.state, &remote_peer, before)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
     assert_eq!(page["cursor"], cursor);
     assert_eq!(page["changes"].as_array().unwrap().len(), 1);
     assert_eq!(page["changes"][0]["id"], transfer);
