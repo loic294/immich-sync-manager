@@ -35,6 +35,7 @@ struct Instance {
     requests: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, usize>>>,
     notification_status: std::sync::Arc<std::sync::atomic::AtomicU16>,
     snapshot_status: std::sync::Arc<std::sync::atomic::AtomicU16>,
+    recovery_status: std::sync::Arc<std::sync::atomic::AtomicU16>,
 }
 
 impl Drop for Instance {
@@ -70,14 +71,17 @@ async fn instance(name: &str) -> Instance {
     let requests = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     let notification_status = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0));
     let snapshot_status = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0));
+    let recovery_status = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0));
     let app = crate::routes::router(state.clone()).layer(axum::middleware::from_fn({
         let requests = requests.clone();
         let status = notification_status.clone();
         let snapshot_status = snapshot_status.clone();
+        let recovery_status = recovery_status.clone();
         move |request: axum::extract::Request, next: axum::middleware::Next| {
             let requests = requests.clone();
             let status = status.clone();
             let snapshot_status = snapshot_status.clone();
+            let recovery_status = recovery_status.clone();
             async move {
                 let path = request.uri().path().to_owned();
                 *requests.lock().unwrap().entry(path.clone()).or_insert(0) += 1;
@@ -88,6 +92,12 @@ async fn instance(name: &str) -> Instance {
                     );
                 }
                 let status = snapshot_status.load(std::sync::atomic::Ordering::SeqCst);
+                let recovery_status = recovery_status.load(std::sync::atomic::Ordering::SeqCst);
+                if path == "/api/peer/v1/recovery" && recovery_status != 0 {
+                    return axum::response::IntoResponse::into_response(
+                        axum::http::StatusCode::from_u16(recovery_status).unwrap(),
+                    );
+                }
                 if matches!(
                     path.as_str(),
                     "/api/peer/v1/recovery" | "/api/peer/v1/sync-activity"
@@ -119,6 +129,7 @@ async fn instance(name: &str) -> Instance {
         requests,
         notification_status,
         snapshot_status,
+        recovery_status,
     }
 }
 
@@ -242,7 +253,7 @@ async fn activity_scheduler_does_not_starve_admitted_worker() {
 #[tokio::test]
 async fn schedulers_suppress_duplicates_and_cancel_admitted_workers() {
     for activity in [false, true] {
-        let (mut local, entered, _respond) = scheduler_fixture(activity).await;
+        let (mut local, entered, respond) = scheduler_fixture(activity).await;
         local.state.sync_wake.notify_one();
         tokio::time::sleep(Duration::from_secs(if activity { 5 } else { 2 })).await;
         assert!(
@@ -254,17 +265,26 @@ async fn schedulers_suppress_duplicates_and_cancel_admitted_workers() {
         let scheduler = local.tasks.pop().unwrap();
         scheduler.abort();
         assert!(scheduler.await.unwrap_err().is_cancelled());
+        if activity {
+            respond.notify_waiters();
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            let saved: i64 = sqlx::query_scalar(
+                "SELECT (SELECT COUNT(*) FROM peer_recovery_state)
+                      + (SELECT COUNT(*) FROM peer_sync_state)",
+            )
+            .fetch_one(&local.state.db)
+            .await
+            .unwrap();
+            assert_eq!(saved, 0, "shutdown must cancel the fetch, not detach it");
+            stop_workers(&mut local).await;
+            continue;
+        }
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 let page = crate::activity::page(&local.state, 100, 0).await.unwrap();
                 if page.current.iter().chain(&page.history).any(|row| {
                     row.status == ism_core::dto::BackgroundStatus::Interrupted
-                        && row.task_key
-                            == if activity {
-                                "recovery-refresh:remote"
-                            } else {
-                                "peer:remote"
-                            }
+                        && row.task_key == "peer:remote"
                 }) {
                     break;
                 }
@@ -2174,6 +2194,9 @@ async fn three_independent_transfers_refill_slots_and_update_receiver_activity()
     let (mut a, mut b) = pair().await;
     stop_workers(&mut a).await;
     stop_workers(&mut b).await;
+    // Manual snapshot refreshes below exercise legacy timestamp freshness, without a stream.
+    a.state.peer_streams.retain(&[]);
+    b.state.peer_streams.retain(&[]);
     for name in ["one.jpg", "two.jpg", "three.jpg", "four.jpg", "five.jpg"] {
         write_old(&a.shared.join(name), name.as_bytes());
     }
@@ -2466,6 +2489,7 @@ async fn sync_activity_warns_until_the_receivers_first_status_response() {
     let (mut a, mut b) = pair().await;
     stop_workers(&mut a).await;
     stop_workers(&mut b).await;
+    a.state.peer_streams.retain(&[]);
     sqlx::query("DELETE FROM peer_sync_state")
         .execute(&a.state.db)
         .await
@@ -2586,6 +2610,8 @@ async fn sync_runs_use_last_minute_bytes_for_eta_and_reset_without_losing_histor
     let (mut a, mut b) = pair().await;
     stop_workers(&mut a).await;
     stop_workers(&mut b).await;
+    a.state.peer_streams.retain(&[]);
+    b.state.peer_streams.retain(&[]);
     let peer = super::net::peers(&b.state).await.unwrap().remove(0);
     super::activity::refresh(&b.state, &peer).await.unwrap();
     let share = super::shares(&b.state).await.unwrap().remove(0);

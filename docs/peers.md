@@ -38,8 +38,13 @@ errors close the stream. Credential/configuration writers must call
 `AppState::peer_configuration_changed` immediately after committing their change.
 Allow long-lived, unbuffered responses through reverse proxies. The peer progress/recovery client
 uses this stream instead of five-second refreshes when supported. It reads notifications independently
-of authoritative fetches and coalesces refreshes to at most once per second. Keepalives do not fetch
-state or create background task history. Closed, silent (45 seconds), or invalid streams report
+of authoritative fetches and coalesces refreshes to at most once per second. Routine successful
+refreshes do not create background task history; fetch errors are logged and remain visible in Sync.
+Keepalives do not fetch state or write heartbeat timestamps to the database. A connection-scoped
+in-memory heartbeat keeps unchanged snapshots current only after both progress and recovery fetches
+succeed for that connection and its latest hint. New hints, failures, disconnects and configuration
+changes invalidate that verification; keepalives alone never authorize failed or previous snapshots.
+Closed, silent (45 seconds), or invalid streams report
 availability errors and reconnect after five seconds, fetching state again on connection.
 Only HTTP 404, 405, or 501 selects legacy five-second polling; legacy peers are probed every minute
 for an upgrade. Authentication and server errors never silently select polling. Peer removal or
