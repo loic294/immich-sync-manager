@@ -31,6 +31,8 @@ struct Restoration {
     generations: Vec<Generation>,
     #[serde(default)]
     evidence_generation: u64,
+    #[serde(default)]
+    requested_evidence: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -161,10 +163,37 @@ async fn request_choice(
     {
         return Ok(());
     }
+    let peer = peers::net::peer(state, &plan.peer_id).await?;
+    let receiving = vec![
+        peers::versions::local(state, &share, &plan.source).await?,
+        peers::versions::local(state, &share, &plan.target).await?,
+    ];
+    let evidence = crate::crypto::sha256_hex(&serde_json::to_vec(&(
+        &plan.share_id,
+        &plan.peer_id,
+        &peer.name,
+        &receiving,
+        current,
+    ))?);
+    if !force
+        && let (Some(id), Some(previous)) = (&plan.conflict_id, &plan.requested_evidence)
+        && previous == &evidence
+    {
+        let open: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM conflicts WHERE id=? AND status='open')",
+        )
+        .bind(id)
+        .fetch_one(&state.db)
+        .await?;
+        if open {
+            return Ok(());
+        }
+    }
     plan.evidence_generation = plan
         .evidence_generation
         .checked_add(1)
         .ok_or_else(|| unverified("restoration evidence generation exhausted"))?;
+    plan.requested_evidence = Some(evidence);
     let local = if plan.conflict_id.is_none() {
         let row = peers::row(state, &share.id, &plan.target).await?;
         Some(peers::side(&state.instance_name().await, row.as_ref()))
@@ -865,6 +894,7 @@ pub(in crate::peers) async fn restore_missing_folder(
         conflict_id: None,
         generations: Vec::new(),
         evidence_generation: 0,
+        requested_evidence: None,
     };
     bound_share(state, &plan).await?;
     let _guard = state.replication_operation_lock.lock().await;

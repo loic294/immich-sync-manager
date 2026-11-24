@@ -534,6 +534,45 @@ async fn interrupted_initial_restoration_conflict_is_reassociated_before_resume(
         .await
         .unwrap();
     assert_eq!(updates, 1, "the operation recovery is updated once");
+    let existing_plan = admin::snapshot_restoration(&a.state, &operation)
+        .await
+        .unwrap();
+    for _ in 0..3 {
+        assert_eq!(
+            admin::validate_folder_restore(&a.state, &operation)
+                .await
+                .unwrap_err()
+                .code(),
+            "choose_version"
+        );
+        assert_eq!(
+            admin::snapshot_restoration(&a.state, &operation)
+                .await
+                .unwrap(),
+            existing_plan,
+            "unchanged evidence must not invalidate an in-flight review"
+        );
+    }
+    write_old(
+        &a.shared.join("new/receiving.jpg"),
+        b"changed receiving evidence",
+    );
+    assert_eq!(
+        admin::validate_folder_restore(&a.state, &operation)
+            .await
+            .unwrap_err()
+            .code(),
+        "choose_version"
+    );
+    assert_ne!(
+        admin::snapshot_restoration(&a.state, &operation)
+            .await
+            .unwrap(),
+        existing_plan,
+        "changed receiving evidence must invalidate the previous plan"
+    );
+    std::fs::remove_file(a.shared.join("new/receiving.jpg")).unwrap();
+    std::fs::remove_dir(a.shared.join("new")).unwrap();
     let conflict: String = sqlx::query_scalar(
         "SELECT id FROM conflicts WHERE kind='folder_restore' AND status='open'",
     )
