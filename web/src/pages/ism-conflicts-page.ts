@@ -434,7 +434,24 @@ export class IsmConflictsPage extends IsmPage {
     if (!this.selecting) return nothing;
     const open = this.open();
     const chosen = this.chosen();
-    if (!open.length && !chosen.length) return nothing;
+    if (!open.length && !chosen.length)
+      return html`<div role="status" class="alert alert-info alert-soft flex-none"
+        aria-label="Batch conflict decisions">
+        <span>${
+          this.includeResolved
+            ? 'Resolved files cannot receive another version decision.'
+            : 'Only files needing review can be selected. Waiting or in-progress files cannot receive a new version decision here.'
+        }</span>
+        ${
+          !this.includeResolved && this.status !== 'needs_decision'
+            ? html`<button type="button" class="btn btn-sm max-sm:min-h-11" @click=${() => {
+                this.status = 'needs_decision';
+                this.filtersOpen = true;
+                this.filter(this.share, this.folder);
+              }}>Show files needing review</button>`
+            : nothing
+        }
+      </div>`;
     const chosenHere = open.filter((conflict) => this.selected.has(key(conflict)));
     const reviewed = chosen.filter((c) => this.review.has(target(c))).length;
     const all = open.length > 0 && chosenHere.length === open.length;
