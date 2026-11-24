@@ -27,6 +27,7 @@ use crate::state::{AppState, ServerEvent};
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/live", get(live))
+        .route("/attention", get(attention))
         .route("/operations/page", get(operations))
         .route("/operations/background", get(background))
         .route("/operations/{id}/detail", get(operation_detail))
@@ -205,6 +206,13 @@ async fn background(
 ) -> AppResult<Json<ism_core::dto::BackgroundActivityPage>> {
     let (limit, offset) = q.bounds()?;
     Ok(Json(crate::activity::page(&state, limit, offset).await?))
+}
+
+async fn attention(
+    State(state): State<AppState>,
+    Admin(_): Admin,
+) -> AppResult<Json<ism_core::dto::AttentionSnapshot>> {
+    Ok(Json(crate::attention::snapshot(&state).await?))
 }
 
 async fn operation_detail(

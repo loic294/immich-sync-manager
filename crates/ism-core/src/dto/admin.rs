@@ -499,6 +499,116 @@ pub struct BackgroundActivityPage {
     pub warnings: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum AttentionCompleteness {
+    Complete,
+    Partial,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum AttentionState {
+    Ready,
+    Running,
+    Waiting,
+    Blocked,
+    Failed,
+    Stalled,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum AttentionLevel {
+    None,
+    Notice,
+    ActionRequired,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum AttentionOwner {
+    Local,
+    Receiver,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum AttentionCode {
+    OperationRecovery,
+    OperationFailed,
+    MaintenanceBlocked,
+    MaintenanceWaiting,
+    WatcherPaused,
+    LibraryScanFailed,
+    PeerOffline,
+    PeerEvidenceUnavailable,
+    TransferFailed,
+    ReceiverTransferFailed,
+    TransferScheduled,
+    TransferScheduleInvalid,
+    TransferBackoff,
+    TransferDependency,
+    TransferReady,
+    TransferRunning,
+    TransferEvidenceUnavailable,
+    PeerInboxFailed,
+    FolderRemovalFailed,
+    PeerInventoryFailed,
+    RecoveryDecision,
+    RecoveryFailed,
+    WorkerStopped,
+    WorkerStalled,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct AttentionItem {
+    pub id: String,
+    pub code: AttentionCode,
+    pub state: AttentionState,
+    pub attention: AttentionLevel,
+    /// True only when this condition is confirmed to prevent the counted work from advancing.
+    pub blocks_work: bool,
+    pub owner: AttentionOwner,
+    pub instance_id: Option<String>,
+    pub instance_name: Option<String>,
+    pub peer_id: Option<String>,
+    pub share_id: Option<String>,
+    pub share_name: Option<String>,
+    /// Confirmed affected work in this group; different groups can overlap.
+    pub count: u64,
+    /// Total work in the underlying scope, when known.
+    pub total_count: Option<u64>,
+    pub next_at: Option<String>,
+    pub recheck_at: Option<String>,
+    pub observed_at: String,
+    pub title: String,
+    pub message: String,
+    pub href: String,
+    pub operation_id: Option<String>,
+    pub acknowledged: Option<bool>,
+    pub unresolved: Option<bool>,
+    pub completeness: AttentionCompleteness,
+    pub examples: Vec<ActivityExample>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct AttentionSnapshot {
+    pub observed_at: String,
+    pub completeness: AttentionCompleteness,
+    pub warnings: Vec<String>,
+    pub items: Vec<AttentionItem>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct OperationStep {

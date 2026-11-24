@@ -77,6 +77,84 @@ async fn background_activity_requires_admin_and_keeps_current_work_outside_histo
     assert!(!reply.json()["warnings"].as_array().unwrap().is_empty());
 }
 
+#[tokio::test]
+async fn attention_requires_admin_and_distinguishes_recovery_from_historical_failure() {
+    let h = harness().await;
+    let uri = "/api/admin/attention";
+    assert_eq!(
+        send(&h.app, get(uri, &[])).await.status,
+        StatusCode::UNAUTHORIZED
+    );
+    for (id, status, handled, resolved) in [
+        (
+            "recovery",
+            "recovery_required",
+            Some("2026-01-01T00:01:00Z"),
+            0,
+        ),
+        ("failure", "failed", None, 0),
+    ] {
+        sqlx::query(
+            "INSERT INTO operations
+             (id,idempotency_key,principal,source,request_json,status,created_at,finished_at,handled_at,recovery_resolved)
+             VALUES (?,?,'admin','admin','{}',?,'2026-01-01T00:00:00Z','2026-01-01T00:01:00Z',?,?)",
+        )
+        .bind(id)
+        .bind(id)
+        .bind(status)
+        .bind(handled)
+        .bind(resolved)
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    }
+
+    let auth = [("cookie", h.cookie.as_str())];
+    let reply = send(&h.app, get(uri, &auth)).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.json());
+    let snapshot = reply.json();
+    let items = snapshot["items"].as_array().unwrap();
+    let recovery = items
+        .iter()
+        .find(|item| item["operation_id"] == "recovery")
+        .unwrap();
+    assert_eq!(recovery["code"], "operation_recovery");
+    assert_eq!(recovery["attention"], "action_required");
+    assert_eq!(recovery["acknowledged"], true);
+    assert_eq!(recovery["unresolved"], true);
+    assert_eq!(recovery["blocks_work"], true);
+    assert_eq!(recovery["owner"], "local");
+    let failure = items
+        .iter()
+        .find(|item| item["operation_id"] == "failure")
+        .unwrap();
+    assert_eq!(failure["code"], "operation_failed");
+    assert_eq!(failure["attention"], "action_required");
+    assert_eq!(failure["acknowledged"], false);
+    assert_eq!(failure["blocks_work"], false);
+    let failure_id = failure["id"].as_str().unwrap().to_owned();
+
+    sqlx::query("UPDATE operations SET handled_at='2026-01-01T00:02:00Z' WHERE id='failure'")
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    let again = send(&h.app, get(uri, &auth)).await.json();
+    assert!(
+        again["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["id"] != failure_id)
+    );
+    assert!(
+        again["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["id"] == recovery["id"] && item["unresolved"] == true)
+    );
+}
+
 impl Reply {
     fn json(&self) -> Value {
         serde_json::from_slice(&self.body).unwrap_or(Value::Null)
