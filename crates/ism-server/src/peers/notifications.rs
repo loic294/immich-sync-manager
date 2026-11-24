@@ -82,6 +82,14 @@ pub(crate) fn snapshot_fresh(state: &AppState, peer: &str, updated: Option<&str>
         .unwrap_or(age <= chrono::Duration::seconds(30))
 }
 
+/// Unchanged snapshots skip their timestamp write while it is well within legacy freshness.
+pub(super) fn snapshot_recent(updated: Option<&str>) -> bool {
+    updated.and_then(crate::db::parse_ts).is_some_and(|at| {
+        let age = chrono::Utc::now() - at;
+        age >= chrono::Duration::zero() && age < chrono::Duration::seconds(10)
+    })
+}
+
 struct Connection(Arc<Mutex<Health>>);
 
 impl Drop for Connection {

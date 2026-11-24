@@ -517,9 +517,22 @@ pub async fn peer_page(state: &AppState, peer: &net::Peer) -> AppResult<Recovery
 }
 
 pub async fn refresh(state: &AppState, peer: &net::Peer) -> AppResult<()> {
-    let page: RecoveryPage = net::get_json(state, peer, "/api/peer/v1/recovery")
-        .await
-        .map_err(|e| AppError::conflict("peer_recovery_unavailable", e))?;
+    // Acceptances recorded after this point may postdate the receiver's snapshot.
+    let generation: i64 = sqlx::query_scalar(
+        "SELECT acceptance_generation FROM peer_recovery_state WHERE peer_id=?",
+    )
+    .bind(&peer.id)
+    .fetch_optional(&state.db)
+    .await?
+    .unwrap_or(0);
+    let page: RecoveryPage = net::get_json_within(
+        state,
+        peer,
+        "/api/peer/v1/recovery",
+        Some(Duration::from_secs(10)),
+    )
+    .await
+    .map_err(|e| AppError::conflict("peer_recovery_unavailable", e))?;
     if page.rows.len() > 5000
         || usize::try_from(page.total).ok() != Some(page.rows.len())
         || page.rows.iter().any(|row| row.target.peer_id.is_some())
@@ -529,42 +542,134 @@ pub async fn refresh(state: &AppState, peer: &net::Peer) -> AppResult<()> {
             "receiver returned an invalid recovery snapshot",
         ));
     }
-    let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
-    sqlx::query("DELETE FROM outgoing_recovery WHERE peer_id=?")
-        .bind(&peer.id)
-        .execute(&mut *tx)
-        .await?;
+    let mut snapshot = std::collections::HashMap::with_capacity(page.rows.len());
     for row in page.rows {
+        let key = (kind_name(row.target.kind).to_owned(), row.target.id.clone());
+        if snapshot.insert(key, serde_json::to_string(&row)?).is_some() {
+            return Err(AppError::conflict(
+                "invalid_peer_recovery",
+                "receiver returned duplicate recovery targets",
+            ));
+        }
+    }
+    // A deferred WAL read does not take the writer lock; the write path rechecks everything.
+    let mut read = state.db.begin().await?;
+    let unchanged = recovery_unchanged(&mut *read, &peer.id, &snapshot, generation).await?;
+    read.rollback().await?;
+    if unchanged {
+        return Ok(());
+    }
+    let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
+    let existing: Vec<(String, String, String)> =
+        sqlx::query_as("SELECT kind,target_id,view_json FROM outgoing_recovery WHERE peer_id=?")
+            .bind(&peer.id)
+            .fetch_all(&mut *tx)
+            .await?;
+    let mut changed = false;
+    let mut existing: std::collections::HashMap<_, _> = existing
+        .into_iter()
+        .map(|(kind, id, json)| ((kind, id), json))
+        .collect();
+    for (kind, id) in existing.keys().filter(|key| !snapshot.contains_key(*key)) {
+        sqlx::query("DELETE FROM outgoing_recovery WHERE peer_id=? AND kind=? AND target_id=?")
+            .bind(&peer.id)
+            .bind(kind)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        changed = true;
+    }
+    for ((kind, id), json) in snapshot {
+        if existing.remove(&(kind.clone(), id.clone())).as_ref() == Some(&json) {
+            continue;
+        }
         sqlx::query(
-            "INSERT INTO outgoing_recovery (peer_id,kind,target_id,view_json) VALUES (?,?,?,?)",
+            "INSERT INTO outgoing_recovery (peer_id,kind,target_id,view_json) VALUES (?,?,?,?)
+             ON CONFLICT(peer_id,kind,target_id) DO UPDATE SET view_json=excluded.view_json",
         )
         .bind(&peer.id)
-        .bind(kind_name(row.target.kind))
-        .bind(&row.target.id)
-        .bind(serde_json::to_string(&row)?)
+        .bind(kind)
+        .bind(id)
+        .bind(json)
+        .execute(&mut *tx)
+        .await?;
+        changed = true;
+    }
+    changed |= sqlx::query(
+        "DELETE FROM outgoing_recovery_requests
+         WHERE peer_id=? AND state='accepted' AND accepted_generation<=?",
+    )
+    .bind(&peer.id)
+    .bind(generation)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected()
+        != 0;
+    let cached: Option<(Option<String>, Option<String>)> =
+        sqlx::query_as("SELECT updated_at,error FROM peer_recovery_state WHERE peer_id=?")
+            .bind(&peer.id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if changed
+        || cached.is_none_or(|(updated, error)| {
+            error.is_some() || !super::notifications::snapshot_recent(updated.as_deref())
+        })
+    {
+        sqlx::query(
+            "INSERT INTO peer_recovery_state (peer_id,updated_at,error) VALUES (?,?,NULL)
+            ON CONFLICT(peer_id) DO UPDATE SET updated_at=excluded.updated_at,error=NULL",
+        )
+        .bind(&peer.id)
+        .bind(db::now())
         .execute(&mut *tx)
         .await?;
     }
-    sqlx::query("DELETE FROM outgoing_recovery_requests WHERE peer_id=? AND state='accepted'")
-        .bind(&peer.id)
-        .execute(&mut *tx)
-        .await?;
-    sqlx::query(
-        "INSERT INTO peer_recovery_state (peer_id,updated_at,error) VALUES (?,?,NULL)
-        ON CONFLICT(peer_id) DO UPDATE SET updated_at=excluded.updated_at,error=NULL",
-    )
-    .bind(&peer.id)
-    .bind(db::now())
-    .execute(&mut *tx)
-    .await?;
     tx.commit().await?;
     Ok(())
+}
+
+async fn recovery_unchanged(
+    conn: &mut sqlx::SqliteConnection,
+    peer: &str,
+    snapshot: &std::collections::HashMap<(String, String), String>,
+    generation: i64,
+) -> AppResult<bool> {
+    let existing: Vec<(String, String, String)> =
+        sqlx::query_as("SELECT kind,target_id,view_json FROM outgoing_recovery WHERE peer_id=?")
+            .bind(peer)
+            .fetch_all(&mut *conn)
+            .await?;
+    if existing.len() != snapshot.len()
+        || existing
+            .into_iter()
+            .any(|(kind, id, json)| snapshot.get(&(kind, id)) != Some(&json))
+    {
+        return Ok(false);
+    }
+    let clearable: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM outgoing_recovery_requests
+         WHERE peer_id=? AND state='accepted' AND accepted_generation<=?)",
+    )
+    .bind(peer)
+    .bind(generation)
+    .fetch_one(&mut *conn)
+    .await?;
+    let cached: Option<(Option<String>, Option<String>)> =
+        sqlx::query_as("SELECT updated_at,error FROM peer_recovery_state WHERE peer_id=?")
+            .bind(peer)
+            .fetch_optional(&mut *conn)
+            .await?;
+    Ok(!clearable
+        && cached.is_some_and(|(updated, error)| {
+            error.is_none() && super::notifications::snapshot_recent(updated.as_deref())
+        }))
 }
 
 pub async fn unavailable(state: &AppState, peer: &str, error: &AppError) -> AppResult<()> {
     sqlx::query(
         "INSERT INTO peer_recovery_state (peer_id,error) VALUES (?,?)
-        ON CONFLICT(peer_id) DO UPDATE SET error=excluded.error",
+        ON CONFLICT(peer_id) DO UPDATE SET error=excluded.error
+        WHERE peer_recovery_state.error IS NOT excluded.error",
     )
     .bind(peer)
     .bind(format!("{}: {}", error.code(), error.message()))
@@ -2691,7 +2796,7 @@ async fn local_loop(state: AppState) {
     }
 }
 
-async fn forward_peer(state: &AppState, peer_id: &str) -> AppResult<()> {
+pub(super) async fn forward_peer(state: &AppState, peer_id: &str) -> AppResult<()> {
     let cutoff = (chrono::Utc::now() - chrono::Duration::seconds(30)).to_rfc3339();
     let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
     type ForwardRow = (String, String, Option<String>, String, Option<String>);
@@ -2814,6 +2919,21 @@ async fn forward_peer(state: &AppState, peer_id: &str) -> AppResult<()> {
     let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
     match result {
         Ok(result) => {
+            let generation: i64 = sqlx::query_scalar(
+                "INSERT INTO peer_recovery_state (peer_id,acceptance_generation) VALUES (?,1)
+                 ON CONFLICT(peer_id) DO UPDATE SET acceptance_generation=acceptance_generation+1
+                 WHERE acceptance_generation<9223372036854775807
+                 RETURNING acceptance_generation",
+            )
+            .bind(peer_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| {
+                AppError::conflict(
+                    "peer_recovery_generation_exhausted",
+                    "Recovery confirmation limit reached; no new confirmation was saved",
+                )
+            })?;
             for mut item in result.items {
                 item.target.peer_id = Some(peer_id.to_owned());
                 let status = if item.state == RecoveryState::Waiting {
@@ -2822,12 +2942,14 @@ async fn forward_peer(state: &AppState, peer_id: &str) -> AppResult<()> {
                     "accepted"
                 };
                 sqlx::query(
-                    "UPDATE outgoing_recovery_requests SET state=?,view_json=?,updated_at=?
+                    "UPDATE outgoing_recovery_requests SET state=?,view_json=?,updated_at=?,
+                        accepted_generation=?
                      WHERE peer_id=? AND kind=? AND target_id=? AND state='forwarding'",
                 )
                 .bind(status)
                 .bind(serde_json::to_string(&item)?)
                 .bind(db::now())
+                .bind(generation)
                 .bind(peer_id)
                 .bind(kind_name(item.target.kind))
                 .bind(&item.target.id)

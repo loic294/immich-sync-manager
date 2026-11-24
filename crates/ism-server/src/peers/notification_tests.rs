@@ -175,27 +175,7 @@ async fn notification_client_attention_only_traffic_keeps_snapshots_fresh_withou
     .await;
     tokio::time::sleep(Duration::from_secs(2)).await;
     age_snapshots(&a).await;
-    sqlx::query("CREATE TABLE write_audit (table_name TEXT NOT NULL)")
-        .execute(&a.state.db)
-        .await
-        .unwrap();
-    for table in [
-        "peer_sync_state",
-        "peer_recovery_state",
-        "outgoing_sync",
-        "outgoing_recovery",
-    ] {
-        for action in ["INSERT", "UPDATE", "DELETE"] {
-            let statement = format!(
-                "CREATE TRIGGER audit_{table}_{action} AFTER {action} ON {table} \
-                 BEGIN INSERT INTO write_audit VALUES ('{table}'); END"
-            );
-            sqlx::query(sqlx::AssertSqlSafe(statement))
-                .execute(&a.state.db)
-                .await
-                .unwrap();
-        }
-    }
+    audit_writes(&a).await;
     let before = (
         count(&b, ATTENTION),
         count(&b, PROGRESS),
@@ -238,6 +218,42 @@ async fn notification_client_attention_only_traffic_keeps_snapshots_fresh_withou
         count(&b, PROGRESS) > before.1 && count(&b, RECOVERY) > before.2
     })
     .await;
+}
+
+async fn audit_writes(a: &Instance) {
+    sqlx::query("CREATE TABLE write_audit (table_name TEXT NOT NULL, action TEXT NOT NULL)")
+        .execute(&a.state.db)
+        .await
+        .unwrap();
+    for table in [
+        "peer_sync_state",
+        "peer_recovery_state",
+        "outgoing_sync",
+        "outgoing_recovery",
+    ] {
+        for action in ["INSERT", "UPDATE", "DELETE"] {
+            let statement = format!(
+                "CREATE TRIGGER audit_{table}_{action} AFTER {action} ON {table} \
+                 BEGIN INSERT INTO write_audit VALUES ('{table}','{action}'); END"
+            );
+            sqlx::query(sqlx::AssertSqlSafe(statement))
+                .execute(&a.state.db)
+                .await
+                .unwrap();
+        }
+    }
+}
+
+async fn take_writes(a: &Instance) -> Vec<(String, String)> {
+    let writes = sqlx::query_as("SELECT table_name,action FROM write_audit ORDER BY rowid")
+        .fetch_all(&a.state.db)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM write_audit")
+        .execute(&a.state.db)
+        .await
+        .unwrap();
+    writes
 }
 
 async fn cache_available(a: &Instance, peer: &net::Peer) -> (bool, bool) {
@@ -679,4 +695,405 @@ async fn notification_client_retries_failed_snapshots_and_fetches_recovery_hints
                 "SELECT EXISTS(SELECT 1 FROM outgoing_recovery WHERE peer_id=? AND target_id='failed-example')",
             ).bind(&peer.id).fetch_one(&a.state.db).await.unwrap()
         }).await;
+}
+
+#[tokio::test]
+async fn notification_client_stalled_recovery_does_not_delay_activity_or_verify_early() {
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    let peer = net::peers(&a.state).await.unwrap().remove(0);
+    for table in ["peer_sync_state", "peer_recovery_state"] {
+        sqlx::query(sqlx::AssertSqlSafe(format!("DELETE FROM {table}")))
+            .execute(&a.state.db)
+            .await
+            .unwrap();
+    }
+    b.recovery_hold.armed.store(true, Ordering::SeqCst);
+    a.tasks.push(tokio::spawn(activity::run(a.state.clone())));
+    tokio::time::timeout(Duration::from_secs(9), b.recovery_hold.entered.notified())
+        .await
+        .expect("recovery response was not held");
+    wait("activity persisted while recovery is stalled", || async {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM peer_sync_state
+             WHERE peer_id=? AND error IS NULL AND updated_at IS NOT NULL)",
+        )
+        .bind(&peer.id)
+        .fetch_one(&a.state.db)
+        .await
+        .unwrap()
+    })
+    .await;
+    assert!(count(&b, PROGRESS) >= 1);
+    let recovered: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM peer_recovery_state WHERE updated_at IS NOT NULL)",
+    )
+    .fetch_one(&a.state.db)
+    .await
+    .unwrap();
+    assert!(!recovered, "the recovery snapshot is still in flight");
+    assert_eq!(
+        a.state.peer_streams.fresh(&peer.id),
+        Some(false),
+        "the stream is verified only after both snapshots succeed"
+    );
+    b.recovery_hold.release.notify_one();
+    wait("verified after the stalled recovery completes", || {
+        ready(&a, &peer)
+    })
+    .await;
+    assert_eq!(a.state.peer_streams.fresh(&peer.id), Some(true));
+}
+
+#[tokio::test]
+async fn unchanged_peer_snapshots_do_not_rewrite_mirrors() {
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    let peer = net::peers(&a.state).await.unwrap().remove(0);
+    failed_remote_operation(&b).await;
+    crate::peers::recovery::refresh(&a.state, &peer)
+        .await
+        .unwrap();
+    activity::refresh(&a.state, &peer).await.unwrap();
+    audit_writes(&a).await;
+    crate::peers::recovery::refresh(&a.state, &peer)
+        .await
+        .unwrap();
+    activity::refresh(&a.state, &peer).await.unwrap();
+    assert!(
+        take_writes(&a).await.is_empty(),
+        "unchanged recent snapshots must not write"
+    );
+    let stale = serde_json::json!({
+        "target": { "kind": "conflict", "id": "stale-example", "peer_id": null },
+        "title": "stale.jpg", "state": "needs_decision", "code": "choose_version",
+        "detail": null, "can_fix": false, "can_dismiss": false, "replacement_operation_id": null
+    });
+    sqlx::query("INSERT INTO outgoing_recovery(peer_id,kind,target_id,view_json) VALUES (?, 'conflict', 'stale-example', ?)")
+        .bind(&peer.id)
+        .bind(stale.to_string())
+        .execute(&a.state.db)
+        .await
+        .unwrap();
+    take_writes(&a).await;
+    crate::peers::recovery::refresh(&a.state, &peer)
+        .await
+        .unwrap();
+    assert_eq!(
+        take_writes(&a).await,
+        [
+            ("outgoing_recovery".to_owned(), "DELETE".to_owned()),
+            ("peer_recovery_state".to_owned(), "UPDATE".to_owned()),
+        ],
+        "only the removed row changes; unchanged rows are not reinserted"
+    );
+    age_snapshots(&a).await;
+    take_writes(&a).await;
+    crate::peers::recovery::refresh(&a.state, &peer)
+        .await
+        .unwrap();
+    activity::refresh(&a.state, &peer).await.unwrap();
+    assert_eq!(
+        take_writes(&a).await,
+        [
+            ("peer_recovery_state".to_owned(), "UPDATE".to_owned()),
+            ("peer_sync_state".to_owned(), "UPDATE".to_owned()),
+        ],
+        "old unchanged snapshots refresh only their timestamps"
+    );
+    let mirrored: Vec<String> =
+        sqlx::query_scalar("SELECT target_id FROM outgoing_recovery WHERE peer_id=?")
+            .bind(&peer.id)
+            .fetch_all(&a.state.db)
+            .await
+            .unwrap();
+    assert_eq!(mirrored, ["heartbeat-example"]);
+}
+
+#[tokio::test]
+async fn unchanged_recent_refresh_skips_the_writer_lock_and_changes_still_persist() {
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    let peer = net::peers(&a.state).await.unwrap().remove(0);
+    failed_remote_operation(&b).await;
+    crate::peers::recovery::refresh(&a.state, &peer)
+        .await
+        .unwrap();
+    activity::refresh(&a.state, &peer).await.unwrap();
+    let mode: String = sqlx::query_scalar("PRAGMA journal_mode")
+        .fetch_one(&a.state.db)
+        .await
+        .unwrap();
+    assert_eq!(mode, "wal");
+
+    let writer = a.state.db.begin_with("BEGIN IMMEDIATE").await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        crate::peers::recovery::refresh(&a.state, &peer)
+            .await
+            .unwrap();
+        activity::refresh(&a.state, &peer).await.unwrap();
+    })
+    .await
+    .expect("an unchanged recent refresh must not wait for an unrelated writer");
+    writer.rollback().await.unwrap();
+
+    let stale = serde_json::json!({
+        "target": { "kind": "conflict", "id": "stale-example", "peer_id": null },
+        "title": "stale.jpg", "state": "needs_decision", "code": "choose_version",
+        "detail": null, "can_fix": false, "can_dismiss": false, "replacement_operation_id": null
+    });
+    sqlx::query("INSERT INTO outgoing_recovery(peer_id,kind,target_id,view_json) VALUES (?, 'conflict', 'stale-example', ?)")
+        .bind(&peer.id)
+        .bind(stale.to_string())
+        .execute(&a.state.db)
+        .await
+        .unwrap();
+    let before: Option<String> =
+        sqlx::query_scalar("SELECT updated_at FROM peer_recovery_state WHERE peer_id=?")
+            .bind(&peer.id)
+            .fetch_one(&a.state.db)
+            .await
+            .unwrap();
+    let writer = a.state.db.begin_with("BEGIN IMMEDIATE").await.unwrap();
+    let changed = tokio::spawn({
+        let state = a.state.clone();
+        let peer = peer.clone();
+        async move { crate::peers::recovery::refresh(&state, &peer).await }
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        !changed.is_finished(),
+        "a changed snapshot must wait for the writer lock"
+    );
+    writer.rollback().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(9), changed)
+        .await
+        .expect("changed snapshot did not persist after the writer released")
+        .unwrap()
+        .unwrap();
+    let mirrored: Vec<String> =
+        sqlx::query_scalar("SELECT target_id FROM outgoing_recovery WHERE peer_id=?")
+            .bind(&peer.id)
+            .fetch_all(&a.state.db)
+            .await
+            .unwrap();
+    assert_eq!(mirrored, ["heartbeat-example"]);
+    let after: Option<String> =
+        sqlx::query_scalar("SELECT updated_at FROM peer_recovery_state WHERE peer_id=?")
+            .bind(&peer.id)
+            .fetch_one(&a.state.db)
+            .await
+            .unwrap();
+    assert_ne!(after, before, "a changed snapshot records its verification");
+}
+
+#[tokio::test]
+async fn recovery_snapshot_started_before_acceptance_keeps_it_until_a_later_snapshot() {
+    use ism_core::dto::{RecoveryBatchInput, RecoveryKind, RecoveryTarget};
+
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    let owner = net::peers(&b.state).await.unwrap().remove(0);
+    let share = crate::peers::shares(&b.state).await.unwrap().remove(0);
+    sqlx::query(
+        "INSERT INTO transfers (id,peer_id,share_id,rel_path,sha256,size,vv_json,status,queued_at,updated_at,error)
+         VALUES ('late-accept',?,?, 'photo.xmp',?,3,'{}','failed',?,?, 'peer unavailable')",
+    )
+    .bind(&owner.id)
+    .bind(&share.id)
+    .bind(crate::crypto::sha256_hex(b"xmp"))
+    .bind(crate::db::now())
+    .bind(crate::db::now())
+    .execute(&b.state.db)
+    .await
+    .unwrap();
+    let receiver = net::peers(&a.state).await.unwrap().remove(0);
+    crate::peers::recovery::refresh(&a.state, &receiver)
+        .await
+        .unwrap();
+    crate::peers::recovery::submit(
+        &a.state,
+        RecoveryBatchInput {
+            targets: vec![RecoveryTarget {
+                kind: RecoveryKind::Transfer,
+                id: "late-accept".into(),
+                peer_id: Some(receiver.id.clone()),
+            }],
+            all: false,
+            resolution: None,
+        },
+    )
+    .await
+    .unwrap();
+    // Recreate the pre-upgrade schema, seed a legacy acceptance, then reopen normally.
+    let migration: i64 = sqlx::query_scalar(
+        "SELECT version FROM _sqlx_migrations WHERE description='recovery acceptance generation'",
+    )
+    .fetch_one(&a.state.db)
+    .await
+    .unwrap();
+    for statement in [
+        "ALTER TABLE outgoing_recovery_requests DROP COLUMN accepted_generation",
+        "ALTER TABLE peer_recovery_state DROP COLUMN acceptance_generation",
+    ] {
+        sqlx::query(statement).execute(&a.state.db).await.unwrap();
+    }
+    sqlx::query("DELETE FROM _sqlx_migrations WHERE version=?")
+        .bind(migration)
+        .execute(&a.state.db)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO outgoing_recovery_requests
+         (peer_id,kind,target_id,state,view_json,updated_at)
+         SELECT peer_id,kind,'legacy-accept','accepted',view_json,updated_at
+         FROM outgoing_recovery_requests WHERE target_id='late-accept'",
+    )
+    .execute(&a.state.db)
+    .await
+    .unwrap();
+    sqlx::query("DELETE FROM peer_recovery_state WHERE peer_id=?")
+        .bind(&receiver.id)
+        .execute(&a.state.db)
+        .await
+        .unwrap();
+    a.state.db.close().await;
+    let db = crate::db::connect(a._dir.path()).await.unwrap();
+    a.state = AppState::new(
+        Config::for_tests(a._dir.path()),
+        db,
+        SecretBox::open_or_create(a._dir.path()).unwrap(),
+    )
+    .await
+    .unwrap();
+    let legacy: (String, i64) = sqlx::query_as(
+        "SELECT state,accepted_generation FROM outgoing_recovery_requests
+         WHERE peer_id=? AND target_id='legacy-accept'",
+    )
+    .bind(&receiver.id)
+    .fetch_one(&a.state.db)
+    .await
+    .unwrap();
+    assert_eq!(legacy, ("accepted".to_owned(), 0));
+    let state_exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM peer_recovery_state WHERE peer_id=?)")
+            .bind(&receiver.id)
+            .fetch_one(&a.state.db)
+            .await
+            .unwrap();
+    assert!(!state_exists, "the legacy peer had no recovery state");
+    b.recovery_hold.armed.store(true, Ordering::SeqCst);
+    let held = tokio::spawn({
+        let state = a.state.clone();
+        let receiver = receiver.clone();
+        async move { crate::peers::recovery::refresh(&state, &receiver).await }
+    });
+    tokio::time::timeout(Duration::from_secs(9), b.recovery_hold.entered.notified())
+        .await
+        .expect("recovery response was not held");
+    crate::peers::recovery::forward_peer(&a.state, &receiver.id)
+        .await
+        .unwrap();
+    let accepted = || async {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM outgoing_recovery_requests
+             WHERE target_id='late-accept' AND state='accepted'",
+        )
+        .fetch_one(&a.state.db)
+        .await
+        .unwrap()
+    };
+    assert_eq!(accepted().await, 1);
+    let generation: (i64, i64) = sqlx::query_as(
+        "SELECT s.acceptance_generation,r.accepted_generation
+         FROM peer_recovery_state s JOIN outgoing_recovery_requests r ON r.peer_id=s.peer_id
+         WHERE s.peer_id=? AND r.target_id='late-accept'",
+    )
+    .bind(&receiver.id)
+    .fetch_one(&a.state.db)
+    .await
+    .unwrap();
+    assert_eq!(generation, (1, 1), "missing counters are created atomically");
+    b.recovery_hold.release.notify_one();
+    held.await.unwrap().unwrap();
+    let legacy: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM outgoing_recovery_requests WHERE target_id='legacy-accept'",
+    )
+    .fetch_one(&a.state.db)
+    .await
+    .unwrap();
+    assert_eq!(legacy, 0, "a verified snapshot clears legacy acceptances");
+    assert_eq!(
+        accepted().await,
+        1,
+        "a snapshot requested before acceptance must not clear it"
+    );
+    crate::peers::recovery::refresh(&a.state, &receiver)
+        .await
+        .unwrap();
+    assert_eq!(
+        accepted().await,
+        0,
+        "a later snapshot reflects and clears the acceptance"
+    );
+}
+
+#[tokio::test]
+async fn recovery_acceptance_counter_exhaustion_fails_closed() {
+    use ism_core::dto::{RecoveryBatchInput, RecoveryKind, RecoveryTarget};
+
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    let peer = net::peers(&a.state).await.unwrap().remove(0);
+    failed_remote_operation(&b).await;
+    crate::peers::recovery::refresh(&a.state, &peer)
+        .await
+        .unwrap();
+    crate::peers::recovery::submit(
+        &a.state,
+        RecoveryBatchInput {
+            targets: vec![RecoveryTarget {
+                kind: RecoveryKind::Operation,
+                id: "heartbeat-example".into(),
+                peer_id: Some(peer.id.clone()),
+            }],
+            all: false,
+            resolution: None,
+        },
+    )
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE peer_recovery_state SET acceptance_generation=9223372036854775807 WHERE peer_id=?",
+    )
+    .bind(&peer.id)
+    .execute(&a.state.db)
+    .await
+    .unwrap();
+    let error = crate::peers::recovery::forward_peer(&a.state, &peer.id)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), "peer_recovery_generation_exhausted");
+    let counter: (i64, String) = sqlx::query_as(
+        "SELECT acceptance_generation,typeof(acceptance_generation)
+         FROM peer_recovery_state WHERE peer_id=?",
+    )
+    .bind(&peer.id)
+    .fetch_one(&a.state.db)
+    .await
+    .unwrap();
+    assert_eq!(counter, (i64::MAX, "integer".to_owned()));
+    let accepted: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM outgoing_recovery_requests WHERE peer_id=? AND state='accepted'",
+    )
+    .bind(&peer.id)
+    .fetch_one(&a.state.db)
+    .await
+    .unwrap();
+    assert_eq!(accepted, 0, "an exhausted counter cannot save an acceptance");
 }

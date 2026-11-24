@@ -48,6 +48,13 @@ Keepalives do not fetch state or write heartbeat timestamps to the database. A c
 in-memory heartbeat keeps unchanged snapshots current only after both progress and recovery fetches
 succeed for that connection and its latest hint. New hints, failures, disconnects and configuration
 changes invalidate that verification; keepalives alone never authorize failed or previous snapshots.
+Progress and recovery are fetched concurrently (recovery within ten seconds), so a stalled endpoint
+does not delay the other snapshot. Refreshes write only changed mirror rows, and rewrite an unchanged
+snapshot's timestamp at most every ten seconds; an unchanged recent snapshot is checked with a read
+only and does not wait for the database writer lock. A recovery snapshot clears accepted Fix requests only
+when they were accepted before its request started; later acceptances wait for the next snapshot.
+Upgrades retain legacy accepted requests until a successful snapshot clears them. Acceptance ordering
+uses an atomic per-peer integer counter; exhaustion stops new confirmations instead of wrapping.
 Closed, silent (45 seconds), or invalid streams report
 availability errors and reconnect after five seconds, fetching state again on connection.
 Only HTTP 404, 405, or 501 selects legacy five-second polling; legacy peers are probed every minute

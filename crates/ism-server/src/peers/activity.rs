@@ -77,21 +77,28 @@ pub async fn run(state: AppState) {
 }
 
 pub(super) async fn refresh_peer(state: &AppState, peer: &net::Peer) -> bool {
-    let mut success = true;
-    if let Err(error) = super::recovery::refresh(state, peer).await {
-        success = false;
+    // A stalled receiver endpoint must not delay the other snapshot.
+    let recovery = async {
+        let Err(error) = super::recovery::refresh(state, peer).await else {
+            return true;
+        };
         tracing::warn!(peer=%peer.id,"cannot refresh recovery: {}",error.message());
         if let Err(error) = super::recovery::unavailable(state, &peer.id, &error).await {
             tracing::error!("cannot persist recovery availability: {}", error.message());
         }
-    }
-    if let Err(error) = refresh(state, peer).await {
-        success = false;
+        false
+    };
+    let activity = async {
+        let Err(error) = refresh(state, peer).await else {
+            return true;
+        };
         let error = crate::error::redact(&error);
         tracing::warn!(peer=%peer.id, "cannot refresh activity: {error}");
         unavailable(state, &peer.id, &error).await;
-    }
-    success
+        false
+    };
+    let (recovery, activity) = tokio::join!(recovery, activity);
+    recovery && activity
 }
 
 const CTE: &str = "
@@ -541,6 +548,8 @@ pub async fn changes(state: &AppState, peer: &str, after: i64) -> AppResult<Chan
     })
 }
 
+type CachedProgress = (i64, Option<String>, Option<String>, Option<String>);
+
 pub async fn refresh(state: &AppState, peer: &net::Peer) -> Result<(), String> {
     let mut cursor: i64 =
         sqlx::query_scalar("SELECT cursor FROM peer_sync_state WHERE peer_id = ?")
@@ -574,6 +583,25 @@ pub async fn refresh(state: &AppState, peer: &net::Peer) -> Result<(), String> {
             || batch.progress.files_completed > batch.progress.files_total
         {
             return Err("invalid peer sync activity".into());
+        }
+        let json = serde_json::to_string(&batch.progress).map_err(|e| e.to_string())?;
+        if batch.changes.is_empty() && !batch.more {
+            // Unchanged recent snapshots skip the writer lock; the write path rechecks.
+            let old: Option<CachedProgress> = sqlx::query_as(
+                "SELECT cursor,progress_json,error,updated_at FROM peer_sync_state WHERE peer_id = ?",
+            )
+            .bind(&peer.id)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|e| e.to_string())?;
+            if old.is_some_and(|(old_cursor, progress, error, updated)| {
+                old_cursor == batch.cursor
+                    && progress.as_deref() == Some(&json)
+                    && error.is_none()
+                    && super::notifications::snapshot_recent(updated.as_deref())
+            }) {
+                return Ok(());
+            }
         }
         let shares = super::shares(state)
             .await
@@ -622,8 +650,6 @@ pub async fn refresh(state: &AppState, peer: &net::Peer) -> Result<(), String> {
                 .await
                 .map_err(|e| e.to_string())?;
         }
-        let json = serde_json::to_string(&batch.progress).map_err(|e| e.to_string())?;
-        type CachedProgress = (i64, Option<String>, Option<String>, Option<String>);
         let old: Option<CachedProgress> = sqlx::query_as(
             "SELECT cursor,progress_json,error,updated_at FROM peer_sync_state WHERE peer_id = ?",
         )
@@ -640,12 +666,17 @@ pub async fn refresh(state: &AppState, peer: &net::Peer) -> Result<(), String> {
                     || updated_at.is_none() != batch.more
             });
         let updated_at = (!batch.more).then(db::now);
-        sqlx::query(
-            "INSERT INTO peer_sync_state (peer_id,cursor,progress_json,updated_at,error) VALUES (?,?,?,?,NULL)
-             ON CONFLICT(peer_id) DO UPDATE SET cursor = excluded.cursor,progress_json = excluded.progress_json,
-                 updated_at = excluded.updated_at,error = NULL",
-        ).bind(&peer.id).bind(batch.cursor).bind(json).bind(updated_at)
-        .execute(&mut *tx).await.map_err(|e| e.to_string())?;
+        let recent = old.as_ref().is_some_and(|(_, _, _, updated)| {
+            super::notifications::snapshot_recent(updated.as_deref())
+        });
+        if changed || !recent {
+            sqlx::query(
+                "INSERT INTO peer_sync_state (peer_id,cursor,progress_json,updated_at,error) VALUES (?,?,?,?,NULL)
+                 ON CONFLICT(peer_id) DO UPDATE SET cursor = excluded.cursor,progress_json = excluded.progress_json,
+                     updated_at = excluded.updated_at,error = NULL",
+            ).bind(&peer.id).bind(batch.cursor).bind(json).bind(updated_at)
+            .execute(&mut *tx).await.map_err(|e| e.to_string())?;
+        }
         tx.commit().await.map_err(|e| e.to_string())?;
         if changed {
             state.emit_ui(ServerEvent::SyncChanged);

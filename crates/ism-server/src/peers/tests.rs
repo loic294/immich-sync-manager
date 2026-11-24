@@ -793,12 +793,13 @@ struct Instance {
     snapshot_status: std::sync::Arc<std::sync::atomic::AtomicU16>,
     recovery_status: std::sync::Arc<std::sync::atomic::AtomicU16>,
     evidence_status: std::sync::Arc<std::sync::atomic::AtomicU16>,
-    attention_hold: std::sync::Arc<AttentionHold>,
+    attention_hold: std::sync::Arc<ResponseHold>,
+    recovery_hold: std::sync::Arc<ResponseHold>,
     inventory_response: std::sync::Arc<std::sync::Mutex<Option<InventoryResponseControl>>>,
 }
 
 #[derive(Default)]
-struct AttentionHold {
+struct ResponseHold {
     armed: std::sync::atomic::AtomicBool,
     entered: tokio::sync::Notify,
     release: tokio::sync::Notify,
@@ -839,7 +840,8 @@ async fn instance(name: &str) -> Instance {
     let snapshot_status = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0));
     let recovery_status = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0));
     let evidence_status = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0));
-    let attention_hold = std::sync::Arc::new(AttentionHold::default());
+    let attention_hold = std::sync::Arc::new(ResponseHold::default());
+    let recovery_hold = std::sync::Arc::new(ResponseHold::default());
     let inventory_response = std::sync::Arc::new(std::sync::Mutex::new(None));
     let app = crate::routes::router(state.clone()).layer(axum::middleware::from_fn({
         let requests = requests.clone();
@@ -849,6 +851,7 @@ async fn instance(name: &str) -> Instance {
         let evidence_status = evidence_status.clone();
         let attention_hold = attention_hold.clone();
         let inventory_response = inventory_response.clone();
+        let recovery_hold = recovery_hold.clone();
         move |request: axum::extract::Request, next: axum::middleware::Next| {
             let requests = requests.clone();
             let status = status.clone();
@@ -857,6 +860,7 @@ async fn instance(name: &str) -> Instance {
             let evidence_status = evidence_status.clone();
             let attention_hold = attention_hold.clone();
             let inventory_response = inventory_response.clone();
+            let recovery_hold = recovery_hold.clone();
             async move {
                 let path = request.uri().path().to_owned();
                 *requests.lock().unwrap().entry(path.clone()).or_insert(0) += 1;
@@ -907,14 +911,17 @@ async fn instance(name: &str) -> Instance {
                         axum::http::StatusCode::from_u16(status).unwrap(),
                     );
                 }
-                if path == "/api/peer/v1/attention"
-                    && attention_hold
-                        .armed
-                        .swap(false, std::sync::atomic::Ordering::SeqCst)
-                {
+                let hold = match path.as_str() {
+                    "/api/peer/v1/attention" => Some(&attention_hold),
+                    "/api/peer/v1/recovery" => Some(&recovery_hold),
+                    _ => None,
+                };
+                if let Some(hold) = hold.filter(|hold| {
+                    hold.armed.swap(false, std::sync::atomic::Ordering::SeqCst)
+                }) {
                     let response = next.run(request).await;
-                    attention_hold.entered.notify_one();
-                    attention_hold.release.notified().await;
+                    hold.entered.notify_one();
+                    hold.release.notified().await;
                     return response;
                 }
                 next.run(request).await
@@ -943,6 +950,7 @@ async fn instance(name: &str) -> Instance {
         evidence_status,
         attention_hold,
         inventory_response,
+        recovery_hold,
     }
 }
 
