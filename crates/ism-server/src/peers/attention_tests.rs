@@ -470,7 +470,7 @@ async fn remote_attention_healthy_peer_has_partial_coverage_without_retry_warnin
         healthy.warnings.is_empty(),
         "scope limits are not retryable failures"
     );
-    assert!(crate::peers::activity::refresh_peer(&b.state, &peer).await);
+    assert!(crate::peers::activity::refresh_peer(&b.state, &peer, None).await);
     let combined = crate::attention::snapshot(&b.state).await.unwrap();
     assert_eq!(combined.completeness, AttentionCompleteness::Partial);
     assert!(

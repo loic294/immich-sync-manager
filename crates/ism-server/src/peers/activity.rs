@@ -76,10 +76,21 @@ pub async fn run(state: AppState) {
     }
 }
 
-pub(super) async fn refresh_peer(state: &AppState, peer: &net::Peer) -> bool {
+pub(super) async fn refresh_peer(
+    state: &AppState,
+    peer: &net::Peer,
+    verification: Option<&super::notifications::Refresh>,
+) -> bool {
     // A stalled receiver endpoint must not delay the other snapshot.
     let recovery = async {
-        let Err(error) = super::recovery::refresh(state, peer).await else {
+        let result = super::recovery::refresh(state, peer).await;
+        if let Some(verification) = verification
+            && verification.complete(super::notifications::Snapshot::Recovery, result.is_ok())
+            && result.is_ok()
+        {
+            state.emit_ui(ServerEvent::SyncChanged);
+        }
+        let Err(error) = result else {
             return true;
         };
         tracing::warn!(peer=%peer.id,"cannot refresh recovery: {}",error.message());
@@ -89,7 +100,14 @@ pub(super) async fn refresh_peer(state: &AppState, peer: &net::Peer) -> bool {
         false
     };
     let activity = async {
-        let Err(error) = refresh(state, peer).await else {
+        let result = refresh(state, peer).await;
+        if let Some(verification) = verification
+            && verification.complete(super::notifications::Snapshot::Activity, result.is_ok())
+            && result.is_ok()
+        {
+            state.emit_ui(ServerEvent::SyncChanged);
+        }
+        let Err(error) = result else {
             return true;
         };
         let error = crate::error::redact(&error);

@@ -300,7 +300,9 @@ pub(super) async fn outgoing(
             error,
             updated,
             pending,
-            state.peer_streams.fresh(peer),
+            state
+                .peer_streams
+                .fresh(peer, super::notifications::Snapshot::Recovery),
         )
     })
     .transpose()
@@ -427,7 +429,9 @@ pub async fn page(state: &AppState, limit: i64, offset: i64) -> AppResult<Recove
         .map_err(AppError::internal)?
         .saturating_sub(items.len());
     for (peer, json, error, updated, pending) in outgoing.into_iter().skip(skip).take(remaining) {
-        let fresh = state.peer_streams.fresh(&peer);
+        let fresh = state
+            .peer_streams
+            .fresh(&peer, super::notifications::Snapshot::Recovery);
         items.push(outgoing_view(peer, &json, error, updated, pending, fresh)?);
     }
     Ok(RecoveryPage { total, rows: items })
@@ -466,7 +470,9 @@ pub(super) async fn peer_conflicts_page(
     let rows = rows
         .into_iter()
         .map(|(peer, _, json, error, updated, pending)| {
-            let fresh = state.peer_streams.fresh(&peer);
+            let fresh = state
+                .peer_streams
+                .fresh(&peer, super::notifications::Snapshot::Recovery);
             outgoing_view(peer, &json, error, updated, pending, fresh)
         })
         .collect::<AppResult<Vec<_>>>()?;
@@ -518,13 +524,12 @@ pub async fn peer_page(state: &AppState, peer: &net::Peer) -> AppResult<Recovery
 
 pub async fn refresh(state: &AppState, peer: &net::Peer) -> AppResult<()> {
     // Acceptances recorded after this point may postdate the receiver's snapshot.
-    let generation: i64 = sqlx::query_scalar(
-        "SELECT acceptance_generation FROM peer_recovery_state WHERE peer_id=?",
-    )
-    .bind(&peer.id)
-    .fetch_optional(&state.db)
-    .await?
-    .unwrap_or(0);
+    let generation: i64 =
+        sqlx::query_scalar("SELECT acceptance_generation FROM peer_recovery_state WHERE peer_id=?")
+            .bind(&peer.id)
+            .fetch_optional(&state.db)
+            .await?
+            .unwrap_or(0);
     let page: RecoveryPage = net::get_json_within(
         state,
         peer,

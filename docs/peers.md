@@ -45,13 +45,15 @@ uses this stream instead of five-second refreshes when supported. It reads notif
 of authoritative fetches and coalesces refreshes to at most once per second. Routine successful
 refreshes do not create background task history; fetch errors are logged and remain visible in Sync.
 Keepalives do not fetch state or write heartbeat timestamps to the database. A connection-scoped
-in-memory heartbeat keeps unchanged snapshots current only after both progress and recovery fetches
-succeed for that connection and its latest hint. New hints, failures, disconnects and configuration
-changes invalidate that verification; keepalives alone never authorize failed or previous snapshots.
+in-memory heartbeat keeps each unchanged snapshot current only after its own fetch succeeds for that
+connection and its latest hint. Activity and recovery verify independently: a stalled or failed recovery
+fetch does not suppress current transfer rates or ETA. New hints, disconnects and configuration changes
+invalidate both verifications; a fetch failure revokes only its own snapshot. Keepalives alone never
+authorize failed or previous snapshots.
 Progress and recovery are fetched concurrently (recovery within ten seconds), so a stalled endpoint
 does not delay the other snapshot. Refreshes write only changed mirror rows, and rewrite an unchanged
-snapshot's timestamp at most every ten seconds; an unchanged recent snapshot is checked with a read
-only and does not wait for the database writer lock. A recovery snapshot clears accepted Fix requests only
+snapshot's timestamp at most every ten seconds; an unchanged recent snapshot uses only a read
+and does not wait for the database writer lock. A recovery snapshot clears accepted Fix requests only
 when they were accepted before its request started; later acceptances wait for the next snapshot.
 Upgrades retain legacy accepted requests until a successful snapshot clears them. Acceptance ordering
 uses an atomic per-peer integer counter; exhaustion stops new confirmations instead of wrapping.

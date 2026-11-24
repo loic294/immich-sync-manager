@@ -28,8 +28,14 @@ pub(crate) struct Streams(Mutex<HashMap<String, Arc<Mutex<Health>>>>);
 struct Health {
     connected: bool,
     revision: u64,
-    verified: Option<u64>,
+    verified: [Option<u64>; 2],
     heartbeat: tokio::time::Instant,
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum Snapshot {
+    Activity,
+    Recovery,
 }
 
 impl Streams {
@@ -37,18 +43,18 @@ impl Streams {
         let health = Arc::new(Mutex::new(Health {
             connected: true,
             revision: 0,
-            verified: None,
+            verified: [None; 2],
             heartbeat: tokio::time::Instant::now(),
         }));
         lock(&self.0).insert(peer.into(), health.clone());
         Connection(health)
     }
 
-    pub(crate) fn fresh(&self, peer: &str) -> Option<bool> {
+    pub(super) fn fresh(&self, peer: &str, snapshot: Snapshot) -> Option<bool> {
         lock(&self.0).get(peer).map(|health| {
             let health = lock(health);
             health.connected
-                && health.verified == Some(health.revision)
+                && health.verified[snapshot as usize] == Some(health.revision)
                 && health.heartbeat.elapsed() <= FRESHNESS
         })
     }
@@ -68,6 +74,7 @@ impl Streams {
     }
 }
 
+/// Activity uses only its own stream verification; unsupported peers keep timestamp freshness.
 pub(crate) fn snapshot_fresh(state: &AppState, peer: &str, updated: Option<&str>) -> bool {
     let Some(at) = updated.and_then(crate::db::parse_ts) else {
         return false;
@@ -78,7 +85,7 @@ pub(crate) fn snapshot_fresh(state: &AppState, peer: &str, updated: Option<&str>
     }
     state
         .peer_streams
-        .fresh(peer)
+        .fresh(peer, Snapshot::Activity)
         .unwrap_or(age <= chrono::Duration::seconds(30))
 }
 
@@ -102,7 +109,7 @@ impl Connection {
     fn refresh(&self) -> Refresh {
         let mut health = lock(&self.0);
         health.revision += 1;
-        health.verified = None;
+        health.verified = [None; 2];
         health.heartbeat = tokio::time::Instant::now();
         Refresh {
             health: self.0.clone(),
@@ -116,17 +123,19 @@ impl Connection {
 }
 
 #[derive(Clone)]
-struct Refresh {
+pub(super) struct Refresh {
     health: Arc<Mutex<Health>>,
     revision: u64,
 }
 
 impl Refresh {
-    fn complete(&self, success: bool) {
+    pub(super) fn complete(&self, snapshot: Snapshot, success: bool) -> bool {
         let mut health = lock(&self.health);
         if health.connected && health.revision == self.revision {
-            health.verified = success.then_some(self.revision);
+            health.verified[snapshot as usize] = success.then_some(self.revision);
+            return true;
         }
+        false
     }
 }
 
@@ -223,15 +232,7 @@ pub(super) async fn run(state: &AppState, peer: &net::Peer) {
             match hint {
                 Hint::Waiting => {}
                 Hint::Refresh(refresh) => {
-                    let success = activity::refresh_peer(state, peer).await;
-                    if let Some(refresh) = &refresh {
-                        refresh.complete(success);
-                    }
-                    if success && refresh.is_some() {
-                        // A hint can represent prepared evidence even when the recovery rows
-                        // themselves did not change.
-                        state.emit_ui(crate::state::ServerEvent::SyncChanged);
-                    }
+                    let success = activity::refresh_peer(state, peer, refresh.as_ref()).await;
                     if !success {
                         retry = Some(refresh);
                     }
@@ -398,35 +399,84 @@ mod tests {
 
     #[test]
     fn stale_or_failed_refresh_cannot_verify_a_new_connection_or_revision() {
+        for snapshot in [Snapshot::Activity, Snapshot::Recovery] {
+            let streams = Streams::default();
+            let first = streams.connect("peer-example");
+            let old = first.refresh();
+            assert!(old.complete(snapshot, true));
+            assert_eq!(streams.fresh("peer-example", snapshot), Some(true));
+            drop(first);
+            let current = streams.connect("peer-example");
+            current.heartbeat();
+            assert!(!old.complete(snapshot, true));
+            assert_eq!(streams.fresh("peer-example", snapshot), Some(false));
+            let initial = current.refresh();
+            initial.complete(snapshot, false);
+            current.heartbeat();
+            assert_eq!(streams.fresh("peer-example", snapshot), Some(false));
+            let pending = current.refresh();
+            assert!(!initial.complete(snapshot, true));
+            assert_eq!(streams.fresh("peer-example", snapshot), Some(false));
+            pending.complete(snapshot, true);
+            lock(&current.0).heartbeat =
+                tokio::time::Instant::now() - FRESHNESS - Duration::from_secs(1);
+            assert_eq!(streams.fresh("peer-example", snapshot), Some(false));
+            current.heartbeat();
+            assert_eq!(streams.fresh("peer-example", snapshot), Some(true));
+            streams.invalidate();
+            current.heartbeat();
+            assert!(!pending.complete(snapshot, true));
+            assert_eq!(streams.fresh("peer-example", snapshot), Some(false));
+            streams.legacy("peer-example");
+            assert_eq!(streams.fresh("peer-example", snapshot), None);
+        }
+    }
+
+    #[test]
+    fn snapshot_verification_is_independent_but_hints_revoke_both() {
         let streams = Streams::default();
-        let first = streams.connect("peer-example");
-        let old = first.refresh();
-        old.complete(true);
-        assert_eq!(streams.fresh("peer-example"), Some(true));
-        drop(first);
-        let current = streams.connect("peer-example");
-        current.heartbeat();
-        old.complete(true);
-        assert_eq!(streams.fresh("peer-example"), Some(false));
-        let initial = current.refresh();
-        initial.complete(false);
-        current.heartbeat();
-        assert_eq!(streams.fresh("peer-example"), Some(false));
-        let pending = current.refresh();
-        initial.complete(true);
-        assert_eq!(streams.fresh("peer-example"), Some(false));
-        pending.complete(true);
-        lock(&current.0).heartbeat =
-            tokio::time::Instant::now() - FRESHNESS - Duration::from_secs(1);
-        assert_eq!(streams.fresh("peer-example"), Some(false));
-        current.heartbeat();
-        assert_eq!(streams.fresh("peer-example"), Some(true));
-        streams.invalidate();
-        current.heartbeat();
-        pending.complete(true);
-        assert_eq!(streams.fresh("peer-example"), Some(false));
-        streams.legacy("peer-example");
-        assert_eq!(streams.fresh("peer-example"), None);
+        let connection = streams.connect("peer-example");
+        let refresh = connection.refresh();
+        refresh.complete(Snapshot::Activity, true);
+        assert_eq!(
+            streams.fresh("peer-example", Snapshot::Activity),
+            Some(true)
+        );
+        assert_eq!(
+            streams.fresh("peer-example", Snapshot::Recovery),
+            Some(false)
+        );
+        refresh.complete(Snapshot::Recovery, false);
+        assert_eq!(
+            streams.fresh("peer-example", Snapshot::Activity),
+            Some(true)
+        );
+        refresh.complete(Snapshot::Recovery, true);
+        assert_eq!(
+            streams.fresh("peer-example", Snapshot::Recovery),
+            Some(true)
+        );
+        let pending = connection.refresh();
+        assert_eq!(
+            streams.fresh("peer-example", Snapshot::Activity),
+            Some(false)
+        );
+        assert_eq!(
+            streams.fresh("peer-example", Snapshot::Recovery),
+            Some(false)
+        );
+        assert!(!refresh.complete(Snapshot::Activity, true));
+        assert!(!refresh.complete(Snapshot::Recovery, true));
+        pending.complete(Snapshot::Recovery, true);
+        pending.complete(Snapshot::Activity, false);
+        assert_eq!(
+            streams.fresh("peer-example", Snapshot::Activity),
+            Some(false)
+        );
+        assert_eq!(
+            streams.fresh("peer-example", Snapshot::Recovery),
+            Some(true)
+        );
     }
 
     #[test]

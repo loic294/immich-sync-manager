@@ -1,6 +1,7 @@
 //! Paired real-HTTP notification clients, with controllable endpoint compatibility/failure.
 
 use super::*;
+use crate::peers::notifications::Snapshot;
 use crate::peers::{activity, net};
 use std::sync::atomic::Ordering;
 
@@ -59,7 +60,15 @@ async fn ready(a: &Instance, peer: &net::Peer) -> bool {
     .fetch_one(&a.state.db)
     .await
     .unwrap();
-    snapshots && a.state.peer_streams.fresh(&peer.id).unwrap_or(true)
+    snapshots
+        && [Snapshot::Activity, Snapshot::Recovery]
+            .into_iter()
+            .all(|snapshot| {
+                a.state
+                    .peer_streams
+                    .fresh(&peer.id, snapshot)
+                    .unwrap_or(true)
+            })
 }
 
 async fn age_snapshots(a: &Instance) {
@@ -396,7 +405,7 @@ async fn notification_client_failed_fetch_or_connection_never_extends_freshness(
     assert_eq!(cache_available(&a, &peer).await, (false, false));
     tokio::time::sleep(Duration::from_secs(16)).await;
     assert_eq!(
-        a.state.peer_streams.fresh(&peer.id),
+        a.state.peer_streams.fresh(&peer.id, Snapshot::Recovery),
         Some(false),
         "keepalives cannot authorize failed snapshots"
     );
@@ -409,12 +418,13 @@ async fn notification_client_failed_fetch_or_connection_never_extends_freshness(
     b.recovery_status.store(500, Ordering::SeqCst);
     a.state.peer_configuration_changed();
     assert_eq!(
-        a.state.peer_streams.fresh(&peer.id),
+        a.state.peer_streams.fresh(&peer.id, Snapshot::Recovery),
         Some(false),
         "configuration invalidation is immediate"
     );
     wait("new stream with failed initial recovery fetch", || async {
         count(&b, NOTIFICATIONS) >= 2
+            && a.state.peer_streams.fresh(&peer.id, Snapshot::Activity) == Some(true)
             && sqlx::query_scalar::<_, bool>(
                 "SELECT EXISTS(SELECT 1 FROM peer_sync_state WHERE error IS NULL)
                  AND EXISTS(SELECT 1 FROM peer_recovery_state WHERE error IS NOT NULL)",
@@ -427,8 +437,8 @@ async fn notification_client_failed_fetch_or_connection_never_extends_freshness(
     age_snapshots(&a).await;
     assert_eq!(
         cache_available(&a, &peer).await,
-        (false, false),
-        "both initial snapshots are required"
+        (true, false),
+        "activity verifies independently while recovery remains unavailable"
     );
     b.recovery_status.store(0, Ordering::SeqCst);
     wait("both new snapshots verified", || ready(&a, &peer)).await;
@@ -438,7 +448,7 @@ async fn notification_client_failed_fetch_or_connection_never_extends_freshness(
     b.notification_status.store(500, Ordering::SeqCst);
     b.state.peer_configuration_changed();
     wait("disconnection", || async {
-        a.state.peer_streams.fresh(&peer.id) == Some(false)
+        a.state.peer_streams.fresh(&peer.id, Snapshot::Activity) == Some(false)
     })
     .await;
     assert_eq!(cache_available(&a, &peer).await, (false, false));
@@ -449,7 +459,7 @@ async fn notification_client_failed_fetch_or_connection_never_extends_freshness(
     admin::delete_peer(&a.state, &peer.id).await.unwrap();
     tokio::time::sleep(Duration::from_millis(250)).await;
     assert_eq!(
-        a.state.peer_streams.fresh(&peer.id),
+        a.state.peer_streams.fresh(&peer.id, Snapshot::Activity),
         None,
         "removed connection is pruned"
     );
@@ -698,11 +708,39 @@ async fn notification_client_retries_failed_snapshots_and_fetches_recovery_hints
 }
 
 #[tokio::test]
-async fn notification_client_stalled_recovery_does_not_delay_activity_or_verify_early() {
+async fn notification_client_stalled_recovery_keeps_sync_page_fresh_without_verifying_recovery() {
     let (mut a, mut b) = pair().await;
     stop_workers(&mut a).await;
     stop_workers(&mut b).await;
     let peer = net::peers(&a.state).await.unwrap().remove(0);
+    failed_remote_operation(&b).await;
+    crate::peers::recovery::refresh(&a.state, &peer)
+        .await
+        .unwrap();
+    let remote_peer = net::peers(&b.state).await.unwrap().remove(0);
+    let share = crate::peers::shares(&b.state).await.unwrap().remove(0);
+    crate::peers::queue_transfer(
+        &b.state,
+        &remote_peer.id,
+        &share,
+        "progress.jpg",
+        &crate::crypto::sha256_hex(b"synthetic"),
+        1000,
+        &VersionVector::default(),
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE transfers SET status='running'")
+        .execute(&b.state.db)
+        .await
+        .unwrap();
+    let transfer: String = sqlx::query_scalar("SELECT id FROM transfers")
+        .fetch_one(&b.state.db)
+        .await
+        .unwrap();
+    activity::record_progress(&b.state, &transfer, &remote_peer.id, 100, 100)
+        .await
+        .unwrap();
     for table in ["peer_sync_state", "peer_recovery_state"] {
         sqlx::query(sqlx::AssertSqlSafe(format!("DELETE FROM {table}")))
             .execute(&a.state.db)
@@ -725,7 +763,27 @@ async fn notification_client_stalled_recovery_does_not_delay_activity_or_verify_
         .unwrap()
     })
     .await;
+    wait("activity independently verified", || async {
+        a.state.peer_streams.fresh(&peer.id, Snapshot::Activity) == Some(true)
+    })
+    .await;
     assert!(count(&b, PROGRESS) >= 1);
+    let page = activity::page(&a.state, "active", 100, 0, None)
+        .await
+        .unwrap();
+    assert!(page.warnings.is_empty(), "{:?}", page.warnings);
+    assert_eq!(
+        (page.progress.bytes_total, page.progress.bytes_done),
+        (1000, 100)
+    );
+    assert!(page.progress.bytes_per_second > 0.0);
+    assert!(page.progress.eta_seconds.is_some());
+    assert!(
+        page.rows
+            .iter()
+            .any(|row| row.outgoing && row.bytes_done == 100)
+    );
+    assert_eq!(cache_available(&a, &peer).await, (true, false));
     let recovered: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM peer_recovery_state WHERE updated_at IS NOT NULL)",
     )
@@ -734,16 +792,32 @@ async fn notification_client_stalled_recovery_does_not_delay_activity_or_verify_
     .unwrap();
     assert!(!recovered, "the recovery snapshot is still in flight");
     assert_eq!(
-        a.state.peer_streams.fresh(&peer.id),
+        a.state.peer_streams.fresh(&peer.id, Snapshot::Recovery),
         Some(false),
-        "the stream is verified only after both snapshots succeed"
+        "recovery stays unverified while its snapshot is held"
     );
+    b.state.emit(crate::state::ServerEvent::SyncChanged);
+    wait(
+        "new hint revokes the earlier activity verification",
+        || async { a.state.peer_streams.fresh(&peer.id, Snapshot::Activity) == Some(false) },
+    )
+    .await;
+    let page = activity::page(&a.state, "active", 100, 0, None)
+        .await
+        .unwrap();
+    assert!(!page.warnings.is_empty());
+    assert_eq!(page.progress.bytes_per_second, 0.0);
+    assert_eq!(page.progress.eta_seconds, None);
     b.recovery_hold.release.notify_one();
     wait("verified after the stalled recovery completes", || {
         ready(&a, &peer)
     })
     .await;
-    assert_eq!(a.state.peer_streams.fresh(&peer.id), Some(true));
+    assert_eq!(
+        a.state.peer_streams.fresh(&peer.id, Snapshot::Recovery),
+        Some(true)
+    );
+    assert_eq!(cache_available(&a, &peer).await, (true, true));
 }
 
 #[tokio::test]
@@ -1017,7 +1091,11 @@ async fn recovery_snapshot_started_before_acceptance_keeps_it_until_a_later_snap
     .fetch_one(&a.state.db)
     .await
     .unwrap();
-    assert_eq!(generation, (1, 1), "missing counters are created atomically");
+    assert_eq!(
+        generation,
+        (1, 1),
+        "missing counters are created atomically"
+    );
     b.recovery_hold.release.notify_one();
     held.await.unwrap().unwrap();
     let legacy: i64 = sqlx::query_scalar(
@@ -1095,5 +1173,8 @@ async fn recovery_acceptance_counter_exhaustion_fails_closed() {
     .fetch_one(&a.state.db)
     .await
     .unwrap();
-    assert_eq!(accepted, 0, "an exhausted counter cannot save an acceptance");
+    assert_eq!(
+        accepted, 0,
+        "an exhausted counter cannot save an acceptance"
+    );
 }
