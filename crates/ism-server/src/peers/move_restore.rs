@@ -144,6 +144,18 @@ async fn request_choice(
             .await?;
         }
     }
+    let peer = peers::net::peer(state, &plan.peer_id).await?;
+    let receiving = vec![
+        peers::versions::local(state, &share, &plan.source).await?,
+        peers::versions::local(state, &share, &plan.target).await?,
+    ];
+    let evidence = crate::crypto::sha256_hex(&serde_json::to_vec(&(
+        &plan.share_id,
+        &plan.peer_id,
+        &peer.name,
+        &receiving,
+        current,
+    ))?);
     let _guard = state.replication_operation_lock.lock().await;
     let latest = load(state, &plan.operation_id)
         .await?
@@ -163,18 +175,6 @@ async fn request_choice(
     {
         return Ok(());
     }
-    let peer = peers::net::peer(state, &plan.peer_id).await?;
-    let receiving = vec![
-        peers::versions::local(state, &share, &plan.source).await?,
-        peers::versions::local(state, &share, &plan.target).await?,
-    ];
-    let evidence = crate::crypto::sha256_hex(&serde_json::to_vec(&(
-        &plan.share_id,
-        &plan.peer_id,
-        &peer.name,
-        &receiving,
-        current,
-    ))?);
     if !force
         && let (Some(id), Some(previous)) = (&plan.conflict_id, &plan.requested_evidence)
         && previous == &evidence

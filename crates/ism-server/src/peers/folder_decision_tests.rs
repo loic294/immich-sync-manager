@@ -553,6 +553,52 @@ async fn interrupted_initial_restoration_conflict_is_reassociated_before_resume(
             "unchanged evidence must not invalidate an in-flight review"
         );
     }
+    let held = a
+        .state
+        .version_scan_limit
+        .clone()
+        .acquire_many_owned(2)
+        .await
+        .unwrap();
+    a.tasks
+        .push(tokio::spawn(crate::ops::exec::run(a.state.clone())));
+    write_old(&b.shared.join("new/nested/photo.jpg"), b"new peer evidence");
+    scan(&b).await;
+    let scan_refs = std::sync::Arc::strong_count(&a.state.version_scan_limit);
+    let task_state = a.state.clone();
+    let task_operation = operation.clone();
+    let pending_scan =
+        tokio::spawn(
+            async move { admin::validate_folder_restore(&task_state, &task_operation).await },
+        );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while std::sync::Arc::strong_count(&a.state.version_scan_limit) <= scan_refs {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("review did not reach the held scan permit");
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        run_op(
+            &a,
+            "independent-while-review-waits",
+            vec![OperationAction::CreateFolder {
+                target: loc("shared/independent"),
+            }],
+        ),
+    )
+    .await
+    .expect("independent managed operation waited for the held review scan");
+    assert!(a.shared.join("independent").is_dir());
+    drop(held);
+    assert_eq!(
+        pending_scan.await.unwrap().unwrap_err().code(),
+        "choose_version"
+    );
+    let existing_plan = admin::snapshot_restoration(&a.state, &operation)
+        .await
+        .unwrap();
     write_old(
         &a.shared.join("new/receiving.jpg"),
         b"changed receiving evidence",
