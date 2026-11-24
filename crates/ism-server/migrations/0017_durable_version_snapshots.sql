@@ -26,8 +26,10 @@ CREATE INDEX recovery_event_anchor ON event_log(
 CREATE INDEX recovery_event_move ON event_log(
     share_name, json_extract(data_json, '$.from'), seq
 ) WHERE kind IN ('file_moved','folder_moved') AND json_valid(data_json);
+CREATE INDEX recovery_event_prune ON event_log(share_name, seq)
+WHERE kind = 'folder_pruned';
 CREATE INDEX recovery_event_invalid ON event_log(share_name, seq)
-WHERE kind IN ('file_changed','file_moved','folder_created','folder_moved')
+WHERE kind IN ('file_changed','file_moved','folder_created','folder_moved','folder_pruned')
   AND CASE WHEN json_valid(data_json) THEN
       json_type(data_json) IS NOT 'object'
       OR json_type(data_json,'$.path') IS NOT 'text'
