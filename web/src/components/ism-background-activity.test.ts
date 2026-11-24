@@ -42,6 +42,7 @@ describe('background activity', () => {
     const page = await mount('ism-background-activity');
     await vi.waitFor(() => expect(page.textContent).toContain('41 files discovered'));
     expect(page.querySelector('progress')).toBeNull();
+    expect(page.textContent).toContain('Elapsed');
     get.mockResolvedValue(
       snapshot([
         { ...task, done: 15, total: 50, unit: 'files checked', phase: 'Reconciling files' },
@@ -50,12 +51,39 @@ describe('background activity', () => {
     events.emit({ type: 'activity_changed' });
     await vi.waitFor(() => expect(page.textContent).toContain('15 / 50 files checked'));
     expect(page.querySelector('progress')?.value).toBe(30);
+    expect(page.querySelector('progress')?.getAttribute('aria-label')).toBe(
+      'Checking shared files: 30%',
+    );
     page
       .querySelector('ism-pagination')
       ?.dispatchEvent(new CustomEvent('page-change', { detail: { limit: 25, offset: 25 } }));
     await vi.waitFor(() => expect(get).toHaveBeenCalledWith(25, 25));
     expect(page.textContent).toContain('Checking shared files');
     expect(page.querySelector('a')?.getAttribute('href')).toBe('/peers');
+  });
+
+  it.each([
+    ['a missing start time', '', null],
+    ['an invalid start time', 'not-a-date', null],
+    ['an invalid finish time', task.started_at, 'not-a-date'],
+  ])('does not invent an elapsed duration with %s', async (_label, started_at, finished_at) => {
+    vi.spyOn(admin, 'backgroundActivity').mockResolvedValue(
+      snapshot([
+        {
+          ...task,
+          status: 'blocked',
+          started_at,
+          finished_at,
+          phase: 'Saved activity could not be read',
+        },
+      ]),
+    );
+    const page = await mount('ism-background-activity');
+    await vi.waitFor(() => expect(page.textContent).toContain('Saved activity could not be read'));
+    expect(page.textContent).toContain('Started');
+    expect(page.textContent).not.toContain('Elapsed');
+    expect(page.textContent).not.toContain('Duration');
+    expect(page.textContent).not.toContain('NaN');
   });
 
   it('groups bulk blockers into one row with reasons and examples, without a misleading progress bar', async () => {
@@ -97,6 +125,98 @@ describe('background activity', () => {
     await page.updateComplete;
     expect(page.textContent).toContain('Checking shared files');
     expect(page.textContent).not.toContain('Peer B / Archive');
+  });
+
+  it('links grouped conflict comparisons to Conflicts', async () => {
+    vi.spyOn(admin, 'backgroundActivity').mockResolvedValue(
+      snapshot([
+        {
+          ...task,
+          id: 'state:conflict-evidence:blocked',
+          task_key: 'conflict-evidence:blocked',
+          title: 'Conflict evidence preparation',
+          resource: 'Conflicts',
+          status: 'blocked',
+          phase: 'The comparison cannot continue automatically',
+          unit: 'conflicts',
+          count: 3,
+          page: '/conflicts',
+        },
+      ]),
+    );
+    const page = await mount('ism-background-activity');
+    await vi.waitFor(() => expect(page.textContent).toContain('3 conflicts'));
+    expect(page.querySelector('a[href="/conflicts"]')?.textContent).toContain('Open conflicts');
+  });
+
+  it('takes version decisions to Conflicts instead of the sync queue', async () => {
+    vi.spyOn(admin, 'backgroundActivity').mockResolvedValue(
+      snapshot([
+        {
+          ...task,
+          task_key: 'recovery:conflict:needs_decision',
+          title: 'Recovery verification',
+          resource: 'conflict',
+          status: 'blocked',
+          phase: 'Waiting for an administrator to choose a version',
+          page: '/sync',
+        },
+      ]),
+    );
+    const page = await mount('ism-background-activity');
+    await vi.waitFor(() => expect(page.textContent).toContain('Compare the versions in Conflicts'));
+    expect(page.querySelector('a[href="/conflicts"]')?.textContent).toContain('Open conflicts');
+    expect(page.querySelector('a[href="/sync?view=attention"]')).toBeNull();
+  });
+
+  it('explains newly reported waits and unknown comparison status in plain language', async () => {
+    const data = snapshot([
+      {
+        ...task,
+        id: 'state:queue',
+        title: 'Peer file transfer queue',
+        status: 'waiting',
+        phase: 'Peer bookkeeping waits for active managed operations',
+      },
+      {
+        ...task,
+        id: 'state:inbox',
+        title: 'Peer event application',
+        status: 'waiting',
+        phase: 'Received changes await dependency verification and application',
+      },
+      {
+        ...task,
+        id: 'state:comparison',
+        title: 'Conflict evidence preparation',
+        status: 'waiting',
+        phase: 'The saved comparison state or worker could not be verified',
+      },
+      {
+        ...task,
+        id: 'state:slots',
+        title: 'Peer file transfer queue',
+        status: 'waiting',
+        phase: 'ISM records 2 running transfers (limit 2); queue readiness is not fully known',
+      },
+    ]);
+    data.warnings = ['Some conflict comparison work has no verifiable worker or saved state.'];
+    vi.spyOn(admin, 'backgroundActivity').mockResolvedValue(data);
+    const page = await mount('ism-background-activity');
+    await vi.waitFor(() =>
+      expect(page.textContent).toContain('Waiting for another file operation to finish'),
+    );
+    expect(page.textContent).toContain(
+      'Waiting to check and apply changes from the other instance',
+    );
+    expect(page.textContent).toContain('Comparing file versions');
+    expect(page.textContent).toContain("ISM can't confirm whether these comparisons are running");
+    expect(page.textContent).toContain('2 of 2 transfer slots in use');
+    expect(page.textContent).toContain("ISM can't confirm the status of some file comparisons");
+    expect(page.textContent).not.toContain('bookkeeping');
+    expect(page.textContent).not.toContain('dependency verification');
+    expect(page.textContent).not.toContain('queue readiness');
+    expect(page.textContent).not.toContain('evidence preparation');
   });
 
   it('explains dependent work and version conflicts without internal jargon', async () => {
@@ -143,6 +263,7 @@ describe('background activity', () => {
     expect(page.textContent).not.toContain('peer publication');
     expect(page.textContent).not.toContain('peer effect');
     expect(page.querySelector('a[href="/sync?view=attention"]')?.textContent).toContain('sync');
+    expect(page.querySelector('a[href="/conflicts"]')?.textContent).toContain('Open conflicts');
   });
 
   it('explains saved transfer failures while preserving unknown details', async () => {
@@ -254,6 +375,8 @@ describe('background activity', () => {
     );
     expect(page.querySelector('[aria-selected="true"]')?.textContent).toContain('Needs attention');
     expect(page.textContent).toContain('ISM restarted before this finished');
+    expect(page.textContent).toContain('Duration');
+    expect(page.textContent).toContain('1 min');
   });
 
   it('explains waiting and failed work, and opens related operations without unsupported actions', async () => {

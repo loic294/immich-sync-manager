@@ -1,6 +1,6 @@
 //! Observability only: these records never authorize or schedule filesystem mutations.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
@@ -19,11 +19,18 @@ struct Pending {
 }
 
 #[derive(Default)]
+struct UnreadableReports {
+    ids: HashSet<String>,
+    suppressed: bool,
+}
+
+#[derive(Default)]
 pub struct Registry(
     Mutex<HashMap<String, Pending>>,
     Mutex<Option<String>>,
     tokio::sync::Mutex<()>,
     AtomicI64,
+    Mutex<UnreadableReports>,
 );
 
 impl Registry {
@@ -219,6 +226,75 @@ fn status(a: &BackgroundActivity) -> &'static str {
     }
 }
 
+#[derive(sqlx::FromRow)]
+struct SavedActivity {
+    id: String,
+    task_key: String,
+    status: String,
+    revision: i64,
+    updated_at: String,
+    finished_at: Option<String>,
+    activity_json: String,
+}
+
+impl SavedActivity {
+    fn decode(&self) -> Option<BackgroundActivity> {
+        let activity: BackgroundActivity = serde_json::from_str(&self.activity_json).ok()?;
+        (activity.id == self.id
+            && activity.task_key == self.task_key
+            && status(&activity) == self.status)
+            .then_some(activity)
+    }
+
+    fn placeholder(&self) -> BackgroundActivity {
+        let status = match self.status.as_str() {
+            "completed" => BackgroundStatus::Completed,
+            "failed" => BackgroundStatus::Failed,
+            "interrupted" => BackgroundStatus::Interrupted,
+            _ => BackgroundStatus::Blocked,
+        };
+        BackgroundActivity {
+            id: self.id.clone(),
+            task_key: self.task_key.clone(),
+            title: "Unreadable saved activity".into(),
+            resource: "ISM".into(),
+            status,
+            phase: "Saved activity could not be read; see server logs".into(),
+            done: 0,
+            total: None,
+            unit: "items".into(),
+            started_at: String::new(),
+            updated_at: self.updated_at.clone(),
+            finished_at: self.finished_at.clone(),
+            next_at: None,
+            error: None,
+            operation_id: None,
+            page: Some("/operations".into()),
+            count: 1,
+            reasons: Vec::new(),
+            examples: Vec::new(),
+        }
+    }
+}
+
+fn report_unreadable(state: &AppState, id: &str) {
+    const LIMIT: usize = 100;
+    let mut reports = lock(&state.activity.4);
+    if reports.ids.contains(id) {
+        return;
+    }
+    if reports.ids.len() < LIMIT {
+        reports.ids.insert(id.to_owned());
+        tracing::error!(
+            activity_id = id,
+            "saved background activity is unreadable or inconsistent; raw data retained"
+        );
+    } else if !reports.suppressed {
+        reports.suppressed = true;
+        tracing::error!("additional unreadable background activity records will not be logged");
+    }
+}
+
 async fn persist(state: &AppState, pending: &Pending) -> AppResult<()> {
     let a = &pending.activity;
     let mut tx = state.db.begin().await?;
@@ -270,11 +346,17 @@ pub async fn recover(state: &AppState) -> AppResult<()> {
             .fetch_one(&state.db)
             .await?;
     state.activity.3.fetch_max(revision, Ordering::Relaxed);
-    let rows: Vec<(String, i64)> = sqlx::query_as(
-        "SELECT activity_json,revision FROM background_activity WHERE status IN ('running','waiting')",
-    ).fetch_all(&state.db).await?;
-    for (json, revision) in rows {
-        let mut activity: BackgroundActivity = serde_json::from_str(&json)?;
+    let rows: Vec<SavedActivity> = sqlx::query_as(
+        "SELECT id,task_key,status,revision,updated_at,finished_at,activity_json
+         FROM background_activity WHERE status IN ('running','waiting')",
+    )
+    .fetch_all(&state.db)
+    .await?;
+    for row in rows {
+        let Some(mut activity) = row.decode() else {
+            report_unreadable(state, &row.id);
+            continue;
+        };
         activity.status = BackgroundStatus::Interrupted;
         activity.phase = "ISM restarted before this run reported an outcome; queued work is recovered separately".into();
         activity.updated_at = db::now();
@@ -284,7 +366,7 @@ pub async fn recover(state: &AppState) -> AppResult<()> {
             &Pending {
                 activity,
                 revision: state.activity.revision(),
-                saved_revision: revision,
+                saved_revision: row.revision,
             },
         )
         .await?;
@@ -366,17 +448,29 @@ pub async fn run(state: AppState) {
 }
 
 pub async fn page(state: &AppState, limit: i64, offset: i64) -> AppResult<BackgroundActivityPage> {
-    let json: Vec<String> = sqlx::query_scalar(
-        "SELECT activity_json FROM background_activity
+    let rows: Vec<SavedActivity> = sqlx::query_as(
+        "SELECT id,task_key,status,revision,updated_at,finished_at,activity_json FROM background_activity
          WHERE status IN ('running','waiting','blocked') OR
          (status IN ('failed','interrupted') AND resolved=0) ORDER BY updated_at DESC,id",
     )
     .fetch_all(&state.db)
     .await?;
-    let mut current: HashMap<String, BackgroundActivity> = json
-        .into_iter()
-        .map(|j| serde_json::from_str::<BackgroundActivity>(&j).map(|a| (a.id.clone(), a)))
-        .collect::<Result<_, _>>()?;
+    let mut current = HashMap::new();
+    let mut unreadable = Vec::new();
+    for row in rows {
+        if !state
+            .worker_evidence
+            .current_record(&row.task_key, row.revision)
+        {
+            continue;
+        }
+        if let Some(activity) = row.decode() {
+            current.insert(activity.id.clone(), activity);
+        } else {
+            report_unreadable(state, &row.id);
+            unreadable.push(row.placeholder());
+        }
+    }
     let mut warnings: Vec<_> = lock(&state.activity.1).iter().cloned().collect();
     {
         let registry = lock(&state.activity.0);
@@ -387,7 +481,12 @@ pub async fn page(state: &AppState, limit: i64, offset: i64) -> AppResult<Backgr
             );
         }
         for pending in registry.values() {
-            current.insert(pending.activity.id.clone(), pending.activity.clone());
+            if state
+                .worker_evidence
+                .current_record(&pending.activity.task_key, pending.revision)
+            {
+                current.insert(pending.activity.id.clone(), pending.activity.clone());
+            }
         }
     }
     let total = sqlx::query_scalar(
@@ -395,8 +494,9 @@ pub async fn page(state: &AppState, limit: i64, offset: i64) -> AppResult<Backgr
     )
     .fetch_one(&state.db)
     .await?;
-    let history: Vec<String> = sqlx::query_scalar(
-        "SELECT activity_json FROM background_activity WHERE status='completed' OR resolved=1
+    let history: Vec<SavedActivity> = sqlx::query_as(
+        "SELECT id,task_key,status,revision,updated_at,finished_at,activity_json
+         FROM background_activity WHERE status='completed' OR resolved=1
          ORDER BY finished_at DESC,revision DESC,id DESC LIMIT ? OFFSET ?",
     )
     .bind(limit)
@@ -404,7 +504,26 @@ pub async fn page(state: &AppState, limit: i64, offset: i64) -> AppResult<Backgr
     .fetch_all(&state.db)
     .await?;
     let mut current: Vec<_> = current.into_values().collect();
-    let blockers = super::activity_blockers::get(state).await?;
+    let mut has_unreadable = !unreadable.is_empty();
+    current.extend(unreadable);
+    let history = history
+        .into_iter()
+        .map(|row| match row.decode() {
+            Some(activity) => activity,
+            None => {
+                has_unreadable = true;
+                report_unreadable(state, &row.id);
+                row.placeholder()
+            }
+        })
+        .collect();
+    if has_unreadable {
+        warnings.push(
+            "Some saved background activity records could not be read; see server logs.".into(),
+        );
+    }
+    let (blockers, evidence_warnings) = super::activity_blockers::get(state).await?;
+    warnings.extend(evidence_warnings);
     let keys: std::collections::HashSet<_> = current
         .iter()
         .filter(|a| {
@@ -419,22 +538,81 @@ pub async fn page(state: &AppState, limit: i64, offset: i64) -> AppResult<Backgr
     current.sort_by(|a, b| a.started_at.cmp(&b.started_at).then(a.id.cmp(&b.id)));
     Ok(BackgroundActivityPage {
         current,
-        history: history
-            .into_iter()
-            .map(|j| serde_json::from_str(&j))
-            .collect::<Result<_, _>>()?,
+        history,
         total,
         observed_at: db::now(),
         warnings,
     })
 }
 
-pub fn spawn(
+pub(crate) fn worker_started(state: &AppState, name: &str, kind: crate::worker_evidence::Kind) {
+    let revision = state.activity.revision();
+    state.worker_evidence.started(name, kind, revision);
+    state.emit(ServerEvent::ActivityChanged);
+    let state = state.clone();
+    let key = format!("worker:{name}");
+    tokio::spawn(async move {
+        match sqlx::query(
+            "UPDATE background_activity SET resolved=1
+             WHERE task_key=? AND status IN ('failed','interrupted') AND revision < ?",
+        )
+        .bind(&key)
+        .bind(revision)
+        .execute(&state.db)
+        .await
+        {
+            Ok(result) if result.rows_affected() > 0 => state.emit(ServerEvent::ActivityChanged),
+            Ok(_) => {}
+            Err(error) => tracing::error!(
+                worker = %key,
+                "cannot resolve previous worker evidence: {}",
+                redact(&error.to_string())
+            ),
+        }
+    });
+}
+
+pub(crate) async fn worker_stopped(state: &AppState, name: &str, message: &str) {
+    state.worker_evidence.stopped(name, message, db::now());
+    state.emit(ServerEvent::ActivityChanged);
+    let outcome: AppResult<()> = Err(crate::error::AppError::conflict("worker_stopped", message));
+    match Task::start(
+        state,
+        format!("worker:{name}"),
+        name,
+        "ISM",
+        Some("/operations"),
+    )
+    .await
+    {
+        Ok(task) => {
+            if let Err(error) = task.finish(&outcome).await {
+                tracing::error!("cannot persist stopped worker: {}", error.message());
+            }
+        }
+        Err(error) => tracing::error!("cannot report stopped worker: {}", error.message()),
+    }
+}
+
+pub(crate) fn transfer_stopped(
+    state: &AppState,
+    id: &str,
+    reason: crate::worker_evidence::TransferStop,
+) {
+    state
+        .worker_evidence
+        .transfer_stopped(id, reason, state.activity.revision());
+    state.emit(ServerEvent::ActivityChanged);
+}
+
+pub(crate) fn spawn(
     state: &AppState,
     name: &'static str,
+    kind: crate::worker_evidence::Kind,
     work: impl std::future::Future<Output = ()> + Send + 'static,
 ) {
     use futures_util::FutureExt;
+    worker_started(state, name, kind);
     let state = state.clone();
     tokio::spawn(async move {
         let result = std::panic::AssertUnwindSafe(work).catch_unwind().await;
@@ -444,24 +622,7 @@ pub fn spawn(
             "Background worker stopped unexpectedly"
         };
         tracing::error!(worker = name, "{message}");
-        let outcome: AppResult<()> =
-            Err(crate::error::AppError::conflict("worker_stopped", message));
-        match Task::start(
-            &state,
-            format!("worker:{name}"),
-            name,
-            "ISM",
-            Some("/operations"),
-        )
-        .await
-        {
-            Ok(task) => {
-                if let Err(e) = task.finish(&outcome).await {
-                    tracing::error!("cannot persist stopped worker: {}", e.message());
-                }
-            }
-            Err(e) => tracing::error!("cannot report stopped worker: {}", e.message()),
-        }
+        worker_stopped(&state, name, message).await;
     });
 }
 
@@ -483,6 +644,682 @@ mod tests {
         .await
         .unwrap();
         (dir, state)
+    }
+
+    #[tokio::test]
+    async fn only_queued_and_observed_share_scans_are_reported() {
+        let (_dir, state) = harness().await;
+        for id in ["queued", "observed", "idle"] {
+            sqlx::query(
+                "INSERT INTO shares(id,name,root_id,path,peer_ids_json,enabled)
+                 VALUES (?,?,'photos','','[]',1)",
+            )
+            .bind(id)
+            .bind(id)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO operations(id,idempotency_key,principal,source,request_json,status,created_at)
+             VALUES ('operation','operation','admin','admin','{}','running',?)",
+        )
+        .bind(db::now())
+        .execute(&state.db)
+        .await
+        .unwrap();
+        state
+            .share_changes
+            .lock()
+            .unwrap()
+            .insert("queued".into(), std::time::Instant::now());
+        let scan = Task::start(
+            &state,
+            "share:observed",
+            "Share inventory scan",
+            "observed",
+            Some("/peers"),
+        )
+        .await
+        .unwrap();
+        scan.waiting("Waiting for the observed scan's admission");
+        let current = page(&state, 25, 0).await.unwrap().current;
+        let queued = current
+            .iter()
+            .find(|row| row.task_key == "share:queued")
+            .unwrap();
+        assert!(queued.phase.contains("readiness has not been checked"));
+        let observed = current
+            .iter()
+            .find(|row| row.task_key == "share:observed")
+            .unwrap();
+        assert_eq!(observed.phase, "Waiting for the observed scan's admission");
+        assert!(current.iter().all(|row| row.task_key != "share:idle"));
+        scan.finish(&Ok(())).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stopped_worker_is_reported_only_until_its_runtime_restarts() {
+        use ism_core::dto::{AttentionCode, AttentionState};
+
+        let (dir, state) = harness().await;
+        sqlx::query(
+            "INSERT INTO operations(id,idempotency_key,principal,source,request_json,status,created_at)
+             VALUES ('queued','queued','admin','admin','{}','queued',?)",
+        )
+        .bind(db::now())
+        .execute(&state.db)
+        .await
+        .unwrap();
+        spawn(
+            &state,
+            "Operation executor",
+            crate::worker_evidence::Kind::Operations,
+            async { panic!("synthetic worker failure") },
+        );
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if page(&state, 25, 0)
+                    .await
+                    .unwrap()
+                    .current
+                    .iter()
+                    .any(|row| row.task_key == "worker:Operation executor")
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let snapshot = crate::attention::snapshot(&state).await.unwrap();
+        let failure = snapshot
+            .items
+            .iter()
+            .find(|item| item.id == "worker:Operation executor")
+            .unwrap();
+        assert_eq!(failure.code, AttentionCode::WorkerStopped);
+        assert_eq!(failure.state, AttentionState::Failed);
+        assert!(failure.blocks_work);
+        assert_eq!(failure.count, 1);
+        assert!(
+            snapshot
+                .items
+                .iter()
+                .all(|item| item.state != AttentionState::Stalled)
+        );
+        flush(&state).await.unwrap();
+
+        let restarted = AppState::new(
+            Config::for_tests(dir.path()),
+            state.db.clone(),
+            SecretBox::open_or_create(dir.path()).unwrap(),
+        )
+        .await
+        .unwrap();
+        recover(&restarted).await.unwrap();
+        spawn(
+            &restarted,
+            "Operation executor",
+            crate::worker_evidence::Kind::Operations,
+            std::future::pending(),
+        );
+        assert!(
+            !crate::attention::snapshot(&restarted)
+                .await
+                .unwrap()
+                .items
+                .iter()
+                .any(|item| item.id == "worker:Operation executor")
+        );
+        assert!(
+            !page(&restarted, 25, 0)
+                .await
+                .unwrap()
+                .current
+                .iter()
+                .any(|row| row.task_key == "worker:Operation executor")
+        );
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let resolved: bool = sqlx::query_scalar(
+                    "SELECT resolved FROM background_activity WHERE task_key='worker:Operation executor'",
+                )
+                .fetch_one(&restarted.db)
+                .await
+                .unwrap();
+                if resolved {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn peer_child_exit_is_reported_while_the_other_child_keeps_running() {
+        use ism_core::dto::AttentionCode;
+
+        let (_dir, state) = harness().await;
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let supervisor = tokio::spawn(crate::peers::supervise(
+            state.clone(),
+            async { panic!("synthetic peer child failure") },
+            async move {
+                let _ = started.send(());
+                std::future::pending::<()>().await;
+            },
+            std::future::pending(),
+        ));
+        ready.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if state
+                    .worker_evidence
+                    .stopped_workers()
+                    .iter()
+                    .any(|worker| worker.name == "Peer replication")
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!supervisor.is_finished());
+        let snapshot = crate::attention::snapshot(&state).await.unwrap();
+        let failure = snapshot
+            .items
+            .iter()
+            .find(|item| item.id == "worker:Peer replication")
+            .unwrap();
+        assert_eq!(failure.code, AttentionCode::WorkerStopped);
+        assert!(!failure.blocks_work);
+        assert!(
+            !snapshot
+                .items
+                .iter()
+                .any(|item| item.id == "worker:Peer activity mirror")
+        );
+
+        sqlx::query(
+            "INSERT INTO peers(id,name,url,secret_enc,status,created_at)
+             VALUES ('peer','Peer example','https://peer.example','unused','online',?)",
+        )
+        .bind(db::now())
+        .execute(&state.db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO shares(id,name,root_id,path,peer_ids_json,enabled)
+             VALUES ('share','Archive','photos','','[\"peer\"]',1)",
+        )
+        .execute(&state.db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO share_backfills(share_id,peer_id,requested_at) VALUES ('share','peer',?)",
+        )
+        .bind(db::now())
+        .execute(&state.db)
+        .await
+        .unwrap();
+        let snapshot = crate::attention::snapshot(&state).await.unwrap();
+        let failure = snapshot
+            .items
+            .iter()
+            .find(|item| item.id == "worker:Peer replication")
+            .unwrap();
+        assert!(failure.blocks_work);
+        assert_eq!(failure.count, 1);
+
+        sqlx::query(
+            "INSERT INTO operations(id,idempotency_key,principal,source,request_json,status,created_at)
+             VALUES ('operation','operation','admin','admin','{}','queued',?)",
+        )
+        .bind(db::now())
+        .execute(&state.db)
+        .await
+        .unwrap();
+        let event = serde_json::json!({
+            "seq": 1,
+            "origin": "remote",
+            "origin_seq": 1,
+            "share": "Archive",
+            "kind": "folder_created",
+            "data": { "path": "folder", "vv": {} }
+        });
+        sqlx::query(
+            "INSERT INTO peer_inbox(peer_id,seq,origin,origin_seq,share_name,event_json,status,operation_id)
+             VALUES ('peer',1,'remote',1,'Archive',?,'applying','operation')",
+        )
+        .bind(event.to_string())
+        .execute(&state.db)
+        .await
+        .unwrap();
+        let snapshot = crate::attention::snapshot(&state).await.unwrap();
+        let failure = snapshot
+            .items
+            .iter()
+            .find(|item| item.id == "worker:Peer replication")
+            .unwrap();
+        assert_eq!(
+            failure.count, 1,
+            "an operation already handed to the executor may finish independently"
+        );
+        supervisor.abort();
+        let _ = supervisor.await;
+    }
+
+    #[tokio::test]
+    async fn conflict_comparisons_report_queued_retries_and_observed_worker_exits() {
+        use ism_core::dto::{AttentionCode, AttentionState};
+
+        let (_dir, state) = harness().await;
+        sqlx::query(
+            "INSERT INTO peers(id,name,url,secret_enc,status,created_at)
+             VALUES ('peer','Peer example','https://peer.example','unused','online',?)",
+        )
+        .bind(db::now())
+        .execute(&state.db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO shares(id,name,root_id,path,peer_ids_json,enabled)
+             VALUES ('share','Archive','photos','','[\"peer\"]',1)",
+        )
+        .execute(&state.db)
+        .await
+        .unwrap();
+        for (id, status, error, detail, next, generation) in [
+            ("queued-a", "queued", None, None, "", 0),
+            ("queued-b", "queued", None, None, "", 0),
+            (
+                "retry",
+                "queued",
+                Some("peer_busy"),
+                Some("The peer did not respond"),
+                "2099-01-01T00:00:00.000Z",
+                0,
+            ),
+            (
+                "large",
+                "blocked",
+                Some("version_evidence_too_large"),
+                Some("The folder exceeds the comparison limit"),
+                "2099-01-01T00:00:00.000Z",
+                0,
+            ),
+            ("active", "running", None, None, "", 7),
+            ("unknown", "running", None, None, "", 2),
+            ("stopped", "running", None, None, "", 3),
+        ] {
+            sqlx::query(
+                "INSERT INTO conflicts(id,share_id,rel_path,kind,detail,local_json,remote_json,remote_vv_json,peer_id,status,created_at)
+                 VALUES (?,'share',?,'changed_on_both','','{}','{}','{}','peer','open',?)",
+            )
+            .bind(id)
+            .bind(format!("{id}.example.jpg"))
+            .bind(db::now())
+            .execute(&state.db)
+            .await
+            .unwrap();
+            sqlx::query(
+                "UPDATE conflict_evidence_jobs SET state=?,error=?,error_detail=?,next_attempt=?,generation=?
+                 WHERE target_id=?",
+            )
+            .bind(status)
+            .bind(error)
+            .bind(detail)
+            .bind(next)
+            .bind(generation)
+            .bind(id)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        }
+        state
+            .worker_evidence
+            .started("old worker", crate::worker_evidence::Kind::Other, 0);
+        state
+            .worker_evidence
+            .conflict_claimed("old worker", "unknown", 1);
+        let failing = state.clone();
+        let running = state.clone();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let supervisor = tokio::spawn(crate::peers::versions::supervise_workers(
+            state.clone(),
+            async move {
+                failing.worker_evidence.conflict_claimed(
+                    "Conflict evidence worker 1",
+                    "stopped",
+                    3,
+                );
+                panic!("synthetic comparison worker failure");
+            },
+            async move {
+                running
+                    .worker_evidence
+                    .conflict_claimed("Conflict evidence worker 2", "active", 7);
+                let _ = started.send(());
+                std::future::pending::<()>().await;
+            },
+            std::future::pending(),
+        ));
+        ready.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if state
+                    .worker_evidence
+                    .stopped_workers()
+                    .iter()
+                    .any(|worker| worker.name == "Conflict evidence worker 1")
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!supervisor.is_finished());
+        let current = page(&state, 25, 0).await.unwrap();
+        let find = |key: &str| {
+            current
+                .current
+                .iter()
+                .find(|row| row.task_key == key)
+                .unwrap()
+        };
+        let queued = find("conflict-evidence:queued:none");
+        assert_eq!(queued.count, 2);
+        assert_eq!(queued.status, BackgroundStatus::Waiting);
+        let retry = find("conflict-evidence:queued:peer_busy");
+        assert_eq!(retry.status, BackgroundStatus::Waiting);
+        assert_eq!(retry.next_at.as_deref(), Some("2099-01-01T00:00:00.000Z"));
+        assert_eq!(retry.error.as_deref(), Some("The peer did not respond"));
+        let blocked = find("conflict-evidence:blocked:version_evidence_too_large");
+        assert_eq!(blocked.status, BackgroundStatus::Blocked);
+        assert!(blocked.next_at.is_none());
+        assert_eq!(
+            find("conflict-evidence:running").status,
+            BackgroundStatus::Running
+        );
+        assert_eq!(
+            find("conflict-evidence:unverified").status,
+            BackgroundStatus::Waiting
+        );
+        let stopped = find("conflict-evidence:stopped");
+        assert_eq!(stopped.status, BackgroundStatus::Blocked);
+        assert_eq!(stopped.count, 1);
+        assert_eq!(stopped.examples[0].resource, "stopped.example.jpg");
+        assert!(
+            current
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("verifiable"))
+        );
+
+        let attention = crate::attention::snapshot(&state).await.unwrap();
+        let stopped = attention
+            .items
+            .iter()
+            .find(|item| item.id == "conflict-evidence:stopped")
+            .unwrap();
+        assert_eq!(stopped.code, AttentionCode::WorkerStopped);
+        assert_eq!(stopped.state, AttentionState::Failed);
+        assert!(stopped.blocks_work);
+        assert_eq!(stopped.count, 1);
+        assert_eq!(stopped.href, "/conflicts");
+        let blocked = attention
+            .items
+            .iter()
+            .find(|item| item.id == "conflict-evidence:blocked:version_evidence_too_large")
+            .unwrap();
+        assert!(blocked.blocks_work);
+        assert!(blocked.next_at.is_none());
+        let unverified = attention
+            .items
+            .iter()
+            .find(|item| item.id == "conflict-evidence:unverified")
+            .unwrap();
+        assert!(!unverified.blocks_work);
+        assert_eq!(unverified.state, AttentionState::Unavailable);
+
+        for next in ["", "invalid"] {
+            sqlx::query(
+                "UPDATE conflict_evidence_jobs SET error='peer_busy',error_detail='The peer did not respond',next_attempt=?
+                 WHERE target_id='queued-a'",
+            )
+            .bind(next)
+            .execute(&state.db)
+            .await
+            .unwrap();
+            let mixed_retries = page(&state, 25, 0).await.unwrap();
+            let mixed = mixed_retries
+                .current
+                .iter()
+                .find(|row| row.task_key == "conflict-evidence:queued:peer_busy")
+                .unwrap();
+            assert_eq!(mixed.count, 2);
+            assert!(mixed.next_at.is_none());
+        }
+
+        sqlx::query(
+            "UPDATE conflict_evidence_jobs SET state='queued',generation=generation+1 WHERE target_id='stopped'",
+        )
+        .execute(&state.db)
+        .await
+        .unwrap();
+        assert!(
+            page(&state, 25, 0)
+                .await
+                .unwrap()
+                .current
+                .iter()
+                .all(|row| row.task_key != "conflict-evidence:stopped")
+        );
+        supervisor.abort();
+        let _ = supervisor.await;
+        state
+            .worker_evidence
+            .conflict_claimed("Conflict evidence worker 2", "active", 7);
+        let after_abort = page(&state, 25, 0).await.unwrap();
+        let stopped = after_abort
+            .current
+            .iter()
+            .find(|row| row.task_key == "conflict-evidence:stopped")
+            .unwrap();
+        assert_eq!(stopped.count, 1);
+        assert_eq!(stopped.examples[0].resource, "active.example.jpg");
+        let attention = crate::attention::snapshot(&state).await.unwrap();
+        for key in [
+            "conflict-evidence:queued:none",
+            "conflict-evidence:queued:peer_busy",
+        ] {
+            let queued = after_abort
+                .current
+                .iter()
+                .find(|row| row.task_key == key)
+                .unwrap();
+            assert_eq!(queued.status, BackgroundStatus::Blocked);
+            assert!(queued.phase.contains("worker stopped"));
+            assert!(queued.next_at.is_none());
+            let item = attention.items.iter().find(|item| item.id == key).unwrap();
+            assert_eq!(item.code, AttentionCode::WorkerStopped);
+            assert!(item.blocks_work);
+        }
+    }
+
+    #[tokio::test]
+    async fn unreadable_records_do_not_stop_restart_or_hide_other_activity() {
+        let (dir, state) = harness().await;
+        let task = Task::start(&state, "healthy", "Healthy work", "Archive", None)
+            .await
+            .unwrap();
+        flush(&state).await.unwrap();
+        for (id, status, finished_at, json) in [
+            ("bad-current", "running", None, "not json"),
+            ("bad-history", "completed", Some(db::now()), "{}"),
+        ] {
+            sqlx::query(
+                "INSERT INTO background_activity
+                 (id,task_key,status,revision,updated_at,finished_at,activity_json)
+                 VALUES (?,?,?,0,?,?,?)",
+            )
+            .bind(id)
+            .bind(id)
+            .bind(status)
+            .bind(db::now())
+            .bind(finished_at)
+            .bind(json)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        }
+        drop(task);
+        let restarted = AppState::new(
+            Config::for_tests(dir.path()),
+            state.db.clone(),
+            SecretBox::open_or_create(dir.path()).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let before_recovery = page(&restarted, 25, 0).await;
+        let recovery = recover(&restarted).await;
+        assert!(
+            before_recovery.is_ok() && recovery.is_ok(),
+            "snapshot error: {:?}; recovery error: {:?}",
+            before_recovery.err(),
+            recovery.err()
+        );
+        let snapshot = page(&restarted, 25, 0).await.unwrap();
+        assert_eq!(snapshot.total, 1);
+        assert!(
+            snapshot
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("could not be read"))
+        );
+        assert!(snapshot.current.iter().any(|entry| {
+            entry.task_key == "healthy" && entry.status == BackgroundStatus::Interrupted
+        }));
+        assert!(snapshot.current.iter().any(|entry| {
+            entry.task_key == "bad-current"
+                && entry.status == BackgroundStatus::Blocked
+                && entry.phase.contains("read")
+                && entry.started_at.is_empty()
+        }));
+        assert!(snapshot.history.iter().any(|entry| {
+            entry.task_key == "bad-history"
+                && entry.status == BackgroundStatus::Completed
+                && entry.phase.contains("read")
+                && entry.started_at.is_empty()
+        }));
+        let saved: String = sqlx::query_scalar(
+            "SELECT activity_json FROM background_activity WHERE id='bad-current'",
+        )
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+        assert_eq!(saved, "not json");
+        let history: String = sqlx::query_scalar(
+            "SELECT activity_json FROM background_activity WHERE id='bad-history'",
+        )
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+        assert_eq!(history, "{}");
+    }
+
+    #[tokio::test]
+    async fn inconsistent_record_identity_does_not_replace_other_activity() {
+        let (dir, state) = harness().await;
+        let task = Task::start(&state, "healthy", "Healthy work", "Archive", None)
+            .await
+            .unwrap();
+        flush(&state).await.unwrap();
+        let healthy_json: String =
+            sqlx::query_scalar("SELECT activity_json FROM background_activity WHERE id=?")
+                .bind(&task.reporter.id)
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+        let healthy: serde_json::Value = serde_json::from_str(&healthy_json).unwrap();
+        let mut mismatches = Vec::new();
+        for (id, task_key, status, mismatch) in [
+            ("wrong-id", "healthy", "running", "id"),
+            ("wrong-key", "stored-key", "running", "task_key"),
+            ("wrong-status", "wrong-status", "waiting", "status"),
+        ] {
+            let mut json = healthy.clone();
+            if mismatch != "id" {
+                json["id"] = id.into();
+            }
+            if mismatch != "task_key" {
+                json["task_key"] = task_key.into();
+            }
+            if mismatch != "status" {
+                json["status"] = status.into();
+            }
+            let json = serde_json::to_string(&json).unwrap();
+            sqlx::query(
+                "INSERT INTO background_activity
+                 (id,task_key,status,revision,updated_at,activity_json)
+                 VALUES (?,?,?,10000,?,?)",
+            )
+            .bind(id)
+            .bind(task_key)
+            .bind(status)
+            .bind(db::now())
+            .bind(&json)
+            .execute(&state.db)
+            .await
+            .unwrap();
+            mismatches.push((id, task_key, json));
+        }
+        drop(task);
+        let restarted = AppState::new(
+            Config::for_tests(dir.path()),
+            state.db.clone(),
+            SecretBox::open_or_create(dir.path()).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        recover(&restarted).await.unwrap();
+        let snapshot = page(&restarted, 25, 0).await.unwrap();
+        assert!(snapshot.current.iter().any(|entry| {
+            entry.task_key == "healthy" && entry.status == BackgroundStatus::Interrupted
+        }));
+        for (id, task_key, original) in mismatches {
+            assert!(snapshot.current.iter().any(|entry| {
+                entry.id == id
+                    && entry.task_key == task_key
+                    && entry.status == BackgroundStatus::Blocked
+                    && entry.phase.contains("read")
+            }));
+            let saved: String =
+                sqlx::query_scalar("SELECT activity_json FROM background_activity WHERE id=?")
+                    .bind(id)
+                    .fetch_one(&state.db)
+                    .await
+                    .unwrap();
+            assert_eq!(saved, original);
+        }
+        let revision: i64 = sqlx::query_scalar(
+            "SELECT revision FROM background_activity WHERE task_key='healthy' AND id!=?",
+        )
+        .bind("wrong-id")
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+        assert!(revision > 10000);
     }
 
     #[tokio::test]
@@ -710,6 +1547,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn blocked_queue_heads_do_not_make_a_later_ready_transfer_look_blocked() {
+        use crate::peers::transfer::Eligibility;
+        let (dir, state) = harness().await;
+        let root = dir.path().join("archive");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join(".ism-root"), "photos\n").unwrap();
+        sqlx::query("INSERT INTO mappings(root_id,name,container_path,created_at) VALUES ('photos','Archive',?,?)")
+            .bind(root.to_string_lossy().as_ref()).bind(db::now()).execute(&state.db).await.unwrap();
+        sqlx::query("INSERT INTO peers(id,name,url,secret_enc,status,created_at) VALUES ('peer','Peer example','http://peer.example','unused','online',?)")
+            .bind(db::now()).execute(&state.db).await.unwrap();
+        sqlx::query("INSERT INTO shares(id,name,root_id,path,peer_ids_json,enabled) VALUES ('share','Archive','photos','','[\"peer\"]',1)")
+            .execute(&state.db).await.unwrap();
+        for i in 0..11 {
+            let id = format!("queued-{i:02}");
+            let path = format!("photo-{i:02}.jpg");
+            sqlx::query("INSERT INTO transfers(id,peer_id,share_id,rel_path,sha256,size,vv_json,status,queued_at,updated_at)
+                         VALUES (?,'peer','share',?,'example',10,'{}','queued',?,?)")
+                .bind(&id).bind(&path).bind(db::now()).bind(db::now())
+                .execute(&state.db).await.unwrap();
+            if i < 10 {
+                sqlx::query("INSERT INTO transfers(id,peer_id,share_id,rel_path,sha256,size,vv_json,status,queued_at,updated_at)
+                             VALUES (?,'peer','share',?,'example',10,'{}','failed',?,?)")
+                    .bind(format!("failed-{i:02}")).bind(format!("photo-{i:02}.xmp"))
+                    .bind(db::now()).bind(db::now()).execute(&state.db).await.unwrap();
+            }
+        }
+        let share = crate::peers::shares(&state).await.unwrap().remove(0);
+        assert!(matches!(
+            crate::peers::transfer::eligibility(
+                &state,
+                &share,
+                "peer",
+                "queued-00",
+                "photo-00.jpg",
+                0,
+                &db::now()
+            )
+            .await
+            .unwrap(),
+            Eligibility::Waiting { blocked: true, .. }
+        ));
+        assert!(matches!(
+            crate::peers::transfer::eligibility(
+                &state,
+                &share,
+                "peer",
+                "queued-10",
+                "photo-10.jpg",
+                0,
+                &db::now()
+            )
+            .await
+            .unwrap(),
+            Eligibility::Ready(_)
+        ));
+        let snapshot = page(&state, 25, 0).await.unwrap();
+        let queued = snapshot
+            .current
+            .iter()
+            .find(|activity| activity.task_key == "transfer-queue:peer:share")
+            .unwrap();
+        assert_eq!(queued.count, 11);
+        assert_ne!(queued.status, BackgroundStatus::Blocked);
+    }
+
+    #[tokio::test]
     async fn bulk_sync_work_is_grouped_with_reasons_instead_of_listed_per_file() {
         let (dir, state) = harness().await;
         let root = dir.path().join("archive");
@@ -721,6 +1624,15 @@ mod tests {
             .bind(db::now()).execute(&state.db).await.unwrap();
         sqlx::query("INSERT INTO shares(id,name,root_id,path,peer_ids_json,enabled) VALUES ('share','Archive','photos','','[\"peer\"]',1)")
             .execute(&state.db).await.unwrap();
+        sqlx::query(
+            "INSERT INTO peer_sync_state(peer_id,cursor,progress_json,updated_at)
+             VALUES ('peer',0,?,?)",
+        )
+        .bind(serde_json::to_string(&ism_core::dto::SyncProgress::default()).unwrap())
+        .bind(db::now())
+        .execute(&state.db)
+        .await
+        .unwrap();
         let n = 3000;
         let mut tx = state.db.begin().await.unwrap();
         for i in 0..n {

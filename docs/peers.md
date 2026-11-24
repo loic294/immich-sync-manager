@@ -11,10 +11,14 @@ the ISM trash, never straight to deletion.
 ## Pairing
 
 Use **Operations -> Background activity** to see peer connection checks, event processing,
-inventory backfill, file transfer/verification, and recovery work together. Queued transfers explain
-their actual wait: offline peer, allowed hours, retry backoff, unavailable root, dependent original
-file, recovery barrier, or transfer capacity. The related **Sync** and **Peers** pages retain their
-existing controls. A peer-specific wait is not a claim that every share or server has stopped.
+inventory backfill, file transfer/verification, and recovery work together. Queued transfers are
+grouped by peer and share and show confirmed conditions such as an offline peer, allowed hours,
+retry backoff, or an unavailable root. File-specific eligibility may remain unknown; a few blocked
+files do not prove the entire queue is blocked. Use **Sync** for per-file details and **Peers** for
+connection controls. Queued share scans report readiness as unknown until the scan itself reports
+its state. Conflict comparison work is grouped on Operations, with failed attempts, retry times,
+and observed worker exits linked to **Conflicts**. A peer-specific wait is not a claim that every
+share or server has stopped.
 
 1. On instance A: **Peers → Create invite**. The invite is valid for 24 hours and works once.
 2. On instance B: **Peers → Accept invite**, paste it, and give A's URL (e.g. `http://192.0.2.10:8080`)
@@ -126,8 +130,10 @@ including after a restart; unrelated events from the same peer and share can pro
   original. Each file retains its role and is verified individually. A later original is imported
   normally. Deleting one announced file does not delete an unannounced companion.
 - If the saved schedule is invalid, transfers stop rather than defaulting to unrestricted hours.
-  An active, explicitly scoped override still applies. The Sync page provides a replacement
-  schedule with no allowed days; choose the desired hours and save to resume scheduling.
+  An active, explicitly scoped override bypasses the schedule check for matching transfers, but
+  an earlier transfer without an override can prevent the dispatcher from reaching them. The Sync
+  page provides a replacement schedule with no allowed days; choose the desired hours and save to
+  resume scheduling.
 - Changes made outside ISM are picked up from ISM's [file watcher](watching.md): a change under a
   shared folder rescans that share shortly after it settles, and a full rescan still runs every
   `ISM_SCAN_INTERVAL_SECS` as a safety net. Each scan
@@ -147,8 +153,9 @@ including after a restart; unrelated events from the same peer and share can pro
   one activity-refresh worker; admitted workers keep progressing while their schedulers query
   the peer list. Worker failures are logged and release the peer's admission slot for retry.
   Stopping a scheduler cancels its admitted workers rather than leaving them detached.
-  Recovery and failed peer operations protect their
-  uncertain footprints rather than stopping all scans or peer bookkeeping. Managed file trash
+  While a managed operation is running or waiting for maintenance, peer bookkeeping currently
+  waits globally, even for unrelated paths. After it stops, recovery and failed peer operations
+  protect their uncertain footprints rather than stopping all scans or peer bookkeeping. Managed file trash
   records deletion events for the original and moved companions
   immediately, without waiting for the next scan.
   This coordination does not stop external

@@ -1871,7 +1871,7 @@ pub async fn inventory_for(
 }
 
 impl InventoryPage {
-    fn validate(&self, after: &str) -> Result<(), String> {
+    pub(crate) fn validate(&self, after: &str) -> Result<(), String> {
         if self.entries.len() as i64 > INVENTORY_BATCH {
             return Err("invalid peer inventory page size".into());
         }
@@ -2377,15 +2377,47 @@ async fn sync_settings(state: &AppState, peer: &net::Peer) {
 }
 
 pub async fn run(state: AppState) {
+    let replication = replicate(state.clone());
+    let mirror = activity::run(state.clone());
+    let evidence = versions::run(state.clone());
+    supervise(state, replication, mirror, evidence).await;
+}
+
+pub(crate) async fn supervise(
+    state: AppState,
+    replication: impl std::future::Future<Output = ()> + Send + 'static,
+    mirror: impl std::future::Future<Output = ()> + Send + 'static,
+    evidence: impl std::future::Future<Output = ()> + Send + 'static,
+) {
+    const REPLICATION: &str = "Peer replication";
+    const MIRROR: &str = "Peer activity mirror";
+    const EVIDENCE: &str = "Conflict evidence preparation";
+    crate::activity::worker_started(
+        &state,
+        REPLICATION,
+        crate::worker_evidence::Kind::PeerReplication,
+    );
+    crate::activity::worker_started(&state, MIRROR, crate::worker_evidence::Kind::Other);
+    crate::activity::worker_started(&state, EVIDENCE, crate::worker_evidence::Kind::Other);
     let mut workers = tokio::task::JoinSet::new();
-    workers.spawn(replicate(state.clone()));
-    workers.spawn(activity::run(state.clone()));
-    workers.spawn(versions::run(state));
-    while let Some(result) = workers.join_next().await {
-        match result {
-            Ok(()) => tracing::error!("peer background worker stopped unexpectedly"),
-            Err(error) => tracing::error!("peer background worker failed: {error}"),
-        }
+    let mut names = HashMap::new();
+    names.insert(workers.spawn(replication).id(), REPLICATION);
+    names.insert(workers.spawn(mirror).id(), MIRROR);
+    names.insert(workers.spawn(evidence).id(), EVIDENCE);
+    while let Some(result) = workers.join_next_with_id().await {
+        let (id, message) = match result {
+            Ok((id, ())) => (id, "Background worker stopped unexpectedly"),
+            Err(error) => {
+                tracing::error!("peer background worker failed: {error}");
+                (error.id(), "Background worker panicked or was cancelled")
+            }
+        };
+        let Some(name) = names.remove(&id) else {
+            tracing::error!("an unidentified peer background worker stopped");
+            continue;
+        };
+        tracing::error!(worker = name, "{message}");
+        crate::activity::worker_stopped(&state, name, message).await;
     }
 }
 

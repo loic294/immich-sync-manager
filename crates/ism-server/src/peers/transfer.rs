@@ -1,5 +1,6 @@
 //! Copies file contents from peers during allowed hours (or under a manual override).
 
+use std::collections::HashMap;
 use std::time::{Duration, UNIX_EPOCH};
 
 use futures_util::StreamExt;
@@ -659,6 +660,20 @@ async fn next(
                 let _ = pause.reached.send(());
                 let _ = pause.resume.await;
             }
+            if let Eligibility::Waiting {
+                reason,
+                next_at,
+                blocked,
+            } = &eligible
+            {
+                tracing::trace!(
+                    transfer = %id,
+                    reason = %reason,
+                    next_at = ?next_at,
+                    blocked = *blocked,
+                    "transfer remains queued"
+                );
+            }
             if let Eligibility::Ready(ov) = eligible {
                 return Ok(Some((
                     Transfer {
@@ -700,6 +715,7 @@ pub(super) async fn run_paused(state: AppState, pause: EligibilityPause) {
 async fn run_inner(state: AppState, #[cfg(test)] mut pause: Option<EligibilityPause>) {
     let tick = Duration::from_secs(state.config.tick_secs.max(1));
     let mut tasks = tokio::task::JoinSet::new();
+    let mut transfers = HashMap::new();
     loop {
         // A managed operation can finish while eligibility is being checked.
         let wake = state.sync_wake.notified();
@@ -723,11 +739,14 @@ async fn run_inner(state: AppState, #[cfg(test)] mut pause: Option<EligibilityPa
                             continue;
                         }
                     }
+                    state.worker_evidence.transfer_started(&t.id);
                     state.emit(ServerEvent::SyncChanged);
                     let state = state.clone();
-                    tasks.spawn(async move {
+                    let id = t.id.clone();
+                    let task = tasks.spawn(async move {
                         run_claimed(&state, &t).await;
                     });
+                    transfers.insert(task.id(), id);
                     continue;
                 }
                 Ok(None) => {}
@@ -737,13 +756,35 @@ async fn run_inner(state: AppState, #[cfg(test)] mut pause: Option<EligibilityPa
             }
         }
         tokio::select! {
-            Some(result) = tasks.join_next(), if !tasks.is_empty() => {
-                if let Err(e) = result {
-                    tracing::error!("transfer task: {e}");
-                }
+            Some(result) = tasks.join_next_with_id(), if !tasks.is_empty() => {
+                record_transfer_exit(&state, &mut transfers, result);
             }
             () = tokio::time::sleep(tick * 6) => {}
             () = &mut wake => {}
+        }
+    }
+}
+
+fn record_transfer_exit(
+    state: &AppState,
+    transfers: &mut HashMap<tokio::task::Id, String>,
+    result: Result<(tokio::task::Id, ()), tokio::task::JoinError>,
+) {
+    match result {
+        Ok((task, ())) => {
+            transfers.remove(&task);
+        }
+        Err(error) => {
+            tracing::error!("transfer task: {error}");
+            if let Some(id) = transfers.remove(&error.id()) {
+                crate::activity::transfer_stopped(
+                    state,
+                    &id,
+                    crate::worker_evidence::TransferStop::TaskStopped,
+                );
+            } else {
+                tracing::error!("an unidentified transfer task stopped");
+            }
         }
     }
 }
@@ -796,6 +837,11 @@ async fn run_claimed(state: &AppState, t: &Transfer) {
     };
     if let Err(e) = updated {
         tracing::error!(transfer = %t.id, "record transfer outcome: {e}");
+        crate::activity::transfer_stopped(
+            state,
+            &t.id,
+            crate::worker_evidence::TransferStop::OutcomeNotSaved,
+        );
     }
     state.emit(ServerEvent::SyncChanged);
     if deferred {
@@ -1489,6 +1535,74 @@ mod tests {
     use crate::ops::plan::upload_file_needs_sync_add;
     use ism_core::dto::FileRole;
     use ism_core::file_settings::DEFAULT_SIDECAR_EXTENSIONS;
+
+    #[tokio::test]
+    async fn panicked_transfer_task_reports_only_its_running_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = crate::db::connect(dir.path()).await.unwrap();
+        let state = crate::state::AppState::new(
+            crate::config::Config::for_tests(dir.path()),
+            pool,
+            crate::crypto::SecretBox::open_or_create(dir.path()).unwrap(),
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO peers(id,name,url,secret_enc,status,created_at)
+             VALUES ('peer','Peer example','https://peer.example','unused','online',?)",
+        )
+        .bind(crate::db::now())
+        .execute(&state.db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO shares(id,name,root_id,path,peer_ids_json,enabled)
+             VALUES ('share','Archive','photos','','[\"peer\"]',1)",
+        )
+        .execute(&state.db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO transfers(id,peer_id,share_id,rel_path,sha256,size,vv_json,status,queued_at,updated_at)
+             VALUES ('transfer','peer','share','photo.example.jpg','example',10,'{}','running',?,?)",
+        )
+        .bind(crate::db::now())
+        .bind(crate::db::now())
+        .execute(&state.db)
+        .await
+        .unwrap();
+
+        let mut tasks = tokio::task::JoinSet::new();
+        let mut transfers = std::collections::HashMap::new();
+        let failed = tasks.spawn(async { panic!("synthetic transfer task failure") });
+        transfers.insert(failed.id(), "transfer".to_owned());
+        let sibling = tasks.spawn(std::future::pending());
+        transfers.insert(sibling.id(), "other".to_owned());
+        let result = tasks.join_next_with_id().await.unwrap();
+        super::record_transfer_exit(&state, &mut transfers, result);
+        assert!(transfers.contains_key(&sibling.id()));
+        let snapshot = crate::attention::snapshot(&state).await.unwrap();
+        let failure = snapshot
+            .items
+            .iter()
+            .find(|item| item.id == "transfer-worker:peer:share:task-stopped")
+            .unwrap();
+        assert!(failure.blocks_work);
+        assert_eq!(failure.count, 1);
+        sqlx::query("UPDATE transfers SET status='queued' WHERE id='transfer'")
+            .execute(&state.db)
+            .await
+            .unwrap();
+        assert!(
+            !crate::attention::snapshot(&state)
+                .await
+                .unwrap()
+                .items
+                .iter()
+                .any(|item| item.id == "transfer-worker:peer:share:task-stopped")
+        );
+        tasks.shutdown().await;
+    }
 
     #[test]
     fn classifies_peer_xmp_as_attached_to_existing_original() {

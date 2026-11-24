@@ -312,7 +312,160 @@ pub(super) async fn reprepare(state: &AppState, target: &str) -> AppResult<()> {
     Ok(())
 }
 
-async fn worker(state: AppState) {
+#[derive(Clone, Copy, Hash, PartialEq, Eq)]
+pub(crate) enum EvidenceState {
+    Queued,
+    Retrying,
+    Running,
+    Unavailable,
+    Stopped,
+    Blocked,
+}
+
+pub(crate) struct EvidenceGroup {
+    pub key: String,
+    pub state: EvidenceState,
+    pub count: u64,
+    pub first_at: String,
+    pub observed_at: Option<String>,
+    pub next_at: Option<String>,
+    pub example_error: Option<String>,
+    pub examples: Vec<ism_core::dto::ActivityExample>,
+}
+
+/// Read durable job states alongside actual worker observations, without claiming stale rows run.
+pub(crate) async fn evidence_groups(state: &AppState) -> AppResult<Vec<EvidenceGroup>> {
+    use std::collections::HashMap;
+
+    #[derive(sqlx::FromRow)]
+    struct Group {
+        state: String,
+        error: Option<String>,
+        example_error: Option<String>,
+        count: i64,
+        first_at: String,
+        next_at: Option<String>,
+        unclassified_retry: i64,
+    }
+
+    let observations = state.worker_evidence.conflict_observations();
+    let workers_stopped = [EVIDENCE_WORKER_ONE, EVIDENCE_WORKER_TWO]
+        .iter()
+        .all(|name| observations.stopped_workers.contains(*name));
+    let mut tx = state.db.begin().await?;
+    let rows: Vec<Group> = sqlx::query_as(
+        "SELECT j.state,j.error,MIN(j.error_detail) AS example_error,COUNT(*) AS count,
+                MIN(c.created_at) AS first_at,MIN(NULLIF(j.next_attempt,'')) AS next_at,
+                SUM(CASE WHEN j.next_attempt='' OR
+                    strftime('%Y-%m-%dT%H:%M:%fZ',j.next_attempt) IS NOT j.next_attempt
+                    THEN 1 ELSE 0 END) AS unclassified_retry
+         FROM conflict_evidence_jobs j JOIN conflicts c ON c.id=j.target_id
+         WHERE c.status='open' AND j.state NOT IN ('ready','running')
+         GROUP BY j.state,j.error ORDER BY j.state,j.error",
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    let mut groups: Vec<_> = rows
+        .into_iter()
+        .map(|row| {
+            let status = match (row.state.as_str(), row.error.as_ref()) {
+                ("queued", _) if workers_stopped => EvidenceState::Stopped,
+                ("queued", None) => EvidenceState::Queued,
+                ("queued", Some(_)) => EvidenceState::Retrying,
+                ("blocked", _) => EvidenceState::Blocked,
+                _ => EvidenceState::Unavailable,
+            };
+            EvidenceGroup {
+                key: format!(
+                    "conflict-evidence:{}:{}",
+                    row.state,
+                    row.error.as_deref().unwrap_or("none")
+                ),
+                state: status,
+                count: row.count.max(0) as u64,
+                first_at: row.first_at,
+                observed_at: None,
+                next_at: if row.unclassified_retry == 0 {
+                    row.next_at.filter(|at| crate::db::parse_ts(at).is_some())
+                } else {
+                    None
+                },
+                example_error: row.example_error.map(|error| crate::error::redact(&error)),
+                examples: Vec::new(),
+            }
+        })
+        .collect();
+
+    let rows: Vec<(String, i64, String, String)> = sqlx::query_as(
+        "SELECT j.target_id,j.generation,c.created_at,c.rel_path
+         FROM conflict_evidence_jobs j JOIN conflicts c ON c.id=j.target_id
+         WHERE c.status='open' AND j.state='running' ORDER BY c.created_at,j.target_id",
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    let mut current: HashMap<EvidenceState, EvidenceGroup> = HashMap::new();
+    for (target_id, generation, first_at, path) in rows {
+        let key = (target_id, generation);
+        let (status, observed_at) = if let Some(at) = observations.active.get(&key) {
+            (EvidenceState::Running, Some(at.clone()))
+        } else if let Some(failure) = observations.stopped.get(&key) {
+            (EvidenceState::Stopped, Some(failure.stopped_at.clone()))
+        } else {
+            (EvidenceState::Unavailable, None)
+        };
+        let group = current.entry(status).or_insert_with(|| EvidenceGroup {
+            key: match status {
+                EvidenceState::Running => "conflict-evidence:running",
+                EvidenceState::Stopped => "conflict-evidence:stopped",
+                _ => "conflict-evidence:unverified",
+            }
+            .into(),
+            state: status,
+            count: 0,
+            first_at: first_at.clone(),
+            observed_at: None,
+            next_at: None,
+            example_error: None,
+            examples: Vec::new(),
+        });
+        group.count += 1;
+        if first_at < group.first_at {
+            group.first_at = first_at;
+        }
+        if observed_at > group.observed_at {
+            group.observed_at = observed_at;
+        }
+        if group.examples.len() < 5 {
+            group.examples.push(ism_core::dto::ActivityExample {
+                resource: path,
+                detail: None,
+            });
+        }
+    }
+    groups.extend(current.into_values());
+    groups.sort_by(|a, b| a.key.cmp(&b.key));
+    Ok(groups)
+}
+
+const EVIDENCE_WORKER_ONE: &str = "Conflict evidence worker 1";
+const EVIDENCE_WORKER_TWO: &str = "Conflict evidence worker 2";
+const EVIDENCE_NOTIFIER: &str = "Conflict evidence notifications";
+
+struct EvidenceSupervisor(AppState);
+
+impl Drop for EvidenceSupervisor {
+    fn drop(&mut self) {
+        self.0.worker_evidence.conflict_supervisor_stopped(&[
+            EVIDENCE_WORKER_ONE,
+            EVIDENCE_WORKER_TWO,
+            EVIDENCE_NOTIFIER,
+        ]);
+        self.0.emit(crate::state::ServerEvent::ActivityChanged);
+    }
+}
+
+async fn worker(state: AppState, name: &'static str) {
     loop {
         let notified = state.version_wake.notified();
         tokio::pin!(notified);
@@ -330,6 +483,10 @@ async fn worker(state: AppState) {
         .await;
         match claim {
             Ok(Some((id, generation, attempts))) => {
+                state
+                    .worker_evidence
+                    .conflict_claimed(name, &id, generation);
+                state.emit(crate::state::ServerEvent::ActivityChanged);
                 let target = RecoveryTarget {
                     kind: RecoveryKind::Conflict,
                     id: id.clone(),
@@ -371,11 +528,12 @@ async fn worker(state: AppState) {
                         .await
                     }
                 };
-                match updated {
+                let retry_after_save_failure = match updated {
                     Ok(result) if result.rows_affected() > 0 && notify => {
-                        state.version_event_wake.notify_one()
+                        state.version_event_wake.notify_one();
+                        false
                     }
-                    Ok(_) => {}
+                    Ok(_) => false,
                     Err(error) => {
                         tracing::error!(conflict_id=%id, %error, "could not record conflict evidence preparation");
                         loop {
@@ -389,8 +547,15 @@ async fn worker(state: AppState) {
                                 }
                             }
                         }
-                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        true
                     }
+                };
+                state
+                    .worker_evidence
+                    .conflict_finished(name, &id, generation);
+                state.emit(crate::state::ServerEvent::ActivityChanged);
+                if retry_after_save_failure {
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                 }
             }
             Ok(None) => {
@@ -434,18 +599,53 @@ pub(super) async fn run(state: AppState) {
             }
         }
     }
-    let mut workers = tokio::task::JoinSet::new();
-    workers.spawn(worker(state.clone()));
-    workers.spawn(worker(state.clone()));
-    workers.spawn(async move {
+    let first = worker(state.clone(), EVIDENCE_WORKER_ONE);
+    let second = worker(state.clone(), EVIDENCE_WORKER_TWO);
+    let notifier_state = state.clone();
+    let notifier = async move {
         loop {
-            state.version_event_wake.notified().await;
+            notifier_state.version_event_wake.notified().await;
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            state.emit(crate::state::ServerEvent::ConflictsChanged);
+            notifier_state.emit(crate::state::ServerEvent::ConflictsChanged);
         }
-    });
-    while let Some(result) = workers.join_next().await {
-        tracing::error!(?result, "conflict evidence worker stopped unexpectedly");
+    };
+    supervise_workers(state, first, second, notifier).await;
+}
+
+pub(crate) async fn supervise_workers(
+    state: AppState,
+    first: impl std::future::Future<Output = ()> + Send + 'static,
+    second: impl std::future::Future<Output = ()> + Send + 'static,
+    notifier: impl std::future::Future<Output = ()> + Send + 'static,
+) {
+    use std::collections::HashMap;
+
+    for name in [EVIDENCE_WORKER_ONE, EVIDENCE_WORKER_TWO, EVIDENCE_NOTIFIER] {
+        crate::activity::worker_started(&state, name, crate::worker_evidence::Kind::Other);
+    }
+    let _supervisor = EvidenceSupervisor(state.clone());
+    let mut workers = tokio::task::JoinSet::new();
+    let mut names = HashMap::new();
+    names.insert(workers.spawn(first).id(), EVIDENCE_WORKER_ONE);
+    names.insert(workers.spawn(second).id(), EVIDENCE_WORKER_TWO);
+    names.insert(workers.spawn(notifier).id(), EVIDENCE_NOTIFIER);
+    while let Some(result) = workers.join_next_with_id().await {
+        let (id, message) = match result {
+            Ok((id, ())) => (id, "Background worker stopped unexpectedly"),
+            Err(error) => {
+                tracing::error!("conflict evidence worker failed: {error}");
+                (error.id(), "Background worker panicked or was cancelled")
+            }
+        };
+        let Some(name) = names.remove(&id) else {
+            tracing::error!("an unidentified conflict evidence worker stopped");
+            continue;
+        };
+        if name != EVIDENCE_NOTIFIER {
+            state.worker_evidence.conflict_worker_stopped(name);
+        }
+        tracing::error!(worker = name, "{message}");
+        crate::activity::worker_stopped(&state, name, message).await;
     }
 }
 

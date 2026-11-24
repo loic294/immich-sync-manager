@@ -77,6 +77,992 @@ async fn background_activity_requires_admin_and_keeps_current_work_outside_histo
     assert!(!reply.json()["warnings"].as_array().unwrap().is_empty());
 }
 
+#[tokio::test]
+async fn attention_requires_admin_and_distinguishes_recovery_from_historical_failure() {
+    let h = harness().await;
+    let uri = "/api/admin/attention";
+    assert_eq!(
+        send(&h.app, get(uri, &[])).await.status,
+        StatusCode::UNAUTHORIZED
+    );
+    for (id, status, handled, resolved) in [
+        (
+            "recovery",
+            "recovery_required",
+            Some("2026-01-01T00:01:00Z"),
+            0,
+        ),
+        ("failure", "failed", None, 0),
+    ] {
+        sqlx::query(
+            "INSERT INTO operations
+             (id,idempotency_key,principal,source,request_json,status,created_at,finished_at,handled_at,recovery_resolved)
+             VALUES (?,?,'admin','admin','{}',?,'2026-01-01T00:00:00Z','2026-01-01T00:01:00Z',?,?)",
+        )
+        .bind(id)
+        .bind(id)
+        .bind(status)
+        .bind(handled)
+        .bind(resolved)
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    }
+
+    let auth = [("cookie", h.cookie.as_str())];
+    let reply = send(&h.app, get(uri, &auth)).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.json());
+    let snapshot = reply.json();
+    let items = snapshot["items"].as_array().unwrap();
+    let recovery = items
+        .iter()
+        .find(|item| item["operation_id"] == "recovery")
+        .unwrap();
+    assert_eq!(recovery["code"], "operation_recovery");
+    assert_eq!(recovery["attention"], "action_required");
+    assert_eq!(recovery["acknowledged"], true);
+    assert_eq!(recovery["unresolved"], true);
+    assert_eq!(recovery["blocks_work"], true);
+    assert_eq!(recovery["owner"], "local");
+    let failure = items
+        .iter()
+        .find(|item| item["operation_id"] == "failure")
+        .unwrap();
+    assert_eq!(failure["code"], "operation_failed");
+    assert_eq!(failure["attention"], "action_required");
+    assert_eq!(failure["acknowledged"], false);
+    assert_eq!(failure["blocks_work"], false);
+    let failure_id = failure["id"].as_str().unwrap().to_owned();
+
+    sqlx::query("UPDATE operations SET handled_at='2026-01-01T00:02:00Z' WHERE id='failure'")
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    let again = send(&h.app, get(uri, &auth)).await.json();
+    assert!(
+        again["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["id"] != failure_id)
+    );
+    assert!(
+        again["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["id"] == recovery["id"] && item["unresolved"] == true)
+    );
+}
+
+#[tokio::test]
+async fn attention_reports_queue_scope_and_invalid_schedule_without_guessing_stalls() {
+    let h = harness().await;
+    h.map_root().await;
+    for (id, status) in [
+        ("ordinary-peer", "online"),
+        ("override-peer", "online"),
+        ("offline-peer", "offline"),
+        ("unknown-peer", "unknown"),
+    ] {
+        sqlx::query(
+            "INSERT INTO peers(id,name,url,instance_id,secret_enc,status,created_at)
+             VALUES (?,?,?,?,'unused',?,?)",
+        )
+        .bind(id)
+        .bind(id)
+        .bind(format!("https://{id}.example"))
+        .bind(format!("instance-{id}"))
+        .bind(status)
+        .bind(crate::db::now())
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    }
+    sqlx::query(
+        "INSERT INTO shares(id,name,root_id,path,peer_ids_json,enabled)
+         VALUES ('share','Archive','photos','','[]',1)",
+    )
+    .execute(&h.state.db)
+    .await
+    .unwrap();
+    let mut tx = h.state.db.begin().await.unwrap();
+    for (peer, count) in [
+        ("ordinary-peer", 15),
+        ("override-peer", 4),
+        ("offline-peer", 3),
+        ("unknown-peer", 2),
+    ] {
+        for i in 0..count {
+            sqlx::query(
+                "INSERT INTO transfers(id,peer_id,share_id,rel_path,sha256,size,vv_json,status,queued_at,updated_at)
+                 VALUES (?,?,'share',?,'example',10,'{}','queued',?,?)",
+            )
+            .bind(format!("{peer}-{i}"))
+            .bind(peer)
+            .bind(format!("photo-{i}.example.jpg"))
+            .bind(crate::db::now())
+            .bind(crate::db::now())
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        }
+    }
+    sqlx::query(
+        "INSERT INTO transfers(id,peer_id,share_id,rel_path,sha256,size,vv_json,status,error,queued_at,updated_at)
+         VALUES ('failed-transfer','ordinary-peer','share','failed.example.jpg','example',10,'{}','failed',
+                 'synthetic diagnostic detail',?,?)",
+    )
+    .bind(crate::db::now())
+    .bind(crate::db::now())
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO overrides(id,peer_id,until,reason,created_at)
+         VALUES ('override','override-peer',?,'test',?)",
+    )
+    .bind(crate::db::ts(
+        chrono::Utc::now() + chrono::Duration::days(1),
+    ))
+    .bind(crate::db::now())
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    crate::db::set_setting(&h.state.db, "sync_schedule", "not-json")
+        .await
+        .unwrap();
+
+    let auth = [("cookie", h.cookie.as_str())];
+    let response = send(
+        &h.app,
+        get("/api/admin/operations/background?limit=25", &auth),
+    )
+    .await;
+    assert_eq!(response.status, StatusCode::OK, "{}", response.json());
+    let background = response.json();
+    let override_row = background["current"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["task_key"] == "transfer-queue:override-peer:share")
+        .unwrap();
+    assert_eq!(override_row["status"], "waiting");
+
+    let response = send(&h.app, get("/api/admin/attention", &auth)).await;
+    assert_eq!(response.status, StatusCode::OK, "{}", response.json());
+    let snapshot = response.json();
+    let items = snapshot["items"].as_array().unwrap();
+    let invalid = items
+        .iter()
+        .find(|item| {
+            item["code"] == "transfer_schedule_invalid" && item["peer_id"] == "ordinary-peer"
+        })
+        .unwrap();
+    assert_eq!(invalid["count"], 15);
+    assert_eq!(invalid["blocks_work"], true);
+    assert_eq!(invalid["attention"], "action_required");
+    assert_eq!(invalid["href"], "/sync");
+    assert!(!items.iter().any(|item| {
+        item["code"] == "transfer_schedule_invalid" && item["peer_id"] == "override-peer"
+    }));
+    let offline = items
+        .iter()
+        .find(|item| item["code"] == "peer_offline" && item["peer_id"] == "offline-peer")
+        .unwrap();
+    assert_eq!(offline["count"], 3);
+    assert_eq!(offline["state"], "waiting");
+    assert_eq!(offline["attention"], "notice");
+    assert_eq!(offline["blocks_work"], true);
+    let failure = items
+        .iter()
+        .find(|item| item["code"] == "transfer_failed")
+        .unwrap();
+    assert_eq!(failure["count"], 1);
+    assert_eq!(failure["blocks_work"], true);
+    assert!(
+        !failure["message"]
+            .as_str()
+            .unwrap()
+            .contains("synthetic diagnostic detail")
+    );
+    let unknown = items
+        .iter()
+        .find(|item| {
+            item["code"] == "transfer_evidence_unavailable" && item["peer_id"] == "override-peer"
+        })
+        .unwrap();
+    assert_eq!(unknown["completeness"], "partial");
+    assert_eq!(unknown["blocks_work"], false);
+    let unknown_peer = items
+        .iter()
+        .find(|item| {
+            item["code"] == "peer_evidence_unavailable" && item["peer_id"] == "unknown-peer"
+        })
+        .unwrap();
+    assert_eq!(unknown_peer["blocks_work"], false);
+    assert_eq!(unknown_peer["completeness"], "partial");
+    assert!(
+        !items
+            .iter()
+            .any(|item| item["code"] == "peer_offline" && item["peer_id"] == "unknown-peer")
+    );
+    assert!(items.iter().all(|item| item["state"] != "stalled"));
+
+    sqlx::query("UPDATE overrides SET revoked_at=? WHERE id='override'")
+        .bind(crate::db::now())
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    let snapshot = send(&h.app, get("/api/admin/attention", &auth))
+        .await
+        .json();
+    assert!(snapshot["items"].as_array().unwrap().iter().any(|item| {
+        item["code"] == "transfer_schedule_invalid"
+            && item["peer_id"] == "override-peer"
+            && item["count"] == 4
+    }));
+    sqlx::query(
+        "UPDATE overrides SET revoked_at=NULL,until='2000-01-01T00:00:00.000Z' WHERE id='override'",
+    )
+    .execute(&h.state.db)
+    .await
+    .unwrap();
+    let snapshot = send(&h.app, get("/api/admin/attention", &auth))
+        .await
+        .json();
+    assert!(snapshot["items"].as_array().unwrap().iter().any(|item| {
+        item["code"] == "transfer_schedule_invalid" && item["peer_id"] == "override-peer"
+    }));
+
+    for (id, updated_at) in [
+        ("ordinary-peer-0", crate::db::now()),
+        ("ordinary-peer-1", chrono::Utc::now().to_rfc3339()),
+    ] {
+        sqlx::query("UPDATE transfers SET attempts=2,updated_at=? WHERE id=?")
+            .bind(updated_at)
+            .bind(id)
+            .execute(&h.state.db)
+            .await
+            .unwrap();
+    }
+    let snapshot = send(&h.app, get("/api/admin/attention", &auth))
+        .await
+        .json();
+    let backoff = snapshot["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["code"] == "transfer_backoff" && item["peer_id"] == "ordinary-peer")
+        .unwrap();
+    assert_eq!(backoff["count"], 1);
+    assert_eq!(backoff["total_count"], 15);
+    assert_eq!(backoff["completeness"], "partial");
+    assert_eq!(backoff["blocks_work"], true);
+    assert!(backoff["next_at"].is_null());
+
+    let permits = tokio::time::timeout(
+        Duration::from_secs(2),
+        h.state
+            .queue_root_probes
+            .clone()
+            .acquire_many_owned(crate::queue_evidence::ROOT_PROBE_LIMIT as u32),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let snapshot = tokio::time::timeout(
+        Duration::from_secs(2),
+        send(&h.app, get("/api/admin/attention", &auth)),
+    )
+    .await
+    .unwrap()
+    .json();
+    let root = snapshot["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["id"] == "transfer-root-evidence:ordinary-peer:share")
+        .unwrap();
+    assert_eq!(root["completeness"], "partial");
+    assert_eq!(root["blocks_work"], false);
+    assert!(
+        !snapshot["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["id"] == "transfer-root:ordinary-peer:share")
+    );
+    drop(permits);
+
+    sqlx::query(
+        "INSERT INTO operations(id,idempotency_key,principal,source,request_json,status,created_at)
+         VALUES ('active','active','admin','admin','{}','running',?)",
+    )
+    .bind(crate::db::now())
+    .execute(&h.state.db)
+    .await
+    .unwrap();
+    let snapshot = send(&h.app, get("/api/admin/attention", &auth))
+        .await
+        .json();
+    let gate = snapshot["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["code"] == "transfer_dependency" && item["peer_id"] == "ordinary-peer")
+        .unwrap();
+    assert_eq!(gate["count"], 15);
+    assert_eq!(gate["attention"], "none");
+    assert_eq!(gate["blocks_work"], true);
+    assert_eq!(gate["state"], "waiting");
+    assert_eq!(gate["href"], "/operations");
+    sqlx::query("UPDATE operations SET status='waiting_maintenance' WHERE id='active'")
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    let snapshot = send(&h.app, get("/api/admin/attention", &auth))
+        .await
+        .json();
+    assert!(snapshot["items"].as_array().unwrap().iter().any(|item| {
+        item["code"] == "transfer_dependency"
+            && item["peer_id"] == "ordinary-peer"
+            && item["title"] == "Transfers wait for a managed operation"
+    }));
+    sqlx::query("UPDATE operations SET status='queued' WHERE id='active'")
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    let snapshot = send(&h.app, get("/api/admin/attention", &auth))
+        .await
+        .json();
+    assert!(!snapshot["items"].as_array().unwrap().iter().any(|item| {
+        item["code"] == "transfer_dependency"
+            && item["title"] == "Transfers wait for a managed operation"
+    }));
+}
+
+#[tokio::test]
+async fn attention_distinguishes_fresh_receiver_failures_from_stale_peer_evidence() {
+    let h = harness().await;
+    for (peer, updated) in [
+        ("fresh-peer", crate::db::now()),
+        ("stale-peer", "2000-01-01T00:00:00.000Z".into()),
+        (
+            "future-peer",
+            crate::db::ts(chrono::Utc::now() + chrono::Duration::hours(1)),
+        ),
+        ("error-peer", crate::db::now()),
+    ] {
+        sqlx::query(
+            "INSERT INTO peers(id,name,url,instance_id,secret_enc,status,created_at)
+             VALUES (?,?,?,?,'unused','online',?)",
+        )
+        .bind(peer)
+        .bind(peer)
+        .bind(format!("https://{peer}.example"))
+        .bind(format!("instance-{peer}"))
+        .bind(crate::db::now())
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+        let progress = serde_json::to_string(&ism_core::dto::SyncProgress::default()).unwrap();
+        sqlx::query(
+            "INSERT INTO peer_sync_state(peer_id,cursor,progress_json,updated_at)
+             VALUES (?,0,?,?)",
+        )
+        .bind(peer)
+        .bind(progress)
+        .bind(updated)
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+        let transfer = json!({
+            "id": format!("{peer}-file"),
+            "outgoing": true,
+            "peer_id": peer,
+            "share_name": "Archive",
+            "relative_path": "photo.example.jpg",
+            "location": { "root_id": "photos", "path": "photo.example.jpg" },
+            "source": "ISM: Local",
+            "destination": "ISM: Peer",
+            "destination_path": "photo.example.jpg",
+            "status": "failed",
+            "size": 10,
+            "bytes_done": 0,
+            "error": "synthetic receiver detail",
+            "queued_at": crate::db::now(),
+            "finished_at": null,
+            "operation_id": null
+        });
+        sqlx::query("INSERT INTO outgoing_sync(peer_id,id,activity_json) VALUES (?,?,?)")
+            .bind(peer)
+            .bind(format!("{peer}-file"))
+            .bind(transfer.to_string())
+            .execute(&h.state.db)
+            .await
+            .unwrap();
+    }
+    sqlx::query("UPDATE peer_sync_state SET error='synthetic connection failure' WHERE peer_id='error-peer'")
+            .execute(&h.state.db)
+            .await
+            .unwrap();
+    sqlx::query(
+            "INSERT INTO outgoing_sync(peer_id,id,activity_json) VALUES ('fresh-peer','bad-record','{}')",
+    )
+    .execute(&h.state.db)
+    .await
+    .unwrap();
+
+    let auth = [("cookie", h.cookie.as_str())];
+    let response = send(&h.app, get("/api/admin/attention", &auth)).await;
+    assert_eq!(response.status, StatusCode::OK, "{}", response.json());
+    let snapshot = response.json();
+    assert_eq!(snapshot["completeness"], "partial");
+    let items = snapshot["items"].as_array().unwrap();
+    let failure = items
+        .iter()
+        .find(|item| item["code"] == "receiver_transfer_failed" && item["peer_id"] == "fresh-peer")
+        .unwrap();
+    assert_eq!(failure["owner"], "receiver");
+    assert_eq!(failure["state"], "failed");
+    assert_eq!(failure["blocks_work"], true);
+    assert_eq!(failure["completeness"], "partial");
+    assert!(
+        !failure["message"]
+            .as_str()
+            .unwrap()
+            .contains("synthetic receiver detail")
+    );
+    let unknown = items
+        .iter()
+        .find(|item| item["code"] == "peer_evidence_unavailable" && item["peer_id"] == "stale-peer")
+        .unwrap();
+    assert_eq!(unknown["owner"], "receiver");
+    assert_eq!(unknown["state"], "unavailable");
+    assert_eq!(unknown["blocks_work"], false);
+    for peer in ["future-peer", "error-peer"] {
+        assert!(items.iter().any(|item| {
+            item["code"] == "peer_evidence_unavailable"
+                && item["peer_id"] == peer
+                && item["blocks_work"] == false
+        }));
+        assert!(
+            !items.iter().any(|item| {
+                item["code"] == "receiver_transfer_failed" && item["peer_id"] == peer
+            })
+        );
+    }
+    assert!(items.iter().any(|item| {
+        item["code"] == "peer_evidence_unavailable"
+            && item["peer_id"] == "fresh-peer"
+            && item["count"] == 1
+    }));
+    assert!(!items.iter().any(|item| {
+        item["code"] == "receiver_transfer_failed" && item["peer_id"] == "stale-peer"
+    }));
+}
+
+#[tokio::test]
+async fn partially_received_peer_snapshot_is_not_reported_as_current() {
+    use std::sync::Arc;
+    use tokio::sync::Notify;
+
+    let h = harness().await;
+    let second_page = Arc::new(Notify::new());
+    let finish = Arc::new(Notify::new());
+    let peer_app = Router::new().route(
+        "/api/peer/v1/sync-activity",
+        axum::routing::get({
+            let second_page = second_page.clone();
+            let finish = finish.clone();
+            move |axum::extract::Query(query): axum::extract::Query<
+                std::collections::HashMap<String, String>,
+            >| {
+                let second_page = second_page.clone();
+                let finish = finish.clone();
+                async move {
+                    if query.get("after").is_some_and(|after| after == "0") {
+                        axum::Json(json!({
+                            "cursor": 1,
+                            "more": true,
+                            "changes": [{ "id": "removed", "activity": null }],
+                            "progress": ism_core::dto::SyncProgress::default()
+                        }))
+                    } else {
+                        second_page.notify_one();
+                        finish.notified().await;
+                        axum::Json(json!({
+                            "cursor": 1,
+                            "more": false,
+                            "changes": [],
+                            "progress": ism_core::dto::SyncProgress::default()
+                        }))
+                    }
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, peer_app).await.unwrap();
+    });
+    sqlx::query(
+        "INSERT INTO peers(id,name,url,instance_id,secret_enc,status,created_at)
+         VALUES ('peer','Peer example',?,'remote','unused','online',?)",
+    )
+    .bind(&url)
+    .bind(crate::db::now())
+    .execute(&h.state.db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO peer_sync_state(peer_id,cursor,progress_json,updated_at)
+         VALUES ('peer',0,?,?)",
+    )
+    .bind(serde_json::to_string(&ism_core::dto::SyncProgress::default()).unwrap())
+    .bind(crate::db::now())
+    .execute(&h.state.db)
+    .await
+    .unwrap();
+    let cached = json!({
+        "id": "cached-file",
+        "outgoing": true,
+        "peer_id": "peer",
+        "share_name": "Archive",
+        "relative_path": "photo.example.jpg",
+        "location": { "root_id": "photos", "path": "photo.example.jpg" },
+        "source": "ISM: Local",
+        "destination": "ISM: Peer example",
+        "destination_path": "photo.example.jpg",
+        "status": "failed",
+        "size": 10,
+        "bytes_done": 0,
+        "error": "synthetic receiver detail",
+        "queued_at": crate::db::now(),
+        "finished_at": null,
+        "operation_id": null
+    });
+    sqlx::query(
+        "INSERT INTO outgoing_sync(peer_id,id,activity_json) VALUES ('peer','cached-file',?)",
+    )
+    .bind(cached.to_string())
+    .execute(&h.state.db)
+    .await
+    .unwrap();
+    let peer = crate::peers::net::Peer {
+        id: "peer".into(),
+        name: "Peer example".into(),
+        url,
+        instance_id: Some("remote".into()),
+        secret: "synthetic-secret".into(),
+        cursor: 0,
+    };
+    let state = h.state.clone();
+    let refresh = tokio::spawn(async move { crate::peers::activity::refresh(&state, &peer).await });
+    tokio::time::timeout(Duration::from_secs(3), second_page.notified())
+        .await
+        .unwrap();
+    let auth = [("cookie", h.cookie.as_str())];
+    let partial = send(&h.app, get("/api/admin/attention", &auth))
+        .await
+        .json();
+    let items = partial["items"].as_array().unwrap();
+    assert!(
+        items.iter().any(|item| {
+            item["code"] == "peer_evidence_unavailable" && item["peer_id"] == "peer"
+        })
+    );
+    assert!(
+        !items
+            .iter()
+            .any(|item| item["code"] == "receiver_transfer_failed")
+    );
+    finish.notify_one();
+    refresh.await.unwrap().unwrap();
+    let complete = send(&h.app, get("/api/admin/attention", &auth))
+        .await
+        .json();
+    assert!(
+        complete["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["code"] == "receiver_transfer_failed")
+    );
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn malformed_peer_activity_does_not_hide_other_attention_or_background_work() {
+    let h = harness().await;
+    sqlx::query(
+        "INSERT INTO peers(id,name,url,instance_id,secret_enc,status,created_at)
+         VALUES ('peer','Peer example','https://peer.example','remote','unused','online',?)",
+    )
+    .bind(crate::db::now())
+    .execute(&h.state.db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO outgoing_sync(peer_id,id,activity_json) VALUES ('peer','bad-record','{}')",
+    )
+    .execute(&h.state.db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO operations(id,idempotency_key,principal,source,request_json,status,created_at)
+         VALUES ('failure','failure','admin','admin','{}','failed',?)",
+    )
+    .bind(crate::db::now())
+    .execute(&h.state.db)
+    .await
+    .unwrap();
+    let auth = [("cookie", h.cookie.as_str())];
+    let attention = send(&h.app, get("/api/admin/attention", &auth)).await;
+    assert_eq!(attention.status, StatusCode::OK, "{}", attention.json());
+    let snapshot = attention.json();
+    assert_ne!(snapshot["completeness"], "complete");
+    assert!(
+        snapshot["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["operation_id"] == "failure")
+    );
+    let unknown = snapshot["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["code"] == "peer_evidence_unavailable")
+        .unwrap();
+    assert_eq!(unknown["blocks_work"], false);
+    let background = send(
+        &h.app,
+        get("/api/admin/operations/background?limit=25", &auth),
+    )
+    .await;
+    assert_eq!(background.status, StatusCode::OK, "{}", background.json());
+    assert!(!background.json()["warnings"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn retained_peer_failures_are_grouped_and_scoped_to_pending_work() {
+    let h = harness().await;
+    h.map_root().await;
+    sqlx::query(
+        "INSERT INTO peers(id,name,url,instance_id,secret_enc,status,created_at)
+         VALUES ('peer','Peer example','https://peer.example','remote','unused','online',?)",
+    )
+    .bind(crate::db::now())
+    .execute(&h.state.db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO shares(id,name,root_id,path,peer_ids_json,enabled)
+         VALUES ('share','Archive','photos','','[\"peer\"]',1)",
+    )
+    .execute(&h.state.db)
+    .await
+    .unwrap();
+    let mut tx = h.state.db.begin().await.unwrap();
+    for seq in 1..=125 {
+        let folder = seq <= 120;
+        let path = if folder {
+            format!("folder-{seq}")
+        } else {
+            format!("photo-{seq}.example.jpg")
+        };
+        let event = json!({
+            "seq": seq,
+            "origin": "remote",
+            "origin_seq": seq,
+            "share": "Archive",
+            "kind": if folder { "folder_pruned" } else { "file_deleted" },
+            "data": { "path": path, "vv": {} }
+        });
+        let error = if folder {
+            Some(crate::peers::inbox::folder_pruned_message(
+                "Peer example",
+                "Archive",
+                &path,
+            ))
+        } else if seq < 125 {
+            Some(format!("Last attempt failed for {path}"))
+        } else {
+            None
+        };
+        sqlx::query(
+            "INSERT INTO peer_inbox(peer_id,seq,origin,origin_seq,share_name,event_json,error,attempted_at)
+             VALUES ('peer',?,'remote',?,'Archive',?,?,?)",
+        )
+        .bind(seq)
+        .bind(seq)
+        .bind(event.to_string())
+        .bind(error)
+        .bind(crate::db::now())
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    }
+    sqlx::query(
+        "INSERT INTO peer_inbox(peer_id,seq,origin,origin_seq,share_name,event_json)
+         VALUES ('peer',200,'remote',200,'Archive','not-json')",
+    )
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    let invalid_identity = json!({
+        "seq": 201,
+        "origin": "",
+        "origin_seq": 201,
+        "share": "Archive",
+        "kind": "folder_pruned",
+        "data": { "path": "unverifiable", "vv": {} }
+    });
+    sqlx::query(
+        "INSERT INTO peer_inbox(peer_id,seq,origin,origin_seq,share_name,event_json)
+         VALUES ('peer',201,'',201,'Archive',?)",
+    )
+    .bind(invalid_identity.to_string())
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    for path in ["inventory-1.example.jpg", "inventory-2.example.jpg"] {
+        let inventory = json!({
+            "path": path,
+            "sha256": null,
+            "size": 0,
+            "mtime_ns": 0,
+            "deleted": true,
+            "vv": {}
+        });
+        sqlx::query(
+            "INSERT INTO peer_backfill_inbox(peer_id,share_id,path,entry_json,error)
+             VALUES ('peer','share',?,?,?)",
+        )
+        .bind(path)
+        .bind(inventory.to_string())
+        .bind(format!("Could not apply {path}"))
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    }
+    tx.commit().await.unwrap();
+
+    let auth = [("cookie", h.cookie.as_str())];
+    let attention = send(&h.app, get("/api/admin/attention", &auth)).await;
+    assert_eq!(attention.status, StatusCode::OK, "{}", attention.json());
+    let snapshot = attention.json();
+    let items = snapshot["items"].as_array().unwrap();
+    let folder = items
+        .iter()
+        .find(|item| item["code"] == "folder_removal_failed")
+        .unwrap();
+    assert_eq!(folder["count"], 120);
+    assert_eq!(folder["peer_id"], "peer");
+    assert_eq!(folder["share_id"], "share");
+    assert_eq!(folder["blocks_work"], true);
+    assert!(
+        folder["message"]
+            .as_str()
+            .unwrap()
+            .contains("Other folders")
+    );
+    let event = items
+        .iter()
+        .find(|item| item["code"] == "peer_inbox_failed")
+        .unwrap();
+    assert_eq!(event["count"], 4);
+    assert_eq!(event["blocks_work"], false);
+    assert_eq!(event["completeness"], "partial");
+    let inventory = items
+        .iter()
+        .find(|item| item["code"] == "peer_inventory_failed")
+        .unwrap();
+    assert_eq!(inventory["count"], 2);
+    assert_eq!(inventory["blocks_work"], false);
+    assert_eq!(inventory["completeness"], "partial");
+    let unknown = items
+        .iter()
+        .find(|item| {
+            item["code"] == "peer_evidence_unavailable"
+                && item["title"] == "Saved peer work could not be verified"
+        })
+        .unwrap();
+    assert_eq!(unknown["count"], 2);
+    assert_eq!(unknown["blocks_work"], false);
+
+    let background = send(
+        &h.app,
+        get("/api/admin/operations/background?limit=25", &auth),
+    )
+    .await;
+    assert_eq!(background.status, StatusCode::OK, "{}", background.json());
+    let snapshot = background.json();
+    let current = snapshot["current"].as_array().unwrap();
+    let folder = current
+        .iter()
+        .find(|item| item["task_key"] == folder["id"])
+        .unwrap();
+    assert_eq!(folder["status"], "blocked");
+    assert_eq!(folder["count"], 120);
+    assert_eq!(folder["reasons"][0]["count"], 120);
+    assert_eq!(folder["examples"].as_array().unwrap().len(), 5);
+    let generic_event = current
+        .iter()
+        .find(|item| item["task_key"] == event["id"])
+        .unwrap();
+    assert_eq!(generic_event["status"], "failed");
+    assert_eq!(
+        current
+            .iter()
+            .filter(|item| item["title"] == "Peer event application")
+            .count(),
+        4
+    );
+    assert!(!snapshot["warnings"].as_array().unwrap().is_empty());
+
+    sqlx::query("UPDATE peer_inbox SET status='done'")
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM peer_backfill_inbox")
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    let snapshot = send(&h.app, get("/api/admin/attention", &auth))
+        .await
+        .json();
+    assert!(snapshot["items"].as_array().unwrap().iter().all(|item| {
+        !matches!(
+            item["code"].as_str(),
+            Some("folder_removal_failed" | "peer_inbox_failed" | "peer_inventory_failed")
+        )
+    }));
+}
+
+#[tokio::test]
+async fn unsaved_transfer_outcome_remains_visible_until_the_running_row_changes() {
+    let h = harness().await;
+    h.map_root().await;
+    sqlx::query(
+        "INSERT INTO peers(id,name,url,instance_id,secret_enc,status,created_at)
+         VALUES ('peer','Peer example','https://peer.example','remote','invalid','online',?)",
+    )
+    .bind(crate::db::now())
+    .execute(&h.state.db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO shares(id,name,root_id,path,peer_ids_json,enabled)
+         VALUES ('share','Archive','photos','','[\"peer\"]',1)",
+    )
+    .execute(&h.state.db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO transfers(id,peer_id,share_id,rel_path,sha256,size,vv_json,status,queued_at,updated_at)
+         VALUES ('transfer','peer','share','photo.example.jpg','example',10,'{}','queued',?,?)",
+    )
+    .bind(crate::db::now())
+    .bind(crate::db::now())
+    .execute(&h.state.db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER reject_transfer_outcome BEFORE UPDATE OF status ON transfers
+         WHEN OLD.status='running'
+         BEGIN SELECT RAISE(FAIL, 'synthetic outcome write failure'); END",
+    )
+    .execute(&h.state.db)
+    .await
+    .unwrap();
+
+    let worker = tokio::spawn(crate::peers::transfer::run(h.state.clone()));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if h.state
+                .worker_evidence
+                .transfer_failures()
+                .contains_key("transfer")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the dispatcher must attempt and fail to save the outcome");
+    let status: String = sqlx::query_scalar("SELECT status FROM transfers WHERE id='transfer'")
+        .fetch_one(&h.state.db)
+        .await
+        .unwrap();
+    assert_eq!(status, "running");
+
+    let auth = [("cookie", h.cookie.as_str())];
+    let snapshot = send(&h.app, get("/api/admin/attention", &auth))
+        .await
+        .json();
+    let failure = snapshot["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["id"] == "transfer-worker:peer:share:outcome-not-saved")
+        .unwrap();
+    assert_eq!(failure["code"], "worker_stopped");
+    assert_eq!(failure["blocks_work"], true);
+    assert_eq!(failure["count"], 1);
+    let background = send(
+        &h.app,
+        get("/api/admin/operations/background?limit=25", &auth),
+    )
+    .await
+    .json();
+    let transfer = background["current"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["task_key"] == "transfer:transfer" && item["status"] == "blocked")
+        .unwrap();
+    assert!(
+        transfer["phase"]
+            .as_str()
+            .unwrap()
+            .contains("outcome could not be saved")
+    );
+
+    worker.abort();
+    let _ = worker.await;
+    sqlx::query("DROP TRIGGER reject_transfer_outcome")
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE transfers SET status='failed' WHERE id='transfer'")
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    let snapshot = send(&h.app, get("/api/admin/attention", &auth))
+        .await
+        .json();
+    assert!(
+        snapshot["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["id"] != "transfer-worker:peer:share:outcome-not-saved")
+    );
+    assert!(
+        !h.state
+            .worker_evidence
+            .transfer_failures()
+            .contains_key("transfer")
+    );
+}
+
 impl Reply {
     fn json(&self) -> Value {
         serde_json::from_slice(&self.body).unwrap_or(Value::Null)
