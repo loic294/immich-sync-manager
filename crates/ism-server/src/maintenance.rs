@@ -55,21 +55,44 @@ fn blocked(message: impl Into<String>) -> AppError {
 /// The barrier was verified end to end against stock Immich v3.4.1
 /// (`docker/immich-proof/RESULTS.md`).
 pub async fn acquire(state: &AppState, server_id: &str) -> AppResult<()> {
+    acquire_inner(state, server_id, None).await
+}
+
+/// Acquires a barrier for an interrupted operation without an anonymous holder.
+pub async fn acquire_recovery(
+    state: &AppState,
+    server_id: &str,
+    operation_id: &str,
+) -> AppResult<()> {
+    acquire_inner(state, server_id, Some(operation_id)).await
+}
+
+async fn acquire_inner(
+    state: &AppState,
+    server_id: &str,
+    recovery_operation: Option<&str>,
+) -> AppResult<()> {
     let deadline = tokio::time::Instant::now() + state.config.timing.admission_timeout;
     loop {
-        let (admission, _) = update(state, server_id, |m| {
-            let a = m.admission();
-            match a {
-                Admission::Admit => m.admit(),
-                Admission::Prepare => m.begin_prepare(),
-                Admission::Wait | Admission::Deny(_) => {}
+        let admission = match recovery_operation {
+            Some(operation_id) => recovery_admission(state, server_id, operation_id).await?,
+            None => {
+                update(state, server_id, |m| {
+                    let admission = m.admission();
+                    match admission {
+                        Admission::Admit => m.admit(),
+                        Admission::Prepare => m.begin_prepare(),
+                        Admission::Wait | Admission::Deny(_) => {}
+                    }
+                    admission
+                })
+                .await?
+                .0
             }
-            a
-        })
-        .await?;
+        };
         match admission {
             Admission::Admit => return Ok(()),
-            Admission::Prepare => return prepare(state, server_id).await,
+            Admission::Prepare => return prepare(state, server_id, recovery_operation).await,
             Admission::Deny(message) => return Err(blocked(message)),
             Admission::Wait => {
                 if tokio::time::Instant::now() >= deadline {
@@ -82,16 +105,105 @@ pub async fn acquire(state: &AppState, server_id: &str) -> AppResult<()> {
     }
 }
 
+async fn recovery_admission(
+    state: &AppState,
+    server_id: &str,
+    operation_id: &str,
+) -> AppResult<Admission> {
+    let _guard = state.maintenance_lock.lock().await;
+    let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
+    let raw: String = sqlx::query_scalar("SELECT maintenance_json FROM immich_servers WHERE id=?")
+        .bind(server_id)
+        .fetch_one(&mut *tx)
+        .await?;
+    let mut maintenance: MaintenanceState = serde_json::from_str(&raw)?;
+    let admission = maintenance.admission();
+    match &admission {
+        Admission::Admit => {
+            if !maintenance.queue_paused_by_ism {
+                return Err(AppError::conflict(
+                    "recovery_changed",
+                    "maintenance changed during recovery admission",
+                ));
+            }
+            attach_recovery(&mut tx, server_id, operation_id, &mut maintenance).await?;
+        }
+        Admission::Prepare => maintenance.begin_prepare(),
+        Admission::Wait | Admission::Deny(_) => {}
+    }
+    if matches!(admission, Admission::Admit | Admission::Prepare) {
+        sqlx::query("UPDATE immich_servers SET maintenance_json=? WHERE id=?")
+            .bind(serde_json::to_string(&maintenance)?)
+            .bind(server_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    if matches!(admission, Admission::Admit | Admission::Prepare) {
+        state.emit(ServerEvent::MaintenanceChanged {
+            server_id: server_id.to_owned(),
+        });
+        state.maintenance_wake.notify_waiters();
+    }
+    Ok(admission)
+}
+
+async fn attach_recovery(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    server_id: &str,
+    operation_id: &str,
+    maintenance: &mut MaintenanceState,
+) -> AppResult<()> {
+    let raw: Option<String> = sqlx::query_scalar(
+        "SELECT admitted_server_ids_json FROM operations WHERE id=? AND status='recovery_required' AND recovery_resolved=0",
+    )
+    .bind(operation_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let raw = raw.ok_or_else(|| {
+        AppError::conflict(
+            "recovery_changed",
+            "operation changed during recovery admission",
+        )
+    })?;
+    let mut admitted: Vec<String> = serde_json::from_str(&raw)?;
+    if admitted.iter().any(|id| id == server_id) {
+        return Err(AppError::conflict(
+            "recovery_changed",
+            "operation changed during recovery admission",
+        ));
+    }
+    admitted.push(server_id.to_owned());
+    let updated = sqlx::query("UPDATE operations SET admitted_server_ids_json=? WHERE id=? AND status='recovery_required' AND recovery_resolved=0")
+        .bind(serde_json::to_string(&admitted)?)
+        .bind(operation_id)
+        .execute(&mut **tx)
+        .await?;
+    if updated.rows_affected() != 1 {
+        return Err(AppError::conflict(
+            "recovery_changed",
+            "operation changed during recovery admission",
+        ));
+    }
+    maintenance.unresolved_recoveries += 1;
+    maintenance.require_recovery("finishing interrupted filesystem move");
+    Ok(())
+}
+
 /// Checks the settings, pauses the library queue and confirms it idle. On failure the queue is
 /// resumed (when possible) and the server blocked; no file has been touched.
-async fn prepare(state: &AppState, server_id: &str) -> AppResult<()> {
+async fn prepare(
+    state: &AppState,
+    server_id: &str,
+    recovery_operation: Option<&str>,
+) -> AppResult<()> {
     crate::activity::observe(
         state,
         format!("prepare:{server_id}"),
         "Prepare Immich write barrier",
         server_id,
         Some("/servers"),
-        |task| async move { prepare_reporting(state, server_id, &task).await },
+        |task| async move { prepare_reporting(state, server_id, recovery_operation, &task).await },
     )
     .await
 }
@@ -99,6 +211,7 @@ async fn prepare(state: &AppState, server_id: &str) -> AppResult<()> {
 async fn prepare_reporting(
     state: &AppState,
     server_id: &str,
+    recovery_operation: Option<&str>,
     task: &crate::activity::Reporter,
 ) -> AppResult<()> {
     task.phase("Verifying settings and pausing the Immich library queue");
@@ -111,7 +224,25 @@ async fn prepare_reporting(
     };
     match outcome {
         Ok(()) => {
-            update(state, server_id, MaintenanceState::prepared).await?;
+            if let Some(operation_id) = recovery_operation {
+                if let Err(error) = finish_recovery_prepare(state, server_id, operation_id).await {
+                    if let Err(block_error) =
+                        record_failed_recovery_prepare(state, server_id, server.maintenance.epoch)
+                            .await
+                    {
+                        tracing::error!(server = %server.name, error = %block_error.message(), "could not record failed recovery admission");
+                        let state = state.clone();
+                        let server_id = server_id.to_owned();
+                        let epoch = server.maintenance.epoch;
+                        tokio::spawn(async move {
+                            retry_failed_recovery_prepare(state, server_id, epoch).await;
+                        });
+                    }
+                    return Err(error);
+                }
+            } else {
+                update(state, server_id, MaintenanceState::prepared).await?;
+            }
             tracing::info!(server = %server.name, "library queue paused; changes admitted");
             Ok(())
         }
@@ -142,6 +273,73 @@ async fn prepare_reporting(
             Err(blocked(message))
         }
     }
+}
+
+async fn record_failed_recovery_prepare(
+    state: &AppState,
+    server_id: &str,
+    epoch: u64,
+) -> AppResult<()> {
+    update(state, server_id, |m| {
+        if m.phase == Phase::Preparing && m.epoch == epoch {
+            m.block("could not record recovery admission; retry");
+        }
+    })
+    .await?;
+    Ok(())
+}
+
+async fn retry_failed_recovery_prepare(state: AppState, server_id: String, epoch: u64) {
+    let mut delay = Duration::from_secs(1);
+    loop {
+        tokio::time::sleep(delay).await;
+        match record_failed_recovery_prepare(&state, &server_id, epoch).await {
+            Ok(()) => return,
+            Err(error) if error.code() == "not_found" => {
+                tracing::error!(server = %server_id, "cannot record failed recovery admission: {}", error.message());
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(server = %server_id, "retrying failed recovery admission bookkeeping: {}", error.message());
+                delay = (delay * 2).min(Duration::from_secs(60));
+            }
+        }
+    }
+}
+
+async fn finish_recovery_prepare(
+    state: &AppState,
+    server_id: &str,
+    operation_id: &str,
+) -> AppResult<()> {
+    let _guard = state.maintenance_lock.lock().await;
+    let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
+    let raw: String = sqlx::query_scalar("SELECT maintenance_json FROM immich_servers WHERE id=?")
+        .bind(server_id)
+        .fetch_one(&mut *tx)
+        .await?;
+    let mut maintenance: MaintenanceState = serde_json::from_str(&raw)?;
+    if maintenance.phase != Phase::Preparing
+        || !maintenance.queue_paused_by_ism
+        || maintenance.drift.is_some()
+    {
+        return Err(AppError::conflict(
+            "recovery_changed",
+            "maintenance changed during recovery admission",
+        ));
+    }
+    attach_recovery(&mut tx, server_id, operation_id, &mut maintenance).await?;
+    sqlx::query("UPDATE immich_servers SET maintenance_json=? WHERE id=?")
+        .bind(serde_json::to_string(&maintenance)?)
+        .bind(server_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    state.emit(ServerEvent::MaintenanceChanged {
+        server_id: server_id.to_owned(),
+    });
+    state.maintenance_wake.notify_waiters();
+    Ok(())
 }
 
 /// Resumes the library queue; false when that failed or no API is available.

@@ -2227,45 +2227,9 @@ async fn recovery_window(state: &AppState, id: &str, root: &files::Root) -> AppR
             .bind(id)
             .fetch_one(&state.db)
             .await?;
-    let mut admitted: Vec<String> = serde_json::from_str(&raw)?;
+    let admitted: Vec<String> = serde_json::from_str(&raw)?;
     if !admitted.contains(server) {
-        crate::maintenance::acquire(state, server).await?;
-        let _maintenance_guard = state.maintenance_lock.lock().await;
-        let mut tx = state.db.begin().await?;
-        let raw: String =
-            sqlx::query_scalar("SELECT maintenance_json FROM immich_servers WHERE id=?")
-                .bind(server)
-                .fetch_one(&mut *tx)
-                .await?;
-        let mut maintenance: ism_core::maintenance::MaintenanceState = serde_json::from_str(&raw)?;
-        if maintenance.phase != ism_core::maintenance::Phase::Active
-            || !maintenance.queue_paused_by_ism
-            || maintenance.drift.is_some()
-        {
-            return Err(recovery_changed(
-                "maintenance changed during recovery admission",
-            ));
-        }
-        maintenance.unresolved_recoveries += 1;
-        maintenance.require_recovery("finishing interrupted filesystem move");
-        maintenance.settle();
-        admitted.push(server.clone());
-        sqlx::query("UPDATE operations SET admitted_server_ids_json=? WHERE id=? AND status='recovery_required' AND recovery_resolved=0")
-            .bind(serde_json::to_string(&admitted)?)
-            .bind(id)
-            .execute(&mut *tx)
-            .await?.rows_affected().eq(&1).then_some(())
-            .ok_or_else(|| recovery_changed("operation changed during recovery admission"))?;
-        sqlx::query("UPDATE immich_servers SET maintenance_json=? WHERE id=?")
-            .bind(serde_json::to_string(&maintenance)?)
-            .bind(server)
-            .execute(&mut *tx)
-            .await?;
-        tx.commit().await?;
-        state.emit(ServerEvent::MaintenanceChanged {
-            server_id: server.clone(),
-        });
-        state.maintenance_wake.notify_waiters();
+        crate::maintenance::acquire_recovery(state, server, id).await?;
     }
     let maintenance = registry::server(state, server).await?.maintenance;
     if !maintenance.queue_paused_by_ism

@@ -1276,6 +1276,251 @@ async fn interrupted_file_finish_and_repeated_recovery_are_idempotent() {
     assert!(fixture.trash().await.is_empty());
 }
 
+async fn setup_unattached_recovery(fixture: &mut Fixture, server: &MockServer, active: bool) {
+    fixture.immich(server).await;
+    let maintenance = if active {
+        ism_core::maintenance::MaintenanceState {
+            phase: ism_core::maintenance::Phase::Active,
+            active_ops: 1,
+            queue_paused_by_ism: true,
+            ..Default::default()
+        }
+    } else {
+        Default::default()
+    };
+    sqlx::query("UPDATE immich_servers SET maintenance_json=? WHERE id='server-1'")
+        .bind(serde_json::to_string(&maintenance).unwrap())
+        .execute(&fixture.state.db)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE operations SET admitted_server_ids_json='[]' WHERE id='op-1'")
+        .execute(&fixture.state.db)
+        .await
+        .unwrap();
+}
+
+async fn admitted_servers(fixture: &Fixture) -> String {
+    sqlx::query_scalar("SELECT admitted_server_ids_json FROM operations WHERE id='op-1'")
+        .fetch_one(&fixture.state.db)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn recovery_admission_rolls_back_both_records_on_either_write_failure() {
+    for (trigger, drop_trigger) in [
+        (
+            "CREATE TRIGGER reject_operation BEFORE UPDATE OF admitted_server_ids_json ON operations
+             BEGIN SELECT RAISE(FAIL, 'synthetic operation failure'); END",
+            "DROP TRIGGER reject_operation",
+        ),
+        (
+            "CREATE TRIGGER reject_barrier BEFORE UPDATE OF maintenance_json ON immich_servers
+             WHEN json_extract(NEW.maintenance_json, '$.phase')='recovery_required'
+             BEGIN SELECT RAISE(FAIL, 'synthetic barrier failure'); END",
+            "DROP TRIGGER reject_barrier",
+        ),
+    ] {
+        let server = MockServer::start().await;
+        let mut fixture = Fixture::new(false, false).await;
+        setup_unattached_recovery(&mut fixture, &server, true).await;
+        let before = registry::server(&fixture.state, "server-1")
+            .await
+            .unwrap()
+            .maintenance;
+        sqlx::query(trigger).execute(&fixture.state.db).await.unwrap();
+        let root = files::root(&fixture.state.db, "root-1").await.unwrap();
+        assert!(recovery_window(&fixture.state, "op-1", &root).await.is_err());
+        assert_eq!(admitted_servers(&fixture).await, "[]");
+        assert_eq!(
+            registry::server(&fixture.state, "server-1").await.unwrap().maintenance,
+            before
+        );
+        sqlx::query(drop_trigger)
+            .execute(&fixture.state.db)
+            .await
+            .unwrap();
+        recovery_window(&fixture.state, "op-1", &root).await.unwrap();
+        let after = registry::server(&fixture.state, "server-1")
+            .await
+            .unwrap()
+            .maintenance;
+        assert_eq!(after.active_ops, 1);
+        assert_eq!(after.unresolved_recoveries, 1);
+        assert_eq!(after.phase, ism_core::maintenance::Phase::RecoveryRequired);
+        assert_eq!(admitted_servers(&fixture).await, "[\"server-1\"]");
+    }
+}
+
+#[tokio::test]
+async fn failed_recovery_admission_after_pause_retries_bookkeeping_and_recovers() {
+    let server = MockServer::start().await;
+    let mut fixture = Fixture::new(false, false).await;
+    setup_unattached_recovery(&mut fixture, &server, false).await;
+    Mock::given(method("GET"))
+        .and(path("/api/admin/config"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "library":{"watch":{"enabled":false},"scan":{"enabled":false}},
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/api/queues/library"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/queues"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
+            "name":"library","isPaused":true,"statistics":{"active":0},
+        }])))
+        .mount(&server)
+        .await;
+    sqlx::query(
+        "CREATE TRIGGER reject_operation BEFORE UPDATE OF admitted_server_ids_json ON operations
+         BEGIN SELECT RAISE(FAIL, 'synthetic admission failure'); END",
+    )
+    .execute(&fixture.state.db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER reject_blocked BEFORE UPDATE OF maintenance_json ON immich_servers
+         WHEN json_extract(NEW.maintenance_json, '$.phase')='blocked'
+         BEGIN SELECT RAISE(FAIL, 'synthetic barrier failure'); END",
+    )
+    .execute(&fixture.state.db)
+    .await
+    .unwrap();
+    let root = files::root(&fixture.state.db, "root-1").await.unwrap();
+    assert!(
+        recovery_window(&fixture.state, "op-1", &root)
+            .await
+            .is_err()
+    );
+    let preparing = registry::server(&fixture.state, "server-1")
+        .await
+        .unwrap()
+        .maintenance;
+    assert_eq!(preparing.phase, ism_core::maintenance::Phase::Preparing);
+    assert!(preparing.queue_paused_by_ism);
+    assert_eq!(preparing.active_ops, 0);
+    assert_eq!(preparing.unresolved_recoveries, 0);
+    assert_eq!(admitted_servers(&fixture).await, "[]");
+    assert!(fixture.base.join("photo.jpg").is_file());
+    assert!(!fixture.base.join("moved/photo.jpg").exists());
+    sqlx::query("DROP TRIGGER reject_blocked")
+        .execute(&fixture.state.db)
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            if registry::server(&fixture.state, "server-1")
+                .await
+                .unwrap()
+                .maintenance
+                .phase
+                == ism_core::maintenance::Phase::Blocked
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("failed barrier bookkeeping should be retried");
+    let blocked = registry::server(&fixture.state, "server-1")
+        .await
+        .unwrap()
+        .maintenance;
+    assert!(blocked.queue_paused_by_ism);
+    assert_eq!(blocked.active_ops, 0);
+    assert_eq!(blocked.unresolved_recoveries, 0);
+    assert_eq!(admitted_servers(&fixture).await, "[]");
+    sqlx::query("DROP TRIGGER reject_operation")
+        .execute(&fixture.state.db)
+        .await
+        .unwrap();
+    crate::maintenance::retry(&fixture.state, "server-1")
+        .await
+        .unwrap();
+    let worker = tokio::spawn(crate::maintenance::run(fixture.state.clone()));
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if registry::server(&fixture.state, "server-1")
+                .await
+                .unwrap()
+                .maintenance
+                .phase
+                == ism_core::maintenance::Phase::Idle
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    worker.abort();
+    recovery_window(&fixture.state, "op-1", &root)
+        .await
+        .unwrap();
+    let after = registry::server(&fixture.state, "server-1")
+        .await
+        .unwrap()
+        .maintenance;
+    assert_eq!(after.phase, ism_core::maintenance::Phase::RecoveryRequired);
+    assert_eq!(after.active_ops, 0);
+    assert_eq!(after.unresolved_recoveries, 1);
+    assert_eq!(admitted_servers(&fixture).await, "[\"server-1\"]");
+}
+
+#[tokio::test]
+async fn recovery_admission_waits_for_sqlite_writer() {
+    let server = MockServer::start().await;
+    let mut fixture = Fixture::new(false, false).await;
+    setup_unattached_recovery(&mut fixture, &server, true).await;
+    let root = files::root(&fixture.state.db, "root-1").await.unwrap();
+    let mut writer = fixture
+        .state
+        .db
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO settings (key,value) VALUES ('synthetic-writer','held')")
+        .execute(&mut *writer)
+        .await
+        .unwrap();
+    let state = fixture.state.clone();
+    let mut recovery = tokio::spawn(async move { recovery_window(&state, "op-1", &root).await });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(250), &mut recovery)
+            .await
+            .is_err(),
+        "recovery must wait for the writer"
+    );
+    assert_eq!(admitted_servers(&fixture).await, "[]");
+    let before = registry::server(&fixture.state, "server-1")
+        .await
+        .unwrap()
+        .maintenance;
+    assert_eq!(before.active_ops, 1);
+    assert_eq!(before.unresolved_recoveries, 0);
+    writer.commit().await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), recovery)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let after = registry::server(&fixture.state, "server-1")
+        .await
+        .unwrap()
+        .maintenance;
+    assert_eq!(after.phase, ism_core::maintenance::Phase::RecoveryRequired);
+    assert_eq!(after.active_ops, 1);
+    assert_eq!(after.unresolved_recoveries, 1);
+    assert_eq!(admitted_servers(&fixture).await, "[\"server-1\"]");
+}
+
 #[tokio::test]
 async fn file_group_finishes_after_only_original_moved() {
     let fixture = Fixture::new(false, true).await;
