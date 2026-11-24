@@ -549,6 +549,234 @@ async fn restart_retries_stale_removals_without_blocking_other_work() {
 }
 
 #[tokio::test]
+async fn unsupported_recreated_file_does_not_block_supported_files_or_retain_the_batch() {
+    let (dir, state, server, _fake) = setup().await;
+    let (root, base) = map_root(&state, dir.path()).await;
+    std::fs::write(base.join("trip/Thumbs.db"), "metadata").unwrap();
+    Mock::given(method("POST"))
+        .and(path("/api/libraries/lib1/files/remove"))
+        .respond_with(
+            ResponseTemplate::new(400)
+                .set_body_json(json!({ "message": "Removed file still exists" })),
+        )
+        .with_priority(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/libraries/lib1/files/add"))
+        .and(body_json(json!({ "path": "/library/trip/Thumbs.db" })))
+        .respond_with(
+            ResponseTemplate::new(400).set_body_json(
+                json!({ "message": "Added file is not a supported image or video" }),
+            ),
+        )
+        .with_priority(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/libraries/lib1/files/add"))
+        .and(body_json(json!({ "path": "/library/trip/z-photo.jpg" })))
+        .respond_with(ResponseTemplate::new(204))
+        .with_priority(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    handle(
+        &state,
+        &root,
+        vec![
+            outside_change("trip/Thumbs.db", ChangeKind::Removed),
+            outside_change("trip/z-photo.jpg", ChangeKind::Added),
+        ],
+    )
+    .await
+    .unwrap();
+    sqlx::query(
+        "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i < 2499)
+         INSERT INTO scan_work (library_id, work_json)
+         SELECT 'lib1', json_object('path', ?, 'kind', 'Removed') FROM n",
+    )
+    .bind("/library/trip/Thumbs.db")
+    .execute(&state.db)
+    .await
+    .unwrap();
+    assert_eq!(stored_rows(&state).await, 2_502);
+    for i in 0..50 {
+        scheduler::request_work_at(
+            &state,
+            "s1",
+            "lib1",
+            "repeated change",
+            &[file_work(
+                "/library/trip/Thumbs.db",
+                scheduler::WorkKind::Removed,
+            )],
+            i,
+        )
+        .await
+        .unwrap();
+    }
+    assert!(
+        stored_rows(&state).await <= 2_504,
+        "repeated requests must not grow the legacy backlog without bound"
+    );
+    scheduler::step(&state, i64::MAX / 2).await.unwrap();
+    wait_for_sync(&state).await;
+
+    assert_eq!(scheduler::views(&state).await.unwrap()[0].last_error, None);
+    assert_eq!(retained(&state).await, 0);
+    assert_eq!(
+        scan_bodies(&server).await,
+        [json!({ "path": "/library/trip" })]
+    );
+    assert_eq!(
+        std::fs::read(base.join("trip/Thumbs.db")).unwrap(),
+        b"metadata"
+    );
+    wait_for_cleanup(&state).await;
+}
+
+#[tokio::test]
+async fn restart_retries_only_known_recoverable_file_rejections() {
+    for (message, retry) in [
+        ("Added file is not a supported image or video", true),
+        ("Removed file still exists", true),
+        ("Added file does not exist", false),
+        ("Unauthorized", false),
+    ] {
+        let (_dir, state, _server, _fake) = setup().await;
+        scheduler::request_work_at(
+            &state,
+            "s1",
+            "lib1",
+            "outside change",
+            &[scheduler::Work {
+                path: "/library/trip/Thumbs.db".into(),
+                kind: scheduler::WorkKind::Removed,
+            }],
+            1_000,
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE scan_schedule SET due_at = NULL, last_error = ?")
+            .bind(format!("Immich answered 400: {message}"))
+            .execute(&state.db)
+            .await
+            .unwrap();
+
+        scheduler::recover(&state).await.unwrap();
+        assert_eq!(due_at(&state).await.is_some(), retry, "{message}");
+        assert_eq!(retained(&state).await, 1, "recovery must not erase work");
+    }
+}
+
+#[tokio::test]
+async fn recreated_unsupported_file_disappearing_during_scan_remains_queued() {
+    let (dir, state, server, _fake) = setup().await;
+    let (root, base) = map_root(&state, dir.path()).await;
+    let recreated = base.join("trip/Thumbs.db");
+    std::fs::write(&recreated, "metadata").unwrap();
+    Mock::given(method("POST"))
+        .and(path("/api/libraries/lib1/files/remove"))
+        .respond_with(
+            ResponseTemplate::new(400)
+                .set_body_json(json!({ "message": "Removed file still exists" })),
+        )
+        .with_priority(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/libraries/lib1/files/add"))
+        .respond_with(
+            ResponseTemplate::new(400).set_body_json(
+                json!({ "message": "Added file is not a supported image or video" }),
+            ),
+        )
+        .with_priority(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/libraries/lib1/scan"))
+        .respond_with(move |_request: &wiremock::Request| {
+            std::fs::remove_file(&recreated).unwrap();
+            ResponseTemplate::new(204)
+        })
+        .with_priority(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    handle(
+        &state,
+        &root,
+        vec![outside_change("trip/Thumbs.db", ChangeKind::Removed)],
+    )
+    .await
+    .unwrap();
+    scheduler::step(&state, i64::MAX / 2).await.unwrap();
+    wait_for_sync(&state).await;
+
+    assert!(
+        scheduler::views(&state).await.unwrap()[0]
+            .last_error
+            .as_ref()
+            .unwrap()
+            .contains("changed during synchronization")
+    );
+    assert_eq!(retained(&state).await, 1);
+}
+
+#[tokio::test]
+async fn recreated_file_add_errors_other_than_unsupported_remain_queued() {
+    for (status, message) in [(400, "Added file does not exist"), (403, "Unauthorized")] {
+        let (dir, state, server, _fake) = setup().await;
+        let (root, base) = map_root(&state, dir.path()).await;
+        std::fs::write(base.join("trip/photo.jpg"), "photo").unwrap();
+        Mock::given(method("POST"))
+            .and(path("/api/libraries/lib1/files/remove"))
+            .respond_with(
+                ResponseTemplate::new(400)
+                    .set_body_json(json!({ "message": "Removed file still exists" })),
+            )
+            .with_priority(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/libraries/lib1/files/add"))
+            .respond_with(
+                ResponseTemplate::new(status).set_body_json(json!({ "message": message })),
+            )
+            .with_priority(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        handle(
+            &state,
+            &root,
+            vec![outside_change("trip/photo.jpg", ChangeKind::Removed)],
+        )
+        .await
+        .unwrap();
+        scheduler::step(&state, i64::MAX / 2).await.unwrap();
+        wait_for_sync(&state).await;
+
+        assert!(
+            scheduler::views(&state).await.unwrap()[0]
+                .last_error
+                .as_ref()
+                .unwrap()
+                .contains(message)
+        );
+        assert_eq!(retained(&state).await, 1);
+        assert_eq!(scan_requests(&server).await, 0);
+    }
+}
+
+#[tokio::test]
 async fn removal_rejection_stays_queued_if_the_file_cannot_be_verified() {
     for remove_marker in [false, true] {
         let (dir, state, server, _fake) = setup().await;

@@ -26,6 +26,7 @@ use crate::state::{AppState, ServerEvent};
 
 const MAX_REASONS: usize = 10;
 const REMOVED_FILE_EXISTS: &str = "Removed file still exists";
+const UNSUPPORTED_ADDED_FILE: &str = "Added file is not a supported image or video";
 const READ_PAGE: i64 = 2_000;
 const ADMIT_CHUNK: usize = 500;
 /// Newest stored rows admission reads per path. Coalesced admission adds at most a couple of
@@ -472,19 +473,20 @@ pub(crate) async fn recover(state: &AppState) -> AppResult<()> {
     .await?;
     let restored = sqlx::query(
         "UPDATE scan_schedule SET due_at = ?
-         WHERE running = 0 AND due_at IS NULL AND last_error = ?
+         WHERE running = 0 AND due_at IS NULL AND last_error IN (?, ?)
            AND EXISTS (SELECT 1 FROM scan_work WHERE scan_work.library_id = scan_schedule.library_id
                        AND scan_work.id > scan_schedule.acked_through)",
     )
     .bind(now_ms())
     .bind(format!("Immich answered 400: {REMOVED_FILE_EXISTS}"))
+    .bind(format!("Immich answered 400: {UNSUPPORTED_ADDED_FILE}"))
     .execute(&state.db)
     .await?
     .rows_affected();
     if restored > 0 {
         tracing::info!(
             libraries = restored,
-            "rescheduled retained stale-removal work"
+            "rescheduled retained stale-removal or unsupported-file work"
         );
     }
     spawn_collect(state);
@@ -973,6 +975,12 @@ async fn scan_reporting(
     }
 }
 
+fn unsupported_added_file(error: &crate::immich::api::ApiError) -> bool {
+    matches!(error, crate::immich::api::ApiError::Status {
+        status: 400, message
+    } if message == UNSUPPORTED_ADDED_FILE)
+}
+
 /// Synchronizes one coalesced file request; unsupported work falls back to its folder's scan.
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_file(
@@ -1014,24 +1022,31 @@ async fn dispatch_file(
                     status: 400, message
                 } if message == REMOVED_FILE_EXISTS);
             if stale_removal && recreated_file_exists(state, server_id, library_id, &path).await? {
-                api.sync_library_file_add(library_id, &path)
-                    .await
-                    .map_err(immich)?;
+                match api.sync_library_file_add(library_id, &path).await {
+                    Ok(()) => {}
+                    Err(error) if unsupported_added_file(&error) => {
+                        tracing::warn!(
+                            library = %library_id,
+                            path = %crate::error::redact(&path),
+                            "recreated file is unsupported by Immich; requesting a scoped fallback"
+                        );
+                        folders.insert(Work::folder_for_file(&path)?.path);
+                    }
+                    Err(error) => return Err(immich(error)),
+                }
                 recreated.push(path);
                 return Ok(());
             }
             let unavailable = error.is_external_library_api_unavailable()
                 && server.external_library_move_mode == ImmichMoveMode::ApiWithDbFallback
                 && server.external_library_api_capable != Some(true);
-            let unsupported = matches!(&error, crate::immich::api::ApiError::Status {
-                status: 400, message
-            } if message == "Added file is not a supported image or video");
+            let unsupported = unsupported_added_file(&error);
             // Folder scans only discover files in the fork; they cannot reconcile
             // failed removals. Keep that failure visible rather than reporting success.
             if kind == WorkKind::Removed || !(unavailable || unsupported) {
                 return Err(immich(error));
             }
-            tracing::warn!(library = %library_id, "file synchronization failed; requesting a scoped fallback: {}", crate::error::redact(&error.to_string()));
+            tracing::warn!(library = %library_id, path = %crate::error::redact(&path), "file synchronization failed; requesting a scoped fallback: {}", crate::error::redact(&error.to_string()));
         }
         None => {}
     }
