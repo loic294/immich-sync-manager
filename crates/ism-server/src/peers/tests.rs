@@ -5544,14 +5544,8 @@ async fn received_folder_prunes_are_retained_without_stalling_unrelated_events()
                 ("folder_created", "gone/inner"),
             ]
         );
-        assert!(
-            rows[0]
-                .3
-                .as_deref()
-                .unwrap()
-                .contains("other peers may still have it")
-        );
-        assert!(rows[1].3.as_deref().unwrap().contains("left untouched"));
+        assert!(rows[0].3.as_deref().unwrap().contains("future ISM update"));
+        assert!(rows[1].3.as_deref().unwrap().contains("future ISM update"));
         assert_eq!(rows[3].2, "pending");
         assert!(rows[3].3.is_none());
     }

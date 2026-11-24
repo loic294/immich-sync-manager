@@ -791,7 +791,7 @@ async fn apply_received(
     let share = share.ok_or_else(|| AppError::not_found("peer share changed"))?;
     require_operations_stable(state, share, &paths(event)).await?;
     if event.kind == FOLDER_PRUNED {
-        return folder_pruned(state, peer, share, event).await;
+        return Err(folder_pruned(peer, share, event));
     }
     if let Some(resolution) = conflict_decision(state, share, event).await? {
         if matches!(resolution.as_str(), "keep_local" | "skip") {
@@ -909,33 +909,15 @@ async fn apply_received(
 /// Nothing here deletes or advertises it, so it stays pending (path-scoped, holding later
 /// overlapping events) until a version that can handle and propagate prunes replays it,
 /// even when the folder is already absent here and only transitive peers still have it.
-async fn folder_pruned(
-    state: &AppState,
-    peer: &net::Peer,
-    share: &Share,
-    event: &PeerEvent,
-) -> AppResult<bool> {
-    let root = files::root(&state.db, &share.root_id).await?;
-    root.ensure_available()?;
-    let local = match root
-        .abs(&share.root_rel(&event.data.path)?)?
-        .symlink_metadata()
-    {
-        Ok(_) => "the local folder was left untouched",
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            "it is already absent here, but other peers may still have it"
-        }
-        Err(error) => return Err(error.into()),
-    };
-    Err(AppError::conflict(
+fn folder_pruned(peer: &net::Peer, share: &Share, event: &PeerEvent) -> AppError {
+    AppError::conflict(
         "peer_folder_prune_unsupported",
         format!(
-            "{} pruned folder '{}' in share '{}'; this version cannot apply or forward folder \
-             prunes, so the event is kept pending and {local}. Upgrade this instance to process \
-             it; until then, later changes inside that folder wait.",
+            "{} removed folder '{}' in share '{}'. This folder change needs support in a future \
+             ISM update. Other folders can still sync.",
             peer.name, event.data.path, share.name
         ),
-    ))
+    )
 }
 
 async fn conflict_decision(
