@@ -49,7 +49,7 @@ export class IsmAttentionBell extends IsmElement {
           ${
             attentionError.value
               ? html`<div role="alert" class="alert alert-error alert-soft m-3 text-sm">
-                  <span>Could not refresh notifications.</span>
+                  <span>Some notification information is unavailable.</span>
                   <button type="button" class="btn btn-xs" @click=${() => refreshAttention()}>Retry</button>
                 </div>`
               : nothing

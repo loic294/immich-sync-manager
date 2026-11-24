@@ -46,6 +46,7 @@ describe('admin attention', () => {
     const bell = await mount('ism-attention-bell');
     const banners = await mount('ism-blocker-banners');
     expect(bell.textContent).not.toContain('all caught up');
+    expect(bell.textContent).toContain('Some notification information is unavailable.');
     expect(banners.textContent).toContain('status information is unavailable');
     expect(banners.querySelector('button')?.textContent).toContain('Retry');
   });
