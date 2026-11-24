@@ -1,6 +1,7 @@
 import { api } from '@/api/client';
 import type { AccountInput } from '@/api/generated/AccountInput';
 import type { AccountView } from '@/api/generated/AccountView';
+import type { AttentionSnapshot } from '@/api/generated/AttentionSnapshot';
 import type { AuditEntry } from '@/api/generated/AuditEntry';
 import type { BackgroundActivityPage } from '@/api/generated/BackgroundActivityPage';
 import type { ClientTokenCreated } from '@/api/generated/ClientTokenCreated';
@@ -44,22 +45,6 @@ import type { WatchSettingsInput } from '@/api/generated/WatchSettingsInput';
 
 const A = '/api/admin';
 const enc = encodeURIComponent;
-
-// Replaced by the generated DTO when the attention endpoint lands.
-export interface AttentionSnapshot {
-  completeness: 'complete' | 'partial' | 'unavailable';
-  warnings: string[];
-  items: {
-    id: string;
-    attention: 'none' | 'notice' | 'action_required';
-    blocks_work: boolean;
-    title: string;
-    message: string;
-    href: string;
-    recheck_at: string | null;
-    acknowledged: boolean | null;
-  }[];
-}
 
 /** Typed wrappers over the administration API. */
 export const admin = {

@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { api } from '@/api/client';
+import type { AttentionItem } from '@/api/generated/AttentionItem';
+import type { AttentionSnapshot } from '@/api/generated/AttentionSnapshot';
 import {
   attentionError,
   blockers,
@@ -10,19 +12,36 @@ import {
   startAttention,
 } from '@/stores/attention';
 
-const row = {
+const row: AttentionItem = {
   id: 'peer:beta',
-  attention: 'notice' as const,
+  code: 'peer_offline',
+  state: 'waiting',
+  attention: 'notice',
   blocks_work: true,
+  owner: 'local',
+  instance_id: 'alpha',
+  instance_name: 'Alpha',
+  peer_id: 'beta',
+  share_id: 'photos',
+  share_name: 'Photos',
+  count: 1,
+  total_count: 1,
+  next_at: null,
+  observed_at: '2026-01-01T00:00:00Z',
   title: 'Sync is waiting for Beta',
   message: 'Reconnect the other instance to check its queued transfers.',
   href: '/peers',
   recheck_at: null,
   acknowledged: null,
+  operation_id: null,
+  unresolved: true,
+  completeness: 'complete',
+  examples: [],
 };
-const snapshot = {
-  completeness: 'complete' as const,
-  warnings: [] as string[],
+const snapshot: AttentionSnapshot = {
+  observed_at: '2026-01-01T00:00:00Z',
+  completeness: 'complete',
+  warnings: [],
   items: [row],
 };
 
@@ -78,7 +97,7 @@ describe('attention snapshots', () => {
     vi.useFakeTimers();
     const get = vi.spyOn(api, 'get').mockResolvedValue({
       ...snapshot,
-      items: [{ ...row, recheck_at: new Date(Date.now() + 2000).toISOString() }],
+      items: [{ ...row, next_at: new Date(Date.now() + 2000).toISOString() }],
     });
 
     const stop = startAttention();

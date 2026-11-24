@@ -1,6 +1,7 @@
 import { signal } from '@preact/signals-core';
-import { type AttentionSnapshot, admin } from '@/api/admin';
+import { admin } from '@/api/admin';
 import { events } from '@/api/events';
+import type { AttentionSnapshot } from '@/api/generated/AttentionSnapshot';
 
 const DISMISSED_KEY = 'ism.dismissed-attention.v1';
 
@@ -98,7 +99,10 @@ async function loadAttention(epoch: number) {
   attentionError.value = !complete;
   window.clearTimeout(transitionTimer);
   const next = snapshot.items
-    .map((entry) => entry.recheck_at && Date.parse(entry.recheck_at))
+    .map((entry) => {
+      const when = entry.recheck_at ?? entry.next_at;
+      return when && Date.parse(when);
+    })
     .filter((at): at is number => typeof at === 'number' && Number.isFinite(at) && at > Date.now())
     .sort((a, b) => a - b)[0];
   const delay = next === undefined ? undefined : Math.max(1000, next - Date.now() + 100);
