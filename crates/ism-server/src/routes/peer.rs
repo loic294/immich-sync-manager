@@ -74,7 +74,7 @@ async fn recovery_preview(
     )
     .await?;
     peers::versions::authorize_peer_preview(&state, &query, &peer.id).await?;
-    peers::versions::preview(&state, &query).await
+    peers::versions::peer_preview(&state, &query, &peer.id).await
 }
 
 async fn recovery_decisions(

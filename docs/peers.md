@@ -195,6 +195,11 @@ the path the peer moved from. ISM records a conflict when:
 - `folder_move`: a folder move cannot be applied the same way here;
 - `apply_failed`: an incoming change could not be applied.
 
+Conflict previews verify the complete original against the reviewed checksum before display.
+JPEG, PNG and WebP originals up to 64 MiB can be resized for preview, subject to a 60-megapixel
+and 12,000-pixel-per-side limit. AVIF previews retain their 4 MiB limit. Previewing a peer's
+contents follows the configured transfer hours.
+
 Resolutions:
 
 | Choice | Effect |
