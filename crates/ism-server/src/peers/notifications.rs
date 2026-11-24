@@ -68,12 +68,18 @@ impl Streams {
     }
 }
 
-pub(super) fn snapshot_fresh(state: &AppState, peer: &str, updated: Option<&str>) -> bool {
-    state.peer_streams.fresh(peer).unwrap_or_else(|| {
-        updated
-            .and_then(crate::db::parse_ts)
-            .is_some_and(|at| chrono::Utc::now() - at <= chrono::Duration::seconds(30))
-    })
+pub(crate) fn snapshot_fresh(state: &AppState, peer: &str, updated: Option<&str>) -> bool {
+    let Some(at) = updated.and_then(crate::db::parse_ts) else {
+        return false;
+    };
+    let age = chrono::Utc::now() - at;
+    if age < chrono::Duration::zero() {
+        return false;
+    }
+    state
+        .peer_streams
+        .fresh(peer)
+        .unwrap_or(age <= chrono::Duration::seconds(30))
 }
 
 struct Connection(Arc<Mutex<Health>>);

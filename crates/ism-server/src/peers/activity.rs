@@ -623,21 +623,28 @@ pub async fn refresh(state: &AppState, peer: &net::Peer) -> Result<(), String> {
                 .map_err(|e| e.to_string())?;
         }
         let json = serde_json::to_string(&batch.progress).map_err(|e| e.to_string())?;
-        let old: Option<(i64, Option<String>, Option<String>)> = sqlx::query_as(
-            "SELECT cursor,progress_json,error FROM peer_sync_state WHERE peer_id = ?",
+        type CachedProgress = (i64, Option<String>, Option<String>, Option<String>);
+        let old: Option<CachedProgress> = sqlx::query_as(
+            "SELECT cursor,progress_json,error,updated_at FROM peer_sync_state WHERE peer_id = ?",
         )
         .bind(&peer.id)
         .fetch_optional(&mut *tx)
         .await
         .map_err(|e| e.to_string())?;
-        let changed = old.as_ref().is_none_or(|(old_cursor, progress, error)| {
-            *old_cursor != batch.cursor || progress.as_deref() != Some(&json) || error.is_some()
-        });
+        let changed = old
+            .as_ref()
+            .is_none_or(|(old_cursor, progress, error, updated_at)| {
+                *old_cursor != batch.cursor
+                    || progress.as_deref() != Some(&json)
+                    || error.is_some()
+                    || updated_at.is_none() != batch.more
+            });
+        let updated_at = (!batch.more).then(db::now);
         sqlx::query(
             "INSERT INTO peer_sync_state (peer_id,cursor,progress_json,updated_at,error) VALUES (?,?,?,?,NULL)
              ON CONFLICT(peer_id) DO UPDATE SET cursor = excluded.cursor,progress_json = excluded.progress_json,
                  updated_at = excluded.updated_at,error = NULL",
-        ).bind(&peer.id).bind(batch.cursor).bind(json).bind(db::now())
+        ).bind(&peer.id).bind(batch.cursor).bind(json).bind(updated_at)
         .execute(&mut *tx).await.map_err(|e| e.to_string())?;
         tx.commit().await.map_err(|e| e.to_string())?;
         if changed {

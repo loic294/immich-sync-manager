@@ -7,7 +7,7 @@ use ism_core::dto::OperationCommitted;
 use serde::Serialize;
 use sqlx::SqlitePool;
 use sqlx::postgres::PgPool;
-use tokio::sync::{Mutex, Notify, broadcast, watch};
+use tokio::sync::{Mutex, Notify, Semaphore, broadcast, watch};
 
 use crate::config::Config;
 use crate::crypto::SecretBox;
@@ -51,6 +51,9 @@ pub struct Inner {
     /// Changing peer credentials or configuration revokes existing streams without polling.
     pub peer_configuration: watch::Sender<()>,
     pub peer_streams: crate::peers::notifications::Streams,
+    pub(crate) worker_evidence: crate::worker_evidence::Registry,
+    /// Bounds background root probes when a network mount stops responding.
+    pub queue_root_probes: Arc<Semaphore>,
     /// Wakes the operation executor.
     pub ops_wake: Notify,
     /// Wakes the maintenance controller.
@@ -122,6 +125,8 @@ impl AppState {
             peer_events,
             peer_configuration,
             peer_streams: crate::peers::notifications::Streams::default(),
+            worker_evidence: crate::worker_evidence::Registry::default(),
+            queue_root_probes: Arc::new(Semaphore::new(crate::queue_evidence::ROOT_PROBE_LIMIT)),
             ops_wake: Notify::new(),
             maintenance_wake: Notify::new(),
             sync_wake: Notify::new(),

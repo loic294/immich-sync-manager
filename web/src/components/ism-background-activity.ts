@@ -21,6 +21,7 @@ const FILTERS: readonly [Filter, string][] = [
 ];
 const PAGES: Record<string, string> = {
   '/sync': 'Open sync',
+  '/conflicts': 'Open conflicts',
   '/servers': 'Open server maintenance',
   '/mappings': 'Open folder mappings',
   '/peers': 'Open peers and shares',
@@ -43,6 +44,7 @@ function activityTitle(task: BackgroundActivity) {
     'Peer recovery refresh': 'Checking sync issues',
     'Recovery verification': 'Checking sync issues',
     'Recovery execution': 'Fixing a sync issue',
+    'Conflict evidence preparation': 'Comparing file versions',
     'Scoped library synchronization': 'Updating the Immich library',
     'Library synchronization': 'Updating the Immich library',
     'Peer file transfer': 'File transfer',
@@ -72,6 +74,12 @@ function explain(message: string): string {
   const inventory = 'Inventory pagination will continue after ';
   if (message.startsWith(inventory))
     return `Continuing to check files after ${message.slice(inventory.length)}`;
+  const slots =
+    /^ISM records (\d+) running transfers \(limit (\d+)\); queue readiness is not fully known$/.exec(
+      message,
+    );
+  if (slots)
+    return `ISM shows ${slots[1]} of ${slots[2]} transfer slots in use. The status of queued files is not available yet.`;
   if (message.endsWith(' changed on the receiver'))
     return `${message.slice(0, -' changed on the receiver'.length).replaceAll('<item>', 'The file')} changed on the other instance.`;
   if (message.includes('No space left on device'))
@@ -89,12 +97,44 @@ function explain(message: string): string {
       "A file needed for this change couldn't sync. Open Sync issues for details.",
     'peer bookkeeping waits for active managed operations':
       'Waiting for another file change to finish. Check Operations if it stays here.',
+    'Peer bookkeeping waits for active managed operations':
+      'Waiting for another file operation to finish.',
     'peer effect waits for conflict resolution':
-      'Files have different versions. Review them in Sync.',
+      'Files have different versions. Open Conflicts to compare them.',
     'Waiting for the original file before transferring its companion':
       'The original file must sync first. Check Sync issues if it cannot finish.',
     'Retry backoff after a failed transfer': 'The transfer failed. ISM will try again',
+    'At least these files are in retry backoff': 'At least these files are waiting to retry.',
     'Waiting for allowed file-transfer hours': 'Waiting for the scheduled sync hours',
+    'Queued; file-specific eligibility has not been checked':
+      "ISM can't yet show which queued files are ready to sync.",
+    'Mapped folder availability could not be checked; transfer readiness is unknown':
+      "ISM couldn't check the mapped folder, so it can't confirm whether these files can sync.",
+    'Recorded as running; worker liveness is not yet verified':
+      "Saved as in progress, but ISM can't confirm whether the transfer is running.",
+    'Waiting for file changes to settle; scan readiness has not been checked':
+      "Waiting for file changes to finish. ISM can't yet confirm whether the scan can start.",
+    'Share inventory rescan is queued; scan readiness has not been checked':
+      'Waiting to check whether the shared files can be scanned.',
+    'Received inventory awaits safe dependency verification':
+      'Waiting to check the file list from the other instance.',
+    'Received changes await dependency verification and application':
+      'Waiting to check and apply changes from the other instance.',
+    'Waiting for the related managed operation to finish':
+      'Waiting for the related file operation to finish.',
+    'Waiting for the related file content': 'Waiting for the related file.',
+    'Waiting for a conflict comparison worker': 'Waiting to compare file versions.',
+    'The last comparison attempt failed; it is queued for retry':
+      'The last comparison failed. ISM will try again.',
+    'Comparing versions for these conflicts': 'Comparing file versions.',
+    'A comparison worker stopped; restart ISM when safe':
+      'Comparisons stopped. Restart ISM when it is safe to do so.',
+    'The comparison cannot continue automatically':
+      "ISM can't compare these versions automatically. Open Conflicts for details.",
+    'The saved comparison state or worker could not be verified':
+      "ISM can't confirm whether these comparisons are running.",
+    'Some conflict comparison work has no verifiable worker or saved state.':
+      "ISM can't confirm the status of some file comparisons.",
     'Scoped synchronization failed; retained work waits for a new request':
       "Couldn't update the library. Check folder mappings for details.",
     [RESTARTED]: 'ISM restarted before this finished. Check current work for its latest status.',
@@ -102,7 +142,7 @@ function explain(message: string): string {
     'Queued for recovery verification': 'ISM will check these sync issues.',
     'Waiting for dependent work or new evidence': 'Waiting for other work or updated information.',
     'Waiting for an administrator to choose a version':
-      'Compare the versions in Sync, then choose which to keep. You can keep both.',
+      'Compare the versions in Conflicts, then choose which to keep. You can keep both.',
     'Recovery cannot continue automatically':
       "ISM couldn't fix this automatically. Open Sync issues for details.",
     'The receiving ISM reported a failure':
@@ -122,9 +162,9 @@ function explain(message: string): string {
     'peer file changed during the transfer':
       'The file changed on the other instance during download.',
     'the file has an unresolved conflict':
-      'This file has different versions. Compare them in Sync.',
+      'This file has different versions. Compare them in Conflicts.',
     'peer source tree changed; a new choice is required':
-      'The folder changed on the other instance. Compare the versions in Sync, then choose again.',
+      'The folder changed on the other instance. Compare the versions in Conflicts, then choose again.',
     'matching peer file checksums have different sizes':
       'The files appear to match, but their sizes differ. Open Sync issues for details.',
     'peer returned an invalid Content-Range':
@@ -196,6 +236,11 @@ function explain(message: string): string {
       'Waiting for Immich to finish its current library work.',
     'Resuming the library queue after managed operations': 'Resuming Immich library updates.',
     'The receiving ISM is waiting for safe publication': 'The other instance is saving the files.',
+    'Queued on the receiving ISM': 'Waiting on the other instance.',
+    'The receiving ISM is downloading': 'The other instance is downloading the files.',
+    'The receiving ISM reported a failed operation':
+      'A file operation failed on the other instance. Open Sync issues for details.',
+    'Receiver status is not current': "The other instance's latest status is unavailable.",
     'Downloading, verifying, or preparing safe publication': 'Downloading and checking the file.',
     'Waiting for the upload lock': 'Waiting for another upload step to finish.',
     'Waiting to submit safe upload publication': 'Waiting to save the uploaded files.',
@@ -318,7 +363,9 @@ export class IsmBackgroundActivity extends IsmPage {
   private aside(task: BackgroundActivity, now: number) {
     const { bytes, fmt, unit, measured } = this.measure(task);
     const items =
-      task.count > 1 ? `${task.count.toLocaleString()} ${bytes ? 'files' : 'items'}` : '';
+      task.count > 1
+        ? `${task.count.toLocaleString()} ${bytes ? 'files' : task.unit === 'conflicts' ? 'conflicts' : 'items'}`
+        : '';
     let amount = '';
     if (task.status === 'running' && measured)
       amount = `${fmt(task.done)} / ${fmt(task.total ?? 0)} ${unit}`;
@@ -328,7 +375,7 @@ export class IsmBackgroundActivity extends IsmPage {
     return html`<div class="flex min-w-0 flex-col items-end gap-1 text-right text-sm tabular-nums">
       ${items ? html`<span class="font-medium">${items}</span>` : nothing}
       ${amount ? html`<span class="text-base-content/70">${amount}</span>` : nothing}
-      ${task.status === 'running' && measured ? html`<progress class="progress progress-info h-1.5 w-28" value=${pct} max="100" aria-label=${`${task.title}: ${pct}%`}></progress>` : nothing}
+      ${task.status === 'running' && measured ? html`<progress class="progress progress-info h-1.5 w-28" value=${pct} max="100" aria-label=${`${activityTitle(task)}: ${pct}%`}></progress>` : nothing}
       <span class="text-xs text-base-content/60">${task.finished_at ? `Finished ${ago(task.finished_at, now)}` : `Updated ${ago(task.updated_at, now)}`}</span>
     </div>`;
   }
@@ -339,11 +386,16 @@ export class IsmBackgroundActivity extends IsmPage {
     const finished = task.finished_at === null ? now : Date.parse(task.finished_at);
     const elapsed = (finished - Date.parse(task.started_at)) / 1000;
     const reasonTotal = task.reasons.reduce((n, r) => n + r.count, 0);
-    const syncIssue =
-      (task.page === '/sync' && needsAttention(task)) ||
+    const conflictIssue =
+      task.task_key.startsWith('recovery:conflict:') ||
       task.phase === 'peer effect waits for conflict resolution';
-    const href = syncIssue ? '/sync?view=attention' : task.page;
-    const label = syncIssue ? 'Review sync issues' : task.page && PAGES[task.page];
+    const syncIssue = task.page === '/sync' && needsAttention(task);
+    const href = conflictIssue ? '/conflicts' : syncIssue ? '/sync?view=attention' : task.page;
+    const label = conflictIssue
+      ? 'Open conflicts'
+      : syncIssue
+        ? 'Review sync issues'
+        : task.page && PAGES[task.page];
     return html`<div class="grid gap-4 px-3 pb-4 pl-10 text-sm md:grid-cols-[minmax(0,3fr)_minmax(0,2fr)]">
       <div class="min-w-0 space-y-3">
         ${stalled ? html`<p class="text-warning">No progress reported for ${formatDuration((now - Date.parse(task.updated_at)) / 1000)}.</p>` : nothing}
@@ -460,7 +512,7 @@ export class IsmBackgroundActivity extends IsmPage {
           <ism-icon name="refresh-cw"></ism-icon> Refresh
         </button>
       </header>
-      ${this.snapshot?.warnings.map((w) => html`<p role="alert" class="mx-4 mt-3 text-sm text-warning">${w}</p>`)}
+      ${this.snapshot?.warnings.map((w) => html`<p role="alert" class="mx-4 mt-3 text-sm text-warning">${explain(w)}</p>`)}
       <div role="tablist" aria-label="Background activity status" class="tabs tabs-border mt-2 flex-nowrap overflow-x-auto px-2" @keydown=${tabKeydown}>
         ${FILTERS.map(
           ([

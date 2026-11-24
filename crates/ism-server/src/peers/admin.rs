@@ -23,7 +23,7 @@ use crate::state::{AppState, ServerEvent};
 
 const INVITE_PURPOSE: &str = "peer-invite";
 const INVITE_HOURS: i64 = 24;
-const SCHEDULE_KEY: &str = "sync_schedule";
+pub(crate) const SCHEDULE_KEY: &str = "sync_schedule";
 
 #[path = "move_decisions.rs"]
 mod move_decisions;
@@ -593,8 +593,8 @@ async fn discard_finished_pending(
 // ---------------------------------------------------------------------------------------------
 // Schedule, overrides and transfers
 
-pub async fn schedule(state: &AppState) -> AppResult<ScheduleView> {
-    let Some(raw) = db::get_setting(&state.db, SCHEDULE_KEY).await? else {
+pub(crate) fn parse_schedule(raw: Option<String>) -> AppResult<ScheduleView> {
+    let Some(raw) = raw else {
         return Ok(ScheduleView {
             timezone: "UTC".into(),
             windows: Vec::new(),
@@ -609,6 +609,10 @@ pub async fn schedule(state: &AppState) -> AppResult<ScheduleView> {
     let view: ScheduleView = serde_json::from_str(&raw).map_err(|_| invalid())?;
     Schedule::new(&view.timezone, &view.windows).map_err(|_| invalid())?;
     Ok(view)
+}
+
+pub async fn schedule(state: &AppState) -> AppResult<ScheduleView> {
+    parse_schedule(db::get_setting(&state.db, SCHEDULE_KEY).await?)
 }
 
 pub async fn set_schedule(state: &AppState, view: ScheduleView) -> AppResult<ScheduleView> {

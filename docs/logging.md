@@ -50,8 +50,8 @@ Runtime logs complement, rather than replace, ISM's persistent records in the da
   progress, outcomes, errors and recovery details. Background activity includes scans, hashing,
   peer event/inventory processing, transfers, maintenance, upload verification, and recovery.
   Bulk waits and failures are grouped per peer and share (or kind) with an item count, the most
-  common reasons and a few example files; expand a row for those details and use **Sync** for
-  the full per-file list.
+  common reasons and a few example files where available; expand a row for those details and use
+  **Sync** for the full per-file list.
 - **Sync / Conflicts:** queued or failed transfers and conflict details.
 - **Overview / Mappings:** maintenance blocks, watcher warnings and pending library scans.
 
@@ -62,7 +62,17 @@ Background runs retain their current phase, measured counters, resource, and tim
 Unknown totals show counts or a phase, not an invented percentage or ETA. Counters are scoped to
 the displayed phase (for example bytes hashed versus files reconciled); progress writes and
 notifications are coalesced to a one-second cadence. No progress update is not proof of a hang.
-Unexpected worker exits and interrupted runs remain visible rather than appearing healthy.
+Top-level worker exits, the peer replication, activity-mirror and conflict-comparison workers,
+and interrupted runs are recorded. Conflict comparisons are grouped by their queued, retrying,
+blocked or observed-running state; a saved running claim alone does not prove a worker is alive.
+Queued comparisons are reported as blocked if both comparison workers have been observed stopping.
+Individual per-peer polling or activity-refresh exits may still only be logged and retried.
+Queue-wide reasons are reported only when supported by group-wide evidence; file-specific
+readiness and worker liveness can remain unknown. A timed-out mapped-root check is shown as
+unavailable evidence, not proof that the root or transfers are blocked. Structured attention
+reports are currently partial, and overlapping condition counts must not be added as distinct files.
+Retained peer inbox and inventory errors describe the last recorded attempt; generic errors do not
+by themselves establish that work is still blocked.
 
 Activity starts, progress, and outcomes are recorded in memory immediately, then persisted by a
 retrying background reporter. SQLite contention or recording failures do not delay the observed
@@ -83,7 +93,7 @@ unfinished runs are marked interrupted; actual queued work is recovered by the e
 not by the reporting system. Managed file-operation history is unchanged.
 
 The live activity section remains visible when managed-operation history is filtered or paginated.
-It refreshes from live notifications and independently every five seconds. A lost connection,
+It refreshes from live notifications and independently every ten seconds. A lost connection,
 failed snapshot, or persistence error is shown explicitly, retaining the last received evidence.
 
 ## Sharing a report

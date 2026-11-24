@@ -11,13 +11,17 @@ mod db;
 mod error;
 mod files;
 mod immich;
+mod inbox_evidence;
 mod maintenance;
 mod ops;
+mod peer_evidence;
 mod peers;
+mod queue_evidence;
 mod routes;
 mod settings;
 mod state;
 mod watch;
+mod worker_evidence;
 
 use std::time::Duration;
 
@@ -48,7 +52,12 @@ async fn main() -> anyhow::Result<()> {
     activity::recover(&state)
         .await
         .context("activity restart recovery failed")?;
-    tokio::spawn(activity::run(state.clone()));
+    activity::spawn(
+        &state,
+        "Activity recorder",
+        worker_evidence::Kind::Other,
+        activity::run(state.clone()),
+    );
 
     maintenance::recover_after_restart(&state)
         .await
@@ -59,34 +68,63 @@ async fn main() -> anyhow::Result<()> {
     activity::spawn(
         &state,
         "Maintenance controller",
+        worker_evidence::Kind::Other,
         maintenance::run(state.clone()),
     );
-    activity::spawn(&state, "Operation executor", ops::exec::run(state.clone()));
-    activity::spawn(&state, "Peer workers", peers::run(state.clone()));
-    activity::spawn(&state, "Share scanner", peers::scan_worker(state.clone()));
+    activity::spawn(
+        &state,
+        "Operation executor",
+        worker_evidence::Kind::Operations,
+        ops::exec::run(state.clone()),
+    );
+    activity::spawn(
+        &state,
+        "Peer workers",
+        worker_evidence::Kind::PeerWorkers,
+        peers::run(state.clone()),
+    );
+    activity::spawn(
+        &state,
+        "Share scanner",
+        worker_evidence::Kind::Other,
+        peers::scan_worker(state.clone()),
+    );
     activity::spawn(
         &state,
         "Transfer dispatcher",
+        worker_evidence::Kind::Transfers,
         peers::transfer::run(state.clone()),
     );
     activity::spawn(
         &state,
         "Recovery worker",
+        worker_evidence::Kind::Recovery,
         peers::recovery::run(state.clone()),
     );
-    activity::spawn(&state, "File watcher", watch::run(state.clone()));
+    activity::spawn(
+        &state,
+        "File watcher",
+        worker_evidence::Kind::Other,
+        watch::run(state.clone()),
+    );
     activity::spawn(
         &state,
         "Library scheduler",
+        worker_evidence::Kind::Other,
         watch::scheduler::run(state.clone()),
     );
     let janitor = state.clone();
-    tokio::spawn(async move {
-        loop {
-            ops::uploads::expire(&janitor).await;
-            tokio::time::sleep(Duration::from_secs(600)).await;
-        }
-    });
+    activity::spawn(
+        &state,
+        "Upload janitor",
+        worker_evidence::Kind::Other,
+        async move {
+            loop {
+                ops::uploads::expire(&janitor).await;
+                tokio::time::sleep(Duration::from_secs(600)).await;
+            }
+        },
+    );
 
     let app = routes::router(state.clone());
     let listener = tokio::net::TcpListener::bind(listen)

@@ -316,7 +316,7 @@ fn paths(event: &PeerEvent) -> Vec<&str> {
         .collect()
 }
 
-fn event_valid(event: &PeerEvent) -> AppResult<()> {
+pub(crate) fn event_valid(event: &PeerEvent) -> AppResult<()> {
     let result = match event.kind.as_str() {
         SHARE_ENABLED => {
             if event.data != EventData::default() {
@@ -903,14 +903,17 @@ async fn apply_received(
 /// Nothing here deletes or advertises it, so it stays pending (path-scoped, holding later
 /// overlapping events) until a version that can handle and propagate prunes replays it,
 /// even when the folder is already absent here and only transitive peers still have it.
+pub(crate) fn folder_pruned_message(peer: &str, share: &str, path: &str) -> String {
+    format!(
+        "{peer} removed folder '{path}' in share '{share}'. This folder change needs support in a \
+         future ISM update. Other folders can still sync."
+    )
+}
+
 fn folder_pruned(peer: &net::Peer, share: &Share, event: &PeerEvent) -> AppError {
     AppError::conflict(
         "peer_folder_prune_unsupported",
-        format!(
-            "{} removed folder '{}' in share '{}'. This folder change needs support in a future \
-             ISM update. Other folders can still sync.",
-            peer.name, event.data.path, share.name
-        ),
+        folder_pruned_message(&peer.name, &share.name, &event.data.path),
     )
 }
 

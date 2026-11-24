@@ -1472,6 +1472,20 @@ async fn conflict_evidence_is_prepared_retried_and_survives_restart() {
     })
     .await
     .expect("unavailable peer should leave a retryable evidence job");
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while b
+            .state
+            .worker_evidence
+            .conflict_observations()
+            .active
+            .keys()
+            .any(|(target, _)| target == &id)
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a retryable result should release its observed claim");
     super::net::mark(&b.state, &source_peer.id, Err("offline".into())).await;
     a.evidence_status.store(0, Ordering::SeqCst);
     super::net::mark(&b.state, &source_peer.id, Ok(())).await;
@@ -1491,6 +1505,20 @@ async fn conflict_evidence_is_prepared_retried_and_survives_restart() {
     })
     .await
     .expect("reconnected peer should prepare evidence");
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while b
+            .state
+            .worker_evidence
+            .conflict_observations()
+            .active
+            .keys()
+            .any(|(target, _)| target == &id)
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a completed comparison should release its observed claim");
 
     let target = RecoveryTarget {
         kind: RecoveryKind::Conflict,
