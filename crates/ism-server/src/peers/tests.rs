@@ -5582,6 +5582,37 @@ async fn received_folder_prunes_are_retained_without_stalling_unrelated_events()
         0
     );
 
+    // Gamma must not receive complete recovery evidence through a retained prune on Beta.
+    let c_to_b = super::net::peers(&c.state).await.unwrap().remove(0);
+    let error = super::net::get_json::<super::recovery::FileEvidence>(
+        &c.state,
+        &c_to_b,
+        "/api/peer/v1/recovery/file?share=Family&path=kept&vv=%7B%7D",
+    )
+    .await
+    .unwrap_err();
+    assert!(error.starts_with("HTTP 409:"));
+    assert!(error.contains("recovery_evidence_incomplete"));
+    assert!(error.contains("folder prune prevents verifying"));
+    std::fs::create_dir(b.shared.join("independent")).unwrap();
+    let evidence = super::net::get_json::<super::recovery::FileEvidence>(
+        &c.state,
+        &c_to_b,
+        "/api/peer/v1/recovery/file?share=Family&path=independent&vv=%7B%7D",
+    )
+    .await
+    .unwrap();
+    assert_eq!(evidence.path, "independent");
+    let error = super::net::get_json::<super::recovery::FileEvidence>(
+        &b.state,
+        &peer,
+        "/api/peer/v1/recovery/file?share=Family&path=kept&vv=%7B%7D",
+    )
+    .await
+    .unwrap_err();
+    assert!(error.starts_with("HTTP 409:"));
+    assert!(error.contains("recovery_evidence_incomplete"));
+
     // The unrelated later event proceeds independently and reaches the transitive peer.
     let operation_id: String = sqlx::query_scalar("SELECT operation_id FROM pending_peer_events")
         .fetch_one(&b.state.db)
