@@ -71,6 +71,24 @@ every page, trusting a sender's manifest ID, or verifying only a displayed page 
 The current verifier checks all paths, types, sizes and content hashes again, but returns no
 mutation grant. ISM's barrier cannot freeze external writers; coordinate those writers before
 folder changes. No new UI layout or peer wire contract is introduced by this layer.
+The current move/restore decision journals and trash pre/post-mutation checks still persist
+complete inventory vectors. Pinning a manifest alone cannot make that execution and compensation
+path bounded or establish missing peer history, so it must not lift the decision cap.
+
+Managed `CheckTree` execution and manifest preparation share the bounded streaming scanner.
+Legacy checks compare against the existing expected inventory without building another full
+actual inventory, retaining one visited bit per expected entry to reject duplicate observations.
+They await the scanner's final result, including directory-change and read errors, before any
+subsequent mutation. Expected inventories and persisted journals remain legacy vectors; this
+reduces verification memory but is not the reference-backed execution/compensation contract
+needed to authorize larger reviewed decisions.
+
+That contract needs bounded per-action/per-entry decision storage and journaled path projections.
+Receiver-owned references must bind the owner, target, conflict generation and both sides'
+revisions. Pins must survive queued/restarted execution and incomplete compensation, with
+explicit retention through trash and purge rather than the current review expiry. Peer decisions
+also need negotiated capabilities and complete-history guarantees; without these proofs, larger
+folders remain blocked even when a complete local manifest is available.
 
 Independent paths, shares, and servers continue syncing. Overlapping paths and causally dependent
 events wait, and an unresolved Immich maintenance barrier still protects that server. A replacement
