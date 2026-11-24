@@ -86,7 +86,11 @@ async function loadAttention(epoch: number) {
     dismissed = new Set([...dismissed].filter((id) => ids.has(id)));
     saveDismissed();
   }
-  const seen = new Set(snapshot.items.map((entry) => entry.id));
+  const seen = new Set(
+    snapshot.items
+      .filter((entry) => entry.completeness === 'complete' || entry.attention !== 'none')
+      .map((entry) => entry.id),
+  );
   const retain = (entries: AttentionItem[]) =>
     complete
       ? []

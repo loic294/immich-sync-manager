@@ -79,6 +79,13 @@ describe('attention snapshots', () => {
       await refreshAttention();
       expect(attentionError.value).toBe(true);
       expect(blockers.value[0]).toMatchObject({ id: 'peer:beta', stale: true });
+      get.mockResolvedValue({
+        ...snapshot,
+        completeness: 'partial',
+        items: [{ ...row, completeness: 'unavailable', attention: 'none', blocks_work: false }],
+      });
+      await refreshAttention();
+      expect(blockers.value[0]).toMatchObject({ id: 'peer:beta', stale: true });
       get.mockResolvedValue({ ...snapshot, completeness: 'partial' });
       await refreshAttention();
       expect(blockers.value).toHaveLength(1);
