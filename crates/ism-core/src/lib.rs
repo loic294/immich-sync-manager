@@ -6,6 +6,7 @@ pub mod dto;
 pub mod file_settings;
 pub mod maintenance;
 pub mod mapping;
+pub mod media;
 pub mod paths;
 pub mod schedule;
 pub mod sidecar;

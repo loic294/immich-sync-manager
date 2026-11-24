@@ -4902,6 +4902,48 @@ async fn an_upload_gets_its_asset_id_after_the_scoped_scan_fallback() {
 }
 
 #[tokio::test]
+async fn an_upload_immich_cannot_import_is_not_announced_to_it() {
+    let h = harness().await;
+    h.map_root().await;
+    let (server, _fake) = crate::maintenance::tests::fake_server(&h.state).await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/api/libraries/lib1/files/add"))
+        .respond_with(wiremock::ResponseTemplate::new(400).set_body_json(json!({
+            "message": "Added file is not a supported image or video",
+            "error": "Bad Request",
+            "statusCode": 400
+        })))
+        .with_priority(1)
+        .expect(0)
+        .mount(&server)
+        .await;
+    sqlx::query("INSERT INTO immich_libraries (id, server_id, name, owner_user_id, import_paths_json, refreshed_at) VALUES ('lib1', 's1', 'Photos', 'u1', '[\"/library/photos\"]', ?)")
+        .bind(crate::db::now())
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE immich_servers SET direct_writes_enabled = 1, database_url_enc = 'unused', external_library_move_mode = 'api_only', external_library_api_capable = 1 WHERE id = 's1'")
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE mappings SET server_id = 's1', library_id = 'lib1', immich_import_path = '/library/photos' WHERE root_id = 'photos'")
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    let bearer = h.token(&["read", "upload"]).await;
+    let backup: &[u8] = b"backup";
+    let name = "example-photo.JPG.myliobak";
+    let body = json!({
+        "target": { "root_id": "photos", "path": "2024" },
+        "files": [{ "name": name, "role": "original", "size": 6, "sha256": crate::crypto::sha256_hex(backup) }],
+        "on_conflict": "fail"
+    });
+    let done = run_upload(&h, &bearer, &body, &[backup]).await;
+    assert_eq!(done["status"], "completed", "{done}");
+    assert!(h.root.join("2024").join(name).exists());
+}
+
+#[tokio::test]
 async fn opm_trash_expectations_partial_submit_and_lookup_by_key() {
     let h = harness().await;
     h.map_root().await;

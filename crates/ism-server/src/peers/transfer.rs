@@ -1669,13 +1669,13 @@ mod tests {
             peer_upload_file(dir.path(), "retry-move.xmp", &extensions).unwrap();
         assert_eq!(role, FileRole::Sidecar);
         assert!(existing_original.is_some());
-        assert!(!upload_file_needs_sync_add(role));
+        assert!(!upload_file_needs_sync_add(role, "retry-move.xmp"));
 
         let (role, existing_original) =
             peer_upload_file(dir.path(), "new-photo.png", &extensions).unwrap();
         assert_eq!(role, FileRole::Original);
         assert!(existing_original.is_none());
-        assert!(upload_file_needs_sync_add(role));
+        assert!(upload_file_needs_sync_add(role, "new-photo.png"));
     }
 
     #[test]

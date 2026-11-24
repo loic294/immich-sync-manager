@@ -2001,7 +2001,7 @@ async fn authenticated_publish(
         ));
     }
     if let Some(server) = &root.server_id
-        && spec.role == FileRole::Original
+        && plan::upload_file_needs_sync_add(spec.role, &spec.name)
     {
         let library = root
             .library_id
@@ -3017,7 +3017,7 @@ pub(crate) async fn verified_asset_at_root(
     let Some(server_id) = &root.server_id else {
         return Ok(None);
     };
-    if role != ism_core::dto::FileRole::Original {
+    if !plan::upload_file_needs_sync_add(role, path.name().unwrap_or_default()) {
         return Ok(None);
     }
     let library = root.library_id.as_ref().ok_or_else(|| {

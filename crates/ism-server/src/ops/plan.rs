@@ -399,8 +399,10 @@ fn role_of(role: &CompanionRole) -> FileRole {
     }
 }
 
-pub(crate) fn upload_file_needs_sync_add(role: FileRole) -> bool {
-    role == FileRole::Original
+/// Immich's file-add API rejects names it would not import (`photo.JPG.bak`), so only
+/// asset-capable originals are announced and later verified as assets.
+pub(crate) fn upload_file_needs_sync_add(role: FileRole, name: &str) -> bool {
+    role == FileRole::Original && ism_core::media::is_immich_asset_name(name)
 }
 
 /// Whether `name` would collide with an existing entry of `dir` on a case-insensitive or
@@ -1915,7 +1917,7 @@ async fn plan_publish(ctx: &Ctx<'_>, plan: &mut Plan, upload_id: &str) -> AppRes
             expected_size: f.size,
             expected_sha256: f.sha256.clone(),
         });
-        if upload_file_needs_sync_add(f.role) {
+        if upload_file_needs_sync_add(f.role, &name) {
             published_original_path = Some(r.clone());
         }
         if f.name == original || standalone {
@@ -1955,16 +1957,28 @@ mod tests {
 
     #[test]
     fn external_file_sync_only_targets_original_assets() {
-        assert!(upload_file_needs_sync_add(FileRole::Original));
-        assert!(!upload_file_needs_sync_add(FileRole::Sidecar));
-        assert!(!upload_file_needs_sync_add(FileRole::Companion));
-        let adjacent_roles = [FileRole::Original, FileRole::Sidecar];
+        assert!(upload_file_needs_sync_add(FileRole::Original, "a.jpg"));
+        assert!(!upload_file_needs_sync_add(FileRole::Sidecar, "a.jpg.xmp"));
+        assert!(!upload_file_needs_sync_add(FileRole::Companion, "a.aae"));
+        let adjacent = [(FileRole::Original, "a.jpg"), (FileRole::Sidecar, "a.xmp")];
         assert_eq!(
-            adjacent_roles
+            adjacent
                 .into_iter()
-                .filter(|role| upload_file_needs_sync_add(*role))
+                .filter(|(role, name)| upload_file_needs_sync_add(*role, name))
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn unsupported_originals_are_not_announced_to_immich() {
+        assert!(!upload_file_needs_sync_add(
+            FileRole::Original,
+            "example-photo.JPG.myliobak"
+        ));
+        assert!(upload_file_needs_sync_add(
+            FileRole::Original,
+            "example-photo.JPG"
+        ));
     }
 }
