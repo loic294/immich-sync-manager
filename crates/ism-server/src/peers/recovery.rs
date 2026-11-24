@@ -3314,7 +3314,8 @@ type EligibleJob = (String, String, String, Option<String>);
 /// A job whose repair is already under way (a queued transfer or publication) completes on its
 /// own; rechecking it every 30 seconds only adds database writes. A failed item whose sync queue
 /// entry is gone cannot change until new evidence arrives, so it uses the same slower recheck;
-/// Fix still requeues it at once.
+/// Fix still requeues it at once. An unlinked conflict with a chosen resolution needs no periodic
+/// recheck while its status is `resolving`.
 const AWAITING_COMPLETION_RECHECK: chrono::Duration = chrono::Duration::minutes(5);
 
 async fn eligible_jobs(
@@ -3370,7 +3371,12 @@ async fn eligible_jobs(
              WHERE (r.state='queued' OR (r.state='waiting'
                      AND COALESCE(r.code,'')!='recovery_archive_version_missing' AND r.updated_at <
                      CASE WHEN r.code IN ('awaiting_completion','sync_queue_entry_missing')
-                         THEN ? ELSE ? END)
+                         THEN ? ELSE ? END
+                     AND NOT (r.kind='conflict' AND COALESCE(r.code,'')='awaiting_completion'
+                         AND r.resolution IS NOT NULL
+                         AND NOT EXISTS(SELECT 1 FROM sync_recovery_links l WHERE l.recovery_id=r.id)
+                         AND EXISTS(SELECT 1 FROM conflicts c
+                             WHERE c.id=r.target_id AND c.status='resolving')))
                  OR (r.state='needs_decision' AND EXISTS(SELECT 1 FROM sync_recovery_links l JOIN conflicts c ON l.kind='conflict' AND c.id=l.target_id
                      WHERE l.recovery_id=r.id AND c.status='resolved')))
                 AND (? IS NULL OR r.kind=?)
@@ -4697,6 +4703,195 @@ mod policy_tests {
             vec![
                 ("conflict:decision".into(), "needs_decision".into()),
                 ("conflict:waiting".into(), "waiting".into()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn resolving_conflict_recovery_is_not_rewritten_until_the_conflict_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new(
+            Config::for_tests(dir.path()),
+            crate::db::connect(dir.path()).await.unwrap(),
+            SecretBox::open_or_create(dir.path()).unwrap(),
+        )
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO shares(id,name,root_id,path,peer_ids_json,enabled) VALUES('share','Share','root','','[]',1)")
+            .execute(&state.db).await.unwrap();
+        sqlx::query("CREATE TABLE test_recovery_writes(id TEXT NOT NULL)")
+            .execute(&state.db)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TRIGGER test_recovery_writes AFTER UPDATE ON sync_recovery
+             BEGIN INSERT INTO test_recovery_writes(id) VALUES(NEW.id); END",
+        )
+        .execute(&state.db)
+        .await
+        .unwrap();
+        let expired =
+            (chrono::Utc::now() - AWAITING_COMPLETION_RECHECK - chrono::Duration::seconds(1))
+                .to_rfc3339();
+        sqlx::query("INSERT INTO conflicts(id,share_id,rel_path,kind,detail,local_json,remote_json,remote_vv_json,peer_id,status,resolution,created_at) VALUES('waiting','share','waiting.jpg','changed_on_both','synthetic','{}','{}','{}','peer','resolving','keep_remote','2024-01-01')")
+            .execute(&state.db).await.unwrap();
+        sqlx::query("INSERT INTO sync_recovery(id,kind,target_id,state,code,resolution,created_at,updated_at) VALUES('conflict:waiting','conflict','waiting','waiting','awaiting_completion','\"keep_remote\"',?,?)")
+            .bind(&expired).bind(&expired).execute(&state.db).await.unwrap();
+        tick(&state).await.unwrap();
+        let rewritten: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM test_recovery_writes WHERE id='conflict:waiting'",
+        )
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+        let (recovery, updated): (String, String) = sqlx::query_as(
+            "SELECT state,updated_at FROM sync_recovery WHERE id='conflict:waiting'",
+        )
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+        assert_eq!(
+            (rewritten, recovery.as_str(), updated.as_str()),
+            (0, "waiting", expired.as_str())
+        );
+
+        sqlx::query("UPDATE conflicts SET status='resolved' WHERE id='waiting'")
+            .execute(&state.db)
+            .await
+            .unwrap();
+        tick(&state).await.unwrap();
+        let finished: String =
+            sqlx::query_scalar("SELECT state FROM sync_recovery WHERE id='conflict:waiting'")
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+        assert_eq!(finished, "fixed");
+    }
+
+    #[tokio::test]
+    async fn resolving_conflict_skip_preserves_other_recovery_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new(
+            Config::for_tests(dir.path()),
+            crate::db::connect(dir.path()).await.unwrap(),
+            SecretBox::open_or_create(dir.path()).unwrap(),
+        )
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO shares(id,name,root_id,path,peer_ids_json,enabled) VALUES('share','Share','root','','[]',1)")
+            .execute(&state.db).await.unwrap();
+        let expired =
+            (chrono::Utc::now() - AWAITING_COMPLETION_RECHECK - chrono::Duration::seconds(1))
+                .to_rfc3339();
+        // (recovery target, conflict status, recovery state, resolution, linked)
+        let cases = [
+            (
+                "waiting",
+                Some("resolving"),
+                "waiting",
+                Some("\"keep_remote\""),
+                false,
+            ),
+            (
+                "resolved",
+                Some("resolved"),
+                "waiting",
+                Some("\"keep_remote\""),
+                false,
+            ),
+            (
+                "reopened",
+                Some("open"),
+                "waiting",
+                Some("\"keep_remote\""),
+                false,
+            ),
+            ("deleted", None, "waiting", Some("\"keep_remote\""), false),
+            (
+                "fix",
+                Some("resolving"),
+                "waiting",
+                Some("\"keep_remote\""),
+                false,
+            ),
+            (
+                "restarted",
+                Some("resolving"),
+                "fixing",
+                Some("\"keep_remote\""),
+                false,
+            ),
+            ("undecided", Some("resolving"), "waiting", None, false),
+            (
+                "linked",
+                Some("resolving"),
+                "waiting",
+                Some("\"keep_remote\""),
+                true,
+            ),
+            (
+                "no-code",
+                Some("resolving"),
+                "waiting",
+                Some("\"keep_remote\""),
+                false,
+            ),
+        ];
+        for (id, conflict, recovery, resolution, linked) in cases {
+            if let Some(conflict) = conflict {
+                sqlx::query("INSERT INTO conflicts(id,share_id,rel_path,kind,detail,local_json,remote_json,remote_vv_json,peer_id,status,resolution,created_at) VALUES(?,'share',?,'changed_on_both','synthetic','{}','{}','{}','peer',?,'keep_remote','2024-01-01')")
+                    .bind(id).bind(format!("{id}.jpg")).bind(conflict).execute(&state.db).await.unwrap();
+            }
+            sqlx::query("INSERT INTO sync_recovery(id,kind,target_id,state,code,resolution,created_at,updated_at) VALUES(?,'conflict',?,?,'awaiting_completion',?,?,?)")
+                .bind(format!("conflict:{id}")).bind(id).bind(recovery).bind(resolution)
+                .bind(&expired).bind(&expired).execute(&state.db).await.unwrap();
+            if linked {
+                sqlx::query("INSERT INTO sync_recovery_links(recovery_id,kind,target_id) VALUES(?,'conflict',?)")
+                    .bind(format!("conflict:{id}")).bind(id).execute(&state.db).await.unwrap();
+            }
+        }
+        sqlx::query("UPDATE sync_recovery SET code=NULL WHERE id='conflict:no-code'")
+            .execute(&state.db)
+            .await
+            .unwrap();
+        reset_claims(
+            &state,
+            "UPDATE sync_recovery SET state='queued' WHERE state='fixing'",
+            "local",
+        )
+        .await;
+        let admitted = submit_one(
+            &state,
+            RecoveryTarget {
+                kind: RecoveryKind::Conflict,
+                id: "fix".into(),
+                peer_id: None,
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(admitted[0].state, RecoveryState::Queued);
+        let mut ready: Vec<String> =
+            eligible_jobs(&state, 50, None, None, &[], RECOVERY_CONCURRENCY_PER_PEER)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|(id, ..)| id)
+                .collect();
+        ready.sort();
+        assert_eq!(
+            ready,
+            [
+                "conflict:deleted",
+                "conflict:fix",
+                "conflict:linked",
+                "conflict:no-code",
+                "conflict:reopened",
+                "conflict:resolved",
+                "conflict:restarted",
+                "conflict:undecided"
             ]
         );
     }

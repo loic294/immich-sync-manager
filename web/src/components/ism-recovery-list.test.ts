@@ -318,6 +318,7 @@ describe('sync recovery', () => {
     await vi.waitFor(() => expect(page.textContent).toContain('Updated photo.jpg'));
     expect(page.share).toBe('Photos');
     expect(page.total).toBe(1);
+    expect(page.textContent).toContain('Fix all 1 matching issue');
     expect(get).toHaveBeenCalledTimes(calls);
   });
 

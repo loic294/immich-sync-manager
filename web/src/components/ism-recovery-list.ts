@@ -236,7 +236,7 @@ export class IsmRecoveryList extends IsmPage {
     return html`<div id="recovery-filters" class="grid w-full grid-cols-1 items-end gap-3 rounded-box border border-base-300 bg-base-100 p-3 sm:grid-cols-2 lg:grid-cols-3">
       <label class="flex min-w-0 flex-col gap-1 text-sm">
         Share
-        <select class="select select-sm w-full" aria-label="Filter by share" ?disabled=${!!this.busy}
+        <select class="select select-sm w-full max-sm:min-h-11" aria-label="Filter by share" ?disabled=${!!this.busy}
           @change=${(event: Event) => this.updateFilters({ share: (event.target as HTMLSelectElement).value, folder: '' })}>
           <option value="" ?selected=${!this.share}>All shares</option>
           ${this.filters.map((filter) => html`<option value=${filter.share_name} ?selected=${filter.share_name === this.share}>${filter.share_name}</option>`)}
@@ -245,7 +245,7 @@ export class IsmRecoveryList extends IsmPage {
       </label>
       <label class="flex min-w-0 flex-col gap-1 text-sm">
         Subfolder
-        <select class="select select-sm w-full" aria-label="Filter by subfolder" ?disabled=${!this.share || !!this.busy}
+        <select class="select select-sm w-full max-sm:min-h-11" aria-label="Filter by subfolder" ?disabled=${!this.share || !!this.busy}
           @change=${(event: Event) => this.updateFilters({ folder: (event.target as HTMLSelectElement).value })}>
           <option value="" ?selected=${!this.folder}>All folders</option>
           ${folders.map((folder) => html`<option value=${folder} ?selected=${folder === this.folder}>${folder}</option>`)}
@@ -254,7 +254,7 @@ export class IsmRecoveryList extends IsmPage {
       </label>
       <label class="flex min-w-0 flex-col gap-1 text-sm">
         Issue type
-        <select class="select select-sm w-full" aria-label="Filter by issue type" ?disabled=${!!this.busy}
+        <select class="select select-sm w-full max-sm:min-h-11" aria-label="Filter by issue type" ?disabled=${!!this.busy}
           @change=${(event: Event) => this.updateFilters({ issue_type: (event.target as HTMLSelectElement).value })}>
           <option value="" ?selected=${!this.issueType}>All issue types</option>
           ${issueTypes.map((value) => html`<option value=${value} ?selected=${value === this.issueType}>${issueTypeLabel(value)}</option>`)}
@@ -263,7 +263,7 @@ export class IsmRecoveryList extends IsmPage {
       </label>
       <label class="flex min-w-0 flex-col gap-1 text-sm">
         Recovery status
-        <select class="select select-sm w-full" aria-label="Filter by recovery status" ?disabled=${!!this.busy}
+        <select class="select select-sm w-full max-sm:min-h-11" aria-label="Filter by recovery status" ?disabled=${!!this.busy}
           @change=${(event: Event) => this.updateFilters({ status: (event.target as HTMLSelectElement).value })}>
           <option value="" ?selected=${!this.status}>All statuses</option>
           ${Object.entries(LABELS).map(([value, label]) => html`<option value=${value} ?selected=${value === this.status}>${label}</option>`)}
@@ -271,7 +271,7 @@ export class IsmRecoveryList extends IsmPage {
       </label>
       <label class="flex min-w-0 flex-col gap-1 text-sm">
         Item kind
-        <select class="select select-sm w-full" aria-label="Filter by item kind" ?disabled=${!!this.busy}
+        <select class="select select-sm w-full max-sm:min-h-11" aria-label="Filter by item kind" ?disabled=${!!this.busy}
           @change=${(event: Event) => this.updateFilters({ kind: (event.target as HTMLSelectElement).value })}>
           <option value="" ?selected=${!this.kind}>All item kinds</option>
           <option value="conflict" ?selected=${this.kind === 'conflict'}>Conflict</option>
@@ -326,7 +326,7 @@ export class IsmRecoveryList extends IsmPage {
           <button class="btn btn-primary btn-sm max-sm:min-h-11" ?disabled=${!!this.busy || this.filtering || !canFixSelected}
             @click=${() => this.fix()}>${this.spin('fix')}Fix selected</button>
           <button class="btn btn-sm max-sm:min-h-11" ?disabled=${!!this.busy || this.filtering || !this.total}
-            @click=${() => this.fix(true)}>Fix all ${this.total} ${this.filterCount() ? 'matching ' : ''}issues</button>
+            @click=${() => this.fix(true)}>Fix all ${this.total} ${this.filterCount() ? 'matching ' : ''}${this.total === 1 ? 'issue' : 'issues'}</button>
         </div>
       </div>
       ${this.filterControls()}
