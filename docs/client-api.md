@@ -235,7 +235,10 @@ stays in place instead of sending it:
 - Each sidecar being replaced needs its `expected_revision`/`expected_sha256`; omit them for a
   sidecar that must not exist yet (an existing file then fails with `revision_changed`).
 - Only the replaced sidecars go to the ISM trash; the original is never copied.
-- ISM schedules a library scan so Immich re-reads the sidecar; `asset_id` is filled as above.
+- ISM queues scoped synchronization of the sidecar's folder; `asset_id` is filled as above.
+  Immich's scoped folder scan only discovers new files and does not reconcile an existing
+  asset's metadata (see [Watching](watching.md)), so ISM does not verify or promise that Immich
+  re-reads the replaced sidecar.
 
 `DELETE /api/v1/uploads/{upload_id}` cancels a receiving upload and removes its staged files.
 It is safe to retry after an interrupted request or a cleanup error. Once publishing has started,

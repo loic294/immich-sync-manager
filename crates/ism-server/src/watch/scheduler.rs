@@ -9,7 +9,7 @@
 //! pending rows, a run reads its batch in pages, success acknowledges the batch with one
 //! value (`acked_through`), and acknowledged rows are deleted afterwards in small chunks.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -28,6 +28,11 @@ const MAX_REASONS: usize = 10;
 const REMOVED_FILE_EXISTS: &str = "Removed file still exists";
 const READ_PAGE: i64 = 2_000;
 const ADMIT_CHUNK: usize = 500;
+/// Newest stored rows admission reads per path. Coalesced admission adds at most a couple of
+/// pending rows per path, but rows stored before migration 0019 were never coalesced and can
+/// number in the millions for one path. Admission leaves those rows in place and treats any
+/// beyond the window as unknown rather than reading them; a run still reads them in pages.
+const ADMIT_WINDOW: i64 = 8;
 const COLLECT_CHUNK: i64 = 1_000;
 // Lets writers queued behind SQLite's busy handler in between acknowledged-row deletions.
 const COLLECT_PAUSE: Duration = Duration::from_millis(25);
@@ -141,17 +146,81 @@ struct PendingRow {
     dirty: bool,
 }
 
-/// Adds `kind` to one key's pending rows without changing what a run concludes: rows are
-/// folded in id order either on their own (the in-flight batch succeeds) or after
-/// `in_flight` (it fails and is retried with them). The last row is rewritten when a kind
-/// keeps both results exact; otherwise a row is appended, so a key keeps at most a couple of
-/// pending rows however many changes arrive.
-fn admit(in_flight: &[WorkKind], rows: &mut Vec<PendingRow>, kind: WorkKind) {
+const ANY_STATE: [Option<WorkKind>; 4] = [
+    None,
+    Some(WorkKind::Added),
+    Some(WorkKind::Changed),
+    Some(WorkKind::Removed),
+];
+
+/// The states a run can fold before a key's known pending rows: from nothing when the in-flight
+/// batch succeeds, or after it when it fails and is retried with them.
+fn outcomes(in_flight: &[WorkKind]) -> Vec<Option<WorkKind>> {
+    let mut starts = vec![None];
+    starts.extend([fold_from(None, in_flight.iter().copied())]);
+    starts.dedup();
+    starts
+}
+
+/// Splits a key's newest stored rows (ascending, at most [`ADMIT_WINDOW`]) into the states a
+/// run may reach before its known pending rows and those rows. When older rows exist they are
+/// unknown, so every state they could fold to is kept and admission stays exact for all.
+fn known_rows(
+    window: &[(i64, WorkKind)],
+    truncated: bool,
+    pending_after: i64,
+) -> (Vec<Option<WorkKind>>, Vec<PendingRow>) {
+    let in_flight: Vec<WorkKind> = window
+        .iter()
+        .filter(|(id, _)| *id <= pending_after)
+        .map(|&(_, kind)| kind)
+        .collect();
+    let rows = window
+        .iter()
+        .filter(|(id, _)| *id > pending_after)
+        .map(|&(id, kind)| PendingRow {
+            id: Some(id),
+            kind,
+            dirty: false,
+        })
+        .collect();
+    let mut starts = if !truncated {
+        outcomes(&in_flight)
+    } else {
+        // Unknown older rows may include pending ones unless the window reaches in-flight rows.
+        let mut starts = if in_flight.is_empty() {
+            ANY_STATE.to_vec()
+        } else {
+            vec![None]
+        };
+        starts.extend(ANY_STATE.map(|s| fold_from(s, in_flight.iter().copied())));
+        starts
+    };
+    let mut unique = Vec::new();
+    starts.retain(|s| {
+        let new = !unique.contains(s);
+        unique.push(*s);
+        new
+    });
+    (starts, rows)
+}
+
+/// Adds `kind` to one key's pending rows without changing what a run concludes from any of
+/// `starts` (see [`known_rows`]): rows are folded in id order after the state a run reaches
+/// before them. The last row is rewritten when a kind keeps every result exact; otherwise a
+/// row is appended, so new admissions add at most a couple of pending rows per key however
+/// many changes arrive. Uncoalesced rows stored before migration 0019 are not reduced here.
+fn admit(starts: &[Option<WorkKind>], rows: &mut Vec<PendingRow>, kind: WorkKind) {
     if let Some((last, prefix)) = rows.split_last() {
         let last = last.kind;
-        let starts = [None, fold_from(None, in_flight.iter().copied())];
-        let before = starts.map(|start| fold_from(start, prefix.iter().map(|r| r.kind)));
-        let target = before.map(|b| coalesce(Some(coalesce(b, last)), kind));
+        let before: Vec<_> = starts
+            .iter()
+            .map(|&start| fold_from(start, prefix.iter().map(|r| r.kind)))
+            .collect();
+        let target: Vec<_> = before
+            .iter()
+            .map(|&b| coalesce(Some(coalesce(b, last)), kind))
+            .collect();
         let candidates = [
             coalesce(Some(last), kind),
             kind,
@@ -257,44 +326,68 @@ pub(crate) async fn request_work_at(
     .fetch_one(&mut *tx)
     .await?;
     let arrivals: Vec<_> = arrivals.into_iter().collect();
+    // Known limit: chunking bounds each statement, not this transaction. Admission stays one
+    // IMMEDIATE transaction for the whole batch so a crash admits all or none of it, so its
+    // writer hold still grows with the number of distinct paths in one call.
     let mut written = 0u64;
+    let mut legacy_paths = 0u64;
+    let mut unreadable_paths = 0u64;
     // Each statement covers a chunk of keys, so a large batch costs a few statements per
     // chunk rather than several per path while the writer lock is held.
     for chunk in arrivals.chunks(ADMIT_CHUNK) {
         let keys: Vec<&str> = chunk.iter().map(|(key, _)| key.as_str()).collect();
-        let existing: Vec<(i64, String, String)> = sqlx::query_as(
-            "SELECT id, work_key, work_json FROM scan_work
-             WHERE library_id = ? AND id > ? AND work_key IN (SELECT value FROM json_each(?))
-             ORDER BY work_key, id",
+        // Each key reads at most one row past the window through the key index, so the writer
+        // hold and memory of this read stay bounded by the chunk even for a path with a huge
+        // pre-migration backlog; those older rows are kept, not rewritten.
+        let existing: Vec<(String, i64, String)> = sqlx::query_as(
+            "SELECT k.value, w.id, w.work_json FROM json_each(?) k
+             JOIN scan_work w ON w.id IN (
+               SELECT id FROM scan_work INDEXED BY scan_work_key
+               WHERE library_id = ? AND work_key = k.value AND id > ?
+               ORDER BY id DESC LIMIT ?)",
         )
+        .bind(serde_json::to_string(&keys)?)
         .bind(library_id)
         .bind(acked_through)
-        .bind(serde_json::to_string(&keys)?)
+        .bind(ADMIT_WINDOW + 1)
         .fetch_all(&mut *tx)
         .await?;
         let mut stored: HashMap<String, Vec<(i64, WorkKind)>> = HashMap::new();
-        for (id, key, json) in existing {
-            let kind = serde_json::from_str::<Work>(&json)?.kind;
-            stored.entry(key).or_default().push((id, kind));
+        let mut unreadable: HashSet<String> = HashSet::new();
+        for (key, id, json) in existing {
+            match serde_json::from_str::<Work>(&json) {
+                Ok(work) => stored.entry(key).or_default().push((id, work.kind)),
+                Err(_) => {
+                    unreadable.insert(key);
+                }
+            }
         }
         let mut updates: Vec<(i64, String)> = Vec::new();
         let mut inserts: Vec<String> = Vec::new();
         for (key, (path, kinds)) in chunk {
-            let mut in_flight = Vec::new();
-            let mut rows = Vec::new();
-            for &(id, kind) in stored.get(key).into_iter().flatten() {
-                if id <= pending_after {
-                    in_flight.push(kind);
-                } else {
-                    rows.push(PendingRow {
-                        id: Some(id),
+            // An unreadable stored row hides this path's state, so nothing is assumed or
+            // rewritten: the old rows stay as they are and new work is appended in arrival
+            // order. The run's pre-dispatch check then keeps the batch and reports it.
+            if unreadable.contains(key) {
+                unreadable_paths += 1;
+                for &kind in kinds {
+                    inserts.push(serde_json::to_string(&Work {
+                        path: (*path).to_owned(),
                         kind,
-                        dirty: false,
-                    });
+                    })?);
                 }
+                continue;
             }
+            let mut window = stored.remove(key).unwrap_or_default();
+            window.sort_unstable_by_key(|&(id, _)| id);
+            let truncated = window.len() > ADMIT_WINDOW as usize;
+            if truncated {
+                window.remove(0);
+                legacy_paths += 1;
+            }
+            let (starts, mut rows) = known_rows(&window, truncated, pending_after);
             for &kind in kinds {
-                admit(&in_flight, &mut rows, kind);
+                admit(&starts, &mut rows, kind);
             }
             for row in rows.iter().filter(|row| row.dirty) {
                 let json = serde_json::to_string(&Work {
@@ -334,8 +427,11 @@ pub(crate) async fn request_work_at(
     }
     tx.commit().await?;
     clock.report(library_id, work.len() as u64);
-    if written < work.len() as u64 {
-        tracing::debug!(library = %library_id, requests = work.len(), written, "coalesced scoped work");
+    if unreadable_paths > 0 {
+        tracing::warn!(library = %library_id, paths = unreadable_paths, "appended new work after unreadable stored requests without coalescing it");
+    }
+    if written < work.len() as u64 || legacy_paths > 0 {
+        tracing::debug!(library = %library_id, requests = work.len(), written, legacy_paths, "coalesced scoped work");
     }
     state.scan_wake.notify_one();
     state.emit(ServerEvent::WatchChanged);
@@ -620,6 +716,49 @@ async fn scan(state: &AppState, server_id: &str, library_id: &str) -> AppResult<
     result
 }
 
+/// Counts claimed rows that do not deserialize as [`Work`], have a path that is not absolute, or
+/// whose stored key does not match their content. Reads in id pages so memory stays bounded by one page.
+async fn unreadable_scan_work(
+    state: &AppState,
+    library_id: &str,
+    after: i64,
+    through: i64,
+) -> AppResult<i64> {
+    let mut cursor = after;
+    let mut unreadable = 0i64;
+    loop {
+        let page: Vec<(i64, Option<String>, String)> = sqlx::query_as(
+            "SELECT id, work_key, work_json FROM scan_work INDEXED BY scan_work_library
+             WHERE library_id = ? AND id > ? AND id <= ? ORDER BY id LIMIT ?",
+        )
+        .bind(library_id)
+        .bind(cursor)
+        .bind(through)
+        .bind(READ_PAGE)
+        .fetch_all(&state.db)
+        .await?;
+        let done = page.len() < READ_PAGE as usize;
+        for (id, key, json) in page {
+            cursor = id;
+            let readable = serde_json::from_str::<Work>(&json).is_ok_and(|work| {
+                // Admission accepts only absolute paths; anything else was never valid scope.
+                let absolute = Path::new(&work.path).is_absolute();
+                let prefix = if work.kind == WorkKind::Folder {
+                    "folder:"
+                } else {
+                    "file:"
+                };
+                absolute
+                    && key.is_some_and(|key| key.strip_prefix(prefix) == Some(work.path.as_str()))
+            });
+            unreadable += i64::from(!readable);
+        }
+        if done {
+            return Ok(unreadable);
+        }
+    }
+}
+
 async fn scan_reporting(
     state: &AppState,
     server_id: &str,
@@ -660,6 +799,19 @@ async fn scan_reporting(
             "synchronization has no scoped paths",
         ));
     }
+    // Every claimed row must be readable before anything is sent to Immich: the key-ordered
+    // read below dispatches as it streams, so an unreadable row found late would follow
+    // earlier effects, and a row without a key would be skipped and acknowledged unprocessed.
+    // Validate the whole batch first, one page at a time, keeping only a count.
+    let malformed = unreadable_scan_work(state, library_id, after, through).await?;
+    if malformed > 0 {
+        return Err(AppError::conflict(
+            "malformed_scan_work",
+            format!(
+                "{malformed} stored synchronization request(s) are unreadable (invalid JSON, a missing or non-absolute path, or an unknown kind); the batch of {requests} is kept, nothing was sent to Immich, and it is not acknowledged"
+            ),
+        ));
+    }
     // Distinct keys come from the ordered key index; counting them in the same pass as the
     // rows would evaluate every row's generated key and sort them in a temporary B-tree.
     let (total,): (i64,) = sqlx::query_as(
@@ -673,6 +825,9 @@ async fn scan_reporting(
     .fetch_one(&state.db)
     .await?;
     let total = total as u64;
+    // Rows are read in pages and file paths are folded one at a time, but the distinct folders
+    // to scan and the recreated paths are still collected for the whole batch: their size is
+    // bounded only by the number of distinct folders and recreated files in it.
     let mut folders = BTreeSet::new();
     let mut recreated = Vec::new();
     let mut dispatched = 0u64;
@@ -683,6 +838,7 @@ async fn scan_reporting(
     // files are dispatched in the same order as one large read.
     let mut cursor = (String::new(), 0i64);
     let mut current: Option<(String, WorkKind)> = None;
+    let mut read = 0i64;
     loop {
         let page: Vec<(i64, String, String)> = sqlx::query_as(
             "SELECT id, work_key, work_json FROM scan_work
@@ -698,6 +854,7 @@ async fn scan_reporting(
         .fetch_all(&state.db)
         .await?;
         let done = page.len() < READ_PAGE as usize;
+        read += page.len() as i64;
         let mut ready = Vec::new();
         for (id, key, json) in page {
             let work: Work = serde_json::from_str(&json)?;
@@ -735,6 +892,15 @@ async fn scan_reporting(
         if done {
             break;
         }
+    }
+    // Every claimed row must have been read before the batch can be acknowledged.
+    if read != requests {
+        return Err(AppError::conflict(
+            "incomplete_scan_work",
+            format!(
+                "read {read} of {requests} stored synchronization requests; the batch is kept and not acknowledged"
+            ),
+        ));
     }
     let mut scanned: Vec<String> = Vec::new();
     task.progress(dispatched, Some(total), "paths dispatched");
@@ -1034,7 +1200,7 @@ mod tests {
             for arrivals in (1..=6).flat_map(sequences) {
                 let mut rows = Vec::new();
                 for (i, &kind) in arrivals.iter().enumerate() {
-                    admit(&in_flight, &mut rows, kind);
+                    admit(&outcomes(&in_flight), &mut rows, kind);
                     let seen = &arrivals[..=i];
                     let kinds = || rows.iter().map(|r| r.kind);
                     assert_eq!(
@@ -1054,6 +1220,54 @@ mod tests {
     }
 
     #[test]
+    fn admission_from_a_truncated_window_is_exact_for_every_unread_prefix() {
+        for stored in (0..=5).flat_map(sequences) {
+            for pending_after in 0..=stored.len() {
+                for window_len in 1..=3 {
+                    let ids: Vec<(i64, WorkKind)> = stored
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &k)| (i as i64 + 1, k))
+                        .collect();
+                    let truncated = ids.len() > window_len;
+                    let window = &ids[ids.len().saturating_sub(window_len)..];
+                    let (starts, known) = known_rows(window, truncated, pending_after as i64);
+                    let in_flight = &stored[..pending_after];
+                    let unread: Vec<WorkKind> = ids[..ids.len() - window.len()]
+                        .iter()
+                        .filter(|(id, _)| *id > pending_after as i64)
+                        .map(|&(_, k)| k)
+                        .collect();
+                    for arrivals in (1..=3).flat_map(sequences) {
+                        let mut rows = known.clone();
+                        for &kind in &arrivals {
+                            admit(&starts, &mut rows, kind);
+                        }
+                        let after: Vec<_> = unread
+                            .iter()
+                            .copied()
+                            .chain(rows.iter().map(|r| r.kind))
+                            .collect();
+                        let expected: Vec<_> = stored[pending_after..]
+                            .iter()
+                            .chain(&arrivals)
+                            .copied()
+                            .collect();
+                        for start in [None, fold_from(None, in_flight.iter().copied())] {
+                            assert_eq!(
+                                fold_from(start, after.iter().copied()),
+                                fold_from(start, expected.iter().copied()),
+                                "{stored:?} split {pending_after} window {window_len} then {arrivals:?}"
+                            );
+                        }
+                        assert!(rows.len() <= known.len() + 2);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn retained_rows_grow_by_at_most_one_row_per_path() {
         for retained in (1..=3).flat_map(sequences) {
             for arrivals in (1..=5).flat_map(sequences) {
@@ -1066,7 +1280,7 @@ mod tests {
                     })
                     .collect();
                 for &kind in &arrivals {
-                    admit(&[], &mut rows, kind);
+                    admit(&outcomes(&[]), &mut rows, kind);
                 }
                 let all = retained.iter().chain(&arrivals).copied();
                 assert_eq!(

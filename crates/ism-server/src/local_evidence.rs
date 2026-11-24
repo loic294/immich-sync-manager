@@ -327,10 +327,17 @@ pub(crate) async fn selected_snapshot(
             scan.library_name.unwrap_or(scan.library_id)
         );
         item.href = "/mappings".into();
-        item.message = format!(
-            "Review the library and request synchronization in Mappings. {}",
-            crate::error::redact(&scan.last_error)
-        );
+        // No automatic retry is scheduled here: the kept requests run again only with the next
+        // change requested for this library.
+        let kept = if scan.pending > 0 {
+            format!(
+                "ISM kept {} synchronization request(s); no retry is scheduled, and they run again with the next change to this library.",
+                scan.pending
+            )
+        } else {
+            "No synchronization requests are waiting.".to_owned()
+        };
+        item.message = format!("{kept} {}", crate::error::redact(&scan.last_error));
         if let Some(at) = scan.last_finished_at {
             item.observed_at = at;
         }

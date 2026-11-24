@@ -1243,6 +1243,326 @@ async fn stored_requests_from_before_the_migration_coalesce_with_new_ones() {
 }
 
 #[tokio::test]
+async fn stored_requests_without_a_path_keep_the_whole_batch_unacknowledged() {
+    let (_dir, state, server, _fake) = setup().await;
+    let file = "/library/trip/old.jpg";
+    store_pre_migration_removal(&state, file).await;
+    for malformed in [
+        json!({ "kind": "Changed" }),
+        json!({ "path": null, "kind": "Added" }),
+    ] {
+        sqlx::query("INSERT INTO scan_work (library_id, work_json) VALUES ('lib1', ?)")
+            .bind(malformed.to_string())
+            .execute(&state.db)
+            .await
+            .unwrap();
+    }
+    sqlx::query("UPDATE scan_schedule SET due_at = 0")
+        .execute(&state.db)
+        .await
+        .unwrap();
+    scheduler::step(&state, i64::MAX / 2).await.unwrap();
+    wait_for_sync(&state).await;
+    let view = &scheduler::views(&state).await.unwrap()[0];
+    let error = view.last_error.as_deref().unwrap();
+    assert!(
+        error.contains("2 stored synchronization request(s) are unreadable"),
+        "{error}"
+    );
+    // Kept and reported, but not retried automatically: retrying cannot repair the evidence.
+    // A later request for the library makes it due again and reports the same error.
+    assert_eq!(view.due_at, None);
+    assert!(!view.running);
+    let acked: i64 =
+        sqlx::query_scalar("SELECT acked_through FROM scan_schedule WHERE library_id = 'lib1'")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+    assert_eq!(acked, 0);
+    assert_eq!(retained(&state).await, 3);
+    assert_eq!(stored_rows(&state).await, 3);
+    assert_eq!(file_api_requests(&server, "remove").await, 0);
+    assert!(scan_bodies(&server).await.is_empty());
+    let (items, _) = crate::local_evidence::snapshot(&state, "synthetic", &crate::db::now())
+        .await
+        .unwrap();
+    let item = items
+        .iter()
+        .find(|item| item.code == ism_core::dto::AttentionCode::LibraryScanFailed)
+        .unwrap();
+    assert!(item.blocks_work);
+    assert_eq!((item.count, item.next_at.as_deref()), (3, None));
+    assert!(
+        item.message
+            .starts_with("ISM kept 3 synchronization request(s); no retry is scheduled"),
+        "{}",
+        item.message
+    );
+    assert!(!item.message.contains("Mappings"));
+    assert_eq!(scheduler::step(&state, i64::MAX / 2).await.unwrap(), None);
+    assert!(
+        !scheduler::views(&state).await.unwrap()[0].running,
+        "no retry loop"
+    );
+    assert_eq!(retained(&state).await, 3);
+}
+
+#[tokio::test]
+async fn migrating_corrupt_stored_requests_keeps_them_unacknowledged() {
+    let (dir, state, server, _fake) = setup().await;
+    // Revert migration 0019 to recreate a database from before it, holding a valid request
+    // next to corrupt ones that its generated key previously could not index.
+    for statement in [
+        "DROP INDEX scan_work_key",
+        "ALTER TABLE scan_work DROP COLUMN work_key",
+        "ALTER TABLE scan_schedule DROP COLUMN acked_through",
+        "DELETE FROM _sqlx_migrations WHERE version = 19",
+        "INSERT INTO scan_schedule (library_id, server_id, due_at) VALUES ('lib1', 's1', 0)",
+    ] {
+        sqlx::query(statement).execute(&state.db).await.unwrap();
+    }
+    for work in [
+        r#"{"path":"/library/trip/old.jpg","kind":"Removed"}"#,
+        "{",
+        r#"{"path":5,"kind":"Added"}"#,
+    ] {
+        sqlx::query("INSERT INTO scan_work (library_id, work_json) VALUES ('lib1', ?)")
+            .bind(work)
+            .execute(&state.db)
+            .await
+            .unwrap();
+    }
+    let migrated = crate::db::connect(dir.path()).await.unwrap();
+    let keys: Vec<Option<String>> =
+        sqlx::query_scalar("SELECT work_key FROM scan_work ORDER BY id")
+            .fetch_all(&migrated)
+            .await
+            .unwrap();
+    assert_eq!(
+        keys,
+        [Some("file:/library/trip/old.jpg".into()), None, None]
+    );
+    migrated.close().await;
+
+    scheduler::step(&state, i64::MAX / 2).await.unwrap();
+    wait_for_sync(&state).await;
+    let view = &scheduler::views(&state).await.unwrap()[0];
+    let error = view.last_error.as_deref().unwrap();
+    assert!(
+        error.contains("2 stored synchronization request(s) are unreadable (invalid JSON, a missing or non-absolute path, or an unknown kind); the batch of 3 is kept"),
+        "{error}"
+    );
+    let acked: i64 =
+        sqlx::query_scalar("SELECT acked_through FROM scan_schedule WHERE library_id = 'lib1'")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+    assert_eq!(acked, 0);
+    assert_eq!(retained(&state).await, 3);
+    assert_eq!(stored_rows(&state).await, 3);
+    assert_eq!(file_api_requests(&server, "remove").await, 0);
+    assert_eq!(file_api_requests(&server, "add").await, 0);
+    assert!(scan_bodies(&server).await.is_empty());
+}
+
+#[tokio::test]
+async fn an_unreadable_request_after_a_full_page_stops_the_batch_before_dispatch() {
+    let (_dir, state, server, _fake) = setup().await;
+    sqlx::query(
+        "INSERT INTO scan_schedule (library_id, server_id, due_at) VALUES ('lib1', 's1', 0)",
+    )
+    .execute(&state.db)
+    .await
+    .unwrap();
+    // More valid removals than one read page, then requests that have a key but do not
+    // deserialize or name a valid scope: an unknown kind, a duplicate field, a relative path
+    // and an empty one. Streaming dispatch would reach
+    // them only after sending the earlier paths to Immich.
+    sqlx::query(
+        "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i < 2000)
+         INSERT INTO scan_work (library_id, work_json)
+         SELECT 'lib1', json_object('path', printf('/library/trip/%05d.jpg', i), 'kind', 'Removed')
+         FROM n ORDER BY i",
+    )
+    .execute(&state.db)
+    .await
+    .unwrap();
+    for work in [
+        r#"{"path":"/library/z.jpg","kind":"NotAWorkKind"}"#,
+        r#"{"path":"/library/z.jpg","path":"/library/y.jpg","kind":"Removed"}"#,
+        r#"{"path":"library/relative.jpg","kind":"Removed"}"#,
+        r#"{"path":"","kind":"Changed"}"#,
+    ] {
+        sqlx::query("INSERT INTO scan_work (library_id, work_json) VALUES ('lib1', ?)")
+            .bind(work)
+            .execute(&state.db)
+            .await
+            .unwrap();
+    }
+    let null_keys: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM scan_work WHERE work_key IS NULL")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+    assert_eq!(
+        null_keys, 0,
+        "these requests are only detectable by reading them"
+    );
+
+    scheduler::step(&state, i64::MAX / 2).await.unwrap();
+    wait_for_sync(&state).await;
+    let view = &scheduler::views(&state).await.unwrap()[0];
+    let error = view.last_error.as_deref().unwrap();
+    assert!(
+        error.contains("4 stored synchronization request(s) are unreadable (invalid JSON, a missing or non-absolute path, or an unknown kind); the batch of 2005 is kept"),
+        "{error}"
+    );
+    assert_eq!(view.due_at, None);
+    let acked: i64 =
+        sqlx::query_scalar("SELECT acked_through FROM scan_schedule WHERE library_id = 'lib1'")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+    assert_eq!(acked, 0);
+    assert_eq!(stored_rows(&state).await, 2005);
+    assert_eq!(file_api_requests(&server, "remove").await, 0);
+    assert_eq!(file_api_requests(&server, "add").await, 0);
+    assert!(scan_bodies(&server).await.is_empty());
+}
+
+#[tokio::test]
+async fn admission_appends_after_unreadable_stored_requests_and_keeps_other_paths() {
+    use scheduler::WorkKind::{Added, Changed, Removed};
+    let (_dir, state, server, _fake) = setup().await;
+    sqlx::query("INSERT INTO scan_schedule (library_id, server_id) VALUES ('lib1', 's1')")
+        .execute(&state.db)
+        .await
+        .unwrap();
+    // Keyed rows that do not deserialize: an unknown kind and a duplicate field.
+    let corrupt = [
+        r#"{"path":"/library/a.jpg","kind":"NotAWorkKind"}"#,
+        r#"{"path":"/library/b.jpg","path":"/library/x.jpg","kind":"Removed"}"#,
+    ];
+    for work in corrupt {
+        sqlx::query("INSERT INTO scan_work (library_id, work_json) VALUES ('lib1', ?)")
+            .bind(work)
+            .execute(&state.db)
+            .await
+            .unwrap();
+    }
+    scheduler::request_work_at(
+        &state,
+        "s1",
+        "lib1",
+        "changed",
+        &[
+            file_work("/library/a.jpg", Removed),
+            file_work("/library/c.jpg", Added),
+            file_work("/library/b.jpg", Changed),
+            file_work("/library/a.jpg", Added),
+            file_work("/library/c.jpg", Changed),
+        ],
+        0,
+    )
+    .await
+    .unwrap();
+    let rows: Vec<String> = sqlx::query_scalar("SELECT work_json FROM scan_work ORDER BY id")
+        .fetch_all(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(rows[..2], corrupt, "unreadable rows are kept unchanged");
+    let mut appended: Vec<(String, String)> = rows[2..]
+        .iter()
+        .map(|json| {
+            let work: serde_json::Value = serde_json::from_str(json).unwrap();
+            (
+                work["path"].as_str().unwrap().to_owned(),
+                work["kind"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    // Affected paths keep every new request in arrival order; others still coalesce.
+    let a: Vec<_> = appended
+        .iter()
+        .filter(|(p, _)| p == "/library/a.jpg")
+        .collect();
+    assert_eq!(a.len(), 2);
+    assert_eq!((a[0].1.as_str(), a[1].1.as_str()), ("Removed", "Added"));
+    appended.sort();
+    assert_eq!(
+        appended,
+        [
+            ("/library/a.jpg".into(), "Added".into()),
+            ("/library/a.jpg".into(), "Removed".into()),
+            ("/library/b.jpg".into(), "Changed".into()),
+            ("/library/c.jpg".into(), "Added".into()),
+        ]
+    );
+
+    scheduler::step(&state, i64::MAX / 2).await.unwrap();
+    wait_for_sync(&state).await;
+    let view = &scheduler::views(&state).await.unwrap()[0];
+    let error = view.last_error.as_deref().unwrap();
+    assert!(
+        error.contains("2 stored synchronization request(s) are unreadable (invalid JSON, a missing or non-absolute path, or an unknown kind); the batch of 6 is kept"),
+        "{error}"
+    );
+    let acked: i64 =
+        sqlx::query_scalar("SELECT acked_through FROM scan_schedule WHERE library_id = 'lib1'")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+    assert_eq!(acked, 0);
+    assert_eq!(stored_rows(&state).await, 6);
+    assert_eq!(file_api_requests(&server, "remove").await, 0);
+    assert_eq!(file_api_requests(&server, "add").await, 0);
+    assert!(scan_bodies(&server).await.is_empty());
+}
+
+#[tokio::test]
+async fn admission_reads_a_bounded_window_of_a_large_legacy_backlog() {
+    let (_dir, state, _server, _fake) = setup().await;
+    let file = "/library/trip/hot.jpg";
+    sqlx::query("INSERT INTO scan_schedule (library_id, server_id) VALUES ('lib1', 's1')")
+        .execute(&state.db)
+        .await
+        .unwrap();
+    // Uncoalesced rows from before the migration: added, then many changes, so the oldest
+    // row decides the result and lies far outside the admission window.
+    sqlx::query(
+        "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i < 2000)
+         INSERT INTO scan_work (library_id, work_json)
+         SELECT 'lib1', json_object('path', ?, 'kind', CASE i WHEN 0 THEN 'Added' ELSE 'Changed' END)
+         FROM n ORDER BY i",
+    )
+    .bind(file)
+    .execute(&state.db)
+    .await
+    .unwrap();
+    for kind in [
+        scheduler::WorkKind::Removed,
+        scheduler::WorkKind::Added,
+        scheduler::WorkKind::Changed,
+        scheduler::WorkKind::Changed,
+    ] {
+        scheduler::request_work_at(&state, "s1", "lib1", "changed", &[file_work(file, kind)], 0)
+            .await
+            .unwrap();
+    }
+    let kinds: Vec<String> =
+        sqlx::query_scalar("SELECT json_extract(work_json, '$.kind') FROM scan_work ORDER BY id")
+            .fetch_all(&state.db)
+            .await
+            .unwrap();
+    // Added, changes, removed, added folds to a change exactly as the full history does; the
+    // unread rows are untouched and only one row is appended.
+    assert_eq!(kinds.len(), 2002);
+    assert_eq!(kinds[0], "Added");
+    assert!(kinds[1..1999].iter().all(|k| k == "Changed"));
+    assert_eq!(kinds[2000..], ["Removed", "Added"]);
+}
+
+#[tokio::test]
 async fn a_failed_pre_migration_batch_retries_with_new_requests_folded_in() {
     let (_dir, state, server, _fake) = setup().await;
     Mock::given(method("POST"))
