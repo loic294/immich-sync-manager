@@ -2640,6 +2640,10 @@ const FORWARD_CONCURRENCY: usize = 4;
 
 type EligibleJob = (String, String, String, Option<String>);
 
+/// A job whose repair is already under way (a queued transfer or publication) completes on its
+/// own; rechecking it every 30 seconds only adds database writes.
+const AWAITING_COMPLETION_RECHECK: chrono::Duration = chrono::Duration::minutes(5);
+
 async fn eligible_jobs(
     state: &AppState,
     limit: usize,
@@ -2650,6 +2654,7 @@ async fn eligible_jobs(
 ) -> AppResult<Vec<EligibleJob>> {
     let mut peers = active_peers.cloned().unwrap_or_default();
     let cutoff = (chrono::Utc::now() - chrono::Duration::seconds(30)).to_rfc3339();
+    let completion_cutoff = (chrono::Utc::now() - AWAITING_COMPLETION_RECHECK).to_rfc3339();
     let mut cursor: Option<(String, String)> = None;
     let mut jobs = Vec::new();
     let active_jobs = serde_json::to_string(active_jobs)?;
@@ -2689,7 +2694,8 @@ async fn eligible_jobs(
                 END AS peer_id,
                 r.updated_at
              FROM sync_recovery r
-             WHERE (r.state='queued' OR (r.state='waiting' AND r.updated_at < ?)
+             WHERE (r.state='queued' OR (r.state='waiting' AND r.updated_at <
+                     CASE WHEN r.code='awaiting_completion' THEN ? ELSE ? END)
                  OR (r.state='needs_decision' AND EXISTS(SELECT 1 FROM sync_recovery_links l JOIN conflicts c ON l.kind='conflict' AND c.id=l.target_id
                      WHERE l.recovery_id=r.id AND c.status='resolved')))
                 AND (? IS NULL OR r.kind=?)
@@ -2702,6 +2708,7 @@ async fn eligible_jobs(
              ))
              ORDER BY updated_at,id LIMIT 100",
         )
+        .bind(&completion_cutoff)
         .bind(&cutoff)
         .bind(kind)
         .bind(kind)
@@ -2742,7 +2749,8 @@ async fn eligible_jobs(
 async fn run_job(state: &AppState, job: String, kind: String, id: String) -> AppResult<()> {
     let claimed = sqlx::query(
         "UPDATE sync_recovery SET state='fixing',updated_at=?
-         WHERE id=? AND (state='queued' OR (state='waiting' AND updated_at < ?)
+         WHERE id=? AND (state='queued' OR (state='waiting' AND updated_at <
+                 CASE WHEN code='awaiting_completion' THEN ? ELSE ? END)
              OR (state='needs_decision' AND EXISTS(
                  SELECT 1 FROM sync_recovery_links l JOIN conflicts c
                  ON l.kind='conflict' AND c.id=l.target_id
@@ -2750,6 +2758,7 @@ async fn run_job(state: &AppState, job: String, kind: String, id: String) -> App
     )
     .bind(db::now())
     .bind(&job)
+    .bind((chrono::Utc::now() - AWAITING_COMPLETION_RECHECK).to_rfc3339())
     .bind((chrono::Utc::now() - chrono::Duration::seconds(30)).to_rfc3339())
     .execute(&state.db)
     .await?;

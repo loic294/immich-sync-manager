@@ -92,6 +92,12 @@ async fn main() -> anyhow::Result<()> {
     );
     activity::spawn(
         &state,
+        "Share content verifier",
+        worker_evidence::Kind::Other,
+        peers::verify_worker(state.clone()),
+    );
+    activity::spawn(
+        &state,
         "Transfer dispatcher",
         worker_evidence::Kind::Transfers,
         peers::transfer::run(state.clone()),

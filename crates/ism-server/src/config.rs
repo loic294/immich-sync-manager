@@ -24,6 +24,9 @@ pub struct Config {
     pub tick_secs: u64,
     /// `ISM_SCAN_INTERVAL_SECS`, default 300. How often shared folders are scanned for changes.
     pub scan_interval_secs: u64,
+    /// `ISM_VERIFY_INTERVAL_SECS`, default 86400. How often files whose size and date did not
+    /// change are re-hashed to catch edits that preserved both.
+    pub verify_interval_secs: u64,
     /// Maximum number of peer file transfers running concurrently, default 3.
     pub peer_transfer_concurrency: usize,
     /// Timings of the Immich maintenance barrier.
@@ -115,6 +118,9 @@ impl Config {
             scan_interval_secs: env("ISM_SCAN_INTERVAL_SECS")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(300),
+            verify_interval_secs: env("ISM_VERIFY_INTERVAL_SECS")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(86_400),
             peer_transfer_concurrency: peer_transfer_concurrency(
                 transfer_concurrency_raw.as_deref(),
             )?,
@@ -148,6 +154,7 @@ impl Config {
             secure_cookies: false,
             tick_secs: 1,
             scan_interval_secs: 5,
+            verify_interval_secs: 86_400,
             peer_transfer_concurrency: DEFAULT_PEER_TRANSFER_CONCURRENCY,
             timing: Timing {
                 poll: Duration::from_millis(20),

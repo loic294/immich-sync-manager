@@ -172,8 +172,10 @@ including after a restart; unrelated events from the same peer and share can pro
 - Changes made outside ISM are picked up from ISM's [file watcher](watching.md): a change under a
   shared folder rescans that share shortly after it settles, and a full rescan still runs every
   `ISM_SCAN_INTERVAL_SECS` as a safety net. Each scan
-  hashes settled files, including files with unchanged size and modification time; this can cause
-  substantial disk reads on large shares. Scans exclude queued transfers and uncertain operation
+  hashes settled files whose size or modification time changed. Files with unchanged size and
+  modification time are re-hashed separately every `ISM_VERIFY_INTERVAL_SECS` (first an hour after
+  start) in short batches that let operations and transfers run in between, so edits that
+  preserve both are still published without blocking other work for the length of a large share. Scans exclude queued transfers and uncertain operation
   or inbox footprints from hashing and deletion inference, while independent paths remain eligible.
   Unavailable roots never imply deletion. An unreadable subtree is excluded and the incomplete
   scan is reported explicitly. To avoid recording half-completed managed operations, a scan

@@ -698,15 +698,16 @@ async fn scan_share_reporting(
     })
     .await
     .map_err(AppError::internal)??;
-    let known: Vec<(String, i64, i64, i64)> = sqlx::query_as(
-        "SELECT rel_path, size, mtime_ns, deleted FROM replica_files WHERE share_id = ?",
+    let known: Vec<(String, i64, i64, i64, i64)> = sqlx::query_as(
+        "SELECT rel_path, size, mtime_ns, deleted, sha256 IS NOT NULL
+         FROM replica_files WHERE share_id = ?",
     )
     .bind(&share.id)
     .fetch_all(&state.db)
     .await?;
-    let known: HashMap<String, (i64, i64, bool)> = known
+    let known: HashMap<String, (i64, i64, bool, bool)> = known
         .into_iter()
-        .map(|(p, s, m, d)| (p, (s, m, d != 0)))
+        .map(|(p, s, m, d, h)| (p, (s, m, d != 0, h != 0)))
         .collect();
     let settle_cutoff = now_ns() - SETTLE_SECS * 1_000_000_000;
     let mut seen = HashSet::new();
@@ -714,7 +715,8 @@ async fn scan_share_reporting(
     task.phase("Hashing and reconciling settled files");
     let total = found.len() as u64;
     task.progress(0, Some(total), "files checked");
-    for (index, (rel, _size, mtime)) in found.into_iter().enumerate() {
+    let mut hashed = 0u64;
+    for (index, (rel, size, mtime)) in found.into_iter().enumerate() {
         task.progress(index as u64, Some(total), "files checked");
         seen.insert(rel.clone());
         if mtime > settle_cutoff || blocked.iter().any(|p| inbox::overlaps(&rel, p)) {
@@ -725,6 +727,17 @@ async fn scan_share_reporting(
             complete = false;
             continue;
         }
+        // Unchanged size and date: the content verification worker re-hashes these later
+        // without holding the scan admission for the whole share.
+        if known
+            .get(&rel)
+            .is_some_and(|&(known_size, known_mtime, deleted, hashed)| {
+                !deleted && hashed && known_size == size && known_mtime == mtime
+            })
+        {
+            continue;
+        }
+        hashed += 1;
         if let Err(error) = register_local_reporting(state, share, &root, &rel, Some(task)).await {
             if error.io_kind().is_none() {
                 return Err(error);
@@ -734,8 +747,9 @@ async fn scan_share_reporting(
         }
     }
     task.progress(total, Some(total), "files checked");
+    tracing::debug!(share_id = %share.id, files = total, hashed, "share scan hashed changed files");
     task.phase("Reconciling removed files and publishing inventory");
-    for (rel, (_, _, deleted)) in known {
+    for (rel, (_, _, deleted, _)) in known {
         // A newly ignored row is not evidence that the file was deleted.
         if deleted
             || seen.contains(&rel)
@@ -782,6 +796,94 @@ async fn scan_share_reporting(
         ));
     }
     Ok(complete)
+}
+
+/// Longest time one content-verification batch holds the scan admission.
+const VERIFY_BATCH: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Re-hashes files whose size and date look unchanged, so edits that preserved both are still
+/// published. Unlike a scan it takes the scan admission per short batch, so operations,
+/// transfers and peer bookkeeping keep running between batches.
+pub async fn verify_share_content(state: &AppState, share: &Share) -> AppResult<()> {
+    crate::activity::observe(
+        state,
+        format!("share-verify:{}", share.id),
+        "Share content verification",
+        &share.name,
+        Some("/peers"),
+        |task| async move {
+            let rows: Vec<String> = sqlx::query_scalar(
+                "SELECT rel_path FROM replica_files
+                 WHERE share_id = ? AND deleted = 0 AND sha256 IS NOT NULL ORDER BY rel_path",
+            )
+            .bind(&share.id)
+            .fetch_all(&state.db)
+            .await?;
+            let total = rows.len() as u64;
+            let mut rows = rows.into_iter().enumerate().peekable();
+            while rows.peek().is_some() {
+                task.waiting("Waiting for managed operations that are changing files");
+                let _operation_guard = state.replication_operation_lock.lock_scan().await;
+                let Some(share) = shares(state)
+                    .await?
+                    .into_iter()
+                    .find(|current| current.id == share.id && current.enabled)
+                else {
+                    return Ok(());
+                };
+                inbox::require_scannable(state).await?;
+                let mut blocked = blocked_footprints(state, &share).await?;
+                blocked.extend(admin::move_decision_footprints(state, &share).await?);
+                let root = files::root(&state.db, &share.root_id).await?;
+                root.ensure_available()?;
+                task.phase("Re-hashing files whose size and date did not change");
+                let started = std::time::Instant::now();
+                while started.elapsed() < VERIFY_BATCH {
+                    let Some((index, rel)) = rows.next() else {
+                        break;
+                    };
+                    task.progress(index as u64, Some(total), "files verified");
+                    if RelPath::parse(&rel).is_err()
+                        || blocked.iter().any(|p| inbox::overlaps(&rel, p))
+                    {
+                        continue;
+                    }
+                    match register_local_reporting(state, &share, &root, &rel, Some(&task)).await {
+                        Ok(_) => {}
+                        // The next scan or batch handles files that changed or became unreadable.
+                        Err(error)
+                            if error.io_kind().is_some() || error.code() == "revision_changed" => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+            }
+            task.progress(total, Some(total), "files verified");
+            Ok(())
+        },
+    )
+    .await
+}
+
+/// Runs content verification for every enabled share, first an hour after start and then every
+/// `verify_interval_secs`.
+pub async fn verify_worker(state: AppState) {
+    let every = std::time::Duration::from_secs(state.config.verify_interval_secs.max(60));
+    let mut wait = every.min(std::time::Duration::from_secs(3600));
+    loop {
+        tokio::time::sleep(wait).await;
+        wait = every;
+        match shares(&state).await {
+            Ok(shares) => {
+                for share in shares.iter().filter(|share| share.enabled) {
+                    if let Err(error) = verify_share_content(&state, share).await {
+                        tracing::warn!(share = %share.name, code = %error.code(),
+                            "share content verification stopped: {}", error.message());
+                    }
+                }
+            }
+            Err(error) => tracing::error!("cannot load shares: {}", error.message()),
+        }
+    }
 }
 
 fn note_scan_io_failure(failure: &mut Option<bool>, kind: Option<std::io::ErrorKind>) {

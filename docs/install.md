@@ -107,6 +107,7 @@ Docker log history.
 | `ISM_LOG` | `info` | Log filter (`debug`, `ism_server=debug`, …). |
 | `ISM_WORKER_TICK_SECS` | `5` | Background worker interval. |
 | `ISM_SCAN_INTERVAL_SECS` | `300` | Full safety rescan of peer shares; watcher changes trigger earlier rescans. |
+| `ISM_VERIFY_INTERVAL_SECS` | `86400` | Re-hash of shared files whose size and date did not change, to catch edits that kept both. |
 | `ISM_PEER_TRANSFER_CONCURRENCY` | `3` | Concurrent peer file downloads (1–32); raise gradually on high-latency links. |
 | `ISM_QUIESCE_TIMEOUT_SECS` | `600` | Longest wait for Immich's paused `library` queue to have no running job. |
 | `ISM_SCAN_TIMEOUT_SECS` | `7200` | Longest wait for a library scan to finish. |

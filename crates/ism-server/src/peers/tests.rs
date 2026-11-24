@@ -5287,7 +5287,7 @@ async fn incoming_events_recheck_content_even_when_metadata_is_unchanged() {
 }
 
 #[tokio::test]
-async fn periodic_scan_detects_content_change_with_unchanged_metadata() {
+async fn content_verification_detects_change_with_unchanged_metadata() {
     let b = instance("Beta").await;
     for task in &b.tasks {
         task.abort();
@@ -5321,6 +5321,15 @@ async fn periodic_scan_detects_content_change_with_unchanged_metadata() {
         .unwrap();
 
     super::scan_share(&b.state, &share).await.unwrap();
+    let skipped = super::row(&b.state, &share.id, "same.jpg")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        skipped.sha256, before.sha256,
+        "routine scans skip unchanged metadata"
+    );
+    super::verify_share_content(&b.state, &share).await.unwrap();
     let after = super::row(&b.state, &share.id, "same.jpg")
         .await
         .unwrap()
