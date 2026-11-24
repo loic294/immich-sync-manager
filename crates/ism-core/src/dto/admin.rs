@@ -546,6 +546,7 @@ pub enum AttentionCode {
     OperationFailed,
     MaintenanceBlocked,
     MaintenanceWaiting,
+    MappingUnavailable,
     WatcherPaused,
     LibraryScanFailed,
     PeerOffline,
@@ -602,10 +603,20 @@ pub struct AttentionItem {
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
+pub struct AttentionCoverage {
+    pub code: AttentionCode,
+    pub owner: AttentionOwner,
+    /// Complete means absence is authoritative for this code and owner, even in a partial snapshot.
+    pub completeness: AttentionCompleteness,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
 pub struct AttentionSnapshot {
     pub observed_at: String,
     pub completeness: AttentionCompleteness,
     pub warnings: Vec<String>,
+    pub coverage: Vec<AttentionCoverage>,
     pub items: Vec<AttentionItem>,
 }
 

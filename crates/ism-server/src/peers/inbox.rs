@@ -370,7 +370,12 @@ async fn validate_identity(
 }
 
 /// Validate the entire page and atomically persist it with its receipt watermark.
-async fn admit(state: &AppState, peer: &net::Peer, after: i64, page: &EventPage) -> AppResult<()> {
+pub(super) async fn admit(
+    state: &AppState,
+    peer: &net::Peer,
+    after: i64,
+    page: &EventPage,
+) -> AppResult<()> {
     let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM peer_inbox WHERE peer_id = ?")
         .bind(&peer.id)
@@ -382,6 +387,7 @@ async fn admit(state: &AppState, peer: &net::Peer, after: i64, page: &EventPage)
             "peer inbox admission limit reached",
         ));
     }
+    let mut previous_by_share: HashMap<String, Vec<(String, i64, PeerEvent)>> = HashMap::new();
     for event in &page.events {
         event_valid(event)?;
         validate_identity(&mut tx, state, event).await?;
@@ -402,13 +408,25 @@ async fn admit(state: &AppState, peer: &net::Peer, after: i64, page: &EventPage)
         .bind(serde_json::to_string(&event.data)?)
         .execute(&mut *tx)
         .await?;
-        let older: Vec<(String, i64, String)> = sqlx::query_as(
-            "SELECT peer_id, seq, event_json FROM peer_inbox
+        // Retain at most one share's backlog, reloading it after a share switch.
+        previous_by_share.retain(|share, _| share == &event.share);
+        let older = match previous_by_share.entry(event.share.clone()) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let rows: Vec<(String, i64, String)> = sqlx::query_as(
+                    "SELECT peer_id, seq, event_json FROM peer_inbox
              WHERE share_name = ? AND status != 'done' ORDER BY peer_id, seq",
-        )
-        .bind(&event.share)
-        .fetch_all(&mut *tx)
-        .await?;
+                )
+                .bind(&event.share)
+                .fetch_all(&mut *tx)
+                .await?;
+                let older = rows
+                    .into_iter()
+                    .map(|(peer, seq, raw)| Ok((peer, seq, serde_json::from_str(&raw)?)))
+                    .collect::<AppResult<Vec<_>>>()?;
+                entry.insert(older)
+            }
+        };
         sqlx::query(
             "INSERT INTO peer_inbox(peer_id, seq, origin, origin_seq, share_name, event_json)
              VALUES (?, ?, ?, ?, ?, ?)",
@@ -421,8 +439,7 @@ async fn admit(state: &AppState, peer: &net::Peer, after: i64, page: &EventPage)
         .bind(serde_json::to_string(event)?)
         .execute(&mut *tx)
         .await?;
-        for (other_peer, seq, raw) in older {
-            let previous: PeerEvent = serde_json::from_str(&raw)?;
+        for (other_peer, seq, previous) in older.iter() {
             if previous.kind == SHARE_ENABLED || event.kind == SHARE_ENABLED {
                 continue;
             }
@@ -434,7 +451,7 @@ async fn admit(state: &AppState, peer: &net::Peer, after: i64, page: &EventPage)
             }
             if paths(event)
                 .iter()
-                .any(|a| paths(&previous).iter().any(|b| overlaps(a, b)))
+                .any(|a| paths(previous).iter().any(|b| overlaps(a, b)))
             {
                 sqlx::query(
                     "INSERT INTO peer_inbox_dependencies(peer_id, seq, depends_peer_id, depends_seq)
@@ -443,11 +460,12 @@ async fn admit(state: &AppState, peer: &net::Peer, after: i64, page: &EventPage)
                 .bind(&peer.id)
                 .bind(event.seq)
                 .bind(other_peer)
-                .bind(seq)
+                .bind(*seq)
                 .execute(&mut *tx)
                 .await?;
             }
         }
+        older.push((peer.id.clone(), event.seq, event.clone()));
     }
     let updated =
         sqlx::query("UPDATE peers SET received_cursor = ? WHERE id = ? AND received_cursor = ?")

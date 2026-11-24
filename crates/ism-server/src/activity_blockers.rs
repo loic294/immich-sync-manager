@@ -1,7 +1,6 @@
 //! Current waiting evidence, read from the queues that actually govern execution.
 
-use ism_core::dto::{BackgroundActivity, BackgroundStatus};
-use ism_core::maintenance::Phase;
+use ism_core::dto::{AttentionCode, AttentionState, BackgroundActivity, BackgroundStatus};
 use sqlx::Row;
 use std::collections::{HashMap, HashSet};
 
@@ -132,25 +131,30 @@ fn tally(reasons: &mut HashMap<String, u64>, reason: Option<String>) {
 pub async fn get(state: &AppState) -> AppResult<(Vec<BackgroundActivity>, Vec<String>)> {
     let mut out = Vec::new();
     let mut warnings = Vec::new();
-    for server in crate::immich::registry::servers(state).await? {
-        let m = &server.maintenance;
-        if m.phase != Phase::Idle || m.drift.is_some() {
-            let mut row = entry(
-                format!("maintenance:{}", server.id), "Immich maintenance", server.name,
-                m.message.clone().or_else(|| m.drift.clone()).unwrap_or_else(|| match m.phase {
-                    Phase::Preparing => "Pausing the library queue and confirming it is idle".into(),
-                    Phase::Active => format!("Library scans paused while {} managed operations hold the write barrier", m.active_ops),
-                    Phase::Resuming => "Resuming the Immich library queue".into(),
-                    Phase::RecoveryRequired => "Unverified file changes require recovery before writes can resume".into(),
-                    Phase::Blocked => "Maintenance needs attention before writes can resume".into(),
-                    Phase::Idle => "Immich settings drift prevents safe writes".into(),
-                }), "/servers",
-            );
-            if matches!(m.phase, Phase::Blocked | Phase::RecoveryRequired) || m.drift.is_some() {
-                row.status = BackgroundStatus::Blocked;
-            }
-            out.push(row);
-        }
+    let (local, local_warnings) =
+        crate::local_evidence::snapshot(state, &state.instance_name().await, &db::now()).await?;
+    warnings.extend(local_warnings);
+    for item in local
+        .into_iter()
+        .filter(|item| item.code != AttentionCode::LibraryScanFailed)
+    {
+        let mut row = entry(
+            item.id,
+            &item.title,
+            item.share_name.unwrap_or_default(),
+            item.message,
+            &item.href,
+        );
+        row.status = match item.state {
+            AttentionState::Blocked => BackgroundStatus::Blocked,
+            AttentionState::Failed => BackgroundStatus::Failed,
+            _ => BackgroundStatus::Waiting,
+        };
+        row.count = item.count;
+        row.examples = item.examples;
+        row.updated_at = item.observed_at;
+        row.next_at = item.next_at;
+        out.push(row);
     }
     for view in crate::watch::scheduler::views(state).await? {
         if view.due_at.is_none() && view.last_error.is_none() && !view.running {
@@ -185,25 +189,6 @@ pub async fn get(state: &AppState) -> AppResult<(Vec<BackgroundActivity>, Vec<St
             row.status = BackgroundStatus::Running;
         } else if row.error.is_some() && row.next_at.is_none() {
             row.status = BackgroundStatus::Blocked;
-        }
-        out.push(row);
-    }
-    for view in crate::watch::status_views(state)
-        .await?
-        .into_values()
-        .filter(|v| v.paused)
-    {
-        let mut row = entry(
-            format!("watch:{}", view.root_id),
-            "File detection paused",
-            view.name,
-            view.warnings.join("; "),
-            "/mappings",
-        );
-        row.status = BackgroundStatus::Blocked;
-        if let Some(at) = view.last_pass_at {
-            row.started_at = at.clone();
-            row.updated_at = at;
         }
         out.push(row);
     }

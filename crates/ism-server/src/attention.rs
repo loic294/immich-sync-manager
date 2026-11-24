@@ -3,8 +3,8 @@
 use std::collections::{HashMap, HashSet};
 
 use ism_core::dto::{
-    AttentionCode, AttentionCompleteness, AttentionItem, AttentionLevel, AttentionOwner,
-    AttentionSnapshot, AttentionState,
+    AttentionCode, AttentionCompleteness, AttentionCoverage, AttentionItem, AttentionLevel,
+    AttentionOwner, AttentionSnapshot, AttentionState,
 };
 
 use crate::db;
@@ -24,6 +24,14 @@ struct Operation {
 pub async fn snapshot(state: &AppState) -> AppResult<AttentionSnapshot> {
     let observed_at = db::now();
     let instance_name = state.instance_name().await;
+    let (mut items, mut warnings) =
+        crate::local_evidence::snapshot(state, &instance_name, &observed_at).await?;
+    let maintenance_readable = !items.iter().any(|item| {
+        item.code == AttentionCode::MaintenanceBlocked && item.state == AttentionState::Unavailable
+    });
+    let mappings_readable = !items.iter().any(|item| {
+        item.code == AttentionCode::MappingUnavailable && item.state == AttentionState::Unavailable
+    });
     let operations: Vec<Operation> = sqlx::query_as(
         "SELECT id,status,handled_at,recovery_resolved,admitted_server_ids_json
          FROM operations
@@ -34,7 +42,7 @@ pub async fn snapshot(state: &AppState) -> AppResult<AttentionSnapshot> {
     )
     .fetch_all(&state.db)
     .await?;
-    let mut items: Vec<_> = operations
+    items.extend(operations
         .into_iter()
         .map(|operation| {
             let unresolved = !operation.recovery_resolved
@@ -83,7 +91,7 @@ pub async fn snapshot(state: &AppState) -> AppResult<AttentionSnapshot> {
                 examples: Vec::new(),
             }
         })
-        .collect();
+    );
     let queues = crate::queue_evidence::snapshot(state).await?;
     let pending_transfers =
         queues.queued.iter().map(|group| group.count).sum::<u64>() + queues.running.max(0) as u64;
@@ -106,7 +114,7 @@ pub async fn snapshot(state: &AppState) -> AppResult<AttentionSnapshot> {
             count: group.count,
             total_count: Some(group.count),
             next_at: None,
-            recheck_at: None,
+            recheck_at: group.recheck_at.clone(),
             observed_at: observed_at.clone(),
             title: "Transfer readiness is not fully known".into(),
             message: "File-specific dependencies have not been checked; some files may be ready while others wait.".into(),
@@ -236,6 +244,11 @@ pub async fn snapshot(state: &AppState) -> AppResult<AttentionSnapshot> {
             item.count = group.backoff_count;
             if group.unclassified_backoff == 0 {
                 item.next_at = group.next_retry.clone();
+                item.recheck_at = item
+                    .recheck_at
+                    .into_iter()
+                    .chain(item.next_at.clone())
+                    .min();
                 item.completeness = AttentionCompleteness::Complete;
             }
             item.title = "Transfers are waiting to retry".into();
@@ -274,6 +287,10 @@ pub async fn snapshot(state: &AppState) -> AppResult<AttentionSnapshot> {
         });
     }
     let inbox = crate::inbox_evidence::snapshot(state).await?;
+    let inbox_readable = inbox
+        .groups
+        .iter()
+        .all(|group| group.status != crate::inbox_evidence::Status::Unavailable);
     let pending_inbox = inbox.replication_pending;
     for group in inbox.groups {
         use crate::inbox_evidence::{Kind, Status};
@@ -356,7 +373,11 @@ pub async fn snapshot(state: &AppState) -> AppResult<AttentionSnapshot> {
                 .collect(),
         });
     }
-    for group in crate::peers::versions::evidence_groups(state).await? {
+    let comparisons = crate::peers::versions::evidence_groups(state).await?;
+    let comparisons_readable = comparisons
+        .iter()
+        .all(|group| group.state != crate::peers::versions::EvidenceState::Unavailable);
+    for group in comparisons {
         use crate::peers::versions::EvidenceState;
         let (code, item_state, level, blocks_work, title, message) = match group.state {
             EvidenceState::Queued | EvidenceState::Running => continue,
@@ -565,6 +586,11 @@ pub async fn snapshot(state: &AppState) -> AppResult<AttentionSnapshot> {
         .fetch_all(&state.db)
         .await?;
     let receiver = crate::peer_evidence::snapshot(state).await?;
+    let receiver_readable = receiver.orphaned == 0
+        && receiver
+            .peers
+            .iter()
+            .all(|peer| peer.fresh && peer.invalid_count == 0);
     if receiver.orphaned > 0 {
         items.push(AttentionItem {
             id: "orphaned-peer-evidence".into(),
@@ -592,6 +618,9 @@ pub async fn snapshot(state: &AppState) -> AppResult<AttentionSnapshot> {
             completeness: AttentionCompleteness::Partial,
             examples: Vec::new(),
         });
+    }
+    if !receiver.peers.is_empty() {
+        warnings.push("Paired instances report receiver transfers only; their other attention conditions are not available here.".into());
     }
     for peer in receiver.peers {
         let peer_observed_at = peer
@@ -708,12 +737,141 @@ pub async fn snapshot(state: &AppState) -> AppResult<AttentionSnapshot> {
             });
         }
     }
+    let now = chrono::Utc::now();
+    for item in &mut items {
+        let next = item
+            .next_at
+            .as_deref()
+            .and_then(db::parse_ts)
+            .filter(|at| *at > now)
+            .map(db::ts);
+        item.recheck_at = item.recheck_at.take().into_iter().chain(next).min();
+    }
+    if items
+        .iter()
+        .any(|item| item.code == AttentionCode::TransferEvidenceUnavailable)
+    {
+        warnings.push("File-specific transfer dependencies have not all been checked.".into());
+    }
+    if items
+        .iter()
+        .any(|item| item.completeness != AttentionCompleteness::Complete)
+        && warnings.is_empty()
+    {
+        warnings.push("Some conditions could not be fully verified; absence of a blocker does not confirm that work is ready.".into());
+    }
+    let completeness = if warnings.is_empty()
+        && items
+            .iter()
+            .all(|item| item.completeness == AttentionCompleteness::Complete)
+    {
+        AttentionCompleteness::Complete
+    } else {
+        AttentionCompleteness::Partial
+    };
+    let mut coverage = Vec::new();
+    let mut cover = |codes: &[AttentionCode], owner, readable| {
+        coverage.extend(codes.iter().map(|code| AttentionCoverage {
+            code: *code,
+            owner,
+            completeness: if readable {
+                AttentionCompleteness::Complete
+            } else {
+                AttentionCompleteness::Partial
+            },
+        }));
+    };
+    cover(
+        &[
+            AttentionCode::OperationRecovery,
+            AttentionCode::OperationFailed,
+            AttentionCode::WatcherPaused,
+            AttentionCode::LibraryScanFailed,
+            AttentionCode::RecoveryDecision,
+            AttentionCode::TransferFailed,
+            AttentionCode::TransferScheduled,
+            AttentionCode::TransferScheduleInvalid,
+            AttentionCode::TransferEvidenceUnavailable,
+            AttentionCode::WorkerStopped,
+        ],
+        AttentionOwner::Local,
+        true,
+    );
+    cover(
+        &[
+            AttentionCode::MaintenanceBlocked,
+            AttentionCode::MaintenanceWaiting,
+        ],
+        AttentionOwner::Local,
+        maintenance_readable,
+    );
+    cover(
+        &[AttentionCode::MappingUnavailable],
+        AttentionOwner::Local,
+        mappings_readable,
+    );
+    cover(
+        &[AttentionCode::TransferDependency],
+        AttentionOwner::Local,
+        queues
+            .queued
+            .iter()
+            .all(|group| group.root_available.is_some()),
+    );
+    cover(
+        &[AttentionCode::TransferBackoff],
+        AttentionOwner::Local,
+        queues
+            .queued
+            .iter()
+            .all(|group| group.unclassified_backoff == 0),
+    );
+    cover(
+        &[AttentionCode::PeerOffline],
+        AttentionOwner::Local,
+        queues
+            .queued
+            .iter()
+            .all(|group| matches!(group.peer_status.as_str(), "online" | "offline")),
+    );
+    cover(
+        &[AttentionCode::PeerEvidenceUnavailable],
+        AttentionOwner::Local,
+        inbox_readable
+            && !items.iter().any(|item| {
+                item.owner == AttentionOwner::Local
+                    && item.code == AttentionCode::PeerEvidenceUnavailable
+                    && item.state == AttentionState::Unavailable
+            }),
+    );
+    cover(
+        &[
+            AttentionCode::FolderRemovalFailed,
+            AttentionCode::PeerInventoryFailed,
+            AttentionCode::PeerInboxFailed,
+        ],
+        AttentionOwner::Local,
+        inbox_readable,
+    );
+    cover(
+        &[AttentionCode::RecoveryFailed],
+        AttentionOwner::Local,
+        comparisons_readable,
+    );
+    cover(
+        &[
+            AttentionCode::ReceiverTransferFailed,
+            AttentionCode::OperationFailed,
+            AttentionCode::PeerEvidenceUnavailable,
+        ],
+        AttentionOwner::Receiver,
+        receiver_readable,
+    );
     Ok(AttentionSnapshot {
         observed_at,
-        completeness: AttentionCompleteness::Partial,
-        warnings: vec![
-            "Some background and peer conditions are not yet included in this view.".into(),
-        ],
+        completeness,
+        warnings,
+        coverage,
         items,
     })
 }

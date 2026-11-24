@@ -78,6 +78,472 @@ async fn background_activity_requires_admin_and_keeps_current_work_outside_histo
 }
 
 #[tokio::test]
+async fn attention_covers_standalone_local_conditions_and_clears_resolved_sources() {
+    let h = harness().await;
+    let auth = [("cookie", h.cookie.as_str())];
+    let empty = send(&h.app, get("/api/admin/attention", &auth))
+        .await
+        .json();
+    assert_eq!(empty["completeness"], "complete");
+    assert!(empty["warnings"].as_array().unwrap().is_empty());
+    h.map_root().await;
+    let maintenance = ism_core::maintenance::MaintenanceState {
+        drift: Some("synthetic settings drift".into()),
+        ..Default::default()
+    };
+    sqlx::query(
+        "INSERT INTO immich_servers(id,name,url,compatible,maintenance_json,created_at)
+         VALUES ('server','Example','https://immich.example',0,?,?)",
+    )
+    .bind(serde_json::to_string(&maintenance).unwrap())
+    .bind(crate::db::now())
+    .execute(&h.state.db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO shares(id,name,root_id,path,peer_ids_json,enabled)
+         VALUES ('share','Archive','photos','','[]',1)",
+    )
+    .execute(&h.state.db)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO watch_status(root_id,paused,last_pass_at) VALUES ('photos',1,?)")
+        .bind(crate::db::now())
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO scan_schedule(library_id,server_id,last_error,last_finished_at)
+         VALUES ('library','server','synthetic scan failure',?)",
+    )
+    .bind(crate::db::now())
+    .execute(&h.state.db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO scan_work(library_id,work_json) VALUES ('library','{}'),('library','{}')",
+    )
+    .execute(&h.state.db)
+    .await
+    .unwrap();
+    let mut tx = h.state.db.begin().await.unwrap();
+    for i in 0..1_000 {
+        sqlx::query(
+            "INSERT INTO conflicts(id,share_id,rel_path,kind,detail,local_json,remote_json,
+                                   remote_vv_json,peer_id,status,created_at)
+             VALUES (?,'share',?,'edit','synthetic conflict','{}','{}','{}','former-peer','open',?)",
+        ).bind(format!("decision-{i}")).bind(format!("photo-{i}.jpg"))
+            .bind(crate::db::now()).execute(&mut *tx).await.unwrap();
+    }
+    tx.commit().await.unwrap();
+    std::fs::write(h.root.join(".ism-root"), "wrong-root").unwrap();
+
+    let reply = send(&h.app, get("/api/admin/attention", &auth)).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.json());
+    assert!(reply.body.len() < 20_000);
+    let snapshot = reply.json();
+    assert_eq!(snapshot["completeness"], "complete");
+    let items = snapshot["items"].as_array().unwrap();
+    for (id, code, href) in [
+        ("maintenance:server", "maintenance_blocked", "/servers"),
+        ("compatibility:server", "maintenance_blocked", "/servers"),
+        ("mapping:photos", "mapping_unavailable", "/mappings"),
+        ("watch:photos", "watcher_paused", "/mappings"),
+        ("library:library", "library_scan_failed", "/mappings"),
+        (
+            "conflict-decisions:share:former-peer",
+            "recovery_decision",
+            "/conflicts",
+        ),
+    ] {
+        let item = items.iter().find(|item| item["id"] == id).unwrap();
+        assert_eq!(item["code"], code);
+        assert_eq!(item["href"], href);
+        assert_eq!(item["blocks_work"], true);
+        assert_eq!(item["owner"], "local");
+    }
+    let decisions = items
+        .iter()
+        .find(|item| item["code"] == "recovery_decision")
+        .unwrap();
+    assert_eq!(decisions["count"], 1_000);
+    assert_eq!(decisions["peer_id"], "former-peer");
+    assert_eq!(decisions["share_id"], "share");
+    assert_eq!(decisions["examples"].as_array().unwrap().len(), 5);
+    assert_eq!(
+        items
+            .iter()
+            .find(|item| item["code"] == "library_scan_failed")
+            .unwrap()["count"],
+        2
+    );
+    let background = send(&h.app, get("/api/admin/operations/background", &auth)).await;
+    assert_eq!(background.status, StatusCode::OK, "{}", background.json());
+    let background = background.json();
+    for key in [
+        "mapping:photos",
+        "compatibility:server",
+        "conflict-decisions:share:former-peer",
+    ] {
+        assert!(
+            background["current"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["task_key"] == key)
+        );
+    }
+
+    sqlx::query("DELETE FROM scan_work")
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    let historic = send(&h.app, get("/api/admin/attention", &auth))
+        .await
+        .json();
+    let failed_scan = historic["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["code"] == "library_scan_failed")
+        .unwrap();
+    assert_eq!(failed_scan["count"], 0);
+    assert_eq!(failed_scan["blocks_work"], false);
+    sqlx::query("UPDATE immich_servers SET compatible=1,maintenance_json=?")
+        .bind(serde_json::to_string(&ism_core::maintenance::MaintenanceState::default()).unwrap())
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE watch_status SET paused=0")
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE scan_schedule SET last_error=NULL")
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    // A chosen decision in progress must not ask for another decision.
+    sqlx::query("UPDATE conflicts SET status='resolving'")
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    std::fs::write(h.root.join(".ism-root"), "photos").unwrap();
+    let cleared = send(&h.app, get("/api/admin/attention", &auth))
+        .await
+        .json();
+    assert!(cleared["items"].as_array().unwrap().is_empty(), "{cleared}");
+    assert_eq!(cleared["completeness"], "complete");
+
+    sqlx::query(
+        "INSERT INTO peers(id,name,url,secret_enc,status,created_at)
+         VALUES ('peer','Example','https://peer.example','unused','online',?)",
+    )
+    .bind(crate::db::now())
+    .execute(&h.state.db)
+    .await
+    .unwrap();
+    for (phase, code, state) in [
+        (
+            ism_core::maintenance::Phase::Preparing,
+            "maintenance_waiting",
+            "waiting",
+        ),
+        (
+            ism_core::maintenance::Phase::Active,
+            "maintenance_waiting",
+            "waiting",
+        ),
+        (
+            ism_core::maintenance::Phase::Resuming,
+            "maintenance_waiting",
+            "waiting",
+        ),
+        (
+            ism_core::maintenance::Phase::Blocked,
+            "maintenance_blocked",
+            "blocked",
+        ),
+        (
+            ism_core::maintenance::Phase::RecoveryRequired,
+            "maintenance_blocked",
+            "blocked",
+        ),
+    ] {
+        sqlx::query("UPDATE immich_servers SET maintenance_json=?")
+            .bind(
+                serde_json::to_string(&ism_core::maintenance::MaintenanceState {
+                    phase,
+                    ..Default::default()
+                })
+                .unwrap(),
+            )
+            .execute(&h.state.db)
+            .await
+            .unwrap();
+        let snapshot = send(&h.app, get("/api/admin/attention", &auth))
+            .await
+            .json();
+        let item = snapshot["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["id"] == "maintenance:server")
+            .unwrap();
+        assert_eq!(item["code"], code);
+        assert_eq!(item["state"], state);
+        assert_eq!(
+            snapshot["completeness"], "partial",
+            "Remote coverage is unavailable"
+        );
+    }
+    sqlx::query("UPDATE immich_servers SET maintenance_json=?")
+        .bind(serde_json::to_string(&ism_core::maintenance::MaintenanceState::default()).unwrap())
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    let cleared = send(&h.app, get("/api/admin/attention", &auth))
+        .await
+        .json();
+    assert_eq!(cleared["completeness"], "partial");
+    assert!(
+        !cleared["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["id"] == "maintenance:server")
+    );
+    for code in [
+        "maintenance_blocked",
+        "maintenance_waiting",
+        "recovery_decision",
+    ] {
+        let source = cleared["coverage"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|source| source["code"] == code && source["owner"] == "local")
+            .unwrap();
+        assert_eq!(source["completeness"], "complete");
+    }
+    assert!(
+        !cleared["coverage"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|source| source["code"] == "maintenance_blocked" && source["owner"] == "receiver")
+    );
+    sqlx::query("UPDATE immich_servers SET maintenance_json='unreadable'")
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    let unknown = send(&h.app, get("/api/admin/attention", &auth)).await;
+    assert_eq!(unknown.status, StatusCode::OK, "{}", unknown.json());
+    let unknown = unknown.json();
+    let item = unknown["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["id"] == "maintenance:server")
+        .unwrap();
+    assert_eq!(item["state"], "unavailable");
+    assert_eq!(item["completeness"], "unavailable");
+    assert_eq!(item["blocks_work"], false);
+    assert_eq!(unknown["completeness"], "partial");
+    assert!(!unknown["warnings"].as_array().unwrap().is_empty());
+    for code in ["maintenance_blocked", "maintenance_waiting"] {
+        assert_eq!(
+            unknown["coverage"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|source| source["code"] == code && source["owner"] == "local")
+                .unwrap()["completeness"],
+            "partial"
+        );
+    }
+}
+
+#[tokio::test]
+async fn attention_keeps_timed_out_mapping_checks_unknown_and_bounded() {
+    let h = harness().await;
+    h.map_root().await;
+    std::fs::write(h.root.join(".ism-root"), "wrong-root").unwrap();
+    let auth = [("cookie", h.cookie.as_str())];
+    let blocked = send(&h.app, get("/api/admin/attention", &auth))
+        .await
+        .json();
+    assert_eq!(blocked["items"][0]["id"], "mapping:photos");
+    assert_eq!(blocked["items"][0]["blocks_work"], true);
+    assert!(blocked["items"][0]["recheck_at"].is_string());
+
+    let permits = h
+        .state
+        .queue_root_probes
+        .clone()
+        .acquire_many_owned(crate::queue_evidence::ROOT_PROBE_LIMIT as u32)
+        .await
+        .unwrap();
+    let response = tokio::time::timeout(
+        Duration::from_secs(1),
+        send(&h.app, get("/api/admin/attention", &auth)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status, StatusCode::OK, "{}", response.json());
+    let unknown = response.json();
+    assert_eq!(unknown["items"][0]["id"], "mapping:photos");
+    assert_eq!(unknown["items"][0]["state"], "unavailable");
+    assert_eq!(unknown["items"][0]["blocks_work"], false);
+    assert_eq!(unknown["items"][0]["completeness"], "unavailable");
+    assert_eq!(unknown["completeness"], "partial");
+    assert_eq!(
+        unknown["coverage"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|source| source["code"] == "mapping_unavailable" && source["owner"] == "local")
+            .unwrap()["completeness"],
+        "partial"
+    );
+    drop(permits);
+    std::fs::write(h.root.join(".ism-root"), "photos").unwrap();
+    let cleared = send(&h.app, get("/api/admin/attention", &auth))
+        .await
+        .json();
+    assert!(cleared["items"].as_array().unwrap().is_empty());
+    assert_eq!(cleared["completeness"], "complete");
+}
+
+#[tokio::test]
+async fn attention_rechecks_override_expiry_allowed_hours_and_retry_eligibility() {
+    let h = harness().await;
+    h.map_root().await;
+    sqlx::query(
+        "INSERT INTO peers(id,name,url,secret_enc,status,created_at)
+         VALUES ('peer','Example','https://peer.example','unused','online',?)",
+    )
+    .bind(crate::db::now())
+    .execute(&h.state.db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO shares(id,name,root_id,path,peer_ids_json,enabled)
+         VALUES ('share','Archive','photos','','[]',1)",
+    )
+    .execute(&h.state.db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO transfers(id,peer_id,share_id,rel_path,sha256,size,vv_json,status,queued_at,updated_at)
+         VALUES ('transfer','peer','share','photo.jpg','synthetic',1,'{}','queued',?,?)",
+    ).bind(crate::db::now()).bind(crate::db::now()).execute(&h.state.db).await.unwrap();
+    crate::db::set_setting(
+        &h.state.db,
+        "sync_schedule",
+        &json!({"timezone":"UTC","windows":[{"days":[],"start":"00:00","end":"00:00"}]})
+            .to_string(),
+    )
+    .await
+    .unwrap();
+    let until = crate::db::ts(chrono::Utc::now() + chrono::Duration::minutes(5));
+    sqlx::query(
+        "INSERT INTO overrides(id,share_id,peer_id,until,reason,created_at)
+         VALUES ('override','share','peer',?,'synthetic',?)",
+    )
+    .bind(&until)
+    .bind(crate::db::now())
+    .execute(&h.state.db)
+    .await
+    .unwrap();
+    let auth = [("cookie", h.cookie.as_str())];
+    let allowed = send(&h.app, get("/api/admin/attention", &auth))
+        .await
+        .json();
+    let item = allowed["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["code"] == "transfer_evidence_unavailable")
+        .unwrap();
+    assert_eq!(item["recheck_at"], until);
+    assert!(
+        !allowed["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["code"] == "transfer_scheduled")
+    );
+    sqlx::query("UPDATE overrides SET revoked_at=?")
+        .bind(crate::db::now())
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    let closed = send(&h.app, get("/api/admin/attention", &auth))
+        .await
+        .json();
+    let item = closed["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["code"] == "transfer_scheduled")
+        .unwrap();
+    assert!(item["next_at"].is_null());
+    assert_eq!(item["blocks_work"], true);
+
+    let now = chrono::Utc::now();
+    let start = (now - chrono::Duration::hours(1))
+        .format("%H:%M")
+        .to_string();
+    let end = (now + chrono::Duration::hours(1))
+        .format("%H:%M")
+        .to_string();
+    crate::db::set_setting(
+        &h.state.db,
+        "sync_schedule",
+        &json!({"timezone":"UTC","windows":[{"days":[0,1,2,3,4,5,6],"start":start,"end":end}]})
+            .to_string(),
+    )
+    .await
+    .unwrap();
+    let allowed = send(&h.app, get("/api/admin/attention", &auth))
+        .await
+        .json();
+    let item = allowed["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["code"] == "transfer_evidence_unavailable")
+        .unwrap();
+    let transition = crate::db::parse_ts(item["recheck_at"].as_str().unwrap()).unwrap();
+    assert!(transition > now && transition <= now + chrono::Duration::hours(1));
+    assert_eq!(transition.format("%H:%M").to_string(), end);
+    sqlx::query("UPDATE transfers SET attempts=1,updated_at=?")
+        .bind(crate::db::now())
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    let retry = send(&h.app, get("/api/admin/attention", &auth))
+        .await
+        .json();
+    let item = retry["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["code"] == "transfer_backoff")
+        .unwrap();
+    assert!(item["next_at"].is_string());
+    assert_eq!(item["recheck_at"], item["next_at"]);
+    assert_eq!(retry["completeness"], "partial");
+    assert!(
+        retry["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| warning.as_str().unwrap().contains("Paired instances"))
+    );
+}
+
+#[tokio::test]
 async fn attention_requires_admin_and_distinguishes_recovery_from_historical_failure() {
     let h = harness().await;
     let uri = "/api/admin/attention";

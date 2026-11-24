@@ -69,8 +69,22 @@ Queued comparisons are reported as blocked if both comparison workers have been 
 Individual per-peer polling or activity-refresh exits may still only be logged and retried.
 Queue-wide reasons are reported only when supported by group-wide evidence; file-specific
 readiness and worker liveness can remain unknown. A timed-out mapped-root check is shown as
-unavailable evidence, not proof that the root or transfers are blocked. Structured attention
-reports are currently partial, and overlapping condition counts must not be added as distinct files.
+unavailable evidence, not proof that the root or transfers are blocked. Operations and structured
+attention also include unresolved conflict decisions, server maintenance and compatibility gates,
+unavailable mappings even without queued transfers, paused file detection, and failed library
+synchronizations. Each points to the controls needed to resolve it; scheduled maintenance waits
+continue automatically. A chosen conflict resolution is not reported as another pending decision.
+Snapshot completeness reflects the available evidence: unchecked file dependencies, timed-out
+folder checks, unreadable maintenance, and missing remote conditions keep the report partial.
+Paired instances currently report receiver transfers, not their full attention state.
+Per-code and owner coverage separately identifies authoritative sources: a missing item from a
+complete source can be cleared even if an unrelated source keeps the overall snapshot partial.
+Missing or partial source coverage cannot establish that a prior condition has cleared.
+Overlapping condition counts must not be added as distinct files. Library failure counts cover
+retained synchronization requests, not files; a historical failure without retained work is not
+marked as blocking. Refresh hints cover transfer-window openings and closings, override expiry,
+retry eligibility and scheduled synchronization. Unavailable folders are rechecked without
+predicting when they will become available.
 Retained peer inbox and inventory errors describe the last recorded attempt; generic errors do not
 by themselves establish that work is still blocked.
 

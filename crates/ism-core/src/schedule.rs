@@ -84,6 +84,15 @@ impl Schedule {
         if self.is_allowed(now) {
             return Some(now);
         }
+        self.next_transition(now)
+    }
+
+    /// The next minute when allowed-hours eligibility changes (within 8 days).
+    pub fn next_transition(&self, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        if self.windows.is_empty() {
+            return None;
+        }
+        let allowed = self.is_allowed(now);
         let start = now
             .with_second(0)
             .and_then(|t| t.with_nanosecond(0))
@@ -91,7 +100,7 @@ impl Schedule {
             + Duration::minutes(1);
         (0..8 * 24 * 60)
             .map(|m| start + Duration::minutes(m))
-            .find(|t| self.is_allowed(*t))
+            .find(|t| self.is_allowed(*t) != allowed)
     }
 }
 
@@ -157,6 +166,33 @@ mod tests {
         assert!(!s.is_allowed(utc(2026, 1, 15, 5, 30)));
         assert!(s.is_allowed(utc(2026, 7, 15, 5, 30)));
         assert!(!s.is_allowed(utc(2026, 7, 15, 9, 30)));
+    }
+
+    #[test]
+    fn transitions_follow_combined_windows_and_daylight_saving() {
+        let mut windows = every_day("08:00", "12:00");
+        windows.extend(every_day("11:00", "16:00"));
+        let s = Schedule::new("UTC", &windows).unwrap();
+        assert_eq!(
+            s.next_transition(utc(2026, 1, 1, 10, 0)),
+            Some(utc(2026, 1, 1, 16, 0))
+        );
+        assert_eq!(
+            s.next_transition(utc(2026, 1, 1, 17, 0)),
+            Some(utc(2026, 1, 2, 8, 0))
+        );
+        let s = Schedule::new("America/New_York", &every_day("01:00", "02:00")).unwrap();
+        // Both occurrences of 01:00 during the autumn clock change remain allowed.
+        assert_eq!(
+            s.next_transition(utc(2026, 11, 1, 5, 30)),
+            Some(utc(2026, 11, 1, 7, 0))
+        );
+        assert_eq!(
+            Schedule::new("UTC", &[])
+                .unwrap()
+                .next_transition(Utc::now()),
+            None
+        );
     }
 
     #[test]

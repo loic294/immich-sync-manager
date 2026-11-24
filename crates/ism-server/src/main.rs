@@ -12,6 +12,7 @@ mod error;
 mod files;
 mod immich;
 mod inbox_evidence;
+mod local_evidence;
 mod maintenance;
 mod ops;
 mod peer_evidence;
