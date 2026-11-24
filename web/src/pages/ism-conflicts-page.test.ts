@@ -124,6 +124,73 @@ describe('ism-conflicts-page', () => {
   });
   afterEach(() => vi.restoreAllMocks());
 
+  it('explains an ineligible page and lets selection continue on files needing review', async () => {
+    const get = vi.spyOn(api, 'get').mockImplementation(async (path, options) => {
+      if (path.endsWith('/versions')) return versions as never;
+      const needsReview = options?.query?.status === 'needs_decision';
+      return {
+        rows: [
+          {
+            owner: 'local',
+            conflict: needsReview
+              ? conflict
+              : {
+                  ...conflict,
+                  status: 'resolving',
+                  recovery: {
+                    target: { kind: 'conflict', id: conflict.id, peer_id: null },
+                    title: 'Example waiting file',
+                    state: 'waiting',
+                    code: 'awaiting_completion',
+                    detail: null,
+                    can_fix: false,
+                    can_dismiss: false,
+                    replacement_operation_id: null,
+                  },
+                },
+          },
+        ],
+        total: 101,
+        filters: [],
+      } as never;
+    });
+    const page = await mount('ism-conflicts-page');
+    await vi.waitFor(() => expect(page.textContent).toContain('Waiting to continue'));
+    page.share = 'Photos';
+    page.folder = 'Trips';
+    page.offset = 50;
+    await enableSelection(page);
+    expect(page.querySelector('[aria-label="Batch conflict decisions"]')?.textContent).toContain(
+      'Only files needing review',
+    );
+    expect(page.querySelectorAll('input[aria-label^="Select photos:"]')).toHaveLength(0);
+    const showReview = [...page.querySelectorAll<HTMLButtonElement>('button')].find(
+      (button) => button.textContent?.trim() === 'Show files needing review',
+    );
+    expect(showReview).toBeDefined();
+    showReview?.click();
+    await vi.waitFor(() =>
+      expect(get).toHaveBeenCalledWith('/api/admin/conflicts/page', {
+        query: {
+          resolved_only: false,
+          limit: 50,
+          offset: 0,
+          share: 'Photos',
+          folder: 'Trips',
+          status: 'needs_decision',
+        },
+      }),
+    );
+    await vi.waitFor(() =>
+      expect(page.querySelectorAll('input[aria-label^="Select photos:"]')).toHaveLength(1),
+    );
+    expect(page.selecting).toBe(true);
+    expect(page.filtersOpen).toBe(true);
+    page.querySelector<HTMLInputElement>('[aria-label="Select photos:a.jpg"]')?.click();
+    await vi.waitFor(() => expect(page.textContent).toContain('1 of 1 ready'));
+    expect(page.selected.size).toBe(1);
+  });
+
   it('keeps bulk readiness through preparation notifications but rechecks genuinely changed revisions', async () => {
     const rows = Array.from({ length: 51 }, (_, index) => ({
       owner: 'local',
@@ -341,6 +408,16 @@ describe('ism-conflicts-page', () => {
     expect(page.textContent).not.toContain('photos:a.jpg');
     expect(page.querySelector('ism-recovery-versions')).toBeNull();
     expect(get.mock.calls.some(([path]) => path.endsWith('/versions'))).toBe(false);
+    await enableSelection(page);
+    expect(page.querySelector('[aria-label="Batch conflict decisions"]')?.textContent).toContain(
+      'Resolved files cannot receive another version decision',
+    );
+    expect(
+      [...page.querySelectorAll('button')].some(
+        (button) => button.textContent?.trim() === 'Show files needing review',
+      ),
+    ).toBe(false);
+    expect(page.querySelectorAll('input[aria-label^="Select photos:"]')).toHaveLength(0);
   });
 
   it('discards stale results when filters change during a request', async () => {
