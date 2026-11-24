@@ -58,6 +58,7 @@ pub struct Inner {
     pub peer_configuration: watch::Sender<()>,
     pub peer_streams: crate::peers::notifications::Streams,
     pub(crate) peer_attention: crate::peers::attention::Cache,
+    pub(crate) peer_evidence: Mutex<crate::peer_evidence::Cache>,
     pub(crate) worker_evidence: crate::worker_evidence::Registry,
     /// Bounds background root probes when a network mount stops responding.
     pub queue_root_probes: Arc<Semaphore>,
@@ -135,6 +136,7 @@ impl AppState {
             peer_configuration,
             peer_streams: crate::peers::notifications::Streams::default(),
             peer_attention: crate::peers::attention::Cache::default(),
+            peer_evidence: Mutex::new(crate::peer_evidence::Cache::default()),
             worker_evidence: crate::worker_evidence::Registry::default(),
             queue_root_probes: Arc::new(Semaphore::new(crate::queue_evidence::ROOT_PROBE_LIMIT)),
             ops_wake: Notify::new(),

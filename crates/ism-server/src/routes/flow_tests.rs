@@ -29,6 +29,51 @@ struct Reply {
 }
 
 #[tokio::test]
+async fn watch_snapshot_ranges_keep_exact_paths_without_adjacent_prefixes_or_duplicates() {
+    let h = harness().await;
+    sqlx::query(
+        "INSERT INTO mappings(root_id,name,container_path,created_at) VALUES('photos','Archive','/photos',?)",
+    )
+    .bind(crate::db::now())
+    .execute(&h.state.db)
+    .await
+    .unwrap();
+    for path in [
+        "trip",
+        "trip/a.jpg",
+        "trip/nested/b.jpg",
+        "trip0/a.jpg",
+        "trip2",
+    ] {
+        sqlx::query(
+            "INSERT INTO watch_snapshot(root_id,rel_path,size,mtime_ns,inode) VALUES('photos',?,1,2,3)",
+        )
+        .bind(path)
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    }
+    let scoped = crate::watch::poll::load(&h.state, "photos", Some("trip"))
+        .await
+        .unwrap();
+    assert_eq!(
+        scoped.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["trip", "trip/a.jpg", "trip/nested/b.jpg"]
+    );
+    let all = crate::watch::poll::load(&h.state, "photos", None)
+        .await
+        .unwrap();
+    assert_eq!(all.len(), 5);
+    assert_eq!(
+        crate::watch::poll::load(&h.state, "photos", Some("trip/a.jpg"))
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn background_activity_requires_admin_and_keeps_current_work_outside_history_pagination() {
     let h = harness().await;
     let uri = "/api/admin/operations/background?limit=1&offset=99";

@@ -50,7 +50,9 @@ const UPLOAD_ASSET_QUERY: &str = "WITH matched AS NOT MATERIALIZED (
     JOIN operation_items i ON i.operation_id=u.operation_id
     WHERE i.kind='publish_upload' AND i.status='done' AND i.result_json IS NOT NULL
       AND json_extract(i.result_json,'$.asset_id') IS NULL
-      AND (json_extract(u.request_json,'$.existing_original.name') IS NOT NULL
+      AND u.has_original IS NOT 0
+      AND (u.has_original=1
+           OR json_extract(u.request_json,'$.existing_original.name') IS NOT NULL
            OR EXISTS(SELECT 1 FROM json_each(u.request_json,'$.files') f
                      WHERE json_extract(f.value,'$.role')='original'))
 ), summary AS (
@@ -923,6 +925,20 @@ mod tests {
             upload_asset_activity(&pool).await.unwrap().unwrap().count,
             1
         );
+        sqlx::query("UPDATE uploads SET request_json='{\"files\":[{\"role\":\"sidecar\"}]}'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(upload_asset_activity(&pool).await.unwrap().is_none());
+        sqlx::query("UPDATE uploads SET request_json=?")
+            .bind(r#"{"files":[{"role":"sidecar"},{"role":"original"}]}"#)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            upload_asset_activity(&pool).await.unwrap().unwrap().count,
+            1
+        );
         sqlx::query("DELETE FROM uploads")
             .execute(&pool)
             .await
@@ -981,6 +997,12 @@ mod tests {
             .await
             .unwrap();
         sqlx::query("UPDATE uploads SET request_json='invalid' WHERE id='upload-7'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(upload_asset_activity(&pool).await.is_err());
+        sqlx::query("UPDATE uploads SET request_json=? WHERE id='upload-7'")
+            .bind(r#"{"files":["not-an-object"]}"#)
             .execute(&pool)
             .await
             .unwrap();
