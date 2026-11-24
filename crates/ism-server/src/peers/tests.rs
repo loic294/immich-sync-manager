@@ -29,6 +29,522 @@ use crate::config::Config;
 use crate::crypto::SecretBox;
 use crate::state::AppState;
 
+async fn request_backfill(
+    state: &AppState,
+    share_id: &str,
+    peer_id: &str,
+) -> super::inbox::BackfillRequest {
+    let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await.unwrap();
+    super::mark_backfill_in(&mut tx, share_id, peer_id)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let (after, generation): (String, i64) = sqlx::query_as(
+        "SELECT after_path, generation FROM share_backfills WHERE share_id = ? AND peer_id = ?",
+    )
+    .bind(share_id)
+    .bind(peer_id)
+    .fetch_one(&state.db)
+    .await
+    .unwrap();
+    super::inbox::BackfillRequest {
+        share_id: share_id.to_owned(),
+        after,
+        generation,
+    }
+}
+
+fn inventory_page(path: &str, final_page: bool) -> super::InventoryPage {
+    super::InventoryPage {
+        entries: vec![super::InventoryEntry {
+            path: path.into(),
+            sha256: Some("a".repeat(64)),
+            size: 1,
+            mtime_ns: 1,
+            deleted: false,
+            vv: VersionVector::default(),
+        }],
+        next: (!final_page).then(|| path.to_owned()),
+    }
+}
+
+#[tokio::test]
+async fn backfill_rejects_an_http_page_from_before_restart() {
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    let peer = super::net::peers(&b.state).await.unwrap().remove(0);
+    let source_share = super::shares(&a.state).await.unwrap().remove(0);
+    let receiver_share = super::shares(&b.state).await.unwrap().remove(0);
+    let deleted = super::Row {
+        size: 0,
+        mtime_ns: 0,
+        sha256: None,
+        deleted: true,
+        vv: VersionVector::default(),
+    };
+    super::put_row(&a.state, &source_share.id, "stale.jpg", &deleted)
+        .await
+        .unwrap();
+    let old = request_backfill(&b.state, &receiver_share.id, &peer.id).await;
+    let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+    let release = std::sync::Arc::new(tokio::sync::Notify::new());
+    *a.inventory_response.lock().unwrap() = Some(InventoryResponseControl::Hold {
+        entered: entered.clone(),
+        release: release.clone(),
+    });
+    let state = b.state.clone();
+    let remote = peer.clone();
+    let in_flight = tokio::spawn(async move { super::backfill(&state, &remote).await });
+    tokio::time::timeout(Duration::from_secs(5), entered.notified())
+        .await
+        .expect("inventory response must be in flight");
+
+    let current = request_backfill(&b.state, &receiver_share.id, &peer.id).await;
+    assert!(current.generation > old.generation);
+    sqlx::query("DELETE FROM replica_files WHERE share_id = ? AND rel_path = 'stale.jpg'")
+        .bind(&source_share.id)
+        .execute(&a.state.db)
+        .await
+        .unwrap();
+    super::put_row(&a.state, &source_share.id, "fresh.jpg", &deleted)
+        .await
+        .unwrap();
+    release.notify_one();
+    let error = tokio::time::timeout(Duration::from_secs(5), in_flight)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert!(error.contains("backfill") && error.contains("changed"));
+    let pending: (String, i64) = sqlx::query_as(
+        "SELECT after_path, generation FROM share_backfills WHERE share_id = ? AND peer_id = ?",
+    )
+    .bind(&receiver_share.id)
+    .bind(&peer.id)
+    .fetch_one(&b.state.db)
+    .await
+    .unwrap();
+    assert_eq!(pending, (String::new(), current.generation));
+    let stale: i64 = sqlx::query_scalar(
+        "SELECT (SELECT COUNT(*) FROM peer_backfill_inbox WHERE share_id = ? AND path = 'stale.jpg') +
+                (SELECT COUNT(*) FROM replica_files WHERE share_id = ? AND rel_path = 'stale.jpg')",
+    )
+    .bind(&receiver_share.id)
+    .bind(&receiver_share.id)
+    .fetch_one(&b.state.db)
+    .await
+    .unwrap();
+    assert_eq!(stale, 0);
+
+    super::backfill(&b.state, &peer).await.unwrap();
+    let completed: bool = sqlx::query_scalar(
+        "SELECT NOT EXISTS(SELECT 1 FROM share_backfills WHERE share_id = ? AND peer_id = ?)
+         AND EXISTS(SELECT 1 FROM replica_files WHERE share_id = ? AND rel_path = 'fresh.jpg' AND deleted = 1)",
+    )
+    .bind(&receiver_share.id)
+    .bind(&peer.id)
+    .bind(&receiver_share.id)
+    .fetch_one(&b.state.db)
+    .await
+    .unwrap();
+    assert!(completed);
+}
+
+#[tokio::test]
+async fn backfill_rejects_an_http_page_after_other_membership_changes_and_reverts() {
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    let peer = super::net::peers(&b.state).await.unwrap().remove(0);
+    let source_share = super::shares(&a.state).await.unwrap().remove(0);
+    let share = super::shares(&b.state).await.unwrap().remove(0);
+    sqlx::query(
+        "INSERT INTO peers(id, name, url, instance_id, secret_enc, status, created_at)
+         SELECT 'other-peer', 'Other', url, 'other-instance', secret_enc, status, created_at
+         FROM peers WHERE id = ?",
+    )
+    .bind(&peer.id)
+    .execute(&b.state.db)
+    .await
+    .unwrap();
+    let update = |peer_ids: Vec<String>| ShareInput {
+        name: share.name.clone(),
+        location: Location {
+            root_id: share.root_id.clone(),
+            path: share.path.as_str().to_owned(),
+        },
+        peer_ids,
+        enabled: true,
+    };
+    let both = vec![peer.id.clone(), "other-peer".to_owned()];
+    admin::update_share(&b.state, &share.id, update(both.clone()))
+        .await
+        .unwrap();
+    let deleted = super::Row {
+        size: 0,
+        mtime_ns: 0,
+        sha256: None,
+        deleted: true,
+        vv: VersionVector::default(),
+    };
+    super::put_row(&a.state, &source_share.id, "stale.jpg", &deleted)
+        .await
+        .unwrap();
+    let old = request_backfill(&b.state, &share.id, &peer.id).await;
+    let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+    let release = std::sync::Arc::new(tokio::sync::Notify::new());
+    *a.inventory_response.lock().unwrap() = Some(InventoryResponseControl::Hold {
+        entered: entered.clone(),
+        release: release.clone(),
+    });
+    let state = b.state.clone();
+    let remote = peer.clone();
+    let in_flight = tokio::spawn(async move { super::backfill(&state, &remote).await });
+    tokio::time::timeout(Duration::from_secs(5), entered.notified())
+        .await
+        .expect("inventory response must be in flight");
+
+    admin::update_share(&b.state, &share.id, update(vec![peer.id.clone()]))
+        .await
+        .unwrap();
+    admin::update_share(&b.state, &share.id, update(both.clone()))
+        .await
+        .unwrap();
+    let current_share = super::shares(&b.state).await.unwrap().remove(0);
+    assert_eq!(current_share.peer_ids, both);
+    let (after, generation): (String, i64) = sqlx::query_as(
+        "SELECT after_path, generation FROM share_backfills WHERE share_id = ? AND peer_id = ?",
+    )
+    .bind(&share.id)
+    .bind(&peer.id)
+    .fetch_one(&b.state.db)
+    .await
+    .unwrap();
+    assert_eq!(after, "");
+    assert!(generation > old.generation);
+    release.notify_one();
+    let error = tokio::time::timeout(Duration::from_secs(5), in_flight)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert!(error.contains("backfill") && error.contains("changed"));
+    let unchanged: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM share_backfills
+                       WHERE share_id = ? AND peer_id = ? AND after_path = '' AND generation = ?)
+         AND NOT EXISTS(SELECT 1 FROM peer_backfill_inbox WHERE share_id = ? AND path = 'stale.jpg')
+         AND NOT EXISTS(SELECT 1 FROM replica_files WHERE share_id = ? AND rel_path = 'stale.jpg')",
+    )
+    .bind(&share.id)
+    .bind(&peer.id)
+    .bind(generation)
+    .bind(&share.id)
+    .bind(&share.id)
+    .fetch_one(&b.state.db)
+    .await
+    .unwrap();
+    assert!(unchanged);
+    super::backfill(&b.state, &peer).await.unwrap();
+    let applied: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM replica_files WHERE share_id = ? AND rel_path = 'stale.jpg' AND deleted = 1)
+         AND NOT EXISTS(SELECT 1 FROM share_backfills WHERE share_id = ? AND peer_id = ?)",
+    )
+    .bind(&share.id)
+    .bind(&share.id)
+    .bind(&peer.id)
+    .fetch_one(&b.state.db)
+    .await
+    .unwrap();
+    assert!(applied);
+}
+
+#[tokio::test]
+async fn malformed_inventory_page_reports_error_and_replays_independent_receipts() {
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    let peer = super::net::peers(&b.state).await.unwrap().remove(0);
+    let share = super::shares(&b.state).await.unwrap().remove(0);
+    let request = request_backfill(&b.state, &share.id, &peer.id).await;
+    let mut entry = inventory_page("independent.jpg", true).entries.remove(0);
+    entry.deleted = true;
+    entry.sha256 = None;
+    sqlx::query(
+        "INSERT INTO peer_backfill_inbox (peer_id, share_id, path, entry_json) VALUES (?, ?, ?, ?)",
+    )
+    .bind(&peer.id)
+    .bind(&share.id)
+    .bind(&entry.path)
+    .bind(serde_json::to_string(&entry).unwrap())
+    .execute(&b.state.db)
+    .await
+    .unwrap();
+    *a.inventory_response.lock().unwrap() = Some(InventoryResponseControl::Malformed);
+    let error = super::backfill(&b.state, &peer).await.unwrap_err();
+    assert!(error.contains("invalid peer inventory cursor"));
+    let persisted: (String, i64, bool, bool) = sqlx::query_as(
+        "SELECT after_path, generation,
+         EXISTS(SELECT 1 FROM peer_backfill_inbox WHERE peer_id = ? AND share_id = ? AND path = 'independent.jpg'),
+         EXISTS(SELECT 1 FROM replica_files WHERE share_id = ? AND rel_path = 'independent.jpg' AND deleted = 1)
+         FROM share_backfills WHERE peer_id = ? AND share_id = ?",
+    )
+    .bind(&peer.id)
+    .bind(&share.id)
+    .bind(&share.id)
+    .bind(&peer.id)
+    .bind(&share.id)
+    .fetch_one(&b.state.db)
+    .await
+    .unwrap();
+    assert_eq!(persisted, (String::new(), request.generation, false, true));
+}
+
+#[tokio::test]
+async fn backfill_generation_fences_stale_pages_and_survives_recreation_and_restart() {
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    let peer = super::net::peers(&b.state).await.unwrap().remove(0);
+    let share = super::shares(&b.state).await.unwrap().remove(0);
+    let old = request_backfill(&b.state, &share.id, &peer.id).await;
+    let fetched_share = super::inbox::begin_backfill(&b.state, &peer, &old)
+        .await
+        .unwrap()
+        .unwrap();
+    let current = request_backfill(&b.state, &share.id, &peer.id).await;
+    assert!(current.generation > old.generation);
+    assert_eq!(
+        super::inbox::begin_backfill(&b.state, &peer, &old)
+            .await
+            .unwrap_err()
+            .code(),
+        "peer_backfill_changed"
+    );
+    for final_page in [false, true] {
+        let error = super::inbox::admit_inventory(
+            &b.state,
+            &peer,
+            &fetched_share,
+            &old,
+            &inventory_page("stale.jpg", final_page),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), "peer_backfill_changed");
+    }
+    let state: (String, i64, Option<String>, i64) = sqlx::query_as(
+        "SELECT after_path, generation, attempted_at,
+         (SELECT COUNT(*) FROM peer_backfill_inbox WHERE peer_id = ? AND share_id = ?)
+         FROM share_backfills WHERE peer_id = ? AND share_id = ?",
+    )
+    .bind(&peer.id)
+    .bind(&share.id)
+    .bind(&peer.id)
+    .bind(&share.id)
+    .fetch_one(&b.state.db)
+    .await
+    .unwrap();
+    assert_eq!(state, (String::new(), current.generation, None, 0));
+
+    sqlx::query("DELETE FROM share_backfills WHERE peer_id = ? AND share_id = ?")
+        .bind(&peer.id)
+        .bind(&share.id)
+        .execute(&b.state.db)
+        .await
+        .unwrap();
+    let recreated = request_backfill(&b.state, &share.id, &peer.id).await;
+    assert!(recreated.generation > current.generation);
+    for task in b.tasks.drain(..) {
+        task.abort();
+        let _ = task.await;
+    }
+    b.state.db.close().await;
+    let reopened_pool = crate::db::connect(b._dir.path()).await.unwrap();
+    let secrets = SecretBox::open_or_create(b._dir.path()).unwrap();
+    let restarted = AppState::new(Config::for_tests(b._dir.path()), reopened_pool, secrets)
+        .await
+        .unwrap();
+    assert_eq!(
+        super::inbox::admit_inventory(
+            &restarted,
+            &peer,
+            &fetched_share,
+            &current,
+            &inventory_page("old-final.jpg", true),
+        )
+        .await
+        .unwrap_err()
+        .code(),
+        "peer_backfill_changed"
+    );
+    let fresh_share = super::inbox::begin_backfill(&restarted, &peer, &recreated)
+        .await
+        .unwrap()
+        .unwrap();
+    super::inbox::admit_inventory(
+        &restarted,
+        &peer,
+        &fresh_share,
+        &recreated,
+        &inventory_page("current.jpg", false),
+    )
+    .await
+    .unwrap();
+    let next_page = super::inbox::BackfillRequest {
+        share_id: share.id.clone(),
+        after: "current.jpg".into(),
+        generation: recreated.generation,
+    };
+    super::inbox::admit_inventory(
+        &restarted,
+        &peer,
+        &fresh_share,
+        &next_page,
+        &inventory_page("next.jpg", true),
+    )
+    .await
+    .unwrap();
+    let rows: Vec<String> = sqlx::query_scalar(
+        "SELECT path FROM peer_backfill_inbox WHERE peer_id = ? AND share_id = ? ORDER BY path",
+    )
+    .bind(&peer.id)
+    .bind(&share.id)
+    .fetch_all(&restarted.db)
+    .await
+    .unwrap();
+    assert_eq!(rows, vec!["current.jpg", "next.jpg"]);
+    let next = request_backfill(&restarted, &share.id, &peer.id).await;
+    assert!(next.generation > recreated.generation);
+}
+
+#[tokio::test]
+async fn backfill_admission_rechecks_membership_and_other_shares_progress() {
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    let peer = super::net::peers(&b.state).await.unwrap().remove(0);
+    let share = super::shares(&b.state).await.unwrap().remove(0);
+    sqlx::query(
+        "INSERT INTO shares (id, name, root_id, path, peer_ids_json, enabled)
+         SELECT 'independent-share', 'Independent', root_id, 'other', peer_ids_json, enabled
+         FROM shares WHERE id = ?",
+    )
+    .bind(&share.id)
+    .execute(&b.state.db)
+    .await
+    .unwrap();
+    let pending = request_backfill(&b.state, &share.id, &peer.id).await;
+    let fetched_share = super::inbox::begin_backfill(&b.state, &peer, &pending)
+        .await
+        .unwrap()
+        .unwrap();
+    sqlx::query("UPDATE shares SET peer_ids_json = '[]' WHERE id = ?")
+        .bind(&share.id)
+        .execute(&b.state.db)
+        .await
+        .unwrap();
+    assert_eq!(
+        super::inbox::admit_inventory(
+            &b.state,
+            &peer,
+            &fetched_share,
+            &pending,
+            &inventory_page("stale.jpg", true),
+        )
+        .await
+        .unwrap_err()
+        .code(),
+        "peer_backfill_changed"
+    );
+    let independent = request_backfill(&b.state, "independent-share", &peer.id).await;
+    let independent_share = super::inbox::begin_backfill(&b.state, &peer, &independent)
+        .await
+        .unwrap()
+        .unwrap();
+    super::inbox::admit_inventory(
+        &b.state,
+        &peer,
+        &independent_share,
+        &independent,
+        &inventory_page("independent.jpg", true),
+    )
+    .await
+    .unwrap();
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM peer_backfill_inbox WHERE peer_id = ? AND share_id = ?",
+    )
+    .bind(&peer.id)
+    .bind(&share.id)
+    .fetch_one(&b.state.db)
+    .await
+    .unwrap();
+    assert_eq!(count, 0);
+    let newer = request_backfill(&b.state, &share.id, &peer.id).await;
+    assert_eq!(
+        super::inbox::begin_backfill(&b.state, &peer, &pending)
+            .await
+            .unwrap_err()
+            .code(),
+        "peer_backfill_changed"
+    );
+    assert!(
+        super::inbox::begin_backfill(&b.state, &peer, &newer)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    sqlx::query("UPDATE shares SET peer_ids_json = ? WHERE id = ?")
+        .bind(serde_json::to_string(&share.peer_ids).unwrap())
+        .bind(&share.id)
+        .execute(&b.state.db)
+        .await
+        .unwrap();
+    let restored = request_backfill(&b.state, &share.id, &peer.id).await;
+    let before_removal = super::inbox::begin_backfill(&b.state, &peer, &restored)
+        .await
+        .unwrap()
+        .unwrap();
+    sqlx::query("UPDATE shares SET enabled = 0 WHERE id = ?")
+        .bind(&share.id)
+        .execute(&b.state.db)
+        .await
+        .unwrap();
+    assert_eq!(
+        super::inbox::admit_inventory(
+            &b.state,
+            &peer,
+            &before_removal,
+            &restored,
+            &inventory_page("disabled.jpg", true),
+        )
+        .await
+        .unwrap_err()
+        .code(),
+        "peer_backfill_changed"
+    );
+    sqlx::query("UPDATE shares SET enabled = 1 WHERE id = ?")
+        .bind(&share.id)
+        .execute(&b.state.db)
+        .await
+        .unwrap();
+    let reenabled = request_backfill(&b.state, &share.id, &peer.id).await;
+    assert!(reenabled.generation > restored.generation);
+    assert_eq!(
+        super::inbox::admit_inventory(
+            &b.state,
+            &peer,
+            &before_removal,
+            &restored,
+            &inventory_page("before-reenable.jpg", true),
+        )
+        .await
+        .unwrap_err()
+        .code(),
+        "peer_backfill_changed"
+    );
+}
+
 #[tokio::test]
 async fn inbox_admission_keeps_cross_peer_and_page_dependencies_and_rolls_back() {
     let (mut a, mut b) = pair().await;
@@ -180,6 +696,14 @@ async fn inbox_admission_keeps_cross_peer_and_page_dependencies_and_rolls_back()
     assert_eq!(persisted, (cursor, 0, false));
 }
 
+enum InventoryResponseControl {
+    Hold {
+        entered: std::sync::Arc<tokio::sync::Notify>,
+        release: std::sync::Arc<tokio::sync::Notify>,
+    },
+    Malformed,
+}
+
 struct Instance {
     _dir: tempfile::TempDir,
     state: AppState,
@@ -192,6 +716,7 @@ struct Instance {
     recovery_status: std::sync::Arc<std::sync::atomic::AtomicU16>,
     evidence_status: std::sync::Arc<std::sync::atomic::AtomicU16>,
     attention_hold: std::sync::Arc<AttentionHold>,
+    inventory_response: std::sync::Arc<std::sync::Mutex<Option<InventoryResponseControl>>>,
 }
 
 #[derive(Default)]
@@ -237,6 +762,7 @@ async fn instance(name: &str) -> Instance {
     let recovery_status = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0));
     let evidence_status = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0));
     let attention_hold = std::sync::Arc::new(AttentionHold::default());
+    let inventory_response = std::sync::Arc::new(std::sync::Mutex::new(None));
     let app = crate::routes::router(state.clone()).layer(axum::middleware::from_fn({
         let requests = requests.clone();
         let status = notification_status.clone();
@@ -244,6 +770,7 @@ async fn instance(name: &str) -> Instance {
         let recovery_status = recovery_status.clone();
         let evidence_status = evidence_status.clone();
         let attention_hold = attention_hold.clone();
+        let inventory_response = inventory_response.clone();
         move |request: axum::extract::Request, next: axum::middleware::Next| {
             let requests = requests.clone();
             let status = status.clone();
@@ -251,9 +778,29 @@ async fn instance(name: &str) -> Instance {
             let recovery_status = recovery_status.clone();
             let evidence_status = evidence_status.clone();
             let attention_hold = attention_hold.clone();
+            let inventory_response = inventory_response.clone();
             async move {
                 let path = request.uri().path().to_owned();
                 *requests.lock().unwrap().entry(path.clone()).or_insert(0) += 1;
+                let control = if path == "/api/peer/v1/inventory" {
+                    inventory_response.lock().unwrap().take()
+                } else {
+                    None
+                };
+                match control {
+                    Some(InventoryResponseControl::Hold { entered, release }) => {
+                        let response = next.run(request).await;
+                        entered.notify_one();
+                        release.notified().await;
+                        return response;
+                    }
+                    Some(InventoryResponseControl::Malformed) => {
+                        return axum::response::IntoResponse::into_response(axum::Json(
+                            serde_json::json!({"entries": [], "next": "invalid"}),
+                        ));
+                    }
+                    None => {}
+                }
                 let status = status.load(std::sync::atomic::Ordering::SeqCst);
                 if path == "/api/peer/v1/notifications" && status != 0 {
                     return axum::response::IntoResponse::into_response(
@@ -317,6 +864,7 @@ async fn instance(name: &str) -> Instance {
         recovery_status,
         evidence_status,
         attention_hold,
+        inventory_response,
     }
 }
 

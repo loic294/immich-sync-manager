@@ -5,6 +5,83 @@ use serde_json::Value;
 
 const INBOX_LIMIT: i64 = 10_000;
 
+pub(super) struct BackfillRequest {
+    pub(super) share_id: String,
+    pub(super) after: String,
+    pub(super) generation: i64,
+}
+
+async fn backfill_share_in(
+    conn: &mut sqlx::SqliteConnection,
+    state: &AppState,
+    share_id: &str,
+) -> AppResult<Option<Share>> {
+    let row: Option<(String, String, String, String, i64)> = sqlx::query_as(
+        "SELECT name, root_id, path, peer_ids_json, enabled FROM shares WHERE id = ?",
+    )
+    .bind(share_id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    row.map(|(name, root_id, path, peers, enabled)| {
+        Ok(Share {
+            id: share_id.to_owned(),
+            name,
+            root_id,
+            path: files::parse_rel(&path)?,
+            peer_ids: serde_json::from_str(&peers)?,
+            enabled: enabled != 0,
+            junk: state.junk_rules(),
+        })
+    })
+    .transpose()
+}
+
+fn backfill_changed() -> AppError {
+    AppError::conflict(
+        "peer_backfill_changed",
+        "share backfill or membership changed while receiving a page; retrying",
+    )
+}
+
+pub(super) async fn begin_backfill(
+    state: &AppState,
+    peer: &net::Peer,
+    request: &BackfillRequest,
+) -> AppResult<Option<Share>> {
+    let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
+    let share = backfill_share_in(&mut tx, state, &request.share_id).await?;
+    let active = share.as_ref().is_some_and(|share| share.includes(&peer.id));
+    let result = if active {
+        sqlx::query(
+            "UPDATE share_backfills SET attempted_at = ?
+             WHERE peer_id = ? AND share_id = ? AND after_path = ? AND generation = ?",
+        )
+        .bind(db::now())
+        .bind(&peer.id)
+        .bind(&request.share_id)
+        .bind(&request.after)
+        .bind(request.generation)
+        .execute(&mut *tx)
+        .await?
+    } else {
+        sqlx::query(
+            "DELETE FROM share_backfills
+             WHERE peer_id = ? AND share_id = ? AND after_path = ? AND generation = ?",
+        )
+        .bind(&peer.id)
+        .bind(&request.share_id)
+        .bind(&request.after)
+        .bind(request.generation)
+        .execute(&mut *tx)
+        .await?
+    };
+    if result.rows_affected() != 1 {
+        return Err(backfill_changed());
+    }
+    tx.commit().await?;
+    Ok(share.filter(|_| active))
+}
+
 pub(super) async fn backfill(state: &AppState, peer: &net::Peer) -> Result<usize, String> {
     crate::activity::observe(
         state,
@@ -28,9 +105,8 @@ async fn backfill_reporting(
     task: &crate::activity::Reporter,
 ) -> Result<usize, String> {
     task.phase("Fetching inventory pages and saving durable receipts");
-    let all = shares(state).await.map_err(|e| e.message().to_owned())?;
-    let pending: Option<(String, String)> = sqlx::query_as(
-        "SELECT share_id, after_path FROM share_backfills WHERE peer_id = ?
+    let pending: Option<(String, String, i64)> = sqlx::query_as(
+        "SELECT share_id, after_path, generation FROM share_backfills WHERE peer_id = ?
          ORDER BY attempted_at IS NOT NULL, attempted_at, requested_at, share_id LIMIT 1",
     )
     .bind(&peer.id)
@@ -38,20 +114,20 @@ async fn backfill_reporting(
     .await
     .map_err(|e| e.to_string())?;
     let mut receipt = Ok(());
-    if let Some((share_id, after)) = pending {
-        sqlx::query(
-            "UPDATE share_backfills SET attempted_at = ? WHERE peer_id = ? AND share_id = ?",
-        )
-        .bind(db::now())
-        .bind(&peer.id)
-        .bind(&share_id)
-        .execute(&state.db)
-        .await
-        .map_err(|e| e.to_string())?;
-        if let Some(share) = all
-            .iter()
-            .find(|s| s.id == share_id && s.includes(&peer.id))
-        {
+    if let Some((share_id, after, generation)) = pending {
+        let request = BackfillRequest {
+            share_id,
+            after,
+            generation,
+        };
+        let share = match begin_backfill(state, peer, &request).await {
+            Ok(share) => share,
+            Err(error) => {
+                receipt = Err(error.message().to_owned());
+                None
+            }
+        };
+        if let Some(share) = share {
             let count: i64 =
                 sqlx::query_scalar("SELECT COUNT(*) FROM peer_backfill_inbox WHERE peer_id = ?")
                     .bind(&peer.id)
@@ -65,51 +141,54 @@ async fn backfill_reporting(
                     &format!(
                         "/api/peer/v1/inventory?share={}&after={}",
                         transfer::encode(&share.name),
-                        transfer::encode(&after)
+                        transfer::encode(&request.after)
                     ),
                 )
                 .await
                 {
-                    Ok(page) => {
-                        page.validate(&after)?;
-                        admit_inventory(state, peer, share, &after, &page)
+                    Ok(page) => match page.validate(&request.after) {
+                        Ok(()) => admit_inventory(state, peer, &share, &request, &page)
                             .await
-                            .map_err(|e| e.message().to_owned())
-                    }
+                            .map_err(|e| e.message().to_owned()),
+                        Err(error) => Err(error),
+                    },
                     Err(error) => Err(error),
                 };
             }
-        } else {
-            sqlx::query("DELETE FROM share_backfills WHERE peer_id = ? AND share_id = ?")
-                .bind(&peer.id)
-                .bind(&share_id)
-                .execute(&state.db)
-                .await
-                .map_err(|e| e.to_string())?;
         }
     }
     task.waiting("Waiting for the replication-operation lock before applying inventory");
     let _guard = state.replication_operation_lock.lock().await;
+    let all = shares(state).await.map_err(|e| e.message().to_owned())?;
     task.phase("Applying inventory entries");
     let applied = replay_inventory(state, peer, &all, task)
         .await
         .map_err(|e| e.message().to_owned())?;
     if applied > 0 {
         state.emit(ServerEvent::SyncChanged);
-        Ok(applied)
-    } else {
-        receipt.map(|_| 0)
     }
+    receipt.map(|_| applied)
 }
 
-async fn admit_inventory(
+pub(super) async fn admit_inventory(
     state: &AppState,
     peer: &net::Peer,
     share: &Share,
-    after: &str,
+    request: &BackfillRequest,
     page: &InventoryPage,
 ) -> AppResult<()> {
     let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
+    let current = backfill_share_in(&mut tx, state, &request.share_id).await?;
+    if !current.as_ref().is_some_and(|current| {
+        current.includes(&peer.id)
+            && current.id == share.id
+            && current.name == share.name
+            && current.root_id == share.root_id
+            && current.path == share.path
+            && current.peer_ids == share.peer_ids
+    }) {
+        return Err(backfill_changed());
+    }
     let count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM peer_backfill_inbox WHERE peer_id = ?")
             .bind(&peer.id)
@@ -132,23 +211,21 @@ async fn admit_inventory(
         .execute(&mut *tx).await?;
     }
     let changed = if let Some(next) = &page.next {
-        sqlx::query("UPDATE share_backfills SET after_path = ? WHERE share_id = ? AND peer_id = ? AND after_path = ?")
-            .bind(next).bind(&share.id).bind(&peer.id).bind(after).execute(&mut *tx).await?
+        sqlx::query("UPDATE share_backfills SET after_path = ? WHERE share_id = ? AND peer_id = ? AND after_path = ? AND generation = ?")
+            .bind(next).bind(&share.id).bind(&peer.id).bind(&request.after).bind(request.generation).execute(&mut *tx).await?
     } else {
         sqlx::query(
-            "DELETE FROM share_backfills WHERE share_id = ? AND peer_id = ? AND after_path = ?",
+            "DELETE FROM share_backfills WHERE share_id = ? AND peer_id = ? AND after_path = ? AND generation = ?",
         )
         .bind(&share.id)
         .bind(&peer.id)
-        .bind(after)
+        .bind(&request.after)
+        .bind(request.generation)
         .execute(&mut *tx)
         .await?
     };
     if changed.rows_affected() != 1 {
-        return Err(AppError::conflict(
-            "peer_backfill_changed",
-            "share backfill restarted while receiving a page; retrying",
-        ));
+        return Err(backfill_changed());
     }
     tx.commit().await?;
     Ok(())

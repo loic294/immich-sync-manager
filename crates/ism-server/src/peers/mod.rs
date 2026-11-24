@@ -1808,13 +1808,28 @@ async fn mark_backfill_in(
         .fetch_one(&mut *conn)
         .await?;
     if known {
+        let generation: Option<i64> = sqlx::query_scalar(
+            "UPDATE share_backfill_generation SET last_generation = last_generation + 1
+                 WHERE id = 1 AND last_generation < 9223372036854775807 RETURNING last_generation",
+        )
+        .fetch_optional(&mut *conn)
+        .await?;
+        let generation = generation.ok_or_else(|| {
+            AppError::conflict(
+                "peer_backfill_generation_exhausted",
+                "cannot create another backfill request",
+            )
+        })?;
         sqlx::query(
-            "INSERT INTO share_backfills (share_id, peer_id, after_path, requested_at) VALUES (?, ?, '', ?)
-             ON CONFLICT(share_id, peer_id) DO UPDATE SET after_path = '', requested_at = excluded.requested_at",
+                "INSERT INTO share_backfills (share_id, peer_id, after_path, requested_at, generation)
+                 VALUES (?, ?, '', ?, ?)
+                 ON CONFLICT(share_id, peer_id) DO UPDATE SET after_path = '', requested_at = excluded.requested_at,
+                     attempted_at = NULL, generation = excluded.generation",
         )
         .bind(share_id)
         .bind(peer_id)
         .bind(db::now())
+        .bind(generation)
         .execute(&mut *conn)
         .await?;
     }

@@ -78,6 +78,10 @@ the peer had just announced it:
 Hidden paths are skipped. Conflicting or uncertain entries are retained in a durable inbox
 while independent entries continue. The inventory position is saved atomically with each received
 page, so a restart cannot lose entries deferred behind a folder operation or an unavailable root.
+A restarted backfill has a new request generation, so a late page from an earlier request cannot
+advance it or insert entries. Changing the share's membership or enabled state restarts its pending
+backfills, even if the change is later reversed. This does not undo pages already admitted or make
+inventory a complete historical record.
 
 Incoming events likewise have separate **received** and **applied** positions. A page advances
 the receipt position only after its identities and payloads are validated and durably stored.
