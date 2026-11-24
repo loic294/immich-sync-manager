@@ -71,12 +71,36 @@ every page, trusting a sender's manifest ID, or verifying only a displayed page 
 The current verifier checks all paths, types, sizes and content hashes again, but returns no
 mutation grant. ISM's barrier cannot freeze external writers; coordinate those writers before
 folder changes. No new UI layout or peer wire contract is introduced by this layer.
+The current move/restore decision journals and trash pre/post-mutation checks still persist
+complete inventory vectors. Pinning a manifest alone cannot make that execution and compensation
+path bounded or establish missing peer history, so it must not lift the decision cap.
+
+Managed `CheckTree` execution and manifest preparation share the bounded streaming scanner.
+Legacy checks compare against the existing expected inventory without building another full
+actual inventory, retaining one visited bit per expected entry to reject duplicate observations.
+They await the scanner's final result, including directory-change and read errors, before any
+subsequent mutation. Expected inventories and persisted journals remain legacy vectors; this
+reduces verification memory but is not the reference-backed execution/compensation contract
+needed to authorize larger reviewed decisions.
+
+That contract needs bounded per-action/per-entry decision storage and journaled path projections.
+Receiver-owned references must bind the owner, target, conflict generation and both sides'
+revisions. Pins must survive queued/restarted execution and incomplete compensation, with
+explicit retention through trash and purge rather than the current review expiry. Peer decisions
+also need negotiated capabilities and complete-history guarantees; without these proofs, larger
+folders remain blocked even when a complete local manifest is available.
 
 Independent paths, shares, and servers continue syncing. Overlapping paths and causally dependent
 events wait, and an unresolved Immich maintenance barrier still protects that server. A replacement
 transfer may pass its own failed parent's path gate, but never that parent's unresolved maintenance
 barrier or another operation's gate. Waiting for busy work, unavailable mounts, or unavailable peer
 evidence does not consume the recovery attempt counter.
+
+Recovery runs up to four jobs per kind, with at most three jobs attributed to one peer within a
+kind. Forwarding uses up to four peers and refills a slot as soon as its worker finishes. These are
+bounded concurrency limits, not guarantees of immediate progress: jobs without an attributable
+peer can fill a kind's slots, and shared maintenance or path barriers still apply. Waiting jobs retry
+after 30 seconds; interrupted claims are recovered before the affected queue resumes.
 
 Recovery checks retained complete staging, upload staging, local copies, and authenticated share
 peers' applicable trash inventories. It can transfer the exact verified file without restoring

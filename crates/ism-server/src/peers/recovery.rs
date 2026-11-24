@@ -2374,104 +2374,295 @@ async fn process(state: &AppState, kind: &str, id: &str) -> AppResult<bool> {
     }
 }
 
+const RECOVERY_CONCURRENCY_PER_KIND: usize = 4;
+const RECOVERY_CONCURRENCY_PER_PEER: usize = 3;
+const RECOVERY_KINDS: [&str; 3] = ["operation", "transfer", "conflict"];
+const FORWARD_CONCURRENCY: usize = 4;
+
+type EligibleJob = (String, String, String, Option<String>);
+
+async fn eligible_jobs(
+    state: &AppState,
+    limit: usize,
+    kind: Option<&str>,
+    active_peers: Option<&std::collections::HashMap<String, usize>>,
+    active_jobs: &[&str],
+) -> AppResult<Vec<EligibleJob>> {
+    let mut peers = active_peers.cloned().unwrap_or_default();
+    let cutoff = (chrono::Utc::now() - chrono::Duration::seconds(30)).to_rfc3339();
+    let mut cursor: Option<(String, String)> = None;
+    let mut jobs = Vec::new();
+    let active_jobs = serde_json::to_string(active_jobs)?;
+    loop {
+        type Row = (String, String, String, Option<String>, String);
+        let saturated = serde_json::to_string(
+            &peers
+                .iter()
+                .filter_map(|(peer, count)| {
+                    (*count >= RECOVERY_CONCURRENCY_PER_PEER).then_some(peer)
+                })
+                .collect::<Vec<_>>(),
+        )?;
+        let rows: Vec<Row> = sqlx::query_as(
+            "WITH candidates AS (SELECT r.id,r.kind,r.target_id,
+                CASE r.kind
+                    WHEN 'conflict' THEN (SELECT peer_id FROM conflicts WHERE id=r.target_id)
+                    WHEN 'transfer' THEN COALESCE(
+                        (SELECT peer_id FROM transfers WHERE id=r.target_id),
+                        (SELECT peer_id FROM transfer_history WHERE id=r.target_id))
+                    WHEN 'operation' THEN (SELECT MIN(peer_id) FROM pending_peer_ops WHERE operation_id=r.target_id)
+                END AS peer_id,
+                r.updated_at
+             FROM sync_recovery r
+             WHERE (r.state='queued' OR (r.state='waiting' AND r.updated_at < ?)
+                 OR (r.state='needs_decision' AND EXISTS(SELECT 1 FROM sync_recovery_links l JOIN conflicts c ON l.kind='conflict' AND c.id=l.target_id
+                     WHERE l.recovery_id=r.id AND c.status='resolved')))
+                AND (? IS NULL OR r.kind=?)
+                AND r.id NOT IN (SELECT value FROM json_each(?))
+                AND (? IS NULL OR (r.updated_at,r.id) > (?,?)))
+             SELECT id,kind,target_id,peer_id,updated_at FROM candidates
+             WHERE peer_id IS NULL OR NOT EXISTS (
+                 SELECT 1 FROM json_each(?) saturated WHERE saturated.value=peer_id
+             )
+             ORDER BY updated_at,id LIMIT 100",
+        )
+        .bind(&cutoff)
+        .bind(kind)
+        .bind(kind)
+        .bind(&active_jobs)
+        .bind(cursor.as_ref().map(|(updated, _)| updated))
+        .bind(cursor.as_ref().map(|(updated, _)| updated))
+        .bind(cursor.as_ref().map(|(_, id)| id))
+        .bind(&saturated)
+        .fetch_all(&state.db)
+        .await?;
+        let count = rows.len();
+        for (job, job_kind, target, peer, updated) in rows {
+            cursor = Some((updated, job.clone()));
+            if let Some(peer) = &peer
+                && active_peers.is_some()
+            {
+                let active = peers.entry(peer.clone()).or_default();
+                if *active >= RECOVERY_CONCURRENCY_PER_PEER {
+                    continue;
+                }
+                *active += 1;
+            }
+            jobs.push((job, job_kind, target, peer));
+            if jobs.len() == limit {
+                return Ok(jobs);
+            }
+        }
+        if count < 100 {
+            return Ok(jobs);
+        }
+    }
+}
+
+async fn run_job(state: &AppState, job: String, kind: String, id: String) -> AppResult<()> {
+    let claimed = sqlx::query(
+        "UPDATE sync_recovery SET state='fixing',updated_at=?
+         WHERE id=? AND (state='queued' OR (state='waiting' AND updated_at < ?)
+             OR (state='needs_decision' AND EXISTS(
+                 SELECT 1 FROM sync_recovery_links l JOIN conflicts c
+                 ON l.kind='conflict' AND c.id=l.target_id
+                 WHERE l.recovery_id=sync_recovery.id AND c.status='resolved')))",
+    )
+    .bind(db::now())
+    .bind(&job)
+    .bind((chrono::Utc::now() - chrono::Duration::seconds(30)).to_rfc3339())
+    .execute(&state.db)
+    .await?;
+    if claimed.rows_affected() != 1 {
+        return Ok(());
+    }
+    state.emit(ServerEvent::SyncChanged);
+    let result = crate::activity::observe(
+        state,
+        format!("recovery:{job}"),
+        "Recovery execution",
+        &format!("{kind}: {id}"),
+        Some("/sync"),
+        |task| {
+            let (kind, id) = (&kind, &id);
+            async move {
+                task.phase("Verifying evidence and applying the recovery plan");
+                process(state, kind, id).await
+            }
+        },
+    )
+    .await;
+    let (status, code, detail, consumes_attempt) = match result {
+        Ok(true) => ("fixed", None, None, false),
+        Ok(false) => (
+            "waiting",
+            Some("awaiting_completion".to_owned()),
+            None,
+            false,
+        ),
+        Err(e) => {
+            tracing::warn!(recovery = %job, code = %e.code(), "recovery deferred: {}", e.message());
+            (
+                if e.code() == "recovery_exhausted" {
+                    "not_retryable"
+                } else if matches!(e.code(), "choose_version" | "version_conflict") {
+                    "needs_decision"
+                } else {
+                    "waiting"
+                },
+                Some(e.code().to_owned()),
+                Some(e.message().to_owned()),
+                !matches!(
+                    e.code(),
+                    "recovery_required"
+                        | "maintenance_blocked"
+                        | "root_unavailable"
+                        | "peer_evidence_unavailable"
+                        | "peer_unreachable"
+                        | "peer_share_changed"
+                        | "recovery_evidence_missing"
+                        | "recovery_evidence_changed"
+                        | "recovery_plan_unchanged"
+                        | "revision_changed"
+                        | "peer_busy"
+                        | "direct_writes_unavailable"
+                        | "choose_version"
+                        | "version_conflict"
+                ),
+            )
+        }
+    };
+    if kind == "conflict" && status == "needs_decision" {
+        super::versions::reprepare(state, &id).await?;
+    }
+    sqlx::query(
+        "UPDATE sync_recovery SET state=?,code=?,detail=?,updated_at=?,attempts=attempts+?
+             WHERE id=? AND state='fixing'",
+    )
+    .bind(status)
+    .bind(code)
+    .bind(&detail)
+    .bind(db::now())
+    .bind(i64::from(consumes_attempt))
+    .bind(&job)
+    .execute(&state.db)
+    .await?;
+    state.emit(ServerEvent::SyncChanged);
+    Ok(())
+}
+
+#[cfg(test)]
 pub async fn tick(state: &AppState) -> AppResult<()> {
     discover(state).await?;
-    let jobs: Vec<(String, String, String)> = sqlx::query_as(
-        "SELECT id,kind,target_id FROM sync_recovery
-         WHERE state='queued' OR (state='waiting' AND updated_at < ?)
-            OR (state='needs_decision' AND EXISTS(SELECT 1 FROM sync_recovery_links l JOIN conflicts c ON l.kind='conflict' AND c.id=l.target_id
-                WHERE l.recovery_id=sync_recovery.id AND c.status='resolved'))
-         ORDER BY updated_at,id LIMIT 50",
-    )
-    .bind((chrono::Utc::now() - chrono::Duration::seconds(30)).to_rfc3339())
-    .fetch_all(&state.db)
-    .await?;
-    for (job, kind, id) in jobs {
-        let claimed = sqlx::query(
-            "UPDATE sync_recovery SET state='fixing',updated_at=?
-             WHERE id=? AND state IN ('queued','waiting','needs_decision')",
-        )
-        .bind(db::now())
-        .bind(&job)
-        .execute(&state.db)
-        .await?;
-        if claimed.rows_affected() != 1 {
-            continue;
-        }
-        state.emit(ServerEvent::SyncChanged);
-        let result = crate::activity::observe(
-            state,
-            format!("recovery:{job}"),
-            "Recovery execution",
-            &format!("{kind}: {id}"),
-            Some("/sync"),
-            |task| {
-                let (kind, id) = (&kind, &id);
-                async move {
-                    task.phase("Verifying evidence and applying the recovery plan");
-                    process(state, kind, id).await
-                }
-            },
-        )
-        .await;
-        let (status, code, detail, consumes_attempt) = match result {
-            Ok(true) => ("fixed", None, None, false),
-            Ok(false) => (
-                "waiting",
-                Some("awaiting_completion".to_owned()),
-                None,
-                false,
-            ),
-            Err(e) => {
-                tracing::warn!(recovery = %job, code = %e.code(), "recovery deferred: {}", e.message());
-                (
-                    if e.code() == "recovery_exhausted" {
-                        "not_retryable"
-                    } else if matches!(e.code(), "choose_version" | "version_conflict") {
-                        "needs_decision"
-                    } else {
-                        "waiting"
-                    },
-                    Some(e.code().to_owned()),
-                    Some(e.message().to_owned()),
-                    !matches!(
-                        e.code(),
-                        "recovery_required"
-                            | "maintenance_blocked"
-                            | "root_unavailable"
-                            | "peer_evidence_unavailable"
-                            | "peer_unreachable"
-                            | "peer_share_changed"
-                            | "recovery_evidence_missing"
-                            | "recovery_evidence_changed"
-                            | "recovery_plan_unchanged"
-                            | "revision_changed"
-                            | "peer_busy"
-                            | "direct_writes_unavailable"
-                            | "choose_version"
-                            | "version_conflict"
-                    ),
-                )
-            }
-        };
-        if kind == "conflict" && status == "needs_decision" {
-            super::versions::reprepare(state, &id).await?;
-        }
-        sqlx::query(
-            "UPDATE sync_recovery SET state=?,code=?,detail=?,updated_at=?,attempts=attempts+?
-             WHERE id=? AND state='fixing'",
-        )
-        .bind(status)
-        .bind(code)
-        .bind(&detail)
-        .bind(db::now())
-        .bind(i64::from(consumes_attempt))
-        .bind(&job)
-        .execute(&state.db)
-        .await?;
-        state.emit(ServerEvent::SyncChanged);
+    for (job, kind, id, _) in eligible_jobs(state, 50, None, None, &[]).await? {
+        run_job(state, job, kind, id).await?;
     }
     Ok(())
+}
+
+async fn local_loop(state: AppState) {
+    let mut workers = tokio::task::JoinSet::new();
+    let mut running: std::collections::HashMap<tokio::task::Id, (&str, String, Option<String>)> =
+        std::collections::HashMap::new();
+    let mut interrupted = std::collections::HashSet::new();
+    let tick = Duration::from_secs(state.config.tick_secs.max(1));
+    loop {
+        for job in interrupted.clone() {
+            match sqlx::query(
+                "UPDATE sync_recovery SET state='waiting',code='recovery_worker_interrupted',
+                 detail='Recovery was interrupted. ISM will retry.',updated_at=?
+                 WHERE id=? AND state='fixing'",
+            )
+            .bind(db::now())
+            .bind(&job)
+            .execute(&state.db)
+            .await
+            {
+                Ok(result) => {
+                    interrupted.remove(&job);
+                    if result.rows_affected() != 0 {
+                        state.emit(ServerEvent::SyncChanged);
+                    }
+                }
+                Err(error) => {
+                    tracing::error!(recovery=%job, error=%error, "could not requeue interrupted recovery");
+                }
+            }
+        }
+        if running.len() < RECOVERY_CONCURRENCY_PER_KIND * RECOVERY_KINDS.len() {
+            if let Err(error) = discover(&state).await {
+                tracing::error!("recovery queue: {}", error.message());
+            } else {
+                for kind in RECOVERY_KINDS {
+                    let active = running
+                        .values()
+                        .filter(|(running_kind, _, _)| *running_kind == kind)
+                        .count();
+                    let available = RECOVERY_CONCURRENCY_PER_KIND - active;
+                    if available == 0 {
+                        continue;
+                    }
+                    let mut active_peers = std::collections::HashMap::new();
+                    for (_, _, peer) in running
+                        .values()
+                        .filter(|(running_kind, _, _)| *running_kind == kind)
+                    {
+                        if let Some(peer) = peer {
+                            *active_peers.entry(peer.clone()).or_default() += 1;
+                        }
+                    }
+                    let active_jobs: Vec<&str> = running
+                        .values()
+                        .map(|(_, job, _)| job.as_str())
+                        .chain(interrupted.iter().map(String::as_str))
+                        .collect();
+                    match eligible_jobs(
+                        &state,
+                        available,
+                        Some(kind),
+                        Some(&active_peers),
+                        &active_jobs,
+                    )
+                    .await
+                    {
+                        Ok(jobs) => {
+                            for (job, job_kind, id, peer) in jobs {
+                                let state = state.clone();
+                                let running_job = job.clone();
+                                let handle = workers
+                                    .spawn(async move { run_job(&state, job, job_kind, id).await });
+                                running.insert(handle.id(), (kind, running_job, peer));
+                            }
+                        }
+                        Err(error) => tracing::error!("recovery queue: {}", error.message()),
+                    }
+                }
+            }
+        }
+        tokio::select! {
+            result = workers.join_next_with_id(), if !workers.is_empty() => {
+                match result {
+                    Some(Ok((id, result))) => {
+                        let running_job = running.remove(&id);
+                        if let Err(error) = result {
+                            tracing::error!("recovery worker: {}", error.message());
+                            if let Some((_, job, _)) = running_job {
+                                interrupted.insert(job);
+                            }
+                        }
+                    }
+                    Some(Err(error)) => {
+                        if let Some((_, job, _)) = running.remove(&error.id()) {
+                            interrupted.insert(job);
+                        }
+                        tracing::error!("recovery task: {error}");
+                    }
+                    _ => {}
+                }
+            }
+            () = tokio::time::sleep(tick) => {}
+        }
+    }
 }
 
 async fn forward_peer(state: &AppState, peer_id: &str) -> AppResult<()> {
@@ -2647,78 +2838,138 @@ async fn forward_peer(state: &AppState, peer_id: &str) -> AppResult<()> {
 }
 
 async fn forward_loop(state: AppState) {
+    let mut workers = tokio::task::JoinSet::new();
+    let mut running = std::collections::HashMap::new();
+    let mut resetting = std::collections::HashSet::new();
+    let tick = Duration::from_secs(state.config.tick_secs.max(1));
     loop {
-        let peers: AppResult<Vec<String>> = async {
-            // All prior peer workers have been joined before this loop repeats.
-            sqlx::query(
-                "UPDATE outgoing_recovery_requests SET state='queued' WHERE state='forwarding'",
+        for peer in resetting.clone() {
+            match sqlx::query(
+                "UPDATE outgoing_recovery_requests SET state='queued'
+                 WHERE peer_id=? AND state='forwarding'",
             )
+            .bind(&peer)
             .execute(&state.db)
-            .await?;
-            Ok(sqlx::query_scalar(
+            .await
+            {
+                Ok(_) => {
+                    resetting.remove(&peer);
+                }
+                Err(error) => tracing::error!(peer=%peer, "outgoing recovery claim reset: {error}"),
+            }
+        }
+        if running.len() < FORWARD_CONCURRENCY {
+            let excluded: Vec<&str> = running
+                .values()
+                .map(String::as_str)
+                .chain(resetting.iter().map(String::as_str))
+                .collect();
+            let excluded = match serde_json::to_string(&excluded) {
+                Ok(excluded) => excluded,
+                Err(error) => {
+                    tracing::error!("cannot encode active recovery peers: {error}");
+                    tokio::time::sleep(tick).await;
+                    continue;
+                }
+            };
+            let peers = sqlx::query_scalar::<_, String>(
                 "SELECT peer_id FROM outgoing_recovery_requests
-                 WHERE state='queued' OR (state='waiting' AND updated_at<?)
-                 GROUP BY peer_id ORDER BY MIN(updated_at),peer_id LIMIT 4",
+                 WHERE (state='queued' OR (state='waiting' AND updated_at<?))
+                 AND peer_id NOT IN (SELECT value FROM json_each(?))
+                 GROUP BY peer_id ORDER BY MIN(updated_at),peer_id LIMIT ?",
             )
             .bind((chrono::Utc::now() - chrono::Duration::seconds(30)).to_rfc3339())
+            .bind(excluded)
+            .bind((FORWARD_CONCURRENCY - running.len()) as i64)
             .fetch_all(&state.db)
-            .await?)
-        }
-        .await;
-        match peers {
-            Ok(peers) => {
-                let mut workers = tokio::task::JoinSet::new();
-                for peer in peers {
-                    let state = state.clone();
-                    workers.spawn(async move {
-                        if let Err(error) = crate::activity::observe(&state, format!("recovery-forward:{peer}"),
-                            "Forward recovery request", &peer, Some("/sync"), |task| {
-                                let (state,peer)=(&state,&peer);
-                                async move {
-                                task.phase("Forwarding recovery decisions to peer");
-                                forward_peer(state,peer).await
-                            }}).await {
-                            tracing::error!(peer=%peer, "outgoing recovery worker: {}", error.message());
-                        }
-                    });
-                }
-                while let Some(result) = workers.join_next().await {
-                    if let Err(error) = result {
-                        tracing::error!("outgoing recovery task: {error}");
+            .await;
+            match peers {
+                Ok(peers) => {
+                    for peer in peers {
+                        let state = state.clone();
+                        let worker_peer = peer.clone();
+                        let handle = workers.spawn(async move {
+                            crate::activity::observe(
+                                &state,
+                                format!("recovery-forward:{worker_peer}"),
+                                "Forward recovery request",
+                                &worker_peer,
+                                Some("/sync"),
+                                |task| {
+                                    let (state, peer) = (&state, &worker_peer);
+                                    async move {
+                                        task.phase("Forwarding recovery decisions to peer");
+                                        forward_peer(state, peer).await
+                                    }
+                                },
+                            )
+                            .await
+                        });
+                        running.insert(handle.id(), peer);
                     }
                 }
+                Err(error) => tracing::error!("outgoing recovery queue: {error}"),
             }
-            Err(error) => tracing::error!("outgoing recovery queue: {}", error.message()),
+        }
+        tokio::select! {
+            result = workers.join_next_with_id(), if !workers.is_empty() => {
+                let (id, error) = match result {
+                    Some(Ok((id, result))) => (id, result.err().map(|e| e.message().to_owned())),
+                    Some(Err(error)) => (error.id(), Some(error.to_string())),
+                    None => continue,
+                };
+                if let Some(peer) = running.remove(&id)
+                    && let Some(error) = error
+                {
+                    tracing::error!(peer=%peer, "outgoing recovery worker: {error}");
+                    resetting.insert(peer);
+                }
+            }
+            () = tokio::time::sleep(tick) => {}
+        }
+    }
+}
+
+async fn reset_claims(state: &AppState, query: &'static str, queue: &str) {
+    let mut failed = false;
+    loop {
+        match sqlx::query(query).execute(&state.db).await {
+            Ok(_) => {
+                if failed {
+                    tracing::info!(queue, "recovery restart succeeded");
+                }
+                return;
+            }
+            Err(error) if !failed => {
+                tracing::error!(queue, %error, "recovery restart failed; retrying");
+                failed = true;
+            }
+            Err(error) => tracing::debug!(queue, %error, "recovery restart retry failed"),
         }
         tokio::time::sleep(Duration::from_secs(state.config.tick_secs.max(1))).await;
     }
 }
 
 pub async fn run(state: AppState) {
-    if let Err(e) = sqlx::query("UPDATE sync_recovery SET state='queued' WHERE state='fixing'")
-        .execute(&state.db)
-        .await
-    {
-        tracing::error!("recovery restart: {e}");
-        return;
-    }
-    if let Err(error) =
-        sqlx::query("UPDATE outgoing_recovery_requests SET state='queued' WHERE state='forwarding'")
-            .execute(&state.db)
-            .await
-    {
-        tracing::error!("outgoing recovery restart: {error}");
-        return;
-    }
     let local = async {
-        loop {
-            if let Err(e) = tick(&state).await {
-                tracing::error!("recovery worker: {}", e.message());
-            }
-            tokio::time::sleep(Duration::from_secs(state.config.tick_secs.max(1))).await;
-        }
+        reset_claims(
+            &state,
+            "UPDATE sync_recovery SET state='queued' WHERE state='fixing'",
+            "local",
+        )
+        .await;
+        local_loop(state.clone()).await;
     };
-    tokio::join!(local, forward_loop(state.clone()));
+    let outgoing = async {
+        reset_claims(
+            &state,
+            "UPDATE outgoing_recovery_requests SET state='queued' WHERE state='forwarding'",
+            "outgoing",
+        )
+        .await;
+        forward_loop(state.clone()).await;
+    };
+    tokio::join!(local, outgoing);
 }
 
 #[cfg(test)]
@@ -2727,6 +2978,377 @@ mod policy_tests {
 
     use super::*;
     use crate::{config::Config, crypto::SecretBox};
+
+    async fn startup_reset_retries_without_blocking_other_queue(block_local: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new(
+            Config::for_tests(dir.path()),
+            crate::db::connect(dir.path()).await.unwrap(),
+            SecretBox::open_or_create(dir.path()).unwrap(),
+        )
+        .await
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let app = axum::Router::new()
+                .fallback(|| async { axum::http::StatusCode::SERVICE_UNAVAILABLE });
+            axum::serve(listener, app).await.unwrap();
+        });
+        let secret = state
+            .secrets
+            .encrypt(net::SECRET_PURPOSE, "synthetic-key")
+            .unwrap();
+        sqlx::query("INSERT INTO peers(id,name,url,instance_id,secret_enc,status,created_at) VALUES('peer','Peer',?,'remote',?,'online',?)")
+            .bind(url).bind(secret).bind(db::now()).execute(&state.db).await.unwrap();
+        sqlx::query(
+            "INSERT INTO sync_recovery(id,kind,target_id,state,created_at,updated_at)
+             VALUES ('conflict:missing','conflict','missing',?,?,?)",
+        )
+        .bind(if block_local { "fixing" } else { "queued" })
+        .bind(db::now())
+        .bind(db::now())
+        .execute(&state.db)
+        .await
+        .unwrap();
+        let item = RecoveryView {
+            target: RecoveryTarget {
+                kind: RecoveryKind::Transfer,
+                id: "missing".into(),
+                peer_id: None,
+            },
+            title: "photo.jpg".into(),
+            state: RecoveryState::Queued,
+            can_fix: false,
+            can_dismiss: false,
+            code: None,
+            detail: None,
+            replacement_operation_id: None,
+            local_instance: None,
+            peer_instance: None,
+        };
+        sqlx::query("INSERT INTO outgoing_recovery_requests(peer_id,kind,target_id,state,view_json,updated_at) VALUES('peer','transfer','missing',?,?,?)")
+            .bind(if block_local { "queued" } else { "forwarding" })
+            .bind(serde_json::to_string(&item).unwrap())
+            .bind(db::now())
+            .execute(&state.db)
+            .await
+            .unwrap();
+        sqlx::query(if block_local {
+            "CREATE TRIGGER reject_startup_reset BEFORE UPDATE ON sync_recovery
+             WHEN OLD.state='fixing' AND NEW.state='queued'
+             BEGIN SELECT RAISE(FAIL,'injected startup error'); END"
+        } else {
+            "CREATE TRIGGER reject_startup_reset BEFORE UPDATE ON outgoing_recovery_requests
+             WHEN OLD.state='forwarding' AND NEW.state='queued'
+             BEGIN SELECT RAISE(FAIL,'injected startup error'); END"
+        })
+        .execute(&state.db)
+        .await
+        .unwrap();
+        let worker = tokio::spawn(run(state.clone()));
+        let independent = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let query = if block_local {
+                    "SELECT state FROM outgoing_recovery_requests WHERE peer_id='peer'"
+                } else {
+                    "SELECT state FROM sync_recovery WHERE id='conflict:missing'"
+                };
+                let status: String = sqlx::query_scalar(query)
+                    .fetch_one(&state.db)
+                    .await
+                    .unwrap();
+                if status == "waiting" {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        sqlx::query("DROP TRIGGER reject_startup_reset")
+            .execute(&state.db)
+            .await
+            .unwrap();
+        let recovered = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let query = if block_local {
+                    "SELECT state FROM sync_recovery WHERE id='conflict:missing'"
+                } else {
+                    "SELECT state FROM outgoing_recovery_requests WHERE peer_id='peer'"
+                };
+                let status: String = sqlx::query_scalar(query)
+                    .fetch_one(&state.db)
+                    .await
+                    .unwrap();
+                if status == "waiting" {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        worker.abort();
+        server.abort();
+        assert!(independent.is_ok(), "an unrelated queue did not run");
+        assert!(recovered.is_ok(), "the startup reset was not retried");
+    }
+
+    #[tokio::test]
+    async fn startup_reset_errors_do_not_stop_either_recovery_queue() {
+        startup_reset_retries_without_blocking_other_queue(true).await;
+        startup_reset_retries_without_blocking_other_queue(false).await;
+    }
+
+    #[tokio::test]
+    async fn claim_rechecks_waiting_and_decision_eligibility() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new(
+            Config::for_tests(dir.path()),
+            crate::db::connect(dir.path()).await.unwrap(),
+            SecretBox::open_or_create(dir.path()).unwrap(),
+        )
+        .await
+        .unwrap();
+        for (id, status, updated) in [
+            ("conflict:waiting", "waiting", "2024-01-01T00:00:00Z"),
+            ("conflict:decision", "queued", "2024-01-01T00:00:00Z"),
+        ] {
+            sqlx::query("INSERT INTO sync_recovery(id,kind,target_id,state,created_at,updated_at) VALUES(?,'conflict',?,?,?,?)")
+                .bind(id).bind(id.strip_prefix("conflict:").unwrap()).bind(status)
+                .bind(db::now()).bind(updated).execute(&state.db).await.unwrap();
+        }
+        let selected = eligible_jobs(&state, 2, None, None, &[]).await.unwrap();
+        assert_eq!(selected.len(), 2);
+        sqlx::query("UPDATE sync_recovery SET updated_at=? WHERE id='conflict:waiting'")
+            .bind(db::now())
+            .execute(&state.db)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE sync_recovery SET state='needs_decision' WHERE id='conflict:decision'")
+            .execute(&state.db)
+            .await
+            .unwrap();
+        for (job, kind, id, _) in selected {
+            run_job(&state, job, kind, id).await.unwrap();
+        }
+        let states: Vec<(String, String)> =
+            sqlx::query_as("SELECT id,state FROM sync_recovery ORDER BY id")
+                .fetch_all(&state.db)
+                .await
+                .unwrap();
+        assert_eq!(
+            states,
+            vec![
+                ("conflict:decision".into(), "needs_decision".into()),
+                ("conflict:waiting".into(), "waiting".into()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_slow_peer_does_not_hold_other_forwarding_slots() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new(
+            Config::for_tests(dir.path()),
+            crate::db::connect(dir.path()).await.unwrap(),
+            SecretBox::open_or_create(dir.path()).unwrap(),
+        )
+        .await
+        .unwrap();
+        let (entered, mut requests) = tokio::sync::mpsc::unbounded_channel();
+        let stalled = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stalled_url = format!("http://{}", stalled.local_addr().unwrap());
+        let hold = std::sync::Arc::new(tokio::sync::Notify::new());
+        let stalled_hold = hold.clone();
+        let stalled_server = tokio::spawn(async move {
+            let app = axum::Router::new().fallback(move || {
+                let entered = entered.clone();
+                let hold = stalled_hold.clone();
+                async move {
+                    entered.send(()).unwrap();
+                    hold.notified().await;
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE
+                }
+            });
+            axum::serve(stalled, app).await.unwrap();
+        });
+        let fast = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fast_url = format!("http://{}", fast.local_addr().unwrap());
+        let fast_server = tokio::spawn(async move {
+            let app = axum::Router::new()
+                .fallback(|| async { axum::http::StatusCode::SERVICE_UNAVAILABLE });
+            axum::serve(fast, app).await.unwrap();
+        });
+        let secret = state
+            .secrets
+            .encrypt(net::SECRET_PURPOSE, "synthetic-key")
+            .unwrap();
+        for n in 0..5 {
+            let id = format!("peer-{n}");
+            sqlx::query("INSERT INTO peers(id,name,url,instance_id,secret_enc,status,created_at) VALUES(?,?,?,?,?,'online',?)")
+                .bind(&id).bind(&id).bind(if n == 0 { &stalled_url } else { &fast_url })
+                .bind(format!("instance-{n}")).bind(&secret).bind(db::now())
+                .execute(&state.db).await.unwrap();
+            let item = RecoveryView {
+                target: RecoveryTarget {
+                    kind: RecoveryKind::Transfer,
+                    id: format!("transfer-{n}"),
+                    peer_id: None,
+                },
+                title: format!("photo-{n}.jpg"),
+                state: RecoveryState::Queued,
+                can_fix: false,
+                can_dismiss: false,
+                code: None,
+                detail: None,
+                replacement_operation_id: None,
+                local_instance: None,
+                peer_instance: None,
+            };
+            sqlx::query("INSERT INTO outgoing_recovery_requests(peer_id,kind,target_id,state,view_json,updated_at) VALUES(?,'transfer',?,'queued',?,?)")
+                .bind(&id).bind(&item.target.id).bind(serde_json::to_string(&item).unwrap())
+                .bind(format!("2024-01-0{}T00:00:00Z", n + 1))
+                .execute(&state.db).await.unwrap();
+        }
+        let worker = tokio::spawn(forward_loop(state.clone()));
+        tokio::time::timeout(Duration::from_secs(2), requests.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let completed = tokio::time::timeout(Duration::from_secs(4), async {
+            loop {
+                let status: String = sqlx::query_scalar(
+                    "SELECT state FROM outgoing_recovery_requests WHERE peer_id='peer-4'",
+                )
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+                if status == "waiting" {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            requests.try_recv().is_err(),
+            "the stalled peer was forwarded more than once concurrently"
+        );
+        hold.notify_waiters();
+        worker.abort();
+        stalled_server.abort();
+        fast_server.abort();
+        assert!(
+            completed.is_ok(),
+            "an unrelated peer waited for the stalled peer"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_forward_claim_reset_does_not_duplicate_a_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new(
+            Config::for_tests(dir.path()),
+            crate::db::connect(dir.path()).await.unwrap(),
+            SecretBox::open_or_create(dir.path()).unwrap(),
+        )
+        .await
+        .unwrap();
+        let (entered, mut requests) = tokio::sync::mpsc::unbounded_channel();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let app = axum::Router::new().fallback(move || {
+                let entered = entered.clone();
+                async move {
+                    entered.send(()).unwrap();
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE
+                }
+            });
+            axum::serve(listener, app).await.unwrap();
+        });
+        let secret = state
+            .secrets
+            .encrypt(net::SECRET_PURPOSE, "synthetic-key")
+            .unwrap();
+        sqlx::query("INSERT INTO peers(id,name,url,instance_id,secret_enc,status,created_at) VALUES('peer','Peer',?,'remote',?,'online',?)")
+            .bind(url).bind(secret).bind(db::now()).execute(&state.db).await.unwrap();
+        let item = RecoveryView {
+            target: RecoveryTarget {
+                kind: RecoveryKind::Transfer,
+                id: "missing".into(),
+                peer_id: None,
+            },
+            title: "photo.jpg".into(),
+            state: RecoveryState::Queued,
+            can_fix: false,
+            can_dismiss: false,
+            code: None,
+            detail: None,
+            replacement_operation_id: None,
+            local_instance: None,
+            peer_instance: None,
+        };
+        sqlx::query("INSERT INTO outgoing_recovery_requests(peer_id,kind,target_id,state,view_json,updated_at) VALUES('peer','transfer','missing','queued',?,?)")
+            .bind(serde_json::to_string(&item).unwrap())
+            .bind(db::now())
+            .execute(&state.db).await.unwrap();
+        sqlx::query(
+            "CREATE TRIGGER reject_forward_result BEFORE UPDATE ON outgoing_recovery_requests
+             WHEN OLD.state='forwarding' AND NEW.state='waiting'
+             BEGIN SELECT RAISE(FAIL,'injected finalization error'); END",
+        )
+        .execute(&state.db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TRIGGER reject_forward_reset BEFORE UPDATE ON outgoing_recovery_requests
+             WHEN OLD.state='forwarding' AND NEW.state='queued'
+             BEGIN SELECT RAISE(FAIL,'injected reset error'); END",
+        )
+        .execute(&state.db)
+        .await
+        .unwrap();
+        let worker = tokio::spawn(forward_loop(state.clone()));
+        tokio::time::timeout(Duration::from_secs(3), requests.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let page = crate::activity::page(&state, 50, 0).await.unwrap();
+                if page.current.iter().chain(&page.history).any(|activity| {
+                    activity.task_key == "recovery-forward:peer"
+                        && activity.status == ism_core::dto::BackgroundStatus::Failed
+                }) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("forward finalization did not fail");
+        let lock = state.db.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1500), requests.recv())
+                .await
+                .is_err(),
+            "the pending claim was forwarded twice"
+        );
+        lock.commit().await.unwrap();
+        sqlx::query("DROP TRIGGER reject_forward_result")
+            .execute(&state.db)
+            .await
+            .unwrap();
+        sqlx::query("DROP TRIGGER reject_forward_reset")
+            .execute(&state.db)
+            .await
+            .unwrap();
+        let retry = tokio::time::timeout(Duration::from_secs(3), requests.recv()).await;
+        worker.abort();
+        server.abort();
+        assert!(matches!(retry, Ok(Some(()))), "claim was not retried");
+    }
 
     #[test]
     fn stale_receiver_evidence_never_authorizes_a_version_decision_or_dismissal() {
@@ -3197,5 +3819,108 @@ mod policy_tests {
         admit_plan(&state, "operation", "move", &changed)
             .await
             .unwrap();
+    }
+    #[tokio::test]
+    async fn failed_worker_finalization_does_not_leave_recovery_fixing() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new(
+            Config::for_tests(dir.path()),
+            crate::db::connect(dir.path()).await.unwrap(),
+            SecretBox::open_or_create(dir.path()).unwrap(),
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO sync_recovery(id,kind,target_id,state,created_at,updated_at)
+             VALUES ('conflict:missing','conflict','missing','queued',?,?)",
+        )
+        .bind(db::now())
+        .bind(db::now())
+        .execute(&state.db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TRIGGER reject_worker_result BEFORE UPDATE ON sync_recovery
+             WHEN OLD.id='conflict:missing' AND OLD.state='fixing' AND NEW.code='internal'
+             BEGIN SELECT RAISE(FAIL,'injected finalization error'); END",
+        )
+        .execute(&state.db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TRIGGER reject_interrupted_reset BEFORE UPDATE ON sync_recovery
+             WHEN NEW.code='recovery_worker_interrupted'
+             BEGIN SELECT RAISE(FAIL,'injected reset error'); END",
+        )
+        .execute(&state.db)
+        .await
+        .unwrap();
+        let worker = tokio::spawn(local_loop(state.clone()));
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let status: String = sqlx::query_scalar(
+                    "SELECT state FROM sync_recovery WHERE id='conflict:missing'",
+                )
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+                if status == "fixing" {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("worker was not claimed");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        sqlx::query("DROP TRIGGER reject_interrupted_reset")
+            .execute(&state.db)
+            .await
+            .unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let state: (String, Option<String>) = sqlx::query_as(
+                    "SELECT state,code FROM sync_recovery WHERE id='conflict:missing'",
+                )
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+                if state.0 == "waiting" && state.1.as_deref() == Some("recovery_worker_interrupted")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            result.is_ok(),
+            "an interrupted worker remained stuck fixing"
+        );
+        sqlx::query("DROP TRIGGER reject_worker_result")
+            .execute(&state.db)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE sync_recovery SET updated_at='2024-01-01T00:00:00Z' WHERE id='conflict:missing'")
+            .execute(&state.db)
+            .await
+            .unwrap();
+        let retried = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let (status, code): (String, Option<String>) = sqlx::query_as(
+                    "SELECT state,code FROM sync_recovery WHERE id='conflict:missing'",
+                )
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+                if status == "waiting" && code.as_deref() == Some("internal") {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        worker.abort();
+        assert!(retried.is_ok(), "the interrupted recovery was not retried");
     }
 }

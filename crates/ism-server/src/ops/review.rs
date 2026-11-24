@@ -9,7 +9,7 @@ use std::sync::Arc;
 use ism_core::dto::{ClientAction, Location};
 use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::Semaphore;
 
 use super::tree;
 use crate::auth::Principal;
@@ -68,25 +68,6 @@ async fn resolve(
     let root = files::root(&state.db, &location.root_id).await?;
     root.ensure_available()?;
     root.abs(&files::parse_rel(&location.path)?)
-}
-
-struct Scan {
-    entries: mpsc::Receiver<tree::Entry>,
-    task: tokio::task::JoinHandle<std::io::Result<()>>,
-}
-
-async fn scan(path: PathBuf, limit: Arc<Semaphore>) -> AppResult<Scan> {
-    let permit = limit.acquire_owned().await.map_err(AppError::internal)?;
-    let (send, entries) = mpsc::channel(BATCH);
-    let task = tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        tree::walk(&path, None, |entry| {
-            send.blocking_send(entry).map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::Interrupted, "review scan cancelled")
-            })
-        })
-    });
-    Ok(Scan { entries, task })
 }
 
 fn persisted(entry: tree::Entry) -> AppResult<Entry> {
@@ -167,9 +148,9 @@ async fn verify_tree(
     path: PathBuf,
     limit: Arc<Semaphore>,
 ) -> AppResult<()> {
-    let mut scan = scan(path, limit).await?;
+    let mut scan = tree::scan(path, limit).await?;
     let mut actual_count = 0i64;
-    while let Some(item) = scan.entries.recv().await {
+    while let Some(item) = scan.next().await? {
         let actual = persisted(item)?;
         let expected: Option<EntryRow> = sqlx::query_as(
             "SELECT name,sha256,size FROM folder_review_entries WHERE manifest_id=? AND name=?",
@@ -183,7 +164,6 @@ async fn verify_tree(
         }
         actual_count = actual_count.checked_add(1).ok_or_else(changed)?;
     }
-    scan.task.await.map_err(AppError::internal)??;
     if actual_count != count {
         return Err(changed());
     }
@@ -232,12 +212,12 @@ async fn build_entries(
     path: PathBuf,
     limit: Arc<Semaphore>,
 ) -> AppResult<Manifest> {
-    let mut scan = scan(path.clone(), limit.clone()).await?;
+    let mut scan = tree::scan(path.clone(), limit.clone()).await?;
     let mut count = 0i64;
     loop {
         let mut batch = Vec::with_capacity(BATCH);
         while batch.len() < BATCH {
-            let Some(item) = scan.entries.recv().await else {
+            let Some(item) = scan.next().await? else {
                 break;
             };
             batch.push(persisted(item)?);
@@ -260,7 +240,6 @@ async fn build_entries(
         }
         tx.commit().await?;
     }
-    scan.task.await.map_err(AppError::internal)??;
     verify_tree(pool, id, count, path, limit).await?;
     let revision = digest(pool, id, location).await?;
     let published = sqlx::query(

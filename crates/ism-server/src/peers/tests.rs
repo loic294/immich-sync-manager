@@ -8483,3 +8483,426 @@ async fn the_primary_file_settings_reach_peers_and_lock_their_editing() {
             .files_editable
     );
 }
+
+#[tokio::test]
+async fn multiple_slow_conflicts_do_not_block_independent_recovery() {
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    for i in 0..4 {
+        write_old(&a.shared.join(format!("choice-{i}.jpg")), b"source version");
+        write_old(
+            &b.shared.join(format!("choice-{i}.jpg")),
+            b"receiving version",
+        );
+    }
+    scan(&a).await;
+    scan(&b).await;
+    let peer = super::net::peers(&b.state).await.unwrap().remove(0);
+    let share = super::shares(&b.state).await.unwrap().remove(0);
+    let source_share = super::shares(&a.state).await.unwrap().remove(0);
+    for i in 0..4 {
+        let path = format!("choice-{i}.jpg");
+        let version = super::row(&a.state, &source_share.id, &path)
+            .await
+            .unwrap()
+            .unwrap()
+            .vv;
+        super::conflict(
+            &b.state,
+            super::ConflictInput {
+                share: &share,
+                rel: &path,
+                kind: "changed_on_both",
+                detail: "Choose a version".into(),
+                remote: ConflictSide {
+                    instance: "Alpha".into(),
+                    sha256: Some(crate::crypto::sha256_hex(b"source version")),
+                    size: Some(14),
+                    modified_at: None,
+                    deleted: false,
+                },
+                remote_vv: &version,
+                peer_id: &peer.id,
+                from: None,
+            },
+        )
+        .await
+        .unwrap();
+    }
+    let conflicts = admin::list_conflicts(&b.state, false).await.unwrap();
+    assert_eq!(conflicts.len(), 4);
+    super::recovery::submit(
+        &b.state,
+        ism_core::dto::RecoveryBatchInput {
+            targets: conflicts
+                .into_iter()
+                .map(|conflict| ism_core::dto::RecoveryTarget {
+                    kind: ism_core::dto::RecoveryKind::Conflict,
+                    id: conflict.id,
+                    peer_id: None,
+                })
+                .collect(),
+            all: false,
+            resolution: Some(ConflictResolution::KeepRemote),
+        },
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE sync_recovery SET updated_at='2024-01-01T00:00:00Z' WHERE kind='conflict'")
+        .execute(&b.state.db)
+        .await
+        .unwrap();
+
+    sqlx::query(
+        "CREATE TRIGGER reject_independent_event BEFORE INSERT ON event_log
+         WHEN json_extract(NEW.data_json,'$.path')='independent'
+         BEGIN SELECT RAISE(FAIL,'injected'); END",
+    )
+    .execute(&b.state.db)
+    .await
+    .unwrap();
+    let operation = crate::ops::submit(
+        &b.state,
+        &Principal::Admin {
+            username: "test".into(),
+        },
+        OperationRequest {
+            idempotency_key: "independent-recovery".into(),
+            label: None,
+            actions: vec![OperationAction::CreateFolder {
+                target: Location {
+                    root_id: "photos".into(),
+                    path: "shared/independent".into(),
+                },
+            }],
+            allow_owner_transfer: false,
+            allow_partial: false,
+        },
+    )
+    .await
+    .unwrap();
+    crate::ops::exec::run_operation(&b.state, &operation.operation_id)
+        .await
+        .unwrap();
+    sqlx::query("DROP TRIGGER reject_independent_event")
+        .execute(&b.state.db)
+        .await
+        .unwrap();
+
+    let (entered, mut requests) = tokio::sync::mpsc::unbounded_channel();
+    let released = std::sync::Arc::new(tokio::sync::Notify::new());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let source_released = released.clone();
+    let stalled_peer = axum::Router::new().fallback(move || {
+        let entered = entered.clone();
+        let released = source_released.clone();
+        async move {
+            entered.send(()).unwrap();
+            released.notified().await;
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        }
+    });
+    b.tasks.push(tokio::spawn(async move {
+        axum::serve(listener, stalled_peer).await.unwrap();
+    }));
+    sqlx::query("UPDATE peers SET url=? WHERE id=?")
+        .bind(url)
+        .bind(peer.id)
+        .execute(&b.state.db)
+        .await
+        .unwrap();
+    let state = b.state.clone();
+    b.tasks.push(tokio::spawn(async move {
+        super::recovery::run(state).await;
+    }));
+    for _ in 0..3 {
+        tokio::time::timeout(Duration::from_secs(3), requests.recv())
+            .await
+            .expect("conflict never requested peer evidence")
+            .expect("stalled peer stopped");
+    }
+    let active_conflicts: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sync_recovery WHERE kind='conflict' AND state='fixing'",
+    )
+    .fetch_one(&b.state.db)
+    .await
+    .unwrap();
+    assert_eq!(active_conflicts, 3);
+    let completed = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let status = crate::ops::load(&b.state, &operation.operation_id)
+                .await
+                .unwrap()
+                .0
+                .status;
+            if status == ism_core::dto::OperationStatus::Completed {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    if completed.is_err() {
+        let rows: Vec<(String, String, Option<String>, Option<String>)> =
+            sqlx::query_as("SELECT id,state,code,detail FROM sync_recovery ORDER BY id")
+                .fetch_all(&b.state.db)
+                .await
+                .unwrap();
+        let operation = crate::ops::load(&b.state, &operation.operation_id).await;
+        eprintln!("recovery={rows:?}; operation={operation:?}");
+    }
+    completed.expect("an unrelated recovery waited for the stalled conflict");
+    assert!(b.shared.join("independent").is_dir());
+    assert_eq!(
+        std::fs::read(b.shared.join("choice-0.jpg")).unwrap(),
+        b"receiving version"
+    );
+    released.notify_waiters();
+}
+
+#[tokio::test]
+async fn slow_peer_conflicts_do_not_block_another_peers_conflict() {
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    let mut c = instance("Gamma").await;
+    stop_workers(&mut c).await;
+    let invite = admin::create_invite(&b.state).await.unwrap();
+    admin::accept(
+        &c.state,
+        PeerAcceptInput {
+            name: String::new(),
+            url: b.url.clone(),
+            invite: invite.invite,
+            callback_url: c.url.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    let peers = super::net::peers(&b.state).await.unwrap();
+    let a_peer = peers
+        .iter()
+        .find(|peer| peer.instance_id.as_deref() == Some(&a.state.instance_id))
+        .unwrap();
+    let c_peer = peers
+        .iter()
+        .find(|peer| peer.instance_id.as_deref() == Some(&c.state.instance_id))
+        .unwrap();
+    let share = super::shares(&b.state).await.unwrap().remove(0);
+    admin::update_share(
+        &b.state,
+        &share.id,
+        ShareInput {
+            name: share.name.clone(),
+            location: loc("shared"),
+            peer_ids: peers.iter().map(|peer| peer.id.clone()).collect(),
+            enabled: true,
+        },
+    )
+    .await
+    .unwrap();
+    let c_back = super::net::peers(&c.state).await.unwrap().remove(0);
+    admin::create_share(
+        &c.state,
+        ShareInput {
+            name: share.name.clone(),
+            location: loc("shared"),
+            peer_ids: vec![c_back.id],
+            enabled: true,
+        },
+    )
+    .await
+    .unwrap();
+    for i in 0..4 {
+        write_old(&a.shared.join(format!("slow-{i}.jpg")), b"slow source");
+        write_old(&b.shared.join(format!("slow-{i}.jpg")), b"local");
+    }
+    write_old(&c.shared.join("independent.jpg"), b"fast source");
+    write_old(&b.shared.join("independent.jpg"), b"local");
+    scan(&a).await;
+    scan(&b).await;
+    scan(&c).await;
+    let share = super::shares(&b.state).await.unwrap().remove(0);
+    for (source, peer, paths, bytes) in [
+        (
+            &a,
+            a_peer,
+            (0..4).map(|i| format!("slow-{i}.jpg")).collect::<Vec<_>>(),
+            b"slow source".as_slice(),
+        ),
+        (
+            &c,
+            c_peer,
+            vec!["independent.jpg".into()],
+            b"fast source".as_slice(),
+        ),
+    ] {
+        let source_share = super::shares(&source.state).await.unwrap().remove(0);
+        for path in paths {
+            let version = super::row(&source.state, &source_share.id, &path)
+                .await
+                .unwrap()
+                .unwrap()
+                .vv;
+            super::conflict(
+                &b.state,
+                super::ConflictInput {
+                    share: &share,
+                    rel: &path,
+                    kind: "changed_on_both",
+                    detail: "Choose a version".into(),
+                    remote: ConflictSide {
+                        instance: peer.name.clone(),
+                        sha256: Some(crate::crypto::sha256_hex(bytes)),
+                        size: Some(bytes.len() as u64),
+                        modified_at: None,
+                        deleted: false,
+                    },
+                    remote_vv: &version,
+                    peer_id: &peer.id,
+                    from: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+    }
+    let conflicts = admin::list_conflicts(&b.state, false).await.unwrap();
+    let independent = conflicts
+        .iter()
+        .find(|conflict| conflict.location.path == "shared/independent.jpg")
+        .unwrap()
+        .id
+        .clone();
+    super::recovery::submit(
+        &b.state,
+        ism_core::dto::RecoveryBatchInput {
+            targets: conflicts
+                .iter()
+                .map(|conflict| ism_core::dto::RecoveryTarget {
+                    kind: ism_core::dto::RecoveryKind::Conflict,
+                    id: conflict.id.clone(),
+                    peer_id: None,
+                })
+                .collect(),
+            all: false,
+            resolution: Some(ConflictResolution::KeepLocal),
+        },
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE sync_recovery SET updated_at='2024-01-01T00:00:00Z' WHERE kind='conflict' AND target_id!=?")
+        .bind(&independent)
+        .execute(&b.state.db)
+        .await
+        .unwrap();
+    let template = conflicts
+        .iter()
+        .find(|conflict| conflict.peer_id == a_peer.id)
+        .unwrap();
+    let mut tx = b.state.db.begin().await.unwrap();
+    for i in 0..501 {
+        let id = format!("cf_backlog_{i:04}");
+        sqlx::query(
+            "INSERT INTO conflicts(id,share_id,rel_path,kind,detail,local_json,remote_json,remote_vv_json,peer_id,status,created_at)
+             SELECT ?,share_id,?,kind,detail,local_json,remote_json,remote_vv_json,peer_id,status,created_at FROM conflicts WHERE id=?",
+        )
+        .bind(&id)
+        .bind(format!("backlog-{i}.jpg"))
+        .bind(&template.id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO sync_recovery(id,kind,target_id,state,resolution,created_at,updated_at)
+             VALUES(?,'conflict',?,'queued',?,'2024-01-01T00:00:00Z','2024-01-01T00:00:00Z')",
+        )
+        .bind(format!("conflict:{id}"))
+        .bind(&id)
+        .bind(serde_json::to_string(&ConflictResolution::KeepLocal).unwrap())
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    }
+    tx.commit().await.unwrap();
+    let (entered, mut requests) = tokio::sync::mpsc::unbounded_channel();
+    let released = std::sync::Arc::new(tokio::sync::Notify::new());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let source_released = released.clone();
+    let stalled_peer = axum::Router::new().fallback(move || {
+        let entered = entered.clone();
+        let released = source_released.clone();
+        async move {
+            entered.send(()).unwrap();
+            released.notified().await;
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        }
+    });
+    b.tasks.push(tokio::spawn(async move {
+        axum::serve(listener, stalled_peer).await.unwrap();
+    }));
+    sqlx::query("UPDATE peers SET url=? WHERE id=?")
+        .bind(url)
+        .bind(&a_peer.id)
+        .execute(&b.state.db)
+        .await
+        .unwrap();
+    b.tasks
+        .push(tokio::spawn(crate::ops::exec::run(b.state.clone())));
+    b.tasks
+        .push(tokio::spawn(super::recovery::run(b.state.clone())));
+    for _ in 0..3 {
+        tokio::time::timeout(Duration::from_secs(5), requests.recv())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    let active: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sync_recovery r JOIN conflicts c ON c.id=r.target_id
+         WHERE r.kind='conflict' AND r.state='fixing' AND c.peer_id=?",
+    )
+    .bind(&a_peer.id)
+    .fetch_one(&b.state.db)
+    .await
+    .unwrap();
+    assert_eq!(active, 3);
+    let completed = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let status: String = sqlx::query_scalar("SELECT status FROM conflicts WHERE id=?")
+                .bind(&independent)
+                .fetch_one(&b.state.db)
+                .await
+                .unwrap();
+            if status == "resolved" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    if completed.is_err() {
+        let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
+            "SELECT target_id,state,code FROM sync_recovery WHERE kind='conflict' ORDER BY updated_at",
+        )
+        .fetch_all(&b.state.db)
+        .await
+        .unwrap();
+        eprintln!("recovery states: {rows:?}");
+    }
+    assert!(
+        requests.try_recv().is_err(),
+        "the stalled peer exceeded its concurrency limit or a claim executed twice"
+    );
+    released.notify_waiters();
+    assert!(
+        completed.is_ok(),
+        "an unrelated conflict waited for the slow peer"
+    );
+    assert_eq!(
+        std::fs::read(b.shared.join("independent.jpg")).unwrap(),
+        b"local"
+    );
+}
