@@ -2,6 +2,12 @@
 
 pub mod exec;
 pub mod plan;
+#[allow(
+    dead_code,
+    reason = "The manifest protocol is staged until peer and reviewed-operation contracts are integrated."
+)]
+pub mod review;
+mod tree;
 pub mod uploads;
 
 use ism_core::dto::{

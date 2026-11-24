@@ -20,6 +20,12 @@ pub async fn connect(data_dir: &Path) -> anyhow::Result<SqlitePool> {
         .connect_with(options)
         .await?;
     sqlx::migrate!("./migrations").run(&pool).await?;
+    // Unexpired staging might belong to another active connection. It stays unreadable;
+    // expiry prevents its publication and makes cleanup safe without stealing its lease.
+    sqlx::query("DELETE FROM folder_review_manifests WHERE expires_at <= ?")
+        .bind(now())
+        .execute(&pool)
+        .await?;
     Ok(pool)
 }
 

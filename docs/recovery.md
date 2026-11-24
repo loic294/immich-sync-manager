@@ -42,6 +42,36 @@ verifies current evidence again before carrying out a decision. Folder evidence 
 Lineage lookup uses bounded pages, but a very slow peer or unusually long history can exceed the
 evidence deadline. ISM reports the failure and retries; a retry currently starts that lookup again.
 
+### Folder review protocol layer
+
+`ops::review` provides local durable folder manifests as a foundation for paginated evidence,
+not a new decision API. Operations and reviews share a streaming traversal that includes the
+folder itself and every empty directory, rejects symlinks/special files and detects observed
+concurrent changes. It retains at most 128 directory levels rather than buffering arbitrarily
+wide directories; deeper trees fail explicitly. Staging writes and scans use bounded batches,
+and a second full-tree comparison must succeed before a manifest is published.
+
+Ready manifests are immutable. Pages contain at most 500 entries, ordered by binary relative
+path, with a keyset cursor and one content-bound revision for the entire tree. This is a page
+size, not a total-entry cap. A continuation cursor must name an entry in that same manifest;
+an invalid cursor is an error, not an empty final page. The lookup also binds the authenticated local owner, root and
+folder path. A peer cannot obtain or authorize receiver-owned data through this layer.
+Ready evidence survives restart. Interrupted staging remains unreadable and is rebuilt under
+a new ID; cleanup removes only expired manifests, so opening another connection cannot delete
+an active preparation. All manifests expire after 24 hours; expired evidence must be refreshed,
+not reused for a queued operation.
+
+This layer is not yet wired to `RecoveryVersions`, `FileEvidence`, preview URLs or reviewed
+operation authorization: those contracts still require complete vectors and retain their
+10,000-entry fail-closed limit. Integration must negotiate manifest-aware peer capabilities,
+bind both instance-owned manifests and the conflict generation into the decision revision,
+retain the receiver's evidence through queued execution, and run the full live-tree verifier
+inside the managed operation's maintenance barrier immediately before any mutation. Reading
+every page, trusting a sender's manifest ID, or verifying only a displayed page is not sufficient.
+The current verifier checks all paths, types, sizes and content hashes again, but returns no
+mutation grant. ISM's barrier cannot freeze external writers; coordinate those writers before
+folder changes. No new UI layout or peer wire contract is introduced by this layer.
+
 Independent paths, shares, and servers continue syncing. Overlapping paths and causally dependent
 events wait, and an unresolved Immich maintenance barrier still protects that server. A replacement
 transfer may pass its own failed parent's path gate, but never that parent's unresolved maintenance

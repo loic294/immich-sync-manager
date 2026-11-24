@@ -950,45 +950,13 @@ pub(crate) fn folder_inventory_bounded(path: &Path, limit: usize) -> io::Result<
 
 fn folder_inventory_with_limit(path: &Path, limit: Option<usize>) -> io::Result<Vec<TrashEntry>> {
     let mut inventory = Vec::new();
-    for entry in walkdir::WalkDir::new(path).follow_links(false) {
-        if limit.is_some_and(|limit| inventory.len() >= limit) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "folder exceeds the version evidence entry limit",
-            ));
-        }
-        let entry = entry.map_err(io::Error::other)?;
-        let name = entry
-            .path()
-            .strip_prefix(path)
-            .map_err(io::Error::other)?
-            .components()
-            .map(|component| {
-                component
-                    .as_os_str()
-                    .to_str()
-                    .map(str::to_owned)
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "non-UTF-8 name"))
-            })
-            .collect::<io::Result<Vec<_>>>()?
-            .join("/");
-        let kind = entry.file_type();
-        let sha256 = if kind.is_dir() {
-            None
-        } else if kind.is_file() {
-            Some(
-                files::replacement_fingerprint(entry.path())?
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "file disappeared"))?
-                    .1,
-            )
-        } else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "folder contains a symlink or special file",
-            ));
-        };
-        inventory.push(TrashEntry { name, sha256 });
-    }
+    super::tree::walk(path, limit, |entry| {
+        inventory.push(TrashEntry {
+            name: entry.name,
+            sha256: entry.sha256,
+        });
+        Ok(())
+    })?;
     if inventory
         .first()
         .is_none_or(|entry| !entry.name.is_empty() || entry.sha256.is_some())
