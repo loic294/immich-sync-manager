@@ -41,6 +41,11 @@ ISM_LOG: info,ism_server=debug
 Then reproduce the issue and export the logs. Reset it to `info` afterward. Prefer this targeted
 filter over global `debug` or `trace`, which also enables third-party library diagnostics.
 
+At `debug`, `collected imported upload asset activity` records the query's elapsed milliseconds,
+exact matching item count, and returned row count (at most five). The count includes all published
+uploads still awaiting an asset ID; the row limit applies only to examples. This is a fresh database
+snapshot, not a cache. Its duration alone does not identify a SQLite lock holder.
+
 ## Persistent history in the UI
 
 Runtime logs complement, rather than replace, ISM's persistent records in the database on `/data`:

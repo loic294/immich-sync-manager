@@ -42,6 +42,69 @@ fn entry(
 const EXAMPLES: usize = 5;
 const REASONS: usize = 5;
 
+// Keep the full count and oldest timestamp, but only materialize the displayed examples.
+// NOT MATERIALIZED avoids storing the entire backlog in a temporary CTE table.
+// Seek to the first matching rowid so sampling does not reread an unrelated upload prefix.
+const UPLOAD_ASSET_QUERY: &str = "WITH matched AS NOT MATERIALIZED (
+    SELECT u.id,u.operation_id,u.created_at,u.rowid AS upload_rowid FROM uploads u
+    JOIN operation_items i ON i.operation_id=u.operation_id
+    WHERE i.kind='publish_upload' AND i.status='done' AND i.result_json IS NOT NULL
+      AND json_extract(i.result_json,'$.asset_id') IS NULL
+      AND (json_extract(u.request_json,'$.existing_original.name') IS NOT NULL
+           OR EXISTS(SELECT 1 FROM json_each(u.request_json,'$.files') f
+                     WHERE json_extract(f.value,'$.role')='original'))
+), summary AS (
+    SELECT COUNT(*) AS count, MIN(created_at) AS first_at, MIN(upload_rowid) AS first_rowid
+    FROM matched
+)
+SELECT matched.id,matched.operation_id,summary.count,summary.first_at
+FROM summary CROSS JOIN matched
+WHERE matched.upload_rowid >= summary.first_rowid
+LIMIT ?";
+
+async fn upload_asset_activity(pool: &sqlx::SqlitePool) -> AppResult<Option<BackgroundActivity>> {
+    let started = std::time::Instant::now();
+    let examples = sqlx::query(UPLOAD_ASSET_QUERY)
+        .bind(EXAMPLES as i64)
+        .fetch_all(pool)
+        .await?;
+    let count = examples
+        .first()
+        .map(|first| first.try_get::<i64, _>("count"))
+        .transpose()?
+        .unwrap_or(0);
+    tracing::debug!(
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        count,
+        returned_rows = examples.len(),
+        "collected imported upload asset activity"
+    );
+    let Some(first) = examples.first() else {
+        return Ok(None);
+    };
+    let mut row = entry(
+        "upload-asset".into(),
+        "Imported upload asset ID",
+        "Uploads".into(),
+        "Published file is waiting for Immich import and asset lookup".into(),
+        "/operations",
+    );
+    row.count = count as u64;
+    row.started_at = first.try_get("first_at")?;
+    if row.count == 1 {
+        row.operation_id = first.try_get("operation_id")?;
+        row.resource = format!("Uploads / {}", first.try_get::<String, _>("id")?);
+    } else {
+        for example in &examples {
+            row.examples.push(ism_core::dto::ActivityExample {
+                resource: example.try_get("id")?,
+                detail: None,
+            });
+        }
+    }
+    Ok(Some(row))
+}
+
 /// Folds per-item evidence into one row per group so thousands of files stay readable and cheap.
 #[derive(Default)]
 struct Groups {
@@ -731,21 +794,196 @@ pub async fn get(state: &AppState) -> AppResult<(Vec<BackgroundActivity>, Vec<St
         row.updated_at=r.try_get("updated_at")?;
         out.push(row);
     }
-    let mut uploads = Groups::default();
-    for r in sqlx::query(
-        "SELECT u.id,u.operation_id,u.created_at FROM uploads u JOIN operation_items i ON i.operation_id=u.operation_id
-         WHERE i.kind='publish_upload' AND i.status='done' AND i.result_json IS NOT NULL
-           AND json_extract(i.result_json,'$.asset_id') IS NULL
-           AND (json_extract(u.request_json,'$.existing_original.name') IS NOT NULL
-                OR EXISTS(SELECT 1 FROM json_each(u.request_json,'$.files') f WHERE json_extract(f.value,'$.role')='original'))",
-    ).fetch_all(&state.db).await? {
-        let id:String=r.try_get("id")?;
-        let mut row=entry(String::new(),"Imported upload asset ID","Uploads".into(),
-            "Published file is waiting for Immich import and asset lookup".into(),"/operations");
-        row.operation_id=r.try_get("operation_id")?;
-        row.started_at=r.try_get("created_at")?;
-        uploads.add("upload-asset".into(),row,&id,None);
+    if let Some(row) = upload_asset_activity(&state.db).await? {
+        out.push(row);
     }
-    uploads.finish(&mut out);
     Ok((out, warnings))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn upload(pool: &sqlx::SqlitePool, id: &str, at: &str, request: &str) {
+        sqlx::query(
+            "INSERT INTO operations
+             (id,idempotency_key,principal,source,request_json,status,created_at)
+             VALUES (?,?,'synthetic','client','{}','done',?)",
+        )
+        .bind(id)
+        .bind(id)
+        .bind(at)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO uploads (id,principal,request_json,status,operation_id,created_at)
+             VALUES (?,'synthetic',?,'receiving',?,?)",
+        )
+        .bind(id)
+        .bind(request)
+        .bind(id)
+        .bind(at)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO operation_items
+             (operation_id,idx,kind,action_json,status,result_json)
+             VALUES (?,0,'publish_upload','{}','done','{}')",
+        )
+        .bind(id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    const ORIGINAL: &str = r#"{"files":[{"role":"original","name":"photo.jpg"}]}"#;
+
+    #[tokio::test]
+    async fn upload_summary_bounds_examples_without_truncating_count_or_oldest_timestamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = db::connect(dir.path()).await.unwrap();
+        for i in 0..16 {
+            upload(
+                &pool,
+                &format!("sidecar-{i:02}"),
+                "2019-01-01",
+                r#"{"files":[{"role":"sidecar"}]}"#,
+            )
+            .await;
+        }
+        for i in 0..12 {
+            upload(
+                &pool,
+                &format!("upload-{i:02}"),
+                if i == 11 { "2020-01-01" } else { "2026-01-01" },
+                ORIGINAL,
+            )
+            .await;
+        }
+        // Multiple matching items in one operation retain the original join's multiplicity.
+        sqlx::query(
+            "INSERT INTO operation_items
+             (operation_id,idx,kind,action_json,status,result_json)
+             VALUES ('upload-00',1,'publish_upload','{}','done','{}')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let raw = sqlx::query(UPLOAD_ASSET_QUERY)
+            .bind(EXAMPLES as i64)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(raw.len(), EXAMPLES);
+        let before = db::now();
+        let row = upload_asset_activity(&pool).await.unwrap().unwrap();
+        assert_eq!(row.count, 13);
+        assert_eq!(row.started_at, "2020-01-01");
+        assert!(row.updated_at >= before && row.updated_at <= db::now());
+        assert_eq!(row.resource, "Uploads");
+        assert_eq!(row.examples.len(), EXAMPLES);
+        assert!(row.examples.iter().all(|e| e.detail.is_none()));
+        assert!(row.operation_id.is_none());
+        assert!(row.reasons.is_empty());
+        assert_eq!(row.id, "state:upload-asset");
+        assert_eq!(row.task_key, "upload-asset");
+        assert_eq!(row.page.as_deref(), Some("/operations"));
+    }
+
+    #[tokio::test]
+    async fn upload_summary_preserves_singleton_action_and_refreshes_after_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = db::connect(dir.path()).await.unwrap();
+        assert!(upload_asset_activity(&pool).await.unwrap().is_none());
+        upload(
+            &pool,
+            "existing",
+            "2025-01-01",
+            r#"{"existing_original":{"name":"photo.jpg"}}"#,
+        )
+        .await;
+        let row = upload_asset_activity(&pool).await.unwrap().unwrap();
+        assert_eq!(row.count, 1);
+        assert_eq!(row.resource, "Uploads / existing");
+        assert_eq!(row.operation_id.as_deref(), Some("existing"));
+        assert_eq!(row.started_at, "2025-01-01");
+        assert!(row.examples.is_empty());
+        sqlx::query("UPDATE operation_items SET result_json='{\"asset_id\":\"asset\"}'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(upload_asset_activity(&pool).await.unwrap().is_none());
+        sqlx::query("UPDATE operation_items SET result_json='{\"asset_id\":null}'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            upload_asset_activity(&pool).await.unwrap().unwrap().count,
+            1
+        );
+        sqlx::query("DELETE FROM uploads")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(upload_asset_activity(&pool).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn upload_summary_retains_original_eligibility_predicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = db::connect(dir.path()).await.unwrap();
+        for id in [
+            "original",
+            "sidecar",
+            "pending",
+            "no-result",
+            "resolved",
+            "move",
+            "unlinked",
+        ] {
+            upload(&pool, id, "2025-01-01", ORIGINAL).await;
+        }
+        sqlx::raw_sql(
+            "UPDATE uploads SET request_json='{\"files\":[{\"role\":\"sidecar\"}]}' WHERE id='sidecar';
+             UPDATE operation_items SET status='running' WHERE operation_id='pending';
+             UPDATE operation_items SET result_json=NULL WHERE operation_id='no-result';
+             UPDATE operation_items SET result_json='{\"asset_id\":\"asset\"}' WHERE operation_id='resolved';
+             UPDATE operation_items SET kind='move' WHERE operation_id='move';
+             UPDATE uploads SET operation_id=NULL WHERE id='unlinked';",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let row = upload_asset_activity(&pool).await.unwrap().unwrap();
+        assert_eq!(row.count, 1);
+        // Upload status is intentionally not an eligibility predicate.
+        assert_eq!(row.operation_id.as_deref(), Some("original"));
+    }
+
+    #[tokio::test]
+    async fn upload_summary_does_not_hide_unreadable_evidence_beyond_example_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = db::connect(dir.path()).await.unwrap();
+        for i in 0..8 {
+            upload(&pool, &format!("upload-{i}"), "2025-01-01", ORIGINAL).await;
+        }
+        sqlx::query(
+            "UPDATE operation_items SET result_json='invalid' WHERE operation_id='upload-7'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(upload_asset_activity(&pool).await.is_err());
+        sqlx::query("UPDATE operation_items SET result_json='{}'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE uploads SET request_json='invalid' WHERE id='upload-7'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(upload_asset_activity(&pool).await.is_err());
+    }
 }
