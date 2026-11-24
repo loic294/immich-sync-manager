@@ -16,6 +16,23 @@ const EDGE: u32 = 1024;
 static PREVIEWS: Semaphore = Semaphore::const_new(2);
 static WAITING: Semaphore = Semaphore::const_new(32);
 
+pub(super) fn busy() -> AppError {
+    AppError::new(
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        "preview_busy",
+        "Preview preparation is busy or timed out. Try again shortly.",
+    )
+}
+
+pub(super) async fn within<T>(
+    timeout: std::time::Duration,
+    work: impl std::future::Future<Output = AppResult<T>>,
+) -> AppResult<T> {
+    tokio::time::timeout(timeout, work)
+        .await
+        .map_err(|_| busy())?
+}
+
 pub(super) async fn acquire() -> AppResult<SemaphorePermit<'static>> {
     acquire_from(&PREVIEWS, &WAITING, std::time::Duration::from_secs(30)).await
 }
@@ -25,13 +42,6 @@ async fn acquire_from<'a>(
     waiting: &Semaphore,
     timeout: std::time::Duration,
 ) -> AppResult<SemaphorePermit<'a>> {
-    let busy = || {
-        AppError::new(
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            "preview_busy",
-            "Too many previews are being prepared. Try again shortly.",
-        )
-    };
     let _waiting = waiting.try_acquire().map_err(|_| busy())?;
     tokio::time::timeout(timeout, previews.acquire())
         .await
@@ -175,6 +185,28 @@ mod tests {
         assert_eq!(waiting.available_permits(), 0);
         drop(work);
         assert_eq!(waiting.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn whole_preparation_deadline_includes_queue_and_work() {
+        let previews = Semaphore::new(1);
+        let waiting = Semaphore::new(1);
+        let held = previews.try_acquire().unwrap();
+        let work = within(std::time::Duration::from_millis(120), async {
+            let _slot =
+                acquire_from(&previews, &waiting, std::time::Duration::from_secs(1)).await?;
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            Ok(())
+        });
+        tokio::pin!(work);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(90), &mut work)
+                .await
+                .is_err()
+        );
+        drop(held);
+        assert_eq!(work.await.unwrap_err().code(), "preview_busy");
+        assert_eq!(previews.available_permits(), 1);
     }
 
     #[tokio::test]

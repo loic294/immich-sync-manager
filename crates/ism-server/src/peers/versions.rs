@@ -440,12 +440,26 @@ pub async fn preview(state: &AppState, query: &PreviewQuery) -> AppResult<Respon
             ),
             None,
         )
-        .timeout(std::time::Duration::from_secs(45))
+        .timeout(std::time::Duration::from_secs(50))
         .send()
         .await
-        .map_err(|error| AppError::conflict("preview_unavailable", net::net_error(&error)))?;
+        .map_err(|error| {
+            if error.is_timeout() {
+                preview_image::busy()
+            } else {
+                AppError::conflict("preview_unavailable", net::net_error(&error))
+            }
+        })?;
         return crate::routes::activity::image_response(response).await;
     }
+    preview_image::within(
+        std::time::Duration::from_secs(40),
+        preview_local(state, query),
+    )
+    .await
+}
+
+async fn preview_local(state: &AppState, query: &PreviewQuery) -> AppResult<Response> {
     if query.target.kind != RecoveryKind::Conflict {
         return Err(AppError::not_found("version preview not found"));
     }
@@ -528,7 +542,13 @@ pub async fn preview(state: &AppState, query: &PreviewQuery) -> AppResult<Respon
         .timeout(std::time::Duration::from_secs(30))
         .send()
         .await
-        .map_err(|error| AppError::conflict("preview_unavailable", net::net_error(&error)))?;
+        .map_err(|error| {
+            if error.is_timeout() {
+                preview_image::busy()
+            } else {
+                AppError::conflict("preview_unavailable", net::net_error(&error))
+            }
+        })?;
         if !response.status().is_success() {
             return Err(AppError::conflict(
                 "preview_unavailable",
