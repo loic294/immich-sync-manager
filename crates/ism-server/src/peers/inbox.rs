@@ -329,7 +329,7 @@ fn event_valid(event: &PeerEvent) -> AppResult<()> {
             .map(|_| ())
             .map_err(|e| e.message().to_owned()),
         "folder_created" => management_event_valid("folder_created", &event.data),
-        "file_deleted" | "file_moved" | "folder_moved" | "folder_trashed" => {
+        "file_deleted" | "file_moved" | "folder_moved" | "folder_trashed" | FOLDER_PRUNED => {
             management_event_valid(&event.kind, &event.data)
         }
         other => Err(format!("unsupported peer event kind '{other}'")),
@@ -790,6 +790,9 @@ async fn apply_received(
     }
     let share = share.ok_or_else(|| AppError::not_found("peer share changed"))?;
     require_operations_stable(state, share, &paths(event)).await?;
+    if event.kind == FOLDER_PRUNED {
+        return Err(folder_pruned(peer, share, event));
+    }
     if let Some(resolution) = conflict_decision(state, share, event).await? {
         if matches!(resolution.as_str(), "keep_local" | "skip") {
             let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
@@ -900,6 +903,21 @@ async fn apply_received(
         crate::ops::announce_queued(state, accepted);
     }
     Ok(accepted.is_none())
+}
+
+/// Receiver-only compatibility: a peer prune is retained, never applied or acknowledged.
+/// Nothing here deletes or advertises it, so it stays pending (path-scoped, holding later
+/// overlapping events) until a version that can handle and propagate prunes replays it,
+/// even when the folder is already absent here and only transitive peers still have it.
+fn folder_pruned(peer: &net::Peer, share: &Share, event: &PeerEvent) -> AppError {
+    AppError::conflict(
+        "peer_folder_prune_unsupported",
+        format!(
+            "{} removed folder '{}' in share '{}'. This folder change needs support in a future \
+             ISM update. Other folders can still sync.",
+            peer.name, event.data.path, share.name
+        ),
+    )
 }
 
 async fn conflict_decision(

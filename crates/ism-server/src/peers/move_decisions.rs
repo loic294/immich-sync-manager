@@ -257,6 +257,13 @@ pub(super) async fn evidence_at(
                 if event.seq > last || event.share != c.share.name {
                     continue;
                 }
+                if event.kind == peers::FOLDER_PRUNED
+                    && peers::inbox::overlaps(&event.data.path, &current)
+                {
+                    return Err(invalid(
+                        "move lineage contains a peer folder prune this instance cannot verify",
+                    ));
+                }
                 if matches!(event.kind.as_str(), "folder_moved" | "file_moved")
                     && let Some(from) = event.data.from.as_deref()
                     && (from == current
