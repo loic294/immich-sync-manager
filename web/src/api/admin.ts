@@ -45,6 +45,22 @@ import type { WatchSettingsInput } from '@/api/generated/WatchSettingsInput';
 const A = '/api/admin';
 const enc = encodeURIComponent;
 
+// Replaced by the generated DTO when the attention endpoint lands.
+export interface AttentionSnapshot {
+  completeness: 'complete' | 'partial' | 'unavailable';
+  warnings: string[];
+  items: {
+    id: string;
+    attention: 'none' | 'notice' | 'action_required';
+    blocks_work: boolean;
+    title: string;
+    message: string;
+    href: string;
+    recheck_at: string | null;
+    acknowledged: boolean | null;
+  }[];
+}
+
 /** Typed wrappers over the administration API. */
 export const admin = {
   backgroundActivity: (limit = 25, offset = 0) =>
@@ -53,6 +69,7 @@ export const admin = {
     api.post<void>(`${A}/setup`, { body }),
   login: (body: { username: string; password: string }) => api.post<void>(`${A}/login`, { body }),
   overview: () => api.get<Overview>(`${A}/overview`),
+  attention: () => api.get<AttentionSnapshot>(`${A}/attention`),
   settings: () => api.get<SettingsView>(`${A}/settings`),
   saveSettings: (body: SettingsInput) => api.put<SettingsView>(`${A}/settings`, { body }),
 

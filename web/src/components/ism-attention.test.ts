@@ -12,6 +12,7 @@ const item: AttentionItem = {
   href: '/conflicts',
   action: 'Open conflicts',
   blocking: true,
+  notifiable: true,
 };
 
 afterEach(() => {

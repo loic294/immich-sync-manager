@@ -7,7 +7,7 @@ export class IsmBlockerBanners extends IsmElement {
   protected override render() {
     const groups = new Map<string, typeof blockers.value>();
     for (const entry of blockers.value) {
-      const key = entry.id.split(':')[0];
+      const key = `${entry.href}\0${entry.title}`;
       groups.set(key, [...(groups.get(key) ?? []), entry]);
     }
     return html`
@@ -25,7 +25,7 @@ export class IsmBlockerBanners extends IsmElement {
           <ism-icon name="triangle-alert"></ism-icon>
           <div class="min-w-0 flex-1">
             <p class="font-semibold">${first.title}</p>
-            <p class="text-sm">${first.detail}${entries.length > 1 ? ` ${entries.length - 1} more ${entries.length === 2 ? 'item needs' : 'items need'} attention.` : ''}</p>
+            <p class="text-sm">${first.detail}${entries.some((entry) => entry.stale) ? ' Some status information may be out of date.' : ''}${entries.length > 1 ? ` ${entries.length - 1} more ${entries.length === 2 ? 'item needs' : 'items need'} attention.` : ''}</p>
           </div>
           <a class="btn btn-sm" href=${first.href}>${first.action}<ism-icon name="arrow-right" size="xs"></ism-icon></a>
         </section>`;

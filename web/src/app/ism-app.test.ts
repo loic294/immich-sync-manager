@@ -72,6 +72,8 @@ describe('ism-app', () => {
     vi.spyOn(api, 'get').mockImplementation(async (path: string) => {
       if (path === '/api/admin/session')
         return { ...BASE, authenticated: true, username: 'admin' } as never;
+      if (path === '/api/admin/attention')
+        return { completeness: 'complete', warnings: [], items: [] } as never;
       if (path === '/api/admin/overview') return undefined as never;
       throw new Error(`unexpected GET ${path}`);
     });
@@ -118,7 +120,7 @@ describe('ism-app', () => {
     });
     const app = await mount('ism-app', { routes });
     await until(() => expect(app.querySelector('ism-attention-bell')).not.toBeNull());
-    await vi.waitFor(() => expect(api.get).toHaveBeenCalledWith('/api/admin/mappings'));
+    await vi.waitFor(() => expect(api.get).toHaveBeenCalledWith('/api/admin/attention'));
     blockers.value = [
       {
         id: 'peer:example',
@@ -127,6 +129,7 @@ describe('ism-app', () => {
         href: '/peers',
         action: 'Open peers',
         blocking: true,
+        notifiable: true,
       },
     ];
     for (const path of ['/overview', '/operations', '/sync']) {
