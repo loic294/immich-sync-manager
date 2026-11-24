@@ -117,17 +117,24 @@ async fn rows(
     after: Option<&str>,
     limit: usize,
 ) -> AppResult<Vec<Entry>> {
-    let rows: Vec<EntryRow> = sqlx::query_as(
-        "SELECT name,sha256,size FROM folder_review_entries
-         WHERE manifest_id=? AND (? IS NULL OR name > ? COLLATE BINARY)
-         ORDER BY name COLLATE BINARY LIMIT ?",
-    )
-    .bind(id)
-    .bind(after)
-    .bind(after)
-    .bind(i64::try_from(limit).map_err(AppError::internal)?)
-    .fetch_all(pool)
-    .await?;
+    let limit = i64::try_from(limit).map_err(AppError::internal)?;
+    let query = match after {
+        Some(after) => sqlx::query_as(
+            "SELECT name,sha256,size FROM folder_review_entries
+             WHERE manifest_id=? AND name > ? COLLATE BINARY
+             ORDER BY name COLLATE BINARY LIMIT ?",
+        )
+        .bind(id)
+        .bind(after)
+        .bind(limit),
+        None => sqlx::query_as(
+            "SELECT name,sha256,size FROM folder_review_entries
+             WHERE manifest_id=? ORDER BY name COLLATE BINARY LIMIT ?",
+        )
+        .bind(id)
+        .bind(limit),
+    };
+    let rows: Vec<EntryRow> = query.fetch_all(pool).await?;
     Ok(rows.into_iter().map(entry).collect())
 }
 
