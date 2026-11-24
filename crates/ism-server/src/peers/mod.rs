@@ -611,7 +611,7 @@ async fn clear_scan_failure(db: &sqlx::SqlitePool, share_id: &str) -> AppResult<
 /// A batch never overlaps mutation; enumeration is only a list of candidates, not evidence
 /// that a path is still present or absent when a later batch is admitted.
 struct ShareScanBatch<'a> {
-    _operation_guard: tokio::sync::MutexGuard<'a, ()>,
+    _operation_guard: crate::admission::GateGuard<'a>,
     share: Share,
     root: Root,
     blocked: Vec<String>,
@@ -624,7 +624,10 @@ async fn share_scan_batch<'a>(
     task: &crate::activity::Reporter,
 ) -> AppResult<Option<ShareScanBatch<'a>>> {
     task.waiting("Waiting for managed operations that are changing files");
-    let guard = state.replication_operation_lock.lock_scan().await;
+    let guard = state
+        .replication_operation_lock
+        .lock_share_scan(&share.id)
+        .await;
     let Some(current) = shares(state)
         .await?
         .into_iter()
@@ -978,7 +981,10 @@ pub async fn verify_share_content(state: &AppState, share: &Share) -> AppResult<
             let mut rows = rows.into_iter().enumerate().peekable();
             while rows.peek().is_some() {
                 task.waiting("Waiting for managed operations that are changing files");
-                let _operation_guard = state.replication_operation_lock.lock_scan().await;
+                let _operation_guard = state
+                    .replication_operation_lock
+                    .lock_share_scan(&share.id)
+                    .await;
                 let Some(share) = shares(state)
                     .await?
                     .into_iter()

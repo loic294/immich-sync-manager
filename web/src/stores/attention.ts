@@ -101,7 +101,10 @@ export function buildAttention(snapshot: AttentionSnapshot): AttentionItem[] {
         title: entry.title,
         detail: entry.message,
         href: entry.href,
-        action: ACTIONS[url.pathname] ?? 'Open details',
+        action:
+          entry.code === 'operation_gate_wait'
+            ? 'View operations'
+            : (ACTIONS[url.pathname] ?? 'Open details'),
         external: url.origin !== window.location.origin,
         blocking: entry.blocks_work,
         notifiable: entry.attention !== 'none' && entry.acknowledged !== true,

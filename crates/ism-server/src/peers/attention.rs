@@ -32,6 +32,7 @@ const CODES: &[AttentionCode] = &[
 ];
 const UNSUPPORTED_CODES: &[AttentionCode] = &[
     AttentionCode::OperationRecovery,
+    AttentionCode::OperationGateWait,
     AttentionCode::WorkerStopped,
     AttentionCode::WorkerStalled,
 ];

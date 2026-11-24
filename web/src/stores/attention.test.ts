@@ -53,6 +53,41 @@ afterEach(() => {
 });
 
 describe('attention snapshots', () => {
+  it('links an operation gate wait to its operation list', () => {
+    const [item] = buildAttention({
+      ...snapshot,
+      items: [{ ...row, code: 'operation_gate_wait', href: '/operations' }],
+    });
+    expect(item).toMatchObject({ blocking: true, action: 'View operations', href: '/operations' });
+  });
+
+  it('rechecks a quiet gate wait when it becomes a blocker', async () => {
+    vi.useFakeTimers();
+    const wait: AttentionItem = {
+      ...row,
+      id: 'operation-gate-wait:example',
+      code: 'operation_gate_wait',
+      attention: 'none',
+      blocks_work: false,
+      href: '/operations',
+      recheck_at: new Date(Date.now() + 2000).toISOString(),
+    };
+    const get = vi.spyOn(api, 'get').mockResolvedValue({ ...snapshot, items: [wait] });
+    const stop = startAttention();
+    try {
+      await vi.advanceTimersByTimeAsync(0);
+      expect(blockers.value).toEqual([]);
+      get.mockResolvedValue({
+        ...snapshot,
+        items: [{ ...wait, attention: 'notice', blocks_work: true, recheck_at: null }],
+      });
+      await vi.advanceTimersByTimeAsync(2100);
+      expect(blockers.value).toMatchObject([{ id: wait.id, action: 'View operations' }]);
+    } finally {
+      stop();
+    }
+  });
+
   it('uses confirmed blocker and notification classifications independently', () => {
     const items = buildAttention({
       ...snapshot,

@@ -122,6 +122,8 @@ impl AppState {
             .timeout(std::time::Duration::from_secs(120))
             .build()?;
         let (events, _) = broadcast::channel(512);
+        let replication_operation_lock =
+            crate::admission::OperationGate::with_events(events.clone());
         let (peer_events, _) = broadcast::channel(64);
         let (peer_configuration, _) = watch::channel(());
         Ok(Self(Arc::new(Inner {
@@ -149,7 +151,7 @@ impl AppState {
             share_wake: Notify::new(),
             pg_pools: Mutex::new(HashMap::new()),
             maintenance_lock: Mutex::new(()),
-            replication_operation_lock: crate::admission::OperationGate::default(),
+            replication_operation_lock,
             shared_settings: std::sync::RwLock::new(Arc::new(crate::settings::Snapshot::new(
                 shared_settings,
             ))),

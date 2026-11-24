@@ -544,6 +544,7 @@ pub enum AttentionOwner {
 pub enum AttentionCode {
     OperationRecovery,
     OperationFailed,
+    OperationGateWait,
     MaintenanceBlocked,
     MaintenanceWaiting,
     MappingUnavailable,

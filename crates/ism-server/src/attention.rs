@@ -7,6 +7,7 @@ use ism_core::dto::{
     AttentionOwner, AttentionSnapshot, AttentionState,
 };
 
+use crate::admission::{Holder, WAIT_NOTICE_AFTER};
 use crate::db;
 use crate::error::AppResult;
 use crate::queue_evidence::ScheduleState;
@@ -92,6 +93,59 @@ pub async fn snapshot(state: &AppState) -> AppResult<AttentionSnapshot> {
             }
         })
     );
+    for wait in state.replication_operation_lock.waiting() {
+        let queued: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM operations WHERE id=? AND status='queued')",
+        )
+        .bind(&wait.operation_id)
+        .fetch_one(&state.db)
+        .await?;
+        if !queued || !state.replication_operation_lock.still_waiting(&wait) {
+            continue;
+        }
+        let remaining = WAIT_NOTICE_AFTER.saturating_sub(wait.started.elapsed());
+        let (attention, blocks_work, recheck_at) = if remaining.is_zero() {
+            (AttentionLevel::Notice, true, None)
+        } else {
+            let delay = chrono::Duration::milliseconds(remaining.as_millis() as i64 + 1);
+            (
+                AttentionLevel::None,
+                false,
+                Some(db::ts(chrono::Utc::now() + delay)),
+            )
+        };
+        let message = match wait.holder {
+            Holder::Scan { .. } => "Waiting for a share scan.",
+            Holder::Operation { .. } => "Waiting for another operation.",
+            Holder::Unknown => "Waiting for other work; the cause is unknown.",
+        };
+        items.push(AttentionItem {
+            id: format!("operation-gate-wait:{}", wait.operation_id),
+            code: AttentionCode::OperationGateWait,
+            state: AttentionState::Waiting,
+            attention,
+            blocks_work,
+            owner: AttentionOwner::Local,
+            instance_id: Some(state.instance_id.clone()),
+            instance_name: Some(instance_name.clone()),
+            peer_id: None,
+            share_id: None,
+            share_name: None,
+            count: 1,
+            total_count: Some(1),
+            next_at: None,
+            recheck_at,
+            observed_at: observed_at.clone(),
+            title: "Operation waiting".into(),
+            message: message.into(),
+            href: "/operations".into(),
+            operation_id: Some(wait.operation_id),
+            acknowledged: None,
+            unresolved: None,
+            completeness: AttentionCompleteness::Complete,
+            examples: Vec::new(),
+        });
+    }
     let queues = crate::queue_evidence::snapshot(state).await?;
     let pending_transfers =
         queues.queued.iter().map(|group| group.count).sum::<u64>() + queues.running.max(0) as u64;
@@ -790,6 +844,7 @@ pub async fn snapshot(state: &AppState) -> AppResult<AttentionSnapshot> {
         &[
             AttentionCode::OperationRecovery,
             AttentionCode::OperationFailed,
+            AttentionCode::OperationGateWait,
             AttentionCode::WatcherPaused,
             AttentionCode::LibraryScanFailed,
             AttentionCode::ShareScanFailed,

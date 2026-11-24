@@ -176,7 +176,7 @@ async fn set_item(
 }
 
 pub async fn run_operation(state: &AppState, id: &str) -> AppResult<()> {
-    let admitted_exclusively = state.replication_operation_lock.lock().await;
+    let admitted_exclusively = state.replication_operation_lock.lock_operation(id).await;
     let claimed = sqlx::query(
         "UPDATE operations SET status = 'waiting_maintenance' WHERE id = ? AND status = 'queued'",
     )

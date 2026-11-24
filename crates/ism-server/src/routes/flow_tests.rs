@@ -2416,6 +2416,136 @@ async fn instance_scoped_operations_refuse_a_different_instance() {
 }
 
 #[tokio::test]
+async fn attention_reports_only_sustained_gate_waits_for_queued_operations() {
+    let h = harness().await;
+    sqlx::query(
+        "INSERT INTO operations(id,idempotency_key,principal,source,request_json,status,created_at)
+         VALUES ('gate-op','gate-key','admin:test','admin','{}','queued',?)",
+    )
+    .bind(crate::db::now())
+    .execute(&h.state.db)
+    .await
+    .unwrap();
+    let scan = h
+        .state
+        .replication_operation_lock
+        .lock_share_scan("share-example")
+        .await;
+    let wait = h.state.replication_operation_lock.lock_operation("gate-op");
+    tokio::pin!(wait);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), wait.as_mut())
+            .await
+            .is_err()
+    );
+    let snapshot = crate::attention::snapshot(&h.state).await.unwrap();
+    let item = snapshot
+        .items
+        .iter()
+        .find(|item| item.operation_id.as_deref() == Some("gate-op"))
+        .unwrap();
+    assert_eq!(item.code, ism_core::dto::AttentionCode::OperationGateWait);
+    assert_eq!(item.attention, ism_core::dto::AttentionLevel::None);
+    assert!(!item.blocks_work);
+    assert!(item.recheck_at.is_some());
+    h.state
+        .replication_operation_lock
+        .age_wait_for_test("gate-op", Duration::from_secs(31));
+    let snapshot = crate::attention::snapshot(&h.state).await.unwrap();
+    let item = snapshot
+        .items
+        .iter()
+        .find(|item| item.operation_id.as_deref() == Some("gate-op"))
+        .unwrap();
+    assert_eq!(item.attention, ism_core::dto::AttentionLevel::Notice);
+    assert!(item.blocks_work);
+    assert_eq!(item.message, "Waiting for a share scan.");
+    assert_eq!(item.href, "/operations");
+    assert!(item.recheck_at.is_none());
+    sqlx::query("UPDATE operations SET status='cancelled' WHERE id='gate-op'")
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    assert!(
+        !crate::attention::snapshot(&h.state)
+            .await
+            .unwrap()
+            .items
+            .iter()
+            .any(|item| item.code == ism_core::dto::AttentionCode::OperationGateWait)
+    );
+    drop(scan);
+    drop(wait.await);
+    assert!(h.state.replication_operation_lock.waiting().is_empty());
+}
+
+#[tokio::test]
+async fn attention_wait_messages_follow_the_evidenced_holder() {
+    let h = harness().await;
+    sqlx::query(
+        "INSERT INTO operations(id,idempotency_key,principal,source,request_json,status,created_at)
+         VALUES ('gate-op','gate-key','admin:test','admin','{}','queued',?)",
+    )
+    .bind(crate::db::now())
+    .execute(&h.state.db)
+    .await
+    .unwrap();
+    let holder = h.state.replication_operation_lock.lock().await;
+    let wait = h.state.replication_operation_lock.lock_operation("gate-op");
+    tokio::pin!(wait);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), wait.as_mut())
+            .await
+            .is_err()
+    );
+    h.state
+        .replication_operation_lock
+        .age_wait_for_test("gate-op", Duration::from_secs(31));
+    let snapshot = crate::attention::snapshot(&h.state).await.unwrap();
+    let item = snapshot
+        .items
+        .iter()
+        .find(|item| item.code == ism_core::dto::AttentionCode::OperationGateWait)
+        .unwrap();
+    assert_eq!(
+        item.message,
+        "Waiting for other work; the cause is unknown."
+    );
+    let registered = h
+        .state
+        .replication_operation_lock
+        .register(&holder, "holding-operation");
+    let snapshot = crate::attention::snapshot(&h.state).await.unwrap();
+    let item = snapshot
+        .items
+        .iter()
+        .find(|item| item.code == ism_core::dto::AttentionCode::OperationGateWait)
+        .unwrap();
+    assert_eq!(item.message, "Waiting for another operation.");
+    drop(registered);
+    let snapshot = crate::attention::snapshot(&h.state).await.unwrap();
+    let item = snapshot
+        .items
+        .iter()
+        .find(|item| item.code == ism_core::dto::AttentionCode::OperationGateWait)
+        .unwrap();
+    assert_eq!(
+        item.message,
+        "Waiting for other work; the cause is unknown."
+    );
+    drop(holder);
+    drop(wait.await);
+    assert!(
+        !crate::attention::snapshot(&h.state)
+            .await
+            .unwrap()
+            .items
+            .iter()
+            .any(|item| item.code == ism_core::dto::AttentionCode::OperationGateWait)
+    );
+}
+
+#[tokio::test]
 async fn cancellation_by_key_prevents_queued_operation_from_executing() {
     let h = harness().await;
     h.map_root().await;
@@ -2443,7 +2573,26 @@ async fn cancellation_by_key_prevents_queued_operation_from_executing() {
     let worker_id = id.clone();
     let worker =
         tokio::spawn(async move { crate::ops::exec::run_operation(&state, &worker_id).await });
-    tokio::task::yield_now().await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while h.state.replication_operation_lock.waiting().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    h.state
+        .replication_operation_lock
+        .age_wait_for_test(&id, Duration::from_secs(31));
+    assert!(
+        crate::attention::snapshot(&h.state)
+            .await
+            .unwrap()
+            .items
+            .iter()
+            .any(|item| item.operation_id.as_deref() == Some(id.as_str())
+                && item.code == ism_core::dto::AttentionCode::OperationGateWait
+                && item.blocks_work)
+    );
     let wrong = json!({
         "idempotency_key": "cancel-queued",
         "actions": [{ "kind": "create_folder", "target": { "root_id": "photos", "path": "2024/other" } }]
@@ -2476,6 +2625,15 @@ async fn cancellation_by_key_prevents_queued_operation_from_executing() {
     .await;
     assert_eq!(response.status, StatusCode::OK, "{:?}", response.json());
     assert_eq!(response.json()["operation"]["status"], "cancelled");
+    assert!(
+        !crate::attention::snapshot(&h.state)
+            .await
+            .unwrap()
+            .items
+            .iter()
+            .any(|item| item.operation_id.as_deref() == Some(id.as_str())
+                && item.code == ism_core::dto::AttentionCode::OperationGateWait)
+    );
     assert_eq!(
         response.json()["operation"]["items"][0]["status"],
         "skipped"

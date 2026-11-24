@@ -108,6 +108,11 @@ a missing inventory entry is never published as deleted if the path now exists o
 A batch that finds its share disabled stops without clearing its earlier failure. A changed mapping
 or exclusion policy stops the scan and requires a fresh scan rather than reusing stale candidates.
 
+An operation still queued while waiting for the admission gate shows a local attention warning
+after 30 seconds. The message names a share scan or another operation when known, and says the cause
+is unknown otherwise; **View operations** links to the operation list. The warning clears when the
+wait ends. This reports the wait without changing admission or scheduling behavior.
+
 ### Backfill when a share is added or re-enabled
 
 The event cursor is per peer, so events from before a share existed or while it was disabled are
