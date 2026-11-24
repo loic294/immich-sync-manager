@@ -972,6 +972,7 @@ async fn scheduler_fixture(
     Instance,
     std::sync::Arc<tokio::sync::Notify>,
     std::sync::Arc<tokio::sync::Notify>,
+    std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, usize>>>,
 ) {
     use std::sync::Arc;
     use tokio::sync::Notify;
@@ -980,6 +981,7 @@ async fn scheduler_fixture(
     stop_workers(&mut local).await;
     let entered = Arc::new(Notify::new());
     let respond = Arc::new(Notify::new());
+    let requests = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     let app = axum::Router::new()
         .route(
             "/api/peer/v1/notifications",
@@ -992,10 +994,14 @@ async fn scheduler_fixture(
         .fallback({
             let entered = entered.clone();
             let respond = respond.clone();
-            move || {
+            let requests = requests.clone();
+            move |request: axum::extract::Request| {
                 let entered = entered.clone();
                 let respond = respond.clone();
+                let requests = requests.clone();
+                let path = request.uri().path().to_owned();
                 async move {
+                    *requests.lock().unwrap().entry(path).or_insert(0) += 1;
                     entered.notify_one();
                     respond.notified().await;
                     axum::Json(serde_json::json!({
@@ -1036,11 +1042,11 @@ async fn scheduler_fixture(
     tokio::time::timeout(Duration::from_secs(2), entered.notified())
         .await
         .expect("scheduler must admit the peer worker");
-    (local, entered, respond)
+    (local, entered, respond, requests)
 }
 
 async fn scheduler_releases_worker_connection(activity: bool) {
-    let (mut local, _, respond) = scheduler_fixture(activity).await;
+    let (mut local, _, respond, _) = scheduler_fixture(activity).await;
     // Keep seven connections, including the writer, leaving the eighth for the worker.
     let mut writer = local.state.db.acquire().await.unwrap();
     let mut transaction = sqlx::Connection::begin(&mut *writer).await.unwrap();
@@ -1090,15 +1096,29 @@ async fn activity_scheduler_does_not_starve_admitted_worker() {
 #[tokio::test]
 async fn schedulers_suppress_duplicates_and_cancel_admitted_workers() {
     for activity in [false, true] {
-        let (mut local, entered, respond) = scheduler_fixture(activity).await;
+        let (mut local, entered, respond, requests) = scheduler_fixture(activity).await;
         local.state.sync_wake.notify_one();
         tokio::time::sleep(Duration::from_secs(if activity { 5 } else { 2 })).await;
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), entered.notified())
-                .await
-                .is_err(),
-            "a scheduler must not admit a second worker for a running peer"
-        );
+        if activity {
+            let requests = requests.lock().unwrap();
+            assert_eq!(
+                requests.get("/api/peer/v1/recovery"),
+                Some(&1),
+                "recovery consumer must remain single-flight"
+            );
+            assert_eq!(
+                requests.get("/api/peer/v1/sync-activity"),
+                Some(&1),
+                "activity consumer must remain single-flight"
+            );
+        } else {
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), entered.notified())
+                    .await
+                    .is_err(),
+                "a scheduler must not admit a second worker for a running peer"
+            );
+        }
         let scheduler = local.tasks.pop().unwrap();
         scheduler.abort();
         assert!(scheduler.await.unwrap_err().is_cancelled());
