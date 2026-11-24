@@ -41,7 +41,7 @@ export class IsmRecoveryVersions extends IsmElement {
   declare limit: number;
   private readonly previews = new Map<string, Preview>();
   private readonly visible = new Set<string>();
-  private readonly observed = new Set<HTMLElement>();
+  private readonly observed = new Map<HTMLElement, string>();
   private readonly queue: Preview[] = [];
   private active = 0;
   private observer: IntersectionObserver | undefined;
@@ -136,8 +136,8 @@ export class IsmRecoveryVersions extends IsmElement {
   protected override updated() {
     const current = new Set(this.querySelectorAll<HTMLElement>('[data-preview]'));
     const urls = new Set([...current].map((element) => element.dataset.preview));
-    for (const element of this.observed) {
-      if (current.has(element)) continue;
+    for (const [element, url] of this.observed) {
+      if (current.has(element) && element.dataset.preview === url) continue;
       this.observer?.unobserve(element);
       this.observed.delete(element);
     }
@@ -146,9 +146,10 @@ export class IsmRecoveryVersions extends IsmElement {
     }
     for (const element of current) {
       if (this.observed.has(element)) continue;
-      this.observed.add(element);
+      if (!element.dataset.preview) continue;
+      this.observed.set(element, element.dataset.preview);
       if (this.observer) this.observer.observe(element);
-      else if (element.dataset.preview) {
+      else {
         this.visible.add(element.dataset.preview);
         this.enqueue(element.dataset.preview);
       }

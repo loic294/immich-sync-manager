@@ -66,6 +66,41 @@ it('uses the receiving owner for previews and preserves sidecar roles without re
   expect(page.querySelectorAll('img')).toHaveLength(1);
 });
 
+it('reobserves a reused preview element when the target changes', async () => {
+  const observe = vi.fn();
+  const unobserve = vi.fn();
+  vi.stubGlobal(
+    'IntersectionObserver',
+    class {
+      observe = observe;
+      unobserve = unobserve;
+      disconnect() {}
+    },
+  );
+  const page = await mount('ism-recovery-versions', {
+    target: { kind: 'conflict', id: 'local', peer_id: null },
+    versions: {
+      share: 'Photos',
+      revision: 'revision',
+      receiving: [],
+      source: {
+        instance: 'Example',
+        path: 'example.jpg',
+        state: 'file',
+        directories: [],
+        files: [{ path: 'example.jpg', role: 'original', sha256: 'a', size: 1, modified_at: null }],
+      },
+    },
+  });
+  const element = page.querySelector('[data-preview]');
+  expect(observe).toHaveBeenCalledTimes(1);
+  page.target = { kind: 'conflict', id: 'peer', peer_id: 'receiver' };
+  await page.updateComplete;
+  expect(page.querySelector('[data-preview]')).toBe(element);
+  expect(unobserve).toHaveBeenCalledWith(element);
+  expect(observe).toHaveBeenCalledTimes(2);
+});
+
 it.each([
   ['preview_outside_transfer_hours', 'Preview available during allowed transfer hours.'],
   ['preview_busy', 'Preview preparation is busy'],
