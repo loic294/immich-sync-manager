@@ -1230,6 +1230,24 @@ pub(crate) async fn require_no_active_operations(state: &AppState) -> AppResult<
     Ok(())
 }
 
+/// Whether a share scan may run now: active operations must be registered in this process (rows
+/// left active by a restart or panic count as changing files) and none may be changing files.
+pub(crate) async fn require_scannable(state: &AppState) -> AppResult<()> {
+    let active: Vec<String> = sqlx::query_scalar(
+        "SELECT id FROM operations WHERE status IN ('running','waiting_maintenance')",
+    )
+    .fetch_all(&state.db)
+    .await?;
+    let gate = &state.replication_operation_lock;
+    if gate.mutating() || active.iter().any(|id| !gate.is_registered(id)) {
+        return Err(AppError::conflict(
+            "recovery_required",
+            "peer bookkeeping waits for active managed operations",
+        ));
+    }
+    Ok(())
+}
+
 pub(super) async fn require_operations_stable(
     state: &AppState,
     share: &Share,

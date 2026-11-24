@@ -135,8 +135,12 @@ including after a restart; unrelated events from the same peer and share can pro
   substantial disk reads on large shares. Scans exclude queued transfers and uncertain operation
   or inbox footprints from hashing and deletion inference, while independent paths remain eligible.
   Unavailable roots never imply deletion. An unreadable subtree is excluded and the incomplete
-  scan is reported explicitly. To avoid recording half-completed managed operations,
-  each scan and managed operation runs exclusively of the other within this instance. A long scan
+  scan is reported explicitly. To avoid recording half-completed managed operations, a scan
+  never runs while a managed operation is changing files within this instance (or while an
+  operation is left active by a restart). Scans do run while an operation waits for its
+  maintenance barrier, since it has changed nothing yet; it then waits for any scan in progress
+  before its first change, which can lengthen the Immich job pause. Other bookkeeping, including
+  application of incoming events, still waits for every active operation. A long scan
   can therefore delay managed operations and application of incoming events, even though polling
   and scanning run separately. Peer connections are polled independently, so a slow peer does not
   prevent the others from being contacted. Each peer has at most one synchronization worker and

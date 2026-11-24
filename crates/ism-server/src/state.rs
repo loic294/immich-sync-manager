@@ -69,7 +69,9 @@ pub struct Inner {
     /// Serialises read-modify-write of the per-server maintenance state.
     pub maintenance_lock: Mutex<()>,
     /// Serializes replica bookkeeping with managed operations.
-    pub replication_operation_lock: Mutex<()>,
+    /// Operations stay registered while running and exclude scans only while changing files
+    /// (`admission.rs`).
+    pub replication_operation_lock: crate::admission::OperationGate,
     /// The shared file settings in force; replaced as a whole by `settings::update`.
     pub shared_settings: std::sync::RwLock<Arc<crate::settings::Snapshot>>,
     /// Serializes read-modify-write of the shared file settings.
@@ -129,7 +131,7 @@ impl AppState {
             share_wake: Notify::new(),
             pg_pools: Mutex::new(HashMap::new()),
             maintenance_lock: Mutex::new(()),
-            replication_operation_lock: Mutex::new(()),
+            replication_operation_lock: crate::admission::OperationGate::default(),
             shared_settings: std::sync::RwLock::new(Arc::new(crate::settings::Snapshot::new(
                 shared_settings,
             ))),

@@ -215,37 +215,27 @@ pub async fn get(state: &AppState) -> AppResult<Vec<BackgroundActivity>> {
         .lock()
         .map_err(|_| crate::error::AppError::internal("share scan schedule lock poisoned"))?
         .clone();
-    let share_gate = crate::peers::inbox::require_no_active_operations(state).await;
-    let gate_reason = match share_gate {
-        Ok(()) => None,
-        Err(e) if e.code() == "recovery_required" => Some(redact(e.message())),
-        Err(e) => return Err(e),
-    };
     for share in shares.iter().filter(|s| s.enabled) {
-        let due = pending_shares.get(&share.id);
-        if due.is_none() && gate_reason.is_none() {
+        let Some(due) = pending_shares.get(&share.id) else {
             continue;
-        }
+        };
         let mut row = entry(
             format!("share:{}", share.id),
             "Share inventory scan",
             share.name.clone(),
-            gate_reason.clone().unwrap_or_else(|| {
-                if due.is_some_and(|at| *at > std::time::Instant::now()) {
-                    "Waiting for file changes to settle before scanning the share".into()
-                } else {
-                    "Share inventory rescan is queued".into()
-                }
-            }),
+            if *due > std::time::Instant::now() {
+                "Waiting for file changes to settle before scanning the share"
+            } else {
+                "Share inventory rescan is queued"
+            }
+            .into(),
             "/peers",
         );
-        if let Some(at) = due {
-            let delay = at.saturating_duration_since(std::time::Instant::now());
-            row.next_at = chrono::Duration::from_std(delay)
-                .ok()
-                .and_then(|d| chrono::Utc::now().checked_add_signed(d))
-                .map(db::ts);
-        }
+        let delay = due.saturating_duration_since(std::time::Instant::now());
+        row.next_at = chrono::Duration::from_std(delay)
+            .ok()
+            .and_then(|d| chrono::Utc::now().checked_add_signed(d))
+            .map(db::ts);
         out.push(row);
     }
     for r in sqlx::query("SELECT id,name,last_error,last_seen_at FROM peers WHERE status!='online'")
