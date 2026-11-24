@@ -402,6 +402,10 @@ async fn notification_client_failed_fetch_or_connection_never_extends_freshness(
         .unwrap()
     })
     .await;
+    wait("failed recovery re-fetch", || async {
+        a.state.peer_streams.fresh(&peer.id, Snapshot::Recovery) == Some(false)
+    })
+    .await;
     assert_eq!(cache_available(&a, &peer).await, (false, false));
     tokio::time::sleep(Duration::from_secs(16)).await;
     assert_eq!(
