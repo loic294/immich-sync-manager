@@ -134,6 +134,7 @@ describe('ism-app', () => {
         id: 'peer:example',
         code: 'peer_offline',
         owner: 'local',
+        peerId: null,
         title: 'Sync is waiting',
         detail: 'Reconnect the other instance.',
         href: '/peers',

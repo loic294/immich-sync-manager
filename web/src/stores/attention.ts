@@ -2,6 +2,7 @@ import { signal } from '@preact/signals-core';
 import { admin } from '@/api/admin';
 import { events } from '@/api/events';
 import type { AttentionCode } from '@/api/generated/AttentionCode';
+import type { AttentionCoverage } from '@/api/generated/AttentionCoverage';
 import type { AttentionOwner } from '@/api/generated/AttentionOwner';
 import type { AttentionSnapshot } from '@/api/generated/AttentionSnapshot';
 
@@ -12,6 +13,7 @@ export interface AttentionItem {
   id: string;
   code: AttentionCode;
   owner: AttentionOwner;
+  peerId: string | null;
   title: string;
   detail: string;
   href: string;
@@ -36,7 +38,8 @@ export const blockers = signal<AttentionItem[]>([]);
 export const notifications = signal<AttentionItem[]>([]);
 export const attentionError = signal(false);
 
-type Source = { code: string; owner: string };
+type Source = { code: string; owner: string; peerId?: string | null };
+type ScopedCoverage = AttentionCoverage & { peer_id?: string | null };
 let dismissed = new Map<string, Source | null>();
 let timer: number | undefined;
 let transitionTimer: number | undefined;
@@ -58,7 +61,13 @@ function readDismissed(): Map<string, Source | null> {
       else if (entry && typeof entry === 'object' && typeof entry.id === 'string') {
         const source =
           typeof entry.code === 'string' && typeof entry.owner === 'string'
-            ? { code: entry.code, owner: entry.owner }
+            ? {
+                code: entry.code,
+                owner: entry.owner,
+                ...(typeof entry.peerId === 'string' || entry.peerId === null
+                  ? { peerId: entry.peerId }
+                  : {}),
+              }
             : null;
         result.set(entry.id, source);
       }
@@ -90,6 +99,7 @@ export function buildAttention(snapshot: AttentionSnapshot): AttentionItem[] {
         id: entry.id,
         code: entry.code,
         owner: entry.owner,
+        peerId: entry.peer_id,
         title: entry.title,
         detail: entry.message,
         href: entry.href,
@@ -107,22 +117,28 @@ async function loadAttention(epoch: number) {
   const items = buildAttention(snapshot);
   const complete = snapshot.completeness === 'complete' && snapshot.warnings.length === 0;
   const observed = new Map(snapshot.items.map((entry) => [entry.id, entry]));
-  const covered = new Set(
-    snapshot.coverage
-      .filter((entry) => entry.completeness === 'complete')
-      .map((entry) => `${entry.code}\0${entry.owner}`),
-  );
+  const coverage: readonly ScopedCoverage[] = snapshot.coverage;
   const cleared = (id: string, source: Source | null) => {
     const current = observed.get(id);
     if (current) return current.completeness === 'complete' && current.attention === 'none';
-    return complete || (source !== null && covered.has(`${source.code}\0${source.owner}`));
+    return (
+      complete ||
+      (source !== null &&
+        coverage.some(
+          (entry) =>
+            entry.completeness === 'complete' &&
+            entry.code === source.code &&
+            entry.owner === source.owner &&
+            (entry.peer_id == null || entry.peer_id === source.peerId),
+        ))
+    );
   };
   for (const [id, source] of dismissed) {
     if (cleared(id, source)) dismissed.delete(id);
     else {
       const current = observed.get(id);
       if (current && current.attention !== 'none')
-        dismissed.set(id, { code: current.code, owner: current.owner });
+        dismissed.set(id, { code: current.code, owner: current.owner, peerId: current.peer_id });
     }
   }
   saveDismissed();
@@ -217,14 +233,14 @@ export function startAttention(): () => void {
 export function dismissNotification(id: string) {
   const entry = notifications.value.find((item) => item.id === id);
   if (!entry) return;
-  dismissed.set(id, { code: entry.code, owner: entry.owner });
+  dismissed.set(id, { code: entry.code, owner: entry.owner, peerId: entry.peerId });
   saveDismissed();
   notifications.value = notifications.value.filter((entry) => entry.id !== id);
 }
 
 export function dismissAllNotifications() {
   for (const entry of notifications.value)
-    dismissed.set(entry.id, { code: entry.code, owner: entry.owner });
+    dismissed.set(entry.id, { code: entry.code, owner: entry.owner, peerId: entry.peerId });
   saveDismissed();
   notifications.value = [];
 }

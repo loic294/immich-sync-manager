@@ -228,6 +228,70 @@ describe('attention snapshots', () => {
     }
   });
 
+  it('clears only the receiver peer covered by an authoritative response', async () => {
+    const beta = { ...row, id: 'receiver:beta', owner: 'receiver' as const, peer_id: 'beta' };
+    const gamma = { ...beta, id: 'receiver:gamma', peer_id: 'gamma' };
+    const get = vi.spyOn(api, 'get').mockResolvedValue({
+      ...snapshot,
+      completeness: 'partial',
+      items: [beta, gamma],
+    });
+    const coverage = [
+      {
+        code: row.code,
+        owner: 'receiver' as const,
+        peer_id: 'beta',
+        completeness: 'complete' as const,
+      },
+      {
+        code: row.code,
+        owner: 'receiver' as const,
+        peer_id: 'gamma',
+        completeness: 'unavailable' as const,
+      },
+    ];
+    let stop = startAttention();
+    try {
+      await refreshAttention();
+      dismissNotification(beta.id);
+      dismissNotification(gamma.id);
+      get.mockResolvedValue({ ...snapshot, completeness: 'partial', coverage, items: [] });
+      await refreshAttention();
+      expect(blockers.value).toMatchObject([{ id: gamma.id, stale: true }]);
+      stop();
+      stop = startAttention();
+      await refreshAttention();
+      expect(attentionError.value).toBe(true);
+      get.mockResolvedValue({
+        ...snapshot,
+        completeness: 'partial',
+        coverage,
+        items: [beta, gamma],
+      });
+      await refreshAttention();
+      expect(notifications.value.map((entry) => entry.id)).toEqual([beta.id]);
+    } finally {
+      stop();
+    }
+  });
+
+  it('reports uncertainty after a browser restart with unavailable peer evidence', async () => {
+    vi.spyOn(api, 'get').mockResolvedValue({
+      ...snapshot,
+      completeness: 'partial',
+      warnings: ['Peer attention is unavailable.'],
+      items: [],
+    });
+    const stop = startAttention();
+    try {
+      await refreshAttention();
+      expect(attentionError.value).toBe(true);
+      expect(blockers.value).toEqual([]);
+    } finally {
+      stop();
+    }
+  });
+
   it('retains and marks previous blockers when refresh fails, then retries', async () => {
     vi.useFakeTimers();
     vi.spyOn(console, 'error').mockImplementation(() => undefined);
