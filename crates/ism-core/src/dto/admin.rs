@@ -881,6 +881,24 @@ pub struct ConflictView {
     pub created_at: String,
     /// For a move that conflicted: where the peer moved the file or folder from.
     pub moved_from: Option<Location>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub recovery: Option<RecoveryView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(tag = "owner", content = "conflict", rename_all = "snake_case")]
+#[ts(export)]
+pub enum ConflictPageRow {
+    Local(Box<ConflictView>),
+    Peer(RecoveryView),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct ConflictPage {
+    pub rows: Vec<ConflictPageRow>,
+    pub total: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]

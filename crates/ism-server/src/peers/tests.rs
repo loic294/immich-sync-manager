@@ -689,6 +689,125 @@ async fn recovery_automatically_finishes_local_bookkeeping_once() {
 }
 
 #[tokio::test]
+async fn repeated_peer_inbox_errors_are_recorded_and_warned_only_on_change() {
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+    use tracing::instrument::WithSubscriber;
+
+    struct LogWriter(Arc<Mutex<Vec<u8>>>);
+    impl Write for LogWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    write_old(&a.shared.join("photo.jpg"), b"alpha");
+    write_old(&b.shared.join("photo.jpg"), b"beta");
+    scan(&a).await;
+    scan(&b).await;
+    let peer = super::net::peers(&b.state).await.unwrap().remove(0);
+    for _ in 0..2 {
+        let _ = super::pull(&b.state, &peer).await;
+    }
+    sqlx::query("UPDATE peer_inbox SET error = NULL WHERE peer_id = ?")
+        .bind(&peer.id)
+        .execute(&b.state.db)
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE inbox_error_writes (id INTEGER)")
+        .execute(&b.state.db)
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE inbox_attempts (id INTEGER)")
+        .execute(&b.state.db)
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER count_inbox_attempts AFTER UPDATE OF attempted_at ON peer_inbox
+             BEGIN INSERT INTO inbox_attempts VALUES (1); END",
+    )
+    .execute(&b.state.db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER count_inbox_error AFTER UPDATE OF error ON peer_inbox
+         BEGIN INSERT INTO inbox_error_writes VALUES (1); END",
+    )
+    .execute(&b.state.db)
+    .await
+    .unwrap();
+    let logs = Arc::new(Mutex::new(Vec::new()));
+    let log_output = logs.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(move || LogWriter(log_output.clone()))
+        .finish();
+    async {
+        for _ in 0..6 {
+            let error = super::pull(&b.state, &peer).await.unwrap_err();
+            assert!(error.contains("conflict resolution"));
+        }
+        let writes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM inbox_error_writes")
+            .fetch_one(&b.state.db)
+            .await
+            .unwrap();
+        assert_eq!(writes, 1, "identical retries must not rewrite the error");
+        let attempts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM inbox_attempts")
+            .fetch_one(&b.state.db)
+            .await
+            .unwrap();
+        assert_eq!(attempts, 6, "every retry must still be attempted");
+        let error: String = sqlx::query_scalar("SELECT error FROM peer_inbox WHERE peer_id = ?")
+            .bind(&peer.id)
+            .fetch_one(&b.state.db)
+            .await
+            .unwrap();
+        assert!(error.contains("conflict resolution"));
+
+        sqlx::query("UPDATE peer_inbox SET error = 'earlier failure' WHERE peer_id = ?")
+            .bind(&peer.id)
+            .execute(&b.state.db)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM inbox_error_writes")
+            .execute(&b.state.db)
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            assert!(
+                super::pull(&b.state, &peer)
+                    .await
+                    .unwrap_err()
+                    .contains("conflict resolution")
+            );
+        }
+        let writes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM inbox_error_writes")
+            .fetch_one(&b.state.db)
+            .await
+            .unwrap();
+        assert_eq!(writes, 1, "a changed error must be recorded once");
+    }
+    .with_subscriber(subscriber)
+    .await;
+    let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+    assert_eq!(
+        logs.matches("peer effect deferred:").count(),
+        2,
+        "the first and changed errors must each produce a warning"
+    );
+}
+
+#[tokio::test]
 async fn recovery_batch_preserves_decisions_and_never_dismisses_unverified_work() {
     let (mut a, mut b) = pair().await;
     stop_workers(&mut a).await;
@@ -1395,6 +1514,68 @@ async fn recovery_outgoing_fix_is_persisted_offline_and_replayed_after_restart()
 }
 
 #[tokio::test]
+async fn conflict_page_paginates_local_and_peer_targets_without_a_cap() {
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    let share = super::shares(&a.state).await.unwrap().remove(0);
+    let peer = super::net::peers(&a.state).await.unwrap().remove(0);
+    let side = serde_json::to_string(&ConflictSide {
+        instance: "Example".into(),
+        sha256: None,
+        size: None,
+        deleted: false,
+        modified_at: None,
+    })
+    .unwrap();
+    sqlx::query(
+        "WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n<501)
+         INSERT INTO conflicts(id,share_id,rel_path,kind,detail,local_json,remote_json,remote_vv_json,peer_id,status,created_at)
+         SELECT 'page-' || n,?, 'photo-' || n || '.jpg','changed_on_both','',?,?,'{}',?,'open','2026-01-01T00:00:00Z' FROM seq",
+    )
+    .bind(&share.id)
+    .bind(&side)
+    .bind(&side)
+    .bind(&peer.id)
+    .execute(&a.state.db)
+    .await
+    .unwrap();
+    let view = serde_json::json!({
+        "target": { "kind": "conflict", "id": "page-1", "peer_id": null },
+        "title": "peer-photo.jpg", "state": "needs_decision", "code": "choose_version",
+        "detail": null, "can_fix": false, "can_dismiss": false, "replacement_operation_id": null
+    });
+    sqlx::query(
+        "INSERT INTO outgoing_recovery(peer_id,kind,target_id,view_json) VALUES (?, 'conflict', 'page-1', ?)",
+    )
+    .bind(&peer.id)
+    .bind(view.to_string())
+    .execute(&a.state.db)
+    .await
+    .unwrap();
+    let first = super::admin::page_conflicts(&a.state, false, 500, 0)
+        .await
+        .unwrap();
+    assert_eq!(first.total, 502);
+    assert_eq!(first.rows.len(), 500);
+    let second = super::admin::page_conflicts(&a.state, false, 500, 500)
+        .await
+        .unwrap();
+    assert_eq!(second.total, 502);
+    assert!(matches!(
+        second.rows.first(),
+        Some(ism_core::dto::ConflictPageRow::Local(_))
+    ));
+    match second.rows.last().unwrap() {
+        ism_core::dto::ConflictPageRow::Peer(item) => {
+            assert_eq!(item.target.id, "page-1");
+            assert_eq!(item.target.peer_id.as_deref(), Some(peer.id.as_str()));
+        }
+        _ => panic!("expected peer-owned conflict"),
+    }
+}
+
+#[tokio::test]
 async fn recovery_versions_are_current_owner_scoped_and_stale_decisions_do_not_execute() {
     use ism_core::dto::{
         RecoveryDecision, RecoveryDecisionInput, RecoveryKind, RecoveryState, RecoveryTarget,
@@ -1458,6 +1639,22 @@ async fn recovery_versions_are_current_owner_scoped_and_stale_decisions_do_not_e
     );
     let receiver = super::net::peers(&a.state).await.unwrap().remove(0);
     super::recovery::refresh(&a.state, &receiver).await.unwrap();
+    let page = super::admin::page_conflicts(&a.state, false, 1, 0)
+        .await
+        .unwrap();
+    assert_eq!(page.total, 1);
+    match &page.rows[0] {
+        ism_core::dto::ConflictPageRow::Peer(item) => {
+            assert_eq!(item.target.id, target.id);
+            assert_eq!(item.target.peer_id.as_deref(), Some(receiver.id.as_str()));
+        }
+        _ => panic!("expected peer-owned conflict"),
+    }
+    let after = super::admin::page_conflicts(&a.state, false, 1, 1)
+        .await
+        .unwrap();
+    assert_eq!(after.total, 1);
+    assert!(after.rows.is_empty());
     let forwarded = super::versions::get(
         &a.state,
         &RecoveryTarget {
@@ -5581,6 +5778,37 @@ async fn received_folder_prunes_are_retained_without_stalling_unrelated_events()
         count(b.state.clone(), "SELECT COUNT(*) FROM conflicts").await,
         0
     );
+
+    // Gamma must not receive complete recovery evidence through a retained prune on Beta.
+    let c_to_b = super::net::peers(&c.state).await.unwrap().remove(0);
+    let error = super::net::get_json::<super::recovery::FileEvidence>(
+        &c.state,
+        &c_to_b,
+        "/api/peer/v1/recovery/file?share=Family&path=kept&vv=%7B%7D",
+    )
+    .await
+    .unwrap_err();
+    assert!(error.starts_with("HTTP 409:"));
+    assert!(error.contains("recovery_evidence_incomplete"));
+    assert!(error.contains("folder prune prevents verifying"));
+    std::fs::create_dir(b.shared.join("independent")).unwrap();
+    let evidence = super::net::get_json::<super::recovery::FileEvidence>(
+        &c.state,
+        &c_to_b,
+        "/api/peer/v1/recovery/file?share=Family&path=independent&vv=%7B%7D",
+    )
+    .await
+    .unwrap();
+    assert_eq!(evidence.path, "independent");
+    let error = super::net::get_json::<super::recovery::FileEvidence>(
+        &b.state,
+        &peer,
+        "/api/peer/v1/recovery/file?share=Family&path=kept&vv=%7B%7D",
+    )
+    .await
+    .unwrap_err();
+    assert!(error.starts_with("HTTP 409:"));
+    assert!(error.contains("recovery_evidence_incomplete"));
 
     // The unrelated later event proceeds independently and reaches the transitive peer.
     let operation_id: String = sqlx::query_scalar("SELECT operation_id FROM pending_peer_events")

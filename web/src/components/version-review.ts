@@ -2,18 +2,11 @@ import { html, nothing, type ReactiveController, type ReactiveControllerHost } f
 import { admin } from '@/api/admin';
 import type { RecoveryTarget } from '@/api/generated/RecoveryTarget';
 import type { RecoveryVersions } from '@/api/generated/RecoveryVersions';
+import type { VersionChoices } from '@/components/ism-recovery-versions';
 import '@/components/ism-recovery-versions';
 
 export function targetKey(target: RecoveryTarget) {
   return JSON.stringify([target.kind, target.id, target.peer_id]);
-}
-
-export interface ReviewOutcome {
-  /** Targets whose comparison is current and unchanged since the previous review. */
-  unchanged: RecoveryTarget[];
-  /** Targets that were refreshed and now show different versions. */
-  changed: RecoveryTarget[];
-  failed: RecoveryTarget[];
 }
 
 const CONCURRENCY = 4;
@@ -25,7 +18,12 @@ const CONCURRENCY = 4;
 export class VersionReview implements ReactiveController {
   readonly versions = new Map<string, RecoveryVersions>();
   readonly errors = new Map<string, string>();
+  private readonly stale = new Set<string>();
   private readonly loading = new Set<string>();
+  private readonly invalidated = new Set<string>();
+  private readonly retryWhenSettled = new Set<string>();
+  private readonly queue: { target: RecoveryTarget; resolve: () => void }[] = [];
+  private active = 0;
 
   constructor(private readonly host: ReactiveControllerHost) {
     host.addController(this);
@@ -39,51 +37,104 @@ export class VersionReview implements ReactiveController {
 
   has(target: RecoveryTarget) {
     const id = targetKey(target);
-    return this.versions.has(id) && !this.loading.has(id) && !this.errors.has(id);
+    return (
+      this.versions.has(id) && !this.stale.has(id) && !this.loading.has(id) && !this.errors.has(id)
+    );
+  }
+
+  forget(target: RecoveryTarget, retry = true) {
+    const id = targetKey(target);
+    this.stale.add(id);
+    this.errors.delete(id);
+    if (this.loading.has(id)) {
+      this.invalidated.add(id);
+      if (retry) this.retryWhenSettled.add(id);
+      else this.retryWhenSettled.delete(id);
+    }
+  }
+
+  retain(targets: readonly RecoveryTarget[]) {
+    const retained = new Set(targets.map(targetKey));
+    for (let i = this.queue.length - 1; i >= 0; i--) {
+      const job = this.queue[i];
+      const id = targetKey(job.target);
+      if (retained.has(id)) continue;
+      this.queue.splice(i, 1);
+      this.loading.delete(id);
+      this.invalidated.delete(id);
+      this.retryWhenSettled.delete(id);
+      job.resolve();
+    }
   }
 
   isLoading(target: RecoveryTarget) {
     return this.loading.has(targetKey(target));
   }
 
+  retryUnavailable(targets: readonly RecoveryTarget[]) {
+    const failed: RecoveryTarget[] = [];
+    for (const target of targets) {
+      const id = targetKey(target);
+      if (this.loading.has(id)) this.retryWhenSettled.add(id);
+      else if (this.errors.has(id)) failed.push(target);
+    }
+    if (failed.length) void this.compare(failed);
+  }
+
   get busy() {
     return this.loading.size > 0;
   }
 
-  async compare(targets: readonly RecoveryTarget[]): Promise<ReviewOutcome> {
-    const outcome: ReviewOutcome = { unchanged: [], changed: [], failed: [] };
-    const queue = targets.filter((target) => !this.loading.has(targetKey(target)));
-    for (const target of queue) {
-      this.loading.add(targetKey(target));
-      this.errors.delete(targetKey(target));
+  async compare(targets: readonly RecoveryTarget[]): Promise<void> {
+    const pending: Promise<void>[] = [];
+    for (const target of targets) {
+      const id = targetKey(target);
+      if (this.loading.has(id)) continue;
+      this.loading.add(id);
+      this.errors.delete(id);
+      pending.push(new Promise((resolve) => this.queue.push({ target, resolve })));
     }
+    this.pump();
     this.host.requestUpdate();
-    const worker = async () => {
-      for (let target = queue.shift(); target; target = queue.shift()) {
-        const id = targetKey(target);
-        const previous = this.versions.get(id)?.revision;
-        try {
-          const current = await admin.recoveryVersions(target);
-          this.versions.set(id, current);
-          (previous === undefined || previous === current.revision
-            ? outcome.unchanged
-            : outcome.changed
-          ).push(target);
-        } catch (error) {
-          this.errors.set(id, error instanceof Error ? error.message : String(error));
-          outcome.failed.push(target);
-        } finally {
-          this.loading.delete(id);
-          this.host.requestUpdate();
-        }
+    await Promise.all(pending);
+  }
+
+  private pump() {
+    while (this.active < CONCURRENCY && this.queue.length) {
+      const job = this.queue.shift();
+      if (!job) break;
+      this.active++;
+      void this.fetch(job.target).finally(() => {
+        this.active--;
+        job.resolve();
+        this.pump();
+      });
+    }
+  }
+
+  private async fetch(target: RecoveryTarget) {
+    const id = targetKey(target);
+    try {
+      const current = await admin.recoveryVersions(target);
+      if (!this.invalidated.has(id)) {
+        this.versions.set(id, current);
+        this.stale.delete(id);
       }
-    };
-    await Promise.all(Array.from({ length: Math.min(CONCURRENCY, queue.length) }, worker));
-    return outcome;
+    } catch (error) {
+      if (!this.invalidated.has(id))
+        this.errors.set(id, error instanceof Error ? error.message : String(error));
+    } finally {
+      this.loading.delete(id);
+      this.invalidated.delete(id);
+      if (this.retryWhenSettled.delete(id) && !this.has(target)) {
+        void this.compare([target]);
+      }
+      this.host.requestUpdate();
+    }
   }
 
   /** The comparison, its progress, or why it failed with a way to try again. */
-  render(target: RecoveryTarget) {
+  render(target: RecoveryTarget, choices?: VersionChoices) {
     const id = targetKey(target);
     const versions = this.versions.get(id);
     const error = this.errors.get(id);
@@ -102,7 +153,7 @@ export class VersionReview implements ReactiveController {
           </div>`
           : nothing
       }
-      ${versions ? html`<ism-recovery-versions .target=${target} .versions=${versions}></ism-recovery-versions>` : nothing}
+      ${versions ? html`<ism-recovery-versions .target=${target} .versions=${versions} .choices=${choices}></ism-recovery-versions>` : nothing}
     `;
   }
 }
