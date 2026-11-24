@@ -7,7 +7,7 @@ use ism_core::dto::{
 };
 use serde::Deserialize;
 
-use super::{Share, admin, net};
+use super::{Share, admin, net, preview_image};
 use crate::error::{AppError, AppResult};
 use crate::files;
 use crate::state::AppState;
@@ -773,10 +773,16 @@ pub async fn preview(state: &AppState, query: &PreviewQuery) -> AppResult<Respon
             ),
             None,
         )
-        .timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(50))
         .send()
         .await
-        .map_err(|error| AppError::conflict("preview_unavailable", net::net_error(&error)))?;
+        .map_err(|error| {
+            if error.is_timeout() {
+                preview_image::busy()
+            } else {
+                AppError::conflict("preview_unavailable", net::net_error(&error))
+            }
+        })?;
         if !response.status().is_success() {
             let status = response.status();
             let mut body = Vec::new();
@@ -789,12 +795,14 @@ pub async fn preview(state: &AppState, query: &PreviewQuery) -> AppResult<Respon
                 }
                 body.extend_from_slice(&chunk);
             }
-            if serde_json::from_slice::<serde_json::Value>(&body)
+            let code = serde_json::from_slice::<serde_json::Value>(&body)
                 .ok()
                 .and_then(|value| value["error"]["code"].as_str().map(str::to_owned))
-                .as_deref()
-                == Some("preview_outside_transfer_hours")
-            {
+                .unwrap_or_default();
+            if code == "preview_busy" {
+                return Err(preview_image::busy());
+            }
+            if code == "preview_outside_transfer_hours" {
                 return Err(AppError::conflict(
                     "preview_outside_transfer_hours",
                     "Peer previews are unavailable outside allowed file-transfer hours.",
@@ -806,6 +814,7 @@ pub async fn preview(state: &AppState, query: &PreviewQuery) -> AppResult<Respon
             ));
         }
         let mut response = crate::routes::activity::image_response(response).await?;
+        require_preview_transfer(state, &share, peer_id).await?;
         response.headers_mut().insert(
             header::CACHE_CONTROL,
             header::HeaderValue::from_static("private, no-store"),
@@ -816,6 +825,30 @@ pub async fn preview(state: &AppState, query: &PreviewQuery) -> AppResult<Respon
         );
         return Ok(response);
     }
+    preview_image::within(
+        std::time::Duration::from_secs(40),
+        preview_local(state, query, None),
+    )
+    .await
+}
+
+pub(crate) async fn peer_preview(
+    state: &AppState,
+    query: &PreviewQuery,
+    requester: &str,
+) -> AppResult<Response> {
+    preview_image::within(
+        std::time::Duration::from_secs(40),
+        preview_local(state, query, Some(requester)),
+    )
+    .await
+}
+
+async fn preview_local(
+    state: &AppState,
+    query: &PreviewQuery,
+    requester: Option<&str>,
+) -> AppResult<Response> {
     if query.target.kind != RecoveryKind::Conflict {
         return Err(AppError::not_found("version preview not found"));
     }
@@ -839,7 +872,7 @@ pub async fn preview(state: &AppState, query: &PreviewQuery) -> AppResult<Respon
             .find(|file| file.path == query.path)
     }
     .ok_or_else(|| AppError::not_found("file is outside this version decision"))?;
-    let mime = match query
+    let avif = match query
         .path
         .rsplit('.')
         .next()
@@ -847,10 +880,8 @@ pub async fn preview(state: &AppState, query: &PreviewQuery) -> AppResult<Respon
         .to_ascii_lowercase()
         .as_str()
     {
-        "jpg" | "jpeg" => "image/jpeg",
-        "png" => "image/png",
-        "webp" => "image/webp",
-        "avif" => "image/avif",
+        "jpg" | "jpeg" | "png" | "webp" => false,
+        "avif" => true,
         _ => return Err(AppError::not_found("this file has no image preview")),
     };
     let share = super::shares(state)
@@ -860,6 +891,31 @@ pub async fn preview(state: &AppState, query: &PreviewQuery) -> AppResult<Respon
         .ok_or_else(|| {
             AppError::conflict("peer_share_changed", "the preview share is unavailable")
         })?;
+    let max_input = if avif {
+        preview_image::MAX_AVIF_INPUT
+    } else {
+        preview_image::MAX_INPUT
+    };
+    let size_error = || {
+        AppError::conflict(
+            "preview_unavailable",
+            if avif {
+                "AVIF previews larger than 4 MiB are not supported."
+            } else {
+                "Image exceeds the 64 MiB preview input limit."
+            },
+        )
+    };
+    if selected.size.is_some_and(|size| size > max_input as u64) {
+        return Err(size_error());
+    }
+    if query.source {
+        require_preview_transfer(state, &share, &peer_id).await?;
+    }
+    let permit = preview_image::acquire().await?;
+    if let Some(requester) = requester {
+        require_preview_transfer(state, &share, requester).await?;
+    }
     let bytes = if query.source {
         require_preview_transfer(state, &share, &peer_id).await?;
         let peer = net::peer(state, &peer_id).await?;
@@ -880,10 +936,16 @@ pub async fn preview(state: &AppState, query: &PreviewQuery) -> AppResult<Respon
             &format!("/api/peer/v1/content?{}", url.query().unwrap_or_default()),
             None,
         )
-        .timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
         .send()
         .await
-        .map_err(|error| AppError::conflict("preview_unavailable", net::net_error(&error)))?;
+        .map_err(|error| {
+            if error.is_timeout() {
+                preview_image::busy()
+            } else {
+                AppError::conflict("preview_unavailable", net::net_error(&error))
+            }
+        })?;
         if !response.status().is_success() {
             if matches!(
                 response.status(),
@@ -898,11 +960,8 @@ pub async fn preview(state: &AppState, query: &PreviewQuery) -> AppResult<Respon
         }
         let mut bytes = Vec::new();
         while let Some(chunk) = response.chunk().await.map_err(AppError::internal)? {
-            if bytes.len() + chunk.len() > 4 * 1024 * 1024 {
-                return Err(AppError::conflict(
-                    "preview_unavailable",
-                    "image exceeds the bounded preview size",
-                ));
+            if chunk.len() > max_input - bytes.len() {
+                return Err(size_error());
             }
             bytes.extend_from_slice(&chunk);
         }
@@ -924,23 +983,24 @@ pub async fn preview(state: &AppState, query: &PreviewQuery) -> AppResult<Respon
         };
         use tokio::io::AsyncReadExt;
         let mut bytes = Vec::new();
-        file.take(4 * 1024 * 1024 + 1)
+        file.take(max_input as u64 + 1)
             .read_to_end(&mut bytes)
             .await?;
-        if bytes.len() > 4 * 1024 * 1024 {
-            return Err(AppError::conflict(
-                "preview_unavailable",
-                "image exceeds the bounded preview size",
-            ));
+        if bytes.len() > max_input {
+            return Err(size_error());
         }
         bytes
     };
-    if crate::crypto::sha256_hex(&bytes) != selected.sha256 {
+    let result = preview_image::render(bytes, selected.sha256.clone(), permit, avif).await;
+    if result
+        .as_ref()
+        .is_err_and(|error| error.code() == "preview_changed")
+    {
         reprepare(state, &query.target.id).await?;
-        return Err(AppError::conflict(
-            "preview_changed",
-            "refresh current versions",
-        ));
+    }
+    let (mime, bytes) = result?;
+    if let Some(requester) = requester {
+        require_preview_transfer(state, &share, requester).await?;
     }
     Ok((
         [
