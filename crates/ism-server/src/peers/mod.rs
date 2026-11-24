@@ -534,20 +534,62 @@ pub async fn scan_share(state: &AppState, share: &Share) -> AppResult<()> {
         "Share inventory scan",
         &share.name,
         Some("/peers"),
-        |task| async move { scan_share_reporting(state, share, &task).await },
+        |task| async move {
+            task.waiting("Waiting for managed operations that are changing files");
+            let _operation_guard = state.replication_operation_lock.lock_scan().await;
+            let result = scan_share_reporting(state, share, &task).await;
+            match &result {
+                Ok(true) => {
+                    let cleared = sqlx::query(
+                        "DELETE FROM share_scan_failures WHERE share_id=?
+                         AND EXISTS(SELECT 1 FROM shares WHERE id=share_id AND enabled=1)",
+                    )
+                        .bind(&share.id).execute(&state.db).await?;
+                    if cleared.rows_affected() > 0 {
+                        tracing::info!(share_id = %share.id, "share scan recovered after a complete scan");
+                    }
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    let reason = if error.io_kind() == Some(std::io::ErrorKind::PermissionDenied)
+                        || error.code() == "share_scan_permission_denied"
+                    {
+                        "permission"
+                    } else {
+                        "other"
+                    };
+                    tracing::warn!(share_id = %share.id, code = %error.code(), reason,
+                        "share scan failed; incomplete paths remain protected");
+                    if let Err(persistence) = sqlx::query(
+                        "INSERT INTO share_scan_failures(share_id,reason,observed_at)
+                         SELECT id,?,? FROM shares WHERE id=? AND enabled=1
+                         ON CONFLICT(share_id) DO UPDATE SET reason=excluded.reason,
+                         observed_at=excluded.observed_at",
+                    )
+                    .bind(reason).bind(db::now()).bind(&share.id).execute(&state.db).await {
+                        tracing::error!(share_id = %share.id, error = %persistence,
+                            "cannot save share scan failure evidence");
+                        return Err(AppError::new(
+                            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                            "share_scan_evidence_failed",
+                            "Share scan failed and its status could not be saved. Check server logs.",
+                        ));
+                    }
+                }
+            }
+            state.emit(ServerEvent::ActivityChanged);
+            result.map(|_| ())
+        },
     )
     .await
 }
 
+/// A successful partial scan can publish independent changes, but cannot clear an older failure.
 async fn scan_share_reporting(
     state: &AppState,
     share: &Share,
     task: &crate::activity::Reporter,
-) -> AppResult<()> {
-    task.waiting("Waiting for managed operations that are changing files");
-    // Operations waiting to start (e.g. for the maintenance barrier) have changed nothing yet;
-    // none can start changing files while this is held.
-    let _operation_guard = state.replication_operation_lock.lock_scan().await;
+) -> AppResult<bool> {
     task.phase("Checking active operations and uncertain paths");
     inbox::require_scannable(state).await?;
     let mut blocked = blocked_footprints(state, share).await?;
@@ -557,7 +599,7 @@ async fn scan_share_reporting(
     // An unmounted root must never look like "everything was deleted".
     root.ensure_available()?;
     let base = root.abs(&share.path)?;
-    if !base.is_dir() {
+    if !fs::metadata(&base)?.is_dir() {
         return Err(AppError::not_found(format!(
             "share folder '{}' does not exist",
             share.path
@@ -566,9 +608,10 @@ async fn scan_share_reporting(
     let junk = share.junk.clone();
     task.phase("Enumerating share files");
     let reporter = task.clone();
-    let (found, blocked, incomplete) = tokio::task::spawn_blocking(move || {
+    let (found, mut blocked, mut failure) = tokio::task::spawn_blocking(move || {
         let mut found = Vec::new();
         let mut uncertain = blocked.clone();
+        let mut failure = None;
         for entry in walkdir::WalkDir::new(&base)
             .min_depth(1)
             .into_iter()
@@ -588,6 +631,7 @@ async fn scan_share_reporting(
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(error) => {
+                    note_scan_io_failure(&mut failure, error.io_error().map(std::io::Error::kind));
                     if let Some(rel) = error
                         .path()
                         .and_then(|p| p.strip_prefix(&base).ok())
@@ -612,7 +656,8 @@ async fn scan_share_reporting(
                 .replace('\\', "/");
             let meta = match entry.metadata() {
                 Ok(meta) => meta,
-                Err(_) => {
+                Err(error) => {
+                    note_scan_io_failure(&mut failure, error.io_error().map(std::io::Error::kind));
                     uncertain.push(rel);
                     continue;
                 }
@@ -620,8 +665,7 @@ async fn scan_share_reporting(
             found.push((rel, meta.len() as i64, files::mtime_ns(&meta)));
             reporter.progress(found.len() as u64, None, "files discovered");
         }
-        let incomplete = uncertain.len() > blocked.len();
-        Ok::<_, std::io::Error>((found, uncertain, incomplete))
+        Ok::<_, std::io::Error>((found, uncertain, failure))
     })
     .await
     .map_err(AppError::internal)??;
@@ -637,6 +681,7 @@ async fn scan_share_reporting(
         .collect();
     let settle_cutoff = now_ns() - SETTLE_SECS * 1_000_000_000;
     let mut seen = HashSet::new();
+    let mut complete = blocked.is_empty();
     task.phase("Hashing and reconciling settled files");
     let total = found.len() as u64;
     task.progress(0, Some(total), "files checked");
@@ -644,12 +689,20 @@ async fn scan_share_reporting(
         task.progress(index as u64, Some(total), "files checked");
         seen.insert(rel.clone());
         if mtime > settle_cutoff || blocked.iter().any(|p| inbox::overlaps(&rel, p)) {
+            complete = false;
             continue;
         }
         if RelPath::parse(&rel).is_err() {
+            complete = false;
             continue;
         }
-        register_local_reporting(state, share, &root, &rel, Some(task)).await?;
+        if let Err(error) = register_local_reporting(state, share, &root, &rel, Some(task)).await {
+            if error.io_kind().is_none() {
+                return Err(error);
+            }
+            note_scan_io_failure(&mut failure, error.io_kind());
+            blocked.push(rel);
+        }
     }
     task.progress(total, Some(total), "files checked");
     task.phase("Reconciling removed files and publishing inventory");
@@ -685,13 +738,26 @@ async fn scan_share_reporting(
         .bind(&share.id)
         .execute(&state.db)
         .await?;
-    if incomplete {
+    if let Some(permission) = failure {
         return Err(AppError::conflict(
-            "scan_incomplete",
-            "unreadable share paths were excluded from publication and deletion inference",
+            if permission {
+                "share_scan_permission_denied"
+            } else {
+                "scan_incomplete"
+            },
+            if permission {
+                "ISM cannot read some shared files because permission was denied"
+            } else {
+                "unreadable share paths were excluded from publication and deletion inference"
+            },
         ));
     }
-    Ok(())
+    Ok(complete)
+}
+
+fn note_scan_io_failure(failure: &mut Option<bool>, kind: Option<std::io::ErrorKind>) {
+    let permission = kind == Some(std::io::ErrorKind::PermissionDenied);
+    *failure = Some(failure.unwrap_or(true) && permission);
 }
 
 // ---------------------------------------------------------------------------------------------

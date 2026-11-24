@@ -549,6 +549,7 @@ pub enum AttentionCode {
     MappingUnavailable,
     WatcherPaused,
     LibraryScanFailed,
+    ShareScanFailed,
     PeerOffline,
     PeerEvidenceUnavailable,
     PeerAttentionUnavailable,

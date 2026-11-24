@@ -534,6 +534,7 @@ pub async fn update_share(state: &AppState, id: &str, input: ShareInput) -> AppR
     state.peer_configuration_changed();
     db::audit(&state.db, "admin", "share.updated", &current.name).await;
     state.sync_wake.notify_one();
+    state.emit(ServerEvent::SyncChanged);
     share_view(state, id).await
 }
 

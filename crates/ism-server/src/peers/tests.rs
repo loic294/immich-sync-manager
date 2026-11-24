@@ -14,6 +14,9 @@ mod notifications;
 #[path = "attention_tests.rs"]
 mod attention;
 
+#[path = "scan_failure_tests.rs"]
+mod scan_failures;
+
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 

@@ -792,6 +792,7 @@ pub async fn snapshot(state: &AppState) -> AppResult<AttentionSnapshot> {
             AttentionCode::OperationFailed,
             AttentionCode::WatcherPaused,
             AttentionCode::LibraryScanFailed,
+            AttentionCode::ShareScanFailed,
             AttentionCode::RecoveryDecision,
             AttentionCode::TransferFailed,
             AttentionCode::TransferScheduled,

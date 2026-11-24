@@ -61,6 +61,16 @@ A share is a folder replicated under the same name on each instance: pick the lo
 subfolder, then the peers. Create the share with the same name on the other instance, mapped to its
 own folder. Folders may sit at different paths on each machine.
 
+Failed share scans stay in the existing attention banners on Overview, Operations and Sync.
+They name the affected share and link to **Peers** to check its configured folder. A permission
+warning means ISM was denied read access: restore folder traversal and file read permission for
+the account running ISM. Other failures use a general folder/logs remedy, not a permission claim.
+ISM retries on watcher changes and its periodic full scan; there is no manual share-scan retry
+button. Unreadable paths are not treated as deleted, and independent paths and shares can continue.
+A failure survives retries, partial scans and restarts until a complete scan of that same share
+succeeds. Disabled shares hide their warning without erasing it; deleting a share removes its
+warning. Server logs identify the share and failure category, evidence-save failures, and recovery.
+
 ### Backfill when a share is added or re-enabled
 
 The event cursor is per peer, so events from before a share existed or while it was disabled are

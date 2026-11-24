@@ -78,6 +78,67 @@ async fn background_activity_requires_admin_and_keeps_current_work_outside_histo
 }
 
 #[tokio::test]
+async fn share_scan_failure_is_visible_in_attention_and_background_http() {
+    let h = harness().await;
+    h.map_root().await;
+    crate::peers::admin::create_share(
+        &h.state,
+        ism_core::dto::ShareInput {
+            name: "Archive".into(),
+            location: ism_core::dto::Location {
+                root_id: "photos".into(),
+                path: "2024".into(),
+            },
+            peer_ids: vec![],
+            enabled: true,
+        },
+    )
+    .await
+    .unwrap();
+    let share = crate::peers::shares(&h.state).await.unwrap().remove(0);
+    std::fs::remove_dir(h.root.join("2024")).unwrap();
+    assert!(crate::peers::scan_share(&h.state, &share).await.is_err());
+    let auth = [("cookie", h.cookie.as_str())];
+    let response = send(&h.app, get("/api/admin/attention", &auth)).await;
+    assert_eq!(response.status, StatusCode::OK);
+    let body = response.json();
+    let item = body["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["code"] == "share_scan_failed")
+        .unwrap();
+    assert_eq!(item["share_id"], share.id);
+    assert_eq!(item["share_name"], "Archive");
+    assert_eq!(item["blocks_work"], true);
+    assert_eq!(item["attention"], "action_required");
+    assert_eq!(item["href"], "/peers");
+    assert!(!item["message"].as_str().unwrap().contains("permission"));
+    assert!(!item.to_string().contains(&*h.root.to_string_lossy()));
+    let background = send(&h.app, get("/api/admin/operations/background", &auth)).await;
+    assert_eq!(background.status, StatusCode::OK);
+    assert!(
+        background.json()["current"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["task_key"] == format!("share-scan:{}", share.id))
+    );
+    std::fs::create_dir(h.root.join("2024")).unwrap();
+    crate::peers::scan_share(&h.state, &share).await.unwrap();
+    let recovered = send(&h.app, get("/api/admin/attention", &auth))
+        .await
+        .json();
+    assert!(
+        !recovered["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["code"] == "share_scan_failed")
+    );
+}
+
+#[tokio::test]
 async fn attention_covers_standalone_local_conditions_and_clears_resolved_sources() {
     let h = harness().await;
     let auth = [("cookie", h.cookie.as_str())];

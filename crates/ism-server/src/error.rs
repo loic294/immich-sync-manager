@@ -15,6 +15,7 @@ pub struct AppError {
     status: StatusCode,
     code: Cow<'static, str>,
     message: String,
+    io_kind: Option<std::io::ErrorKind>,
 }
 
 impl AppError {
@@ -23,6 +24,7 @@ impl AppError {
             status,
             code: Cow::Borrowed(code),
             message: message.into(),
+            io_kind: None,
         }
     }
 
@@ -59,6 +61,7 @@ impl AppError {
             status,
             code: Cow::Owned(code),
             message,
+            io_kind: None,
         }
     }
 
@@ -96,6 +99,10 @@ impl AppError {
 
     pub fn message(&self) -> &str {
         &self.message
+    }
+
+    pub(crate) fn io_kind(&self) -> Option<std::io::ErrorKind> {
+        self.io_kind
     }
 }
 
@@ -179,7 +186,10 @@ impl From<sqlx::Error> for AppError {
 
 impl From<std::io::Error> for AppError {
     fn from(e: std::io::Error) -> Self {
-        Self::internal(e)
+        let kind = e.kind();
+        let mut error = Self::internal(e);
+        error.io_kind = Some(kind);
+        error
     }
 }
 
