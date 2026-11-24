@@ -8,10 +8,13 @@ import { type AppRouter, createAppRouter } from '@/app/router';
 import { type AppRoute, routes as appRoutes, notFound, redirects, routeAt } from '@/app/routes';
 import { startTheme } from '@/app/theme';
 import { IsmElement } from '@/base/ism-element';
+import { attentionError, blockers, startAttention } from '@/stores/attention';
 import { currentPath, linkTo, startNavSync } from '@/stores/nav';
 import { startOverview } from '@/stores/overview';
 import { logout, refreshSession, session, sessionError } from '@/stores/session';
 import '@/app/ism-theme-toggle';
+import '@/components/ism-attention-bell';
+import '@/components/ism-blocker-banners';
 import '@/components/ism-icon';
 import '@/components/ism-toast-host';
 import '@/pages/ism-login-page';
@@ -80,7 +83,7 @@ export class IsmApp extends IsmElement {
   private signedIn() {
     if (this.stopSignedIn.length > 0) return;
     events.start();
-    this.stopSignedIn = [startOverview(), () => events.stop()];
+    this.stopSignedIn = [startOverview(), startAttention(), () => events.stop()];
   }
 
   private signedOut() {
@@ -214,6 +217,7 @@ export class IsmApp extends IsmElement {
               <span class="badge badge-ghost hidden sm:inline-flex" title="This instance">
                 <ism-icon name="server" size="xs"></ism-icon>${info.instance_name}
               </span>
+              <ism-attention-bell></ism-attention-bell>
               <ism-theme-toggle></ism-theme-toggle>
               <div class="tooltip tooltip-bottom" data-tip=${`Sign out ${info.username ?? ''}`}>
                 <button type="button" class="btn btn-ghost btn-sm btn-square" aria-label="Sign out" @click=${() => logout()}>
@@ -223,7 +227,17 @@ export class IsmApp extends IsmElement {
             </div>
           </header>
           ${this.renderConnectionBanner()}
-          <main class="min-h-0 flex-1 overflow-hidden">${this.router?.outlet()}</main>
+          <main class="flex min-h-0 flex-1 flex-col overflow-hidden">
+            ${
+              ['/overview', '/operations', '/sync'].includes(currentPath.value) &&
+              (blockers.value.length > 0 || attentionError.value)
+                ? html`<div class="mx-auto flex max-h-[40vh] w-full max-w-6xl flex-none flex-col gap-2 overflow-y-auto px-4 pt-4">
+                    <ism-blocker-banners class="flex flex-col gap-2"></ism-blocker-banners>
+                  </div>`
+                : nothing
+            }
+            <div class="min-h-0 flex-1 overflow-hidden">${this.router?.outlet()}</div>
+          </main>
         </div>
         <div class="drawer-side">
           <label for=${TOGGLE_ID} class="drawer-overlay" aria-label="Close menu"></label>

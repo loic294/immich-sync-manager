@@ -4,6 +4,7 @@ import { events } from '@/api/events';
 import type { BackgroundActivity } from '@/api/generated/BackgroundActivity';
 import type { SessionInfo } from '@/api/generated/SessionInfo';
 import type { AppRoute } from '@/app/routes';
+import { blockers } from '@/stores/attention';
 import { session } from '@/stores/session';
 import { mount } from '@/test/helpers';
 import '@/app/ism-app';
@@ -79,6 +80,65 @@ describe('ism-app', () => {
     expect(app.querySelector('nav a[aria-current="page"]')?.textContent).toContain('Overview');
     expect(app.textContent).toContain('Instance A');
     expect(events.start).toHaveBeenCalledOnce();
+  });
+
+  it('shows active blockers on the three work pages only while signed in', async () => {
+    const routes: AppRoute[] = ['/overview', '/operations', '/sync', '/settings'].map((path) => ({
+      path,
+      tag: 'ism-route-placeholder',
+      load: () => import('@/components/ism-route-placeholder'),
+      label: path,
+      icon: 'gauge',
+    }));
+    vi.spyOn(api, 'get').mockImplementation(async (path: string) => {
+      if (path === '/api/admin/session')
+        return { ...BASE, authenticated: true, username: 'admin' } as never;
+      if (path === '/api/admin/overview')
+        return {
+          instance_name: 'Instance A',
+          servers: [],
+          roots_total: 0,
+          roots_unavailable: 0,
+          operations_running: 0,
+          operations_attention: 0,
+          transfers_queued: 0,
+          conflicts_open: 0,
+          peers_online: 0,
+          peers_total: 0,
+          uncovered_libraries: 0,
+          watchers: [],
+          scans: [],
+        } as never;
+      if (path === '/api/admin/operations/background')
+        return { current: [], history: [], total: 0, observed_at: '', warnings: [] } as never;
+      if (path === '/api/admin/operations/page' || path === '/api/admin/recovery/page')
+        return { rows: [], total: 0 } as never;
+      if (path === '/api/admin/conflicts' || path === '/api/admin/mappings') return [] as never;
+      throw new Error(`unexpected GET ${path}`);
+    });
+    const app = await mount('ism-app', { routes });
+    await until(() => expect(app.querySelector('ism-attention-bell')).not.toBeNull());
+    await vi.waitFor(() => expect(api.get).toHaveBeenCalledWith('/api/admin/mappings'));
+    blockers.value = [
+      {
+        id: 'peer:example',
+        title: 'Sync is waiting',
+        detail: 'Reconnect the other instance.',
+        href: '/peers',
+        action: 'Open peers',
+        blocking: true,
+      },
+    ];
+    for (const path of ['/overview', '/operations', '/sync']) {
+      window.history.pushState(null, '', path);
+      window.dispatchEvent(new PopStateEvent('popstate'));
+      await until(() => expect(app.querySelector('ism-blocker-banners')).not.toBeNull());
+      await app.querySelector('ism-blocker-banners')?.updateComplete;
+      expect(app.querySelector('ism-blocker-banners')?.textContent).toContain('Sync is waiting');
+    }
+    window.history.pushState(null, '', '/settings');
+    window.dispatchEvent(new PopStateEvent('popstate'));
+    await until(() => expect(app.querySelector('ism-blocker-banners')).toBeNull());
   });
 
   it('opens sync issues from an activity link through the app router', async () => {
