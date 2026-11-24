@@ -511,7 +511,6 @@ pub async fn changes(state: &AppState, peer: &str, after: i64) -> AppResult<Chan
             "cursor must be nonnegative",
         ));
     }
-    super::recovery::discover(state).await?;
     let name = state.instance_name().await;
     let mut tx = state.db.begin().await?;
     let events: Vec<(i64, String)> = sqlx::query_as(
@@ -544,7 +543,7 @@ pub async fn changes(state: &AppState, peer: &str, after: i64) -> AppResult<Chan
             (ism_core::dto::RecoveryKind::Transfer, row.id.as_str()),
             |id| (ism_core::dto::RecoveryKind::Operation, id.as_str()),
         );
-        row.recovery = super::recovery::get(state, kind, id).await?;
+        row.recovery = super::recovery::get_discovered(state, kind, id).await?;
         decorated.push(row);
     }
     let mut rows: HashMap<_, _> = decorated

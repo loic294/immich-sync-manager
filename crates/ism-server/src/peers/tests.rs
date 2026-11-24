@@ -795,6 +795,8 @@ struct Instance {
     evidence_status: std::sync::Arc<std::sync::atomic::AtomicU16>,
     attention_hold: std::sync::Arc<ResponseHold>,
     recovery_hold: std::sync::Arc<ResponseHold>,
+    /// Milliseconds added after each `/sync-activity` response has been computed.
+    activity_delay: std::sync::Arc<std::sync::atomic::AtomicU64>,
     inventory_response: std::sync::Arc<std::sync::Mutex<Option<InventoryResponseControl>>>,
 }
 
@@ -842,6 +844,7 @@ async fn instance(name: &str) -> Instance {
     let evidence_status = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0));
     let attention_hold = std::sync::Arc::new(ResponseHold::default());
     let recovery_hold = std::sync::Arc::new(ResponseHold::default());
+    let activity_delay = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let inventory_response = std::sync::Arc::new(std::sync::Mutex::new(None));
     let app = crate::routes::router(state.clone()).layer(axum::middleware::from_fn({
         let requests = requests.clone();
@@ -852,6 +855,7 @@ async fn instance(name: &str) -> Instance {
         let attention_hold = attention_hold.clone();
         let inventory_response = inventory_response.clone();
         let recovery_hold = recovery_hold.clone();
+        let activity_delay = activity_delay.clone();
         move |request: axum::extract::Request, next: axum::middleware::Next| {
             let requests = requests.clone();
             let status = status.clone();
@@ -861,6 +865,7 @@ async fn instance(name: &str) -> Instance {
             let attention_hold = attention_hold.clone();
             let inventory_response = inventory_response.clone();
             let recovery_hold = recovery_hold.clone();
+            let activity_delay = activity_delay.clone();
             async move {
                 let path = request.uri().path().to_owned();
                 *requests.lock().unwrap().entry(path.clone()).or_insert(0) += 1;
@@ -916,12 +921,18 @@ async fn instance(name: &str) -> Instance {
                     "/api/peer/v1/recovery" => Some(&recovery_hold),
                     _ => None,
                 };
-                if let Some(hold) = hold.filter(|hold| {
-                    hold.armed.swap(false, std::sync::atomic::Ordering::SeqCst)
-                }) {
+                if let Some(hold) =
+                    hold.filter(|hold| hold.armed.swap(false, std::sync::atomic::Ordering::SeqCst))
+                {
                     let response = next.run(request).await;
                     hold.entered.notify_one();
                     hold.release.notified().await;
+                    return response;
+                }
+                let delay = activity_delay.load(std::sync::atomic::Ordering::SeqCst);
+                if path == "/api/peer/v1/sync-activity" && delay != 0 {
+                    let response = next.run(request).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                     return response;
                 }
                 next.run(request).await
@@ -951,6 +962,7 @@ async fn instance(name: &str) -> Instance {
         attention_hold,
         inventory_response,
         recovery_hold,
+        activity_delay,
     }
 }
 

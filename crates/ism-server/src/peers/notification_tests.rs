@@ -851,6 +851,183 @@ async fn notification_client_stalled_recovery_keeps_sync_page_fresh_without_veri
     assert_eq!(cache_available(&a, &peer).await, (true, true));
 }
 
+async fn running_transfer(b: &Instance, size: u64) -> (String, String) {
+    let remote_peer = net::peers(&b.state).await.unwrap().remove(0);
+    let share = crate::peers::shares(&b.state).await.unwrap().remove(0);
+    crate::peers::queue_transfer(
+        &b.state,
+        &remote_peer.id,
+        &share,
+        "progress.jpg",
+        &crate::crypto::sha256_hex(b"synthetic"),
+        size,
+        &VersionVector::default(),
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE transfers SET status='running'")
+        .execute(&b.state.db)
+        .await
+        .unwrap();
+    let transfer = sqlx::query_scalar("SELECT id FROM transfers")
+        .fetch_one(&b.state.db)
+        .await
+        .unwrap();
+    (transfer, remote_peer.id)
+}
+
+#[tokio::test]
+async fn sustained_progress_hints_faster_than_activity_fetches_keep_sync_fresh() {
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    let peer = net::peers(&a.state).await.unwrap().remove(0);
+    let (transfer, remote_peer) = running_transfer(&b, 100_000_000).await;
+    // Hints coalesce every 250ms on the receiver; each activity response takes longer.
+    b.activity_delay.store(700, Ordering::SeqCst);
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let progress = tokio::spawn({
+        let state = b.state.clone();
+        let stop = stop.clone();
+        async move {
+            let mut done = 0;
+            while !stop.load(Ordering::SeqCst) {
+                done += 10_000;
+                activity::record_progress(&state, &transfer, &remote_peer, done, 10_000)
+                    .await
+                    .unwrap();
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    });
+    a.tasks.push(tokio::spawn(activity::run(a.state.clone())));
+    wait("first activity verified", || async {
+        a.state.peer_streams.fresh(&peer.id, Snapshot::Activity) == Some(true)
+    })
+    .await;
+    let fetched = count(&b, PROGRESS);
+    let (mut first, mut last, mut outpaced) = (None, 0, false);
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let pending = a
+            .state
+            .peer_streams
+            .pending_hints(&peer.id, Snapshot::Activity)
+            .unwrap();
+        outpaced |= pending > 0;
+        let page = activity::page(&a.state, "active", 100, 0, None)
+            .await
+            .unwrap();
+        assert!(
+            page.warnings.is_empty(),
+            "{pending} pending hints: {:?}",
+            page.warnings
+        );
+        assert!(page.progress.bytes_per_second > 0.0);
+        assert!(page.progress.eta_seconds.is_some());
+        assert!(page.progress.bytes_done >= last, "progress never regresses");
+        last = page.progress.bytes_done;
+        first.get_or_insert(last);
+    }
+    stop.store(true, Ordering::SeqCst);
+    progress.await.unwrap();
+    assert!(
+        outpaced,
+        "hints must arrive while an activity fetch is in flight"
+    );
+    assert!(
+        last > first.unwrap(),
+        "persisted snapshots advance under sustained hints"
+    );
+    assert!(count(&b, PROGRESS) > fetched + 1);
+}
+
+#[tokio::test]
+async fn receiver_activity_does_not_wait_for_unrelated_recovery_discovery() {
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    let peer = net::peers(&a.state).await.unwrap().remove(0);
+    let (transfer, remote_peer) = running_transfer(&b, 1000).await;
+    activity::record_progress(&b.state, &transfer, &remote_peer, 100, 100)
+        .await
+        .unwrap();
+    // Undiscovered recovery unrelated to the activity rows, then an unrelated SQLite writer.
+    sqlx::query(
+        "INSERT INTO operations(id,idempotency_key,principal,source,request_json,status,created_at)
+         VALUES('unrelated-example','unrelated',?,'peer','{}','failed',?)",
+    )
+    .bind(format!("peer:{remote_peer}"))
+    .bind(crate::db::now())
+    .execute(&b.state.db)
+    .await
+    .unwrap();
+    // Recently seen peers need no last-seen write, isolating discovery as the only writer.
+    sqlx::query("UPDATE peers SET status='online',last_seen_at=?")
+        .bind(crate::db::now())
+        .execute(&b.state.db)
+        .await
+        .unwrap();
+    let mut writer = b.state.db.begin_with("BEGIN IMMEDIATE").await.unwrap();
+    sqlx::query("UPDATE peers SET last_error='held' WHERE id=?")
+        .bind(&remote_peer)
+        .execute(&mut *writer)
+        .await
+        .unwrap();
+    let changes = tokio::time::timeout(
+        Duration::from_secs(3),
+        activity::changes(&b.state, &remote_peer, 0),
+    )
+    .await
+    .expect("unrelated discovery must not hold activity behind the writer")
+    .unwrap();
+    let encoded = serde_json::to_value(&changes).unwrap();
+    assert_eq!(encoded["progress"]["bytes_done"], 100, "{encoded}");
+    activity::refresh(&a.state, &peer).await.unwrap();
+    assert!(
+        activity::page(&a.state, "active", 100, 0, None)
+            .await
+            .unwrap()
+            .rows
+            .iter()
+            .any(|row| row.outgoing && row.bytes_done == 100),
+        "real HTTP activity completes while the receiver writer is held"
+    );
+    writer.rollback().await.unwrap();
+
+    // A selected row that needs discovery waits for the writer instead of omitting recovery.
+    sqlx::query("UPDATE transfers SET status='failed',error='synthetic' WHERE id=?")
+        .bind(&transfer)
+        .execute(&b.state.db)
+        .await
+        .unwrap();
+    let mut writer = b.state.db.begin_with("BEGIN IMMEDIATE").await.unwrap();
+    sqlx::query("UPDATE peers SET last_error='held again' WHERE id=?")
+        .bind(&remote_peer)
+        .execute(&mut *writer)
+        .await
+        .unwrap();
+    let pending = tokio::spawn({
+        let state = b.state.clone();
+        async move { activity::changes(&state, &remote_peer, 0).await }
+    });
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(!pending.is_finished(), "required recovery is not omitted");
+    writer.rollback().await.unwrap();
+    let changes = serde_json::to_value(pending.await.unwrap().unwrap()).unwrap();
+    let row = changes["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|change| change["id"] == transfer.as_str())
+        .unwrap();
+    assert_eq!(
+        row["activity"]["recovery"]["target"]["id"],
+        transfer.as_str(),
+        "{row}"
+    );
+}
+
 #[tokio::test]
 async fn unchanged_peer_snapshots_do_not_rewrite_mirrors() {
     let (mut a, mut b) = pair().await;

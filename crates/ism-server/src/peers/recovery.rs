@@ -228,6 +228,42 @@ pub async fn get(
     }
 }
 
+/// Like `get`, but discovers only when this target is recoverable and still undiscovered.
+/// Unrelated undiscovered work no longer makes the caller wait for the SQLite writer.
+pub async fn get_discovered(
+    state: &AppState,
+    kind: RecoveryKind,
+    target_id: &str,
+) -> AppResult<Option<RecoveryView>> {
+    if let Some(item) = get(state, kind, target_id).await? {
+        return Ok(Some(item));
+    }
+    let sql = match kind {
+        RecoveryKind::Operation => {
+            "SELECT EXISTS(SELECT 1 FROM operations o WHERE o.id=?
+                 AND o.status IN ('failed','partial','recovery_required') AND (
+                     o.principal LIKE 'peer:%' OR EXISTS (
+                         SELECT 1 FROM operation_items i WHERE i.operation_id = o.id
+                         AND i.error_code = 'peer_bookkeeping_failed')))"
+        }
+        RecoveryKind::Transfer => {
+            "SELECT EXISTS(SELECT 1 FROM transfers WHERE id=? AND status='failed')"
+        }
+        RecoveryKind::Conflict => {
+            "SELECT EXISTS(SELECT 1 FROM conflicts WHERE id=? AND status='open')"
+        }
+    };
+    let recoverable: bool = sqlx::query_scalar(sql)
+        .bind(target_id)
+        .fetch_one(&state.db)
+        .await?;
+    if !recoverable {
+        return Ok(None);
+    }
+    discover(state).await?;
+    get(state, kind, target_id).await
+}
+
 fn mirrored_view(
     peer: String,
     json: &str,

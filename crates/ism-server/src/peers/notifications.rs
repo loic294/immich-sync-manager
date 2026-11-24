@@ -14,6 +14,8 @@ const RETRY: Duration = Duration::from_secs(5);
 const READ_TIMEOUT: Duration = Duration::from_secs(45);
 const FRESHNESS: Duration = Duration::from_secs(30);
 const COALESCE: Duration = Duration::from_secs(1);
+/// Activity may trail newer hints by at most this long; hints can outpace any single fetch.
+const HINT_LAG: Duration = Duration::from_secs(10);
 const PATH: &str = "/api/peer/v1/notifications";
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -28,7 +30,8 @@ pub(crate) struct Streams(Mutex<HashMap<String, Arc<Mutex<Health>>>>);
 struct Health {
     connected: bool,
     revision: u64,
-    verified: [Option<u64>; 2],
+    /// Verified revision and when its hint arrived; later hints arrived no earlier than that.
+    verified: [Option<(u64, tokio::time::Instant)>; 2],
     heartbeat: tokio::time::Instant,
 }
 
@@ -53,9 +56,11 @@ impl Streams {
     pub(super) fn fresh(&self, peer: &str, snapshot: Snapshot) -> Option<bool> {
         lock(&self.0).get(peer).map(|health| {
             let health = lock(health);
-            health.connected
-                && health.verified[snapshot as usize] == Some(health.revision)
-                && health.heartbeat.elapsed() <= FRESHNESS
+            let current = health.verified[snapshot as usize].is_some_and(|(revision, issued)| {
+                revision == health.revision
+                    || matches!(snapshot, Snapshot::Activity) && issued.elapsed() <= HINT_LAG
+            });
+            health.connected && current && health.heartbeat.elapsed() <= FRESHNESS
         })
     }
 
@@ -71,6 +76,15 @@ impl Streams {
 
     fn legacy(&self, peer: &str) {
         lock(&self.0).remove(peer);
+    }
+
+    /// Hints newer than the verified snapshot, for regressions.
+    #[cfg(test)]
+    pub(super) fn pending_hints(&self, peer: &str, snapshot: Snapshot) -> Option<u64> {
+        lock(&self.0).get(peer).map(|health| {
+            let health = lock(health);
+            health.revision - health.verified[snapshot as usize].map_or(0, |(revision, _)| revision)
+        })
     }
 }
 
@@ -109,11 +123,14 @@ impl Connection {
     fn refresh(&self) -> Refresh {
         let mut health = lock(&self.0);
         health.revision += 1;
-        health.verified = [None; 2];
-        health.heartbeat = tokio::time::Instant::now();
+        // Activity ages out through HINT_LAG; recovery requires the exact latest revision.
+        health.verified[Snapshot::Recovery as usize] = None;
+        let issued = tokio::time::Instant::now();
+        health.heartbeat = issued;
         Refresh {
             health: self.0.clone(),
             revision: health.revision,
+            issued,
         }
     }
 
@@ -126,16 +143,28 @@ impl Connection {
 pub(super) struct Refresh {
     health: Arc<Mutex<Health>>,
     revision: u64,
+    issued: tokio::time::Instant,
 }
 
 impl Refresh {
     pub(super) fn complete(&self, snapshot: Snapshot, success: bool) -> bool {
         let mut health = lock(&self.health);
-        if health.connected && health.revision == self.revision {
-            health.verified[snapshot as usize] = success.then_some(self.revision);
+        if !health.connected {
+            return false;
+        }
+        let verified = &mut health.verified[snapshot as usize];
+        if success
+            && matches!(snapshot, Snapshot::Activity)
+            && verified.is_none_or(|(revision, _)| revision < self.revision)
+        {
+            *verified = Some((self.revision, self.issued));
             return true;
         }
-        false
+        if health.revision != self.revision {
+            return false;
+        }
+        health.verified[snapshot as usize] = success.then_some((self.revision, self.issued));
+        true
     }
 }
 
@@ -414,7 +443,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn stale_or_failed_refresh_cannot_verify_a_new_connection_or_revision() {
+    fn stale_or_failed_refresh_cannot_verify_a_new_connection() {
         for snapshot in [Snapshot::Activity, Snapshot::Recovery] {
             let streams = Streams::default();
             let first = streams.connect("peer-example");
@@ -427,13 +456,10 @@ mod tests {
             assert!(!old.complete(snapshot, true));
             assert_eq!(streams.fresh("peer-example", snapshot), Some(false));
             let initial = current.refresh();
-            initial.complete(snapshot, false);
-            current.heartbeat();
+            assert!(initial.complete(snapshot, false));
             assert_eq!(streams.fresh("peer-example", snapshot), Some(false));
             let pending = current.refresh();
-            assert!(!initial.complete(snapshot, true));
-            assert_eq!(streams.fresh("peer-example", snapshot), Some(false));
-            pending.complete(snapshot, true);
+            assert!(pending.complete(snapshot, true));
             lock(&current.0).heartbeat =
                 tokio::time::Instant::now() - FRESHNESS - Duration::from_secs(1);
             assert_eq!(streams.fresh("peer-example", snapshot), Some(false));
@@ -448,51 +474,77 @@ mod tests {
         }
     }
 
+    fn age(connection: &Connection, snapshot: Snapshot, by: Duration) {
+        let mut health = lock(&connection.0);
+        let verified = health.verified[snapshot as usize].as_mut().unwrap();
+        verified.1 = tokio::time::Instant::now() - by;
+    }
+
     #[test]
-    fn snapshot_verification_is_independent_but_hints_revoke_both() {
+    fn recovery_needs_the_latest_hint_but_activity_trails_it_by_a_bounded_lag() {
         let streams = Streams::default();
         let connection = streams.connect("peer-example");
-        let refresh = connection.refresh();
-        refresh.complete(Snapshot::Activity, true);
+        let fresh = |snapshot| streams.fresh("peer-example", snapshot);
+        let first = connection.refresh();
+        assert!(first.complete(Snapshot::Activity, true));
+        assert!(first.complete(Snapshot::Recovery, true));
+        let second = connection.refresh();
+        assert_eq!(fresh(Snapshot::Recovery), Some(false));
+        assert!(!first.complete(Snapshot::Recovery, true));
+        assert_eq!(fresh(Snapshot::Recovery), Some(false));
         assert_eq!(
-            streams.fresh("peer-example", Snapshot::Activity),
-            Some(true)
+            fresh(Snapshot::Activity),
+            Some(true),
+            "hint within HINT_LAG"
         );
+        age(
+            &connection,
+            Snapshot::Activity,
+            HINT_LAG + Duration::from_secs(1),
+        );
+        connection.heartbeat();
         assert_eq!(
-            streams.fresh("peer-example", Snapshot::Recovery),
-            Some(false)
+            fresh(Snapshot::Activity),
+            Some(false),
+            "older than HINT_LAG"
         );
-        refresh.complete(Snapshot::Recovery, false);
+
+        // Sustained hints: each completion verifies its own revision even though newer ones exist.
+        let third = connection.refresh();
+        assert!(second.complete(Snapshot::Activity, true));
+        assert_eq!(fresh(Snapshot::Activity), Some(true));
+        let fourth = connection.refresh();
+        assert!(third.complete(Snapshot::Activity, true));
+        assert_eq!(fresh(Snapshot::Activity), Some(true));
+        assert!(
+            !second.complete(Snapshot::Activity, true),
+            "never regresses"
+        );
+        assert!(!second.complete(Snapshot::Activity, false));
+        assert_eq!(fresh(Snapshot::Activity), Some(true));
+        age(
+            &connection,
+            Snapshot::Activity,
+            HINT_LAG + Duration::from_secs(1),
+        );
+        assert_eq!(fresh(Snapshot::Activity), Some(false));
+        assert!(
+            fourth.complete(Snapshot::Activity, false),
+            "latest failure is authoritative"
+        );
+        assert_eq!(fresh(Snapshot::Activity), Some(false));
+        assert!(fourth.complete(Snapshot::Activity, true));
+        assert_eq!(fresh(Snapshot::Activity), Some(true));
         assert_eq!(
-            streams.fresh("peer-example", Snapshot::Activity),
-            Some(true)
+            fresh(Snapshot::Recovery),
+            Some(false),
+            "independent snapshots"
         );
-        refresh.complete(Snapshot::Recovery, true);
-        assert_eq!(
-            streams.fresh("peer-example", Snapshot::Recovery),
-            Some(true)
-        );
-        let pending = connection.refresh();
-        assert_eq!(
-            streams.fresh("peer-example", Snapshot::Activity),
-            Some(false)
-        );
-        assert_eq!(
-            streams.fresh("peer-example", Snapshot::Recovery),
-            Some(false)
-        );
-        assert!(!refresh.complete(Snapshot::Activity, true));
-        assert!(!refresh.complete(Snapshot::Recovery, true));
-        pending.complete(Snapshot::Recovery, true);
-        pending.complete(Snapshot::Activity, false);
-        assert_eq!(
-            streams.fresh("peer-example", Snapshot::Activity),
-            Some(false)
-        );
-        assert_eq!(
-            streams.fresh("peer-example", Snapshot::Recovery),
-            Some(true)
-        );
+        assert!(fourth.complete(Snapshot::Recovery, true));
+        assert_eq!(fresh(Snapshot::Recovery), Some(true));
+        assert!(fourth.complete(Snapshot::Activity, false));
+        assert_eq!(fresh(Snapshot::Activity), Some(false));
+        assert_eq!(fresh(Snapshot::Recovery), Some(true));
     }
 
     #[test]

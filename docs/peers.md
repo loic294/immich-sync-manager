@@ -46,10 +46,16 @@ of authoritative fetches and coalesces refreshes to at most once per second. Rou
 refreshes do not create background task history; fetch errors are logged and remain visible in Sync.
 Keepalives do not fetch state or write heartbeat timestamps to the database. A connection-scoped
 in-memory heartbeat keeps each unchanged snapshot current only after its own fetch succeeds for that
-connection and its latest hint. Activity and recovery verify independently: a stalled or failed recovery
-fetch does not suppress current transfer rates or ETA. New hints, disconnects and configuration changes
-invalidate both verifications; a fetch failure revokes only its own snapshot. Keepalives alone never
-authorize failed or previous snapshots.
+connection. Activity and recovery verify independently: a stalled or failed recovery
+fetch does not suppress current transfer rates or ETA. Recovery must match the latest hint. Because
+progress hints can arrive faster than a progress fetch completes, activity stays current when its
+successful fetch began after a hint issued within the last ten seconds, so the shown progress lags
+by at most that long; it never replaces a newer verified fetch. Sustained hints can keep recovery
+waiting for a quiet moment. Disconnects and configuration changes invalidate both verifications;
+a failed fetch for the latest hint revokes only its own snapshot. Keepalives alone never authorize
+failed or previous snapshots. The receiver's progress endpoint records missing recovery only for the
+rows it returns, so unrelated undiscovered recovery does not wait for its database writer; a returned
+row that needs recovery still waits (or fails) rather than omitting it.
 Progress and recovery have independently coalesced, single-flight refreshes (recovery within ten
 seconds), so a stalled endpoint does not delay later hints for the other snapshot. Refreshes write
 only changed mirror rows, and rewrite an unchanged
