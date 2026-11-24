@@ -2388,25 +2388,28 @@ async fn eligible_jobs(
     kind: Option<&str>,
     active_peers: Option<&std::collections::HashMap<Option<String>, usize>>,
     active_jobs: &[&str],
-    peer_capacity: usize,
+    group_capacity: usize,
 ) -> AppResult<Vec<EligibleJob>> {
     let mut peers = active_peers.cloned().unwrap_or_default();
     let cutoff = (chrono::Utc::now() - chrono::Duration::seconds(30)).to_rfc3339();
     let mut cursor: Option<(String, String)> = None;
     let mut jobs = Vec::new();
     let active_jobs = serde_json::to_string(active_jobs)?;
+    let unattributed_capacity = group_capacity.min(RECOVERY_CONCURRENCY_UNATTRIBUTED);
     loop {
         type Row = (String, String, String, Option<String>, String);
         let saturated = serde_json::to_string(
             &peers
                 .iter()
                 .filter_map(|(peer, count)| {
-                    (*count >= peer_capacity).then_some(peer.as_ref()).flatten()
+                    (*count >= group_capacity)
+                        .then_some(peer.as_ref())
+                        .flatten()
                 })
                 .collect::<Vec<_>>(),
         )?;
         let unattributed_saturated =
-            peers.get(&None).copied().unwrap_or_default() >= RECOVERY_CONCURRENCY_UNATTRIBUTED;
+            peers.get(&None).copied().unwrap_or_default() >= unattributed_capacity;
         let rows: Vec<Row> = sqlx::query_as(
             "WITH candidates AS (SELECT r.id,r.kind,r.target_id,
                 CASE r.kind
@@ -2457,9 +2460,9 @@ async fn eligible_jobs(
             cursor = Some((updated, job.clone()));
             if active_peers.is_some() {
                 let capacity = if peer.is_some() {
-                    peer_capacity
+                    group_capacity
                 } else {
-                    RECOVERY_CONCURRENCY_UNATTRIBUTED
+                    unattributed_capacity
                 };
                 let active = peers.entry(peer.clone()).or_default();
                 if *active >= capacity {
@@ -2614,7 +2617,7 @@ async fn local_loop(state: AppState) {
             if let Err(error) = discover(&state).await {
                 tracing::error!("recovery queue: {}", error.message());
             } else {
-                for (kind, peer_capacity) in RECOVERY_KINDS
+                for (kind, group_capacity) in RECOVERY_KINDS
                     .into_iter()
                     .flat_map(|kind| [(kind, 1), (kind, RECOVERY_CONCURRENCY_PER_PEER)])
                 {
@@ -2644,7 +2647,7 @@ async fn local_loop(state: AppState) {
                         Some(kind),
                         Some(&active_peers),
                         &active_jobs,
-                        peer_capacity,
+                        group_capacity,
                     )
                     .await
                     {
@@ -3190,9 +3193,20 @@ mod policy_tests {
             .execute(&mut *tx).await.unwrap();
         sqlx::query("INSERT INTO pending_peer_ops(operation_id,idx,share_id,kind,vv_json,peer_id) VALUES('peer',0,'share','file_changed','{}','peer-a')")
             .execute(&mut *tx).await.unwrap();
+        sqlx::query("INSERT INTO sync_recovery(id,kind,target_id,state,created_at,updated_at) VALUES('operation:peer-b','operation','peer-b','queued','2024-01-03','2024-01-03')")
+            .execute(&mut *tx).await.unwrap();
+        sqlx::query("INSERT INTO pending_peer_ops(operation_id,idx,share_id,kind,vv_json,peer_id) VALUES('peer-b',0,'share','file_changed','{}','peer-b')")
+            .execute(&mut *tx).await.unwrap();
         tx.commit().await.unwrap();
         let active = std::collections::HashMap::new();
         let jobs = eligible_jobs(&state, 4, Some("operation"), Some(&active), &[], 1)
+            .await
+            .unwrap();
+        assert_eq!(jobs.len(), 3);
+        assert_eq!(jobs.iter().filter(|job| job.3.is_none()).count(), 1);
+        assert!(jobs.iter().any(|job| job.3.as_deref() == Some("peer-a")));
+        assert!(jobs.iter().any(|job| job.3.as_deref() == Some("peer-b")));
+        let jobs = eligible_jobs(&state, 4, Some("operation"), Some(&active), &[], 3)
             .await
             .unwrap();
         assert_eq!(jobs.len(), 4);
@@ -3202,8 +3216,9 @@ mod policy_tests {
         let jobs = eligible_jobs(&state, 4, Some("operation"), Some(&active), &[], 1)
             .await
             .unwrap();
-        assert_eq!(jobs.len(), 1);
-        assert_eq!(jobs[0].3.as_deref(), Some("peer-a"));
+        assert_eq!(jobs.len(), 2);
+        assert!(jobs.iter().any(|job| job.3.as_deref() == Some("peer-a")));
+        assert!(jobs.iter().any(|job| job.3.as_deref() == Some("peer-b")));
     }
 
     #[tokio::test]

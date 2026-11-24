@@ -97,8 +97,9 @@ barrier or another operation's gate. Waiting for busy work, unavailable mounts, 
 evidence does not consume the recovery attempt counter.
 
 Recovery runs up to four jobs per kind, with at most three jobs per attributed peer. Scheduling
-prefers one job per peer before filling spare slots. Unattributed jobs can use up to three slots
-per kind. Forwarding uses up to four peers and refills a slot as soon as its worker finishes.
+prefers one job per peer or the unattributed group before filling spare slots. Unattributed jobs
+can use up to three slots per kind. Forwarding uses up to four peers and refills a slot as soon as
+its worker finishes.
 These bounded limits do not guarantee immediate progress: multiple stalled jobs can fill a kind's
 slots before another peer arrives, three stalled unattributed jobs block other unattributed jobs,
 and shared maintenance or path barriers still apply. Jobs are not cancelled to free slots. Waiting
