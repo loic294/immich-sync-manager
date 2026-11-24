@@ -176,7 +176,7 @@ async fn set_item(
 }
 
 pub async fn run_operation(state: &AppState, id: &str) -> AppResult<()> {
-    let _replication_guard = state.replication_operation_lock.lock().await;
+    let admitted_exclusively = state.replication_operation_lock.lock().await;
     let claimed = sqlx::query(
         "UPDATE operations SET status = 'waiting_maintenance' WHERE id = ? AND status = 'queued'",
     )
@@ -186,6 +186,12 @@ pub async fn run_operation(state: &AppState, id: &str) -> AppResult<()> {
     if claimed.rows_affected() == 0 {
         return Ok(());
     }
+    // Until it starts changing files, the operation lets share scans run (e.g. while it waits for
+    // the maintenance barrier); every other participant still waits for it to finish.
+    let registration = state
+        .replication_operation_lock
+        .register(&admitted_exclusively, id);
+    drop(admitted_exclusively);
     state.emit(ServerEvent::OperationUpdated {
         operation_id: id.to_owned(),
     });
@@ -271,6 +277,7 @@ pub async fn run_operation(state: &AppState, id: &str) -> AppResult<()> {
         }
         admitted.push(server.clone());
     }
+    registration.begin_mutating().await;
     sqlx::query("UPDATE operations SET status = 'running', started_at = ?, admitted_server_ids_json = ? WHERE id = ?")
         .bind(db::now())
         .bind(serde_json::to_string(&admitted)?)
