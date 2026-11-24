@@ -1735,6 +1735,243 @@ async fn content_wait_drops_a_footprint_error_once_the_footprint_is_released() {
     );
 }
 
+async fn awaiting_content_event(state: &AppState, peer_id: &str) -> super::PeerEvent {
+    let raw: String = sqlx::query_scalar(
+        "SELECT event_json FROM peer_inbox WHERE peer_id = ? AND status = 'awaiting_content'",
+    )
+    .bind(peer_id)
+    .fetch_one(&state.db)
+    .await
+    .unwrap();
+    serde_json::from_str(&raw).unwrap()
+}
+
+async fn insert_later_inbox_row(
+    state: &AppState,
+    peer_id: &str,
+    seq: i64,
+    share: &str,
+    event_json: &str,
+) {
+    sqlx::query(
+        "INSERT INTO peer_inbox(peer_id,seq,origin,origin_seq,share_name,event_json)
+         VALUES (?,?,'later-source',?,?,?)",
+    )
+    .bind(peer_id)
+    .bind(seq)
+    .bind(seq)
+    .bind(share)
+    .bind(event_json)
+    .execute(&state.db)
+    .await
+    .unwrap();
+}
+
+fn later_move(seq: i64, share: &str, from: &str, to: &str) -> String {
+    serde_json::to_string(&super::PeerEvent {
+        seq,
+        origin: "later-source".into(),
+        origin_seq: seq,
+        share: share.into(),
+        kind: "file_moved".into(),
+        data: super::EventData {
+            path: to.into(),
+            from: Some(from.into()),
+            ..Default::default()
+        },
+    })
+    .unwrap()
+}
+
+#[tokio::test]
+async fn present_content_verification_does_not_read_later_inbox_events() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    write_old(&a.shared.join("photo.jpg"), b"remote photo");
+    scan(&a).await;
+    let peer = super::net::peers(&b.state).await.unwrap().remove(0);
+    super::pull(&b.state, &peer).await.unwrap();
+    // The original is present locally with other bytes, so verification registers it once and
+    // then reports unverified content without further writes.
+    write_old(&b.shared.join("photo.jpg"), b"local photo");
+    let db = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(b.state.db.connect_options().as_ref().clone())
+        .await
+        .unwrap();
+    let state = AppState::new(
+        b.state.config.clone(),
+        db,
+        SecretBox::open_or_create(b._dir.path()).unwrap(),
+    )
+    .await
+    .unwrap();
+    let event = awaiting_content_event(&state, &peer.id).await;
+    let all = super::shares(&state).await.unwrap();
+    let share = all.iter().find(|s| s.name == event.share).unwrap().clone();
+    let opcodes = Arc::new(AtomicUsize::new(0));
+    {
+        let mut connection = state.db.acquire().await.unwrap();
+        let counter = opcodes.clone();
+        connection
+            .lock_handle()
+            .await
+            .unwrap()
+            .set_progress_handler(1, move || {
+                counter.fetch_add(1, Ordering::Relaxed);
+                true
+            });
+    }
+    let observe = || async {
+        let mut cost = 0;
+        let mut verified = None;
+        for _ in 0..2 {
+            opcodes.store(0, Ordering::Relaxed);
+            verified = Some(
+                super::inbox::verify_content(&state, &peer, &all, &event)
+                    .await
+                    .unwrap(),
+            );
+            cost = opcodes.load(Ordering::Relaxed);
+        }
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM peer_inbox WHERE peer_id = ? AND seq = ?")
+                .bind(&peer.id)
+                .bind(event.seq)
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+        let row = super::row(&state, &share.id, "photo.jpg").await.unwrap();
+        let moved = super::row(&state, &share.id, "moved/photo.jpg")
+            .await
+            .unwrap();
+        (
+            cost,
+            (verified.unwrap(), status, row, moved),
+            std::fs::read(b.shared.join("photo.jpg")).unwrap(),
+        )
+    };
+    let mut measurements = vec![(0, observe().await)];
+    // Later rows include a move of the original and a malformed event: a present original
+    // never follows lineage, so neither may change the outcome.
+    let mut seq = event.seq;
+    for batch in 0..2 {
+        for index in 0..128 {
+            seq += 1;
+            let raw = match (batch, index) {
+                (0, 0) => later_move(seq, &event.share, "photo.jpg", "moved/photo.jpg"),
+                (1, 127) => "not json".to_owned(),
+                _ => later_move(
+                    seq,
+                    &event.share,
+                    &format!("unrelated/{seq}.jpg"),
+                    &format!("elsewhere/{seq}.jpg"),
+                ),
+            };
+            insert_later_inbox_row(&state, &peer.id, seq, &event.share, &raw).await;
+        }
+        measurements.push(((batch + 1) * 128, observe().await));
+    }
+    let counts: Vec<(usize, usize)> = measurements.iter().map(|(n, m)| (*n, m.0)).collect();
+    eprintln!("later inbox rows / SQLite VM instructions: {counts:?}");
+    let (_, (base_cost, outcome, bytes)) = &measurements[0];
+    assert!(*base_cost > 0, "the work counter must be active");
+    assert!(!outcome.0, "different local bytes must stay unverified");
+    assert_eq!(outcome.1, "awaiting_content");
+    assert!(
+        outcome.3.is_none(),
+        "a present original must not follow a later move"
+    );
+    for (count, (cost, later_outcome, later_bytes)) in &measurements[1..] {
+        assert_eq!(
+            later_outcome, outcome,
+            "outcome changed with {count} later rows"
+        );
+        assert_eq!(
+            later_bytes, bytes,
+            "local bytes changed with {count} later rows"
+        );
+        assert!(
+            cost.saturating_sub(*base_cost) < *count,
+            "a present original must not read later inbox rows: {counts:?}"
+        );
+    }
+    state.db.close().await;
+}
+
+#[tokio::test]
+async fn absent_content_verification_follows_later_moves_and_rejects_malformed_events() {
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    write_old(&a.shared.join("photo.jpg"), b"remote photo");
+    scan(&a).await;
+    let peer = super::net::peers(&b.state).await.unwrap().remove(0);
+    super::pull(&b.state, &peer).await.unwrap();
+    let state = &b.state;
+    let event = awaiting_content_event(state, &peer.id).await;
+    let all = super::shares(state).await.unwrap();
+    let verify = || super::inbox::verify_content(state, &peer, &all, &event);
+
+    sqlx::query(
+        "INSERT INTO operations (id,idempotency_key,principal,source,request_json,status,created_at)
+         VALUES ('moved-footprint','moved-footprint','admin:test','admin',
+           '{\"actions\":[{\"target\":{\"root_id\":\"photos\",\"path\":\"shared/moved/photo.jpg\"}}]}',
+           'failed',?)",
+    )
+    .bind(crate::db::now())
+    .execute(&state.db)
+    .await
+    .unwrap();
+    assert!(
+        !verify().await.unwrap(),
+        "an absent original with no later move does not reach the moved footprint"
+    );
+
+    insert_later_inbox_row(
+        state,
+        &peer.id,
+        event.seq + 1,
+        &event.share,
+        &later_move(event.seq + 1, &event.share, "photo.jpg", "moved/photo.jpg"),
+    )
+    .await;
+    let followed = verify().await.unwrap_err();
+    assert!(
+        followed.message().contains("unresolved managed operations"),
+        "an absent original must follow its later move: {}",
+        followed.message()
+    );
+
+    insert_later_inbox_row(state, &peer.id, event.seq + 2, &event.share, "not json").await;
+    let malformed = verify().await.unwrap_err();
+    assert!(
+        !malformed
+            .message()
+            .contains("unresolved managed operations"),
+        "a malformed later event must fail before lineage is trusted: {}",
+        malformed.message()
+    );
+
+    write_old(&b.shared.join("photo.jpg"), b"local photo");
+    assert!(
+        !verify().await.unwrap(),
+        "a present original ignores later lineage, including malformed rows"
+    );
+    let status: String =
+        sqlx::query_scalar("SELECT status FROM peer_inbox WHERE peer_id = ? AND seq = ?")
+            .bind(&peer.id)
+            .bind(event.seq)
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+    assert_eq!(status, "awaiting_content");
+}
+
 #[tokio::test]
 async fn independent_transfer_candidate_cost_grows_linearly_with_unrelated_conflicts() {
     use std::sync::Arc;

@@ -1070,7 +1070,7 @@ async fn conflict_decision(
     Ok(None)
 }
 
-async fn verify_content(
+pub(super) async fn verify_content(
     state: &AppState,
     peer: &net::Peer,
     all: &[Share],
@@ -1090,13 +1090,15 @@ async fn verify_content(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
         Err(error) => return Err(error.into()),
     };
-    let later: Vec<String> = sqlx::query_scalar(
-        "SELECT event_json FROM peer_inbox WHERE peer_id = ? AND seq > ? AND share_name = ? ORDER BY seq",
-    ).bind(&peer.id).bind(event.seq).bind(&event.share).fetch_all(&state.db).await?;
+    // A present original keeps its own path; only an absent one follows later move lineage.
+    let later: Vec<String> = if original_present {
+        Vec::new()
+    } else {
+        sqlx::query_scalar(
+            "SELECT event_json FROM peer_inbox WHERE peer_id = ? AND seq > ? AND share_name = ? ORDER BY seq",
+        ).bind(&peer.id).bind(event.seq).bind(&event.share).fetch_all(&state.db).await?
+    };
     for raw in later {
-        if original_present {
-            break;
-        }
         let movement: PeerEvent = serde_json::from_str(&raw)?;
         if let Some(from) = &movement.data.from {
             if movement.kind == "file_moved" && current == *from {
