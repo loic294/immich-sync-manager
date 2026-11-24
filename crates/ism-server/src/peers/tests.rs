@@ -5494,7 +5494,13 @@ async fn received_folder_prunes_never_delete_and_do_not_stall_unrelated_events()
             rows.iter().map(|r| r.0.as_str()).collect::<Vec<_>>(),
             ["kept", "later", "kept/inner"]
         );
-        assert!(rows[0].2.as_deref().unwrap().contains("never deletes folders"));
+        assert!(
+            rows[0]
+                .2
+                .as_deref()
+                .unwrap()
+                .contains("never deletes folders")
+        );
         assert_eq!(rows[2].1, "pending");
         assert!(rows[2].2.is_none());
     }
