@@ -2376,6 +2376,7 @@ async fn process(state: &AppState, kind: &str, id: &str) -> AppResult<bool> {
 
 const RECOVERY_CONCURRENCY_PER_KIND: usize = 4;
 const RECOVERY_CONCURRENCY_PER_PEER: usize = 1;
+const RECOVERY_CONCURRENCY_UNATTRIBUTED: usize = RECOVERY_CONCURRENCY_PER_KIND - 1;
 const RECOVERY_KINDS: [&str; 3] = ["operation", "transfer", "conflict"];
 const FORWARD_CONCURRENCY: usize = 4;
 
@@ -2406,7 +2407,7 @@ async fn eligible_jobs(
                 .collect::<Vec<_>>(),
         )?;
         let unattributed_saturated =
-            peers.get(&None).copied().unwrap_or_default() >= RECOVERY_CONCURRENCY_PER_PEER;
+            peers.get(&None).copied().unwrap_or_default() >= RECOVERY_CONCURRENCY_UNATTRIBUTED;
         let rows: Vec<Row> = sqlx::query_as(
             "WITH candidates AS (SELECT r.id,r.kind,r.target_id,
                 CASE r.kind
@@ -2414,7 +2415,17 @@ async fn eligible_jobs(
                     WHEN 'transfer' THEN COALESCE(
                         (SELECT peer_id FROM transfers WHERE id=r.target_id),
                         (SELECT peer_id FROM transfer_history WHERE id=r.target_id))
-                    WHEN 'operation' THEN (SELECT MIN(peer_id) FROM pending_peer_ops WHERE operation_id=r.target_id)
+                    WHEN 'operation' THEN (
+                        SELECT CASE
+                            WHEN COUNT(*)=0 THEN (
+                                SELECT CASE WHEN substr(principal,1,5)='peer:' AND length(principal)>5
+                                    THEN substr(principal,6) END
+                                FROM operations WHERE id=r.target_id)
+                            WHEN MIN(peer_id)=MAX(peer_id) THEN MIN(peer_id)
+                        END
+                        FROM (SELECT peer_id FROM pending_peer_ops WHERE operation_id=r.target_id
+                              UNION ALL
+                              SELECT peer_id FROM pending_peer_events WHERE operation_id=r.target_id))
                 END AS peer_id,
                 r.updated_at
              FROM sync_recovery r
@@ -2446,8 +2457,13 @@ async fn eligible_jobs(
         for (job, job_kind, target, peer, updated) in rows {
             cursor = Some((updated, job.clone()));
             if active_peers.is_some() {
+                let capacity = if peer.is_some() {
+                    RECOVERY_CONCURRENCY_PER_PEER
+                } else {
+                    RECOVERY_CONCURRENCY_UNATTRIBUTED
+                };
                 let active = peers.entry(peer.clone()).or_default();
-                if *active >= RECOVERY_CONCURRENCY_PER_PEER {
+                if *active >= capacity {
                     continue;
                 }
                 *active += 1;
@@ -3172,15 +3188,109 @@ mod policy_tests {
         let jobs = eligible_jobs(&state, 4, Some("operation"), Some(&active), &[])
             .await
             .unwrap();
-        assert_eq!(jobs.len(), 2);
-        assert_eq!(jobs.iter().filter(|job| job.3.is_none()).count(), 1);
+        assert_eq!(jobs.len(), 4);
+        assert_eq!(jobs.iter().filter(|job| job.3.is_none()).count(), 3);
         assert!(jobs.iter().any(|job| job.3.as_deref() == Some("peer-a")));
-        let active = std::collections::HashMap::from([(None, 1)]);
+        let active = std::collections::HashMap::from([(None, 3)]);
         let jobs = eligible_jobs(&state, 4, Some("operation"), Some(&active), &[])
             .await
             .unwrap();
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].3.as_deref(), Some("peer-a"));
+    }
+
+    #[tokio::test]
+    async fn operation_attribution_includes_pending_events_and_rejects_ambiguity() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new(
+            Config::for_tests(dir.path()),
+            crate::db::connect(dir.path()).await.unwrap(),
+            SecretBox::open_or_create(dir.path()).unwrap(),
+        )
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO peers(id,name,url,instance_id,secret_enc,status,created_at) VALUES('peer-a','A','https://a.example','a','secret','online',?)")
+            .bind(db::now()).execute(&state.db).await.unwrap();
+        sqlx::query("INSERT INTO shares(id,name,root_id,path,peer_ids_json,enabled) VALUES('share','Share','root','','[]',1)")
+            .execute(&state.db).await.unwrap();
+        sqlx::query("INSERT INTO operations(id,idempotency_key,principal,source,request_json,status,created_at) VALUES('event','event','admin:test','test','{}','failed',?)")
+            .bind(db::now()).execute(&state.db).await.unwrap();
+        sqlx::query("INSERT INTO pending_peer_events(operation_id,peer_id,share_id,origin,origin_seq,expected_cursor,event_json) VALUES('event','peer-a','share','source',1,0,'{}')")
+            .execute(&state.db).await.unwrap();
+        sqlx::query("INSERT INTO sync_recovery(id,kind,target_id,state,created_at,updated_at) VALUES('operation:event','operation','event','queued',?,?)")
+            .bind(db::now()).bind(db::now()).execute(&state.db).await.unwrap();
+        let active = std::collections::HashMap::new();
+        let jobs = eligible_jobs(&state, 4, Some("operation"), Some(&active), &[])
+            .await
+            .unwrap();
+        assert_eq!(jobs[0].3.as_deref(), Some("peer-a"));
+        sqlx::query("INSERT INTO pending_peer_ops(operation_id,idx,share_id,kind,vv_json,peer_id) VALUES('event',0,'share','file_changed','{}','peer-b')")
+            .execute(&state.db).await.unwrap();
+        let jobs = eligible_jobs(&state, 4, Some("operation"), Some(&active), &[])
+            .await
+            .unwrap();
+        assert_eq!(jobs[0].3, None);
+    }
+
+    #[tokio::test]
+    async fn stalled_unattributed_operation_does_not_block_independent_operation() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new(
+            Config::for_tests(dir.path()),
+            crate::db::connect(dir.path()).await.unwrap(),
+            SecretBox::open_or_create(dir.path()).unwrap(),
+        )
+        .await
+        .unwrap();
+        for (id, status) in [("held", "recovery_required"), ("complete", "completed")] {
+            sqlx::query("INSERT INTO operations(id,idempotency_key,principal,source,request_json,status,created_at) VALUES(?,?,'admin:test','test','{}',?,?)")
+                .bind(id).bind(id).bind(status).bind(db::now()).execute(&state.db).await.unwrap();
+        }
+        sqlx::query("INSERT INTO sync_recovery(id,kind,target_id,state,created_at,updated_at) VALUES('operation:held','operation','held','queued',?,?)")
+            .bind(db::now()).bind(db::now()).execute(&state.db).await.unwrap();
+        let guard = state.replication_operation_lock.lock().await;
+        let worker = tokio::spawn(local_loop(state.clone()));
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let status: String =
+                    sqlx::query_scalar("SELECT state FROM sync_recovery WHERE id='operation:held'")
+                        .fetch_one(&state.db)
+                        .await
+                        .unwrap();
+                if status == "fixing" {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("first recovery was not claimed");
+        sqlx::query("INSERT INTO sync_recovery(id,kind,target_id,state,created_at,updated_at) VALUES('operation:complete','operation','complete','queued',?,?)")
+            .bind(db::now()).bind(db::now()).execute(&state.db).await.unwrap();
+        let independent = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let status: String = sqlx::query_scalar(
+                    "SELECT state FROM sync_recovery WHERE id='operation:complete'",
+                )
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+                if status == "fixed" {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        let held: String =
+            sqlx::query_scalar("SELECT state FROM sync_recovery WHERE id='operation:held'")
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+        worker.abort();
+        drop(guard);
+        assert!(independent.is_ok(), "independent recovery did not progress");
+        assert_eq!(held, "fixing");
     }
 
     #[tokio::test]
