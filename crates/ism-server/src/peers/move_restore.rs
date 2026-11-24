@@ -961,22 +961,37 @@ async fn process_one(state: &AppState, plan: &Restoration) -> AppResult<()> {
             return Ok(());
         }
     }
-    if !finish_generation(state, &plan.operation_id).await? {
+    let mut finished_plan = None;
+    if !finish_generation(state, &plan.operation_id, &mut finished_plan).await? {
         return Ok(());
     }
-    let sentinel = format!("folder-restore:{}", plan.operation_id);
+    let finished_plan =
+        finished_plan.ok_or_else(|| unverified("finished restoration has no plan"))?;
+    cleanup_finished_plan(state, &plan.operation_id, &finished_plan).await
+}
+
+async fn cleanup_finished_plan(
+    state: &AppState,
+    operation_id: &str,
+    finished_plan: &str,
+) -> AppResult<()> {
+    let sentinel = format!("folder-restore:{operation_id}");
     let _guard = state.replication_operation_lock.lock().await;
     let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
-    let finished: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM pending_peer_ops p
+    let raw: Option<String> = sqlx::query_scalar(
+        "SELECT p.vv_json FROM pending_peer_ops p
          LEFT JOIN conflicts c ON c.id=p.conflict_id
          WHERE p.operation_id=? AND p.kind='folder_restore'
-         AND (p.conflict_id IS NULL OR c.status='resolved'))",
+         AND (p.conflict_id IS NULL OR c.status='resolved')",
     )
     .bind(&sentinel)
-    .fetch_one(&mut *tx)
+    .fetch_optional(&mut *tx)
     .await?;
-    if !finished {
+    let Some(raw) = raw else {
+        return Ok(());
+    };
+    let current: Restoration = serde_json::from_str(&raw)?;
+    if serde_json::to_string(&current)? != finished_plan {
         return Ok(());
     }
     sqlx::query("DELETE FROM sync_recovery_links WHERE kind='operation' AND target_id=?")
@@ -992,12 +1007,21 @@ async fn process_one(state: &AppState, plan: &Restoration) -> AppResult<()> {
     Ok(())
 }
 
-async fn finish_generation(state: &AppState, operation_id: &str) -> AppResult<bool> {
+async fn finish_generation(
+    state: &AppState,
+    operation_id: &str,
+    finished_plan: &mut Option<String>,
+) -> AppResult<bool> {
     let mut plan = load(state, operation_id)
         .await?
         .ok_or_else(|| unverified("restoration disappeared before convergence"))?;
+    let token = serde_json::to_string(&plan)?;
     let Some(generation) = plan.generations.last() else {
-        return Ok(plan.conflict_id.is_none());
+        if plan.conflict_id.is_none() {
+            *finished_plan = Some(token);
+            return Ok(true);
+        }
+        return Ok(false);
     };
     let conflict_id = plan
         .conflict_id
@@ -1025,7 +1049,11 @@ async fn finish_generation(state: &AppState, operation_id: &str) -> AppResult<bo
             .keys()
             .ne(inventory(&plan.remote).keys());
     if whole_tree {
-        return finish_tree_generation(state, plan, share).await;
+        if finish_tree_generation(state, plan, share).await? {
+            *finished_plan = Some(token);
+            return Ok(true);
+        }
+        return Ok(false);
     }
     let current =
         move_decisions::evidence_at(state, &context(&plan, share.clone()), Some(&plan.remote))
@@ -1175,16 +1203,40 @@ async fn finish_generation(state: &AppState, operation_id: &str) -> AppResult<bo
             ));
         }
     }
+    if finish_parent(state, &plan, &conflict_id).await? {
+        *finished_plan = Some(token);
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+async fn finish_parent(state: &AppState, plan: &Restoration, id: &str) -> AppResult<bool> {
     let _guard = state.replication_operation_lock.lock().await;
-    sqlx::query(
+    let Some(current) = load(state, &plan.operation_id).await? else {
+        return Ok(false);
+    };
+    if serde_json::to_value(current)? != serde_json::to_value(plan)? {
+        return Ok(false);
+    }
+    let status: String = sqlx::query_scalar("SELECT status FROM conflicts WHERE id=?")
+        .bind(id)
+        .fetch_one(&state.db)
+        .await?;
+    if status == "resolved" {
+        return Ok(true);
+    }
+    let updated = sqlx::query(
         "UPDATE conflicts SET status='resolved',resolved_at=? WHERE id=? AND status='resolving'",
     )
     .bind(crate::db::now())
-    .bind(&conflict_id)
+    .bind(id)
     .execute(&state.db)
     .await?;
-    state.emit(crate::state::ServerEvent::ConflictsChanged);
-    Ok(true)
+    if updated.rows_affected() == 1 {
+        state.emit(crate::state::ServerEvent::ConflictsChanged);
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -1192,7 +1244,37 @@ pub(in crate::peers) async fn finish_generation_before_cleanup(
     state: &AppState,
     operation_id: &str,
 ) -> AppResult<bool> {
-    finish_generation(state, operation_id).await
+    finish_generation(state, operation_id, &mut None).await
+}
+
+#[cfg(test)]
+pub(in crate::peers) async fn snapshot_restoration(
+    state: &AppState,
+    operation_id: &str,
+) -> AppResult<String> {
+    let plan = load(state, operation_id)
+        .await?
+        .ok_or_else(|| unverified("restoration disappeared"))?;
+    Ok(serde_json::to_string(&plan)?)
+}
+
+#[cfg(test)]
+pub(in crate::peers) async fn finish_snapshot(state: &AppState, snapshot: &str) -> AppResult<bool> {
+    let plan: Restoration = serde_json::from_str(snapshot)?;
+    let id = plan
+        .conflict_id
+        .as_deref()
+        .ok_or_else(|| unverified("restoration has no conflict"))?;
+    finish_parent(state, &plan, id).await
+}
+
+#[cfg(test)]
+pub(in crate::peers) async fn cleanup_snapshot(
+    state: &AppState,
+    operation_id: &str,
+    snapshot: &str,
+) -> AppResult<()> {
+    cleanup_finished_plan(state, operation_id, snapshot).await
 }
 
 async fn finish_tree_generation(
@@ -1215,16 +1297,7 @@ async fn finish_tree_generation(
             .fetch_one(&state.db)
             .await?;
         if status == "resolved" {
-            let _guard = state.replication_operation_lock.lock().await;
-            sqlx::query(
-                "UPDATE conflicts SET status='resolved',resolved_at=? WHERE id=? AND status='resolving'",
-            )
-            .bind(crate::db::now())
-            .bind(&parent)
-            .execute(&state.db)
-            .await?;
-            state.emit(crate::state::ServerEvent::ConflictsChanged);
-            return Ok(true);
+            return finish_parent(state, &plan, &parent).await;
         }
         if status != "open" {
             return Ok(false);

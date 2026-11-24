@@ -36,12 +36,14 @@ pub(super) use move_decisions::{
     content_decision, event_decision, finish_step, footprints as move_decision_footprints,
     process as process_move_decisions,
 };
-#[cfg(test)]
-pub(super) use move_restore::finish_generation_before_cleanup;
 pub(super) use move_restore::validate_current_manifest as validate_folder_restore;
 pub(crate) use move_restore::{
     VerifiedFolderRestore, verified_folder_restore, verified_restore_upload,
     verify_restored_folder_source,
+};
+#[cfg(test)]
+pub(super) use move_restore::{
+    cleanup_snapshot, finish_generation_before_cleanup, finish_snapshot, snapshot_restoration,
 };
 pub(super) use move_restore::{process as process_folder_restorations, restore_missing_folder};
 pub(super) use move_restore::{

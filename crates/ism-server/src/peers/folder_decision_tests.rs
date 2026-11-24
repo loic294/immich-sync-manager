@@ -569,6 +569,9 @@ async fn resolved_restoration_reopens_with_a_fresh_reviewed_decision_before_clea
     .await
     .unwrap();
     assert!(pending, "exercise the real gap before restoration cleanup");
+    let old_snapshot = admin::snapshot_restoration(&a.state, &operation)
+        .await
+        .unwrap();
     sqlx::query("UPDATE sync_recovery SET updated_at='2000-01-01T00:00:00Z' WHERE kind='conflict' AND target_id=?")
         .bind(&conflict)
         .execute(&a.state.db)
@@ -639,6 +642,71 @@ async fn resolved_restoration_reopens_with_a_fresh_reviewed_decision_before_clea
     );
     super::super::recovery::tick(&a.state).await.unwrap();
     assert_eq!(status(&a, &conflict).await, "resolving");
+    assert!(
+        !admin::finish_snapshot(&a.state, &old_snapshot)
+            .await
+            .unwrap(),
+        "an old finisher must not resolve the newly approved generation"
+    );
+    assert_eq!(status(&a, &conflict).await, "resolving");
+    a.tasks.extend([
+        tokio::spawn(crate::maintenance::run(a.state.clone())),
+        tokio::spawn(crate::ops::exec::run(a.state.clone())),
+        tokio::spawn(super::super::transfer::run(a.state.clone())),
+    ]);
+    let mut finished = false;
+    for _ in 0..400 {
+        admin::process_pending_choices(&a.state).await.unwrap();
+        if admin::finish_generation_before_cleanup(&a.state, &operation)
+            .await
+            .unwrap()
+        {
+            finished = true;
+            break;
+        }
+        a.state.sync_wake.notify_waiters();
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(finished, "the second reviewed generation did not finish");
+    assert_eq!(status(&a, &conflict).await, "resolved");
+    assert_eq!(
+        std::fs::read(a.shared.join("new/nested/photo.jpg")).unwrap(),
+        b"new peer generation"
+    );
+    admin::cleanup_snapshot(&a.state, &operation, &old_snapshot)
+        .await
+        .unwrap();
+    let pending: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM pending_peer_ops WHERE kind='folder_restore' AND conflict_id=?)",
+    )
+    .bind(&conflict)
+    .fetch_one(&a.state.db)
+    .await
+    .unwrap();
+    assert!(pending, "stale cleanup must preserve the newer generation");
+    admin::process_folder_restorations(&a.state).await.unwrap();
+    let pending: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM pending_peer_ops WHERE kind='folder_restore' AND conflict_id=?)",
+    )
+    .bind(&conflict)
+    .fetch_one(&a.state.db)
+    .await
+    .unwrap();
+    assert!(!pending, "the finished generation must be cleaned up");
+    sqlx::query("UPDATE sync_recovery SET updated_at='2000-01-01T00:00:00Z' WHERE kind='conflict' AND target_id=?")
+        .bind(&conflict)
+        .execute(&a.state.db)
+        .await
+        .unwrap();
+    super::super::recovery::tick(&a.state).await.unwrap();
+    assert_eq!(
+        super::super::recovery::get(&a.state, RecoveryKind::Conflict, &conflict)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        RecoveryState::Fixed
+    );
 }
 
 async fn restored_tree_change_choice(child_created: bool) {
