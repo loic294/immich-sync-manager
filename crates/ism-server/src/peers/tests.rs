@@ -5529,8 +5529,11 @@ async fn received_folder_prunes_are_retained_without_stalling_unrelated_events()
     };
 
     // Two pulls: the second replays the retained receipts without duplicating or deleting.
+    // Unrelated work is queued rather than applied inline, so each pull also reports the
+    // retained, actionable error.
     for _ in 0..2 {
-        super::pull(&b.state, &peer).await.unwrap();
+        let error = super::pull(&b.state, &peer).await.unwrap_err();
+        assert!(error.contains("future ISM update"));
         assert!(b.shared.join("kept").is_dir());
         let rows = inbox(b.state.clone()).await;
         assert_eq!(
@@ -5546,7 +5549,10 @@ async fn received_folder_prunes_are_retained_without_stalling_unrelated_events()
         );
         assert!(rows[0].3.as_deref().unwrap().contains("future ISM update"));
         assert!(rows[1].3.as_deref().unwrap().contains("future ISM update"));
-        assert_eq!(rows[3].2, "pending");
+        assert_eq!(
+            rows[3].2, "received",
+            "held behind the overlapping prune, never attempted"
+        );
         assert!(rows[3].3.is_none());
     }
     let received: i64 = sqlx::query_scalar("SELECT received_cursor FROM peers WHERE id = ?")
@@ -5585,7 +5591,8 @@ async fn received_folder_prunes_are_retained_without_stalling_unrelated_events()
         .await
         .unwrap();
     assert!(b.shared.join("later").is_dir());
-    let _ = super::pull(&c.state, &c_peer).await;
+    let c_net = super::net::peer(&c.state, &c_peer.id).await.unwrap();
+    let _ = super::pull(&c.state, &c_net).await;
     assert_eq!(
         count(
             c.state.clone(),
