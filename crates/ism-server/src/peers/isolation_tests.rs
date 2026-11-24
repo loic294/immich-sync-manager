@@ -2,6 +2,129 @@ use super::*;
 use crate::peers::{self, EventData};
 
 #[tokio::test]
+async fn share_scan_yields_to_operations_and_rechecks_missing_files() {
+    let mut b = instance("Beta").await;
+    stop_workers(&mut b).await;
+    admin::create_share(
+        &b.state,
+        ShareInput {
+            name: "Family".into(),
+            location: loc("shared"),
+            peer_ids: vec![],
+            enabled: true,
+        },
+    )
+    .await
+    .unwrap();
+    let share = peers::shares(&b.state).await.unwrap().remove(0);
+    write_old(&b.shared.join("late.jpg"), b"original");
+    peers::scan_share(&b.state, &share).await.unwrap();
+    std::fs::remove_file(b.shared.join("late.jpg")).unwrap();
+    write_old(
+        &b._dir.path().join("photos/replacement.jpg"),
+        b"replacement",
+    );
+    for index in 0..1024 {
+        write_old(&b.shared.join(format!("photo-{index:04}.jpg")), b"photo");
+    }
+
+    let scan = peers::scan_share(&b.state, &share);
+    tokio::pin!(scan);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::select! {
+            result = &mut scan => panic!("scan finished before publishing its first file: {result:?}"),
+            () = async {
+                loop {
+                    let published: bool = sqlx::query_scalar(
+                        "SELECT EXISTS(SELECT 1 FROM replica_files WHERE share_id=? AND rel_path LIKE 'photo-%')",
+                    )
+                    .bind(&share.id)
+                    .fetch_one(&b.state.db)
+                    .await
+                    .unwrap();
+                    if published {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            } => {}
+        }
+        // Admission must become available before the whole inventory is reconciled.
+        let gate = b.state.replication_operation_lock.lock();
+        tokio::pin!(gate);
+        let guard = tokio::select! {
+            biased;
+            guard = &mut gate => guard,
+            result = &mut scan => panic!("scan held admission until completion: {result:?}"),
+        };
+        let accepted = crate::ops::submit(
+            &b.state,
+            &Principal::Admin {
+                username: "test".into(),
+            },
+            OperationRequest {
+                idempotency_key: "during-share-scan".into(),
+                label: None,
+                actions: vec![OperationAction::Move {
+                    source: loc("replacement.jpg"),
+                    target: loc("shared/late.jpg"),
+                    expected_revision: None,
+                }],
+                allow_owner_transfer: false,
+                allow_partial: false,
+            },
+        )
+        .await
+        .unwrap();
+        let operation = crate::ops::exec::run_operation(&b.state, &accepted.operation_id);
+        tokio::pin!(operation);
+        tokio::select! {
+            biased;
+            result = &mut operation => panic!("operation bypassed admission: {result:?}"),
+            () = tokio::task::yield_now() => {}
+        }
+        drop(guard);
+        tokio::select! {
+            biased;
+            result = &mut operation => result.unwrap(),
+            result = &mut scan => panic!("operation waited for the whole scan: {result:?}"),
+        }
+        assert_eq!(
+            crate::ops::load(&b.state, &accepted.operation_id)
+                .await
+                .unwrap()
+                .0
+                .status,
+            ism_core::dto::OperationStatus::Completed
+        );
+        scan.await.unwrap();
+    })
+    .await
+    .expect("scan and operation must both make progress");
+
+    assert_eq!(
+        std::fs::read(b.shared.join("late.jpg")).unwrap(),
+        b"replacement"
+    );
+    assert!(
+        !peers::row(&b.state, &share.id, "late.jpg")
+            .await
+            .unwrap()
+            .unwrap()
+            .deleted,
+        "an enumeration taken before the move is not evidence of deletion"
+    );
+    let checked: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM replica_files WHERE share_id=? AND rel_path LIKE 'photo-%' AND deleted=0",
+    )
+    .bind(&share.id)
+    .fetch_one(&b.state.db)
+    .await
+    .unwrap();
+    assert_eq!(checked, 1024);
+}
+
+#[tokio::test]
 async fn cancelled_folder_does_not_prevent_another_folder_operation_for_the_same_peer() {
     let (a, b, peer, share_name) = pending_folder_fixture().await;
     peers::pull(&b.state, &peer).await.unwrap();

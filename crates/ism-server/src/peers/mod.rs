@@ -535,8 +535,6 @@ pub async fn scan_share(state: &AppState, share: &Share) -> AppResult<()> {
         &share.name,
         Some("/peers"),
         |task| async move {
-            task.waiting("Waiting for managed operations that are changing files");
-            let _operation_guard = state.replication_operation_lock.lock_scan().await;
             let Some(share) = shares(state).await?.into_iter()
                 .find(|current| current.id == share.id && current.enabled)
             else {
@@ -545,12 +543,7 @@ pub async fn scan_share(state: &AppState, share: &Share) -> AppResult<()> {
             let mut failed_paths = Vec::new();
             let result = scan_share_reporting(state, &share, &task, &mut failed_paths).await;
             match &result {
-                Ok(true) => {
-                    if clear_scan_failure(&state.db, &share.id).await? > 0 {
-                        tracing::info!(share_id = %share.id, "share scan recovered after a complete scan");
-                    }
-                }
-                Ok(false) => {}
+                Ok(_) => {}
                 Err(error) if error.code() == "recovery_required" => {}
                 Err(error) => {
                     let reason = if error.io_kind() == Some(std::io::ErrorKind::PermissionDenied)
@@ -615,6 +608,68 @@ async fn clear_scan_failure(db: &sqlx::SqlitePool, share_id: &str) -> AppResult<
     .rows_affected())
 }
 
+/// A batch never overlaps mutation; enumeration is only a list of candidates, not evidence
+/// that a path is still present or absent when a later batch is admitted.
+struct ShareScanBatch<'a> {
+    _operation_guard: tokio::sync::MutexGuard<'a, ()>,
+    share: Share,
+    root: Root,
+    blocked: Vec<String>,
+}
+
+async fn share_scan_batch<'a>(
+    state: &'a AppState,
+    share: &Share,
+    expected_root: Option<&Root>,
+    task: &crate::activity::Reporter,
+) -> AppResult<Option<ShareScanBatch<'a>>> {
+    task.waiting("Waiting for managed operations that are changing files");
+    let guard = state.replication_operation_lock.lock_scan().await;
+    let Some(current) = shares(state)
+        .await?
+        .into_iter()
+        .find(|current| current.id == share.id && current.enabled)
+    else {
+        return Ok(None);
+    };
+    task.phase("Checking active operations and uncertain paths");
+    inbox::require_scannable(state).await?;
+    let mut blocked = blocked_footprints(state, &current).await?;
+    blocked.extend(admin::move_decision_footprints(state, &current).await?);
+    current.root_rel("")?;
+    let root = files::root(&state.db, &current.root_id).await?;
+    root.ensure_available()?;
+    if expected_root.is_some_and(|expected| expected.mapping != root.mapping)
+        || current.root_id != share.root_id
+        || current.path != share.path
+        || current.name != share.name
+        || current.junk != share.junk
+    {
+        return Err(AppError::conflict(
+            "scan_incomplete",
+            "share configuration changed during enumeration; a fresh scan is required",
+        ));
+    }
+    if !fs::metadata(root.abs(&current.path)?)?.is_dir() {
+        return Err(AppError::new(
+            axum::http::StatusCode::NOT_FOUND,
+            "share_scan_folder_missing",
+            format!("share folder '{}' does not exist", current.path),
+        ));
+    }
+    Ok(Some(ShareScanBatch {
+        _operation_guard: guard,
+        share: current,
+        root,
+        blocked,
+    }))
+}
+
+/// Check whether to yield between entries after one second or 128 entries. Admission checks
+/// and individual filesystem, checksum or SQLite calls can take longer and must finish first.
+const SCAN_BATCH_ENTRIES: usize = 128;
+const SCAN_BATCH_TIME: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// A successful partial scan can publish independent changes, but cannot clear an older failure.
 async fn scan_share_reporting(
     state: &AppState,
@@ -622,26 +677,18 @@ async fn scan_share_reporting(
     task: &crate::activity::Reporter,
     failed_paths: &mut Vec<String>,
 ) -> AppResult<bool> {
-    task.phase("Checking active operations and uncertain paths");
-    inbox::require_scannable(state).await?;
-    let mut blocked = blocked_footprints(state, share).await?;
-    blocked.extend(admin::move_decision_footprints(state, share).await?);
-    share.root_rel("")?;
-    let root = files::root(&state.db, &share.root_id).await?;
-    // An unmounted root must never look like "everything was deleted".
-    root.ensure_available()?;
+    let Some(batch) = share_scan_batch(state, share, None, task).await? else {
+        return Ok(false);
+    };
+    let share = batch.share.clone();
+    let root = batch.root.clone();
+    let blocked = batch.blocked.clone();
     let base = root.abs(&share.path)?;
-    if !fs::metadata(&base)?.is_dir() {
-        return Err(AppError::new(
-            axum::http::StatusCode::NOT_FOUND,
-            "share_scan_folder_missing",
-            format!("share folder '{}' does not exist", share.path),
-        ));
-    }
     let junk = share.junk.clone();
+    drop(batch);
     task.phase("Enumerating share files");
     let reporter = task.clone();
-    let (found, mut blocked, mut failure, paths) = tokio::task::spawn_blocking(move || {
+    let (found, blocked, mut failure, paths) = tokio::task::spawn_blocking(move || {
         let mut found = Vec::new();
         let mut uncertain = blocked.clone();
         let mut failure = None;
@@ -690,16 +737,16 @@ async fn scan_share_reporting(
                 .to_str()
                 .ok_or_else(|| std::io::Error::other("share contains a non-UTF-8 path"))?
                 .replace('\\', "/");
-            let meta = match entry.metadata() {
-                Ok(meta) => meta,
+            match entry.metadata() {
+                Ok(_) => {}
                 Err(error) => {
                     note_scan_io_failure(&mut failure, error.io_error().map(std::io::Error::kind));
                     note_scan_path_failure(&mut paths, &rel);
                     uncertain.push(rel);
                     continue;
                 }
-            };
-            found.push((rel, meta.len() as i64, files::mtime_ns(&meta)));
+            }
+            found.push(rel);
             reporter.progress(found.len() as u64, None, "files discovered");
         }
         Ok::<_, std::io::Error>((found, uncertain, failure, paths))
@@ -707,6 +754,11 @@ async fn scan_share_reporting(
     .await
     .map_err(AppError::internal)??;
     failed_paths.extend(paths);
+    let mut blocked: HashSet<String> = blocked.into_iter().collect();
+    let Some(batch) = share_scan_batch(state, &share, Some(&root), task).await? else {
+        return Ok(false);
+    };
+    blocked.extend(batch.blocked.iter().cloned());
     let known: Vec<(String, i64, i64, i64, i64)> = sqlx::query_as(
         "SELECT rel_path, size, mtime_ns, deleted, sha256 IS NOT NULL
          FROM replica_files WHERE share_id = ?",
@@ -718,74 +770,164 @@ async fn scan_share_reporting(
         .into_iter()
         .map(|(p, s, m, d, h)| (p, (s, m, d != 0, h != 0)))
         .collect();
+    drop(batch);
     let settle_cutoff = now_ns() - SETTLE_SECS * 1_000_000_000;
     let mut seen = HashSet::new();
     let mut complete = blocked.is_empty();
-    task.phase("Hashing and reconciling settled files");
     let total = found.len() as u64;
     task.progress(0, Some(total), "files checked");
     let mut hashed = 0u64;
-    for (index, (rel, size, mtime)) in found.into_iter().enumerate() {
-        task.progress(index as u64, Some(total), "files checked");
-        seen.insert(rel.clone());
-        if mtime > settle_cutoff || blocked.iter().any(|p| inbox::overlaps(&rel, p)) {
-            complete = false;
-            continue;
-        }
-        if RelPath::parse(&rel).is_err() {
-            complete = false;
-            continue;
-        }
-        // Unchanged size and date: the content verification worker re-hashes these later
-        // without holding the scan admission for the whole share.
-        if known
-            .get(&rel)
-            .is_some_and(|&(known_size, known_mtime, deleted, hashed)| {
-                !deleted && hashed && known_size == size && known_mtime == mtime
-            })
-        {
-            continue;
-        }
-        hashed += 1;
-        if let Err(error) = register_local_reporting(state, share, &root, &rel, Some(task)).await {
-            if error.io_kind().is_none() {
-                return Err(error);
+    let mut found = found.into_iter().enumerate().peekable();
+    while found.peek().is_some() {
+        let Some(batch) = share_scan_batch(state, &share, Some(&root), task).await? else {
+            return Ok(false);
+        };
+        blocked.extend(batch.blocked.iter().cloned());
+        complete &= batch.blocked.is_empty();
+        task.phase("Hashing and reconciling settled files");
+        let started = std::time::Instant::now();
+        for _ in 0..SCAN_BATCH_ENTRIES {
+            if started.elapsed() >= SCAN_BATCH_TIME {
+                break;
             }
-            note_scan_io_failure(&mut failure, error.io_kind());
-            note_scan_path_failure(failed_paths, &rel);
-            blocked.push(rel);
+            let Some((index, rel)) = found.next() else {
+                break;
+            };
+            task.progress(index as u64, Some(total), "files checked");
+            seen.insert(rel.clone());
+            if blocked.iter().any(|p| inbox::overlaps(&rel, p)) || RelPath::parse(&rel).is_err() {
+                complete = false;
+                continue;
+            }
+            // Managed operations may have moved or replaced this candidate since enumeration.
+            let abs = match batch.root.abs(&batch.share.root_rel(&rel)?) {
+                Ok(abs) => abs,
+                Err(error) if error.io_kind().is_some() => {
+                    note_scan_io_failure(&mut failure, error.io_kind());
+                    note_scan_path_failure(failed_paths, &rel);
+                    blocked.insert(rel);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let meta = match fs::metadata(abs) {
+                Ok(meta) if meta.is_file() => meta,
+                Ok(_) => {
+                    complete = false;
+                    continue;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    complete = false;
+                    continue;
+                }
+                Err(error) => {
+                    note_scan_io_failure(&mut failure, Some(error.kind()));
+                    note_scan_path_failure(failed_paths, &rel);
+                    blocked.insert(rel);
+                    continue;
+                }
+            };
+            let (size, mtime) = (meta.len() as i64, files::mtime_ns(&meta));
+            if mtime > settle_cutoff {
+                complete = false;
+                continue;
+            }
+            // The content verification worker re-hashes unchanged size/date later.
+            if known
+                .get(&rel)
+                .is_some_and(|&(known_size, known_mtime, deleted, hashed)| {
+                    !deleted && hashed && known_size == size && known_mtime == mtime
+                })
+            {
+                continue;
+            }
+            hashed += 1;
+            if let Err(error) =
+                register_local_reporting(state, &batch.share, &batch.root, &rel, Some(task)).await
+            {
+                if error.io_kind().is_none() {
+                    return Err(error);
+                }
+                note_scan_io_failure(&mut failure, error.io_kind());
+                note_scan_path_failure(failed_paths, &rel);
+                blocked.insert(rel);
+            }
         }
     }
     task.progress(total, Some(total), "files checked");
     tracing::debug!(share_id = %share.id, files = total, hashed, "share scan hashed changed files");
-    task.phase("Reconciling removed files and publishing inventory");
-    for (rel, (_, _, deleted, _)) in known {
-        // A newly ignored row is not evidence that the file was deleted.
-        if deleted
-            || seen.contains(&rel)
-            || rel.split('/').any(|name| hidden(name, &share.junk))
-            || blocked.iter().any(|p| inbox::overlaps(&rel, p))
-        {
-            continue;
-        }
-        if let Some(mut r) = row(state, &share.id, &rel).await? {
-            r.deleted = true;
-            r.vv.increment(&state.instance_id);
-            put_row_and_append_local(
-                state,
-                share,
-                &rel,
-                &r,
-                "file_deleted",
-                &EventData {
-                    path: rel.clone(),
-                    vv: r.vv.clone(),
-                    ..Default::default()
-                },
-            )
-            .await?;
+    let mut known = known.into_iter().peekable();
+    while known.peek().is_some() {
+        let Some(batch) = share_scan_batch(state, &share, Some(&root), task).await? else {
+            return Ok(false);
+        };
+        blocked.extend(batch.blocked.iter().cloned());
+        complete &= batch.blocked.is_empty();
+        task.phase("Reconciling removed files and publishing inventory");
+        let started = std::time::Instant::now();
+        for _ in 0..SCAN_BATCH_ENTRIES {
+            if started.elapsed() >= SCAN_BATCH_TIME {
+                break;
+            }
+            let Some((rel, (_, _, deleted, _))) = known.next() else {
+                break;
+            };
+            if deleted
+                || seen.contains(&rel)
+                || rel.split('/').any(|name| hidden(name, &batch.share.junk))
+                || blocked.iter().any(|p| inbox::overlaps(&rel, p))
+            {
+                continue;
+            }
+            let abs = match batch.root.abs(&batch.share.root_rel(&rel)?) {
+                Ok(abs) => abs,
+                Err(error) if error.io_kind().is_some() => {
+                    note_scan_io_failure(&mut failure, error.io_kind());
+                    note_scan_path_failure(failed_paths, &rel);
+                    blocked.insert(rel);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            match fs::metadata(abs) {
+                // A file may have appeared after enumeration, including a completed move.
+                Ok(_) => {
+                    complete = false;
+                    continue;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    note_scan_io_failure(&mut failure, Some(error.kind()));
+                    note_scan_path_failure(failed_paths, &rel);
+                    blocked.insert(rel);
+                    continue;
+                }
+            }
+            if let Some(mut r) = row(state, &share.id, &rel).await?
+                && !r.deleted
+            {
+                r.deleted = true;
+                r.vv.increment(&state.instance_id);
+                put_row_and_append_local(
+                    state,
+                    &batch.share,
+                    &rel,
+                    &r,
+                    "file_deleted",
+                    &EventData {
+                        path: rel.clone(),
+                        vv: r.vv.clone(),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            }
         }
     }
+    let Some(batch) = share_scan_batch(state, &share, Some(&root), task).await? else {
+        return Ok(false);
+    };
+    complete &= batch.blocked.is_empty();
     sqlx::query("UPDATE shares SET last_scan_at = ? WHERE id = ?")
         .bind(db::now())
         .bind(&share.id)
@@ -805,6 +947,9 @@ async fn scan_share_reporting(
             },
         ));
     }
+    if complete && clear_scan_failure(&state.db, &share.id).await? > 0 {
+        tracing::info!(share_id = %share.id, "share scan recovered after a complete scan");
+    }
     Ok(complete)
 }
 
@@ -812,7 +957,7 @@ async fn scan_share_reporting(
 const VERIFY_BATCH: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Re-hashes files whose size and date look unchanged, so edits that preserved both are still
-/// published. Unlike a scan it takes the scan admission per short batch, so operations,
+/// published. It takes the scan admission per short batch, so operations,
 /// transfers and peer bookkeeping keep running between batches.
 pub async fn verify_share_content(state: &AppState, share: &Share) -> AppResult<()> {
     crate::activity::observe(
@@ -2713,8 +2858,8 @@ async fn replicate(state: AppState) {
     }
 }
 
-/// Scans never run while a managed operation is changing files, so half-done moves are never
-/// mistaken for deletes.
+/// Scan reconciliation never overlaps a managed mutation, so half-done moves are not treated as
+/// deletions. Enumeration can overlap a mutation and is rechecked before reconciliation.
 /// Rescans shares: soon after the file watcher saw an outside change below one (once the
 /// change had time to settle), and every `scan_interval_secs` as a safety net.
 pub async fn scan_worker(state: AppState) {

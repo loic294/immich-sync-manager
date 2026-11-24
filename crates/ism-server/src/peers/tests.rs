@@ -6562,8 +6562,13 @@ async fn scans_and_managed_operations_wait_for_the_same_barrier() {
     );
 
     drop(guard);
-    scan.await.unwrap();
-    operation.await.unwrap();
+    // The scan yields admission between batches, so both futures must keep making progress.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::try_join!(&mut scan, &mut operation)
+    })
+    .await
+    .expect("scan and operation must finish after admission is released")
+    .unwrap();
     super::scan_share(&b.state, &share).await.unwrap();
     assert!(!b.shared.join("before.jpg").exists());
     assert_eq!(std::fs::read(b.shared.join("after.jpg")).unwrap(), b"photo");

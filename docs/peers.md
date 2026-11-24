@@ -97,6 +97,17 @@ library world-writable.
 Share-scan warnings are local to the instance running the scan; peers do not report them through
 the current cross-instance attention protocol.
 
+Share inventory enumeration does not hold operation admission. Reconciliation checks whether to
+release admission between entries after 128 entries or one second, then checks the current share,
+mounted root, active operations and uncertain paths before continuing. This is not a hard time
+limit: admission checks and individual filesystem, checksum or database calls can take longer and
+must finish before an operation may change files. Reconciliation waits while an operation is
+mutating, and operations retain their maintenance barriers.
+Enumeration is not a filesystem snapshot: candidate files are checked again when admitted, and
+a missing inventory entry is never published as deleted if the path now exists or is uncertain.
+A batch that finds its share disabled stops without clearing its earlier failure. A changed mapping
+or exclusion policy stops the scan and requires a fresh scan rather than reusing stale candidates.
+
 ### Backfill when a share is added or re-enabled
 
 The event cursor is per peer, so events from before a share existed or while it was disabled are
