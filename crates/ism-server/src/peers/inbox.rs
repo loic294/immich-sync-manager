@@ -329,7 +329,7 @@ fn event_valid(event: &PeerEvent) -> AppResult<()> {
             .map(|_| ())
             .map_err(|e| e.message().to_owned()),
         "folder_created" => management_event_valid("folder_created", &event.data),
-        "file_deleted" | "file_moved" | "folder_moved" | "folder_trashed" => {
+        "file_deleted" | "file_moved" | "folder_moved" | "folder_trashed" | FOLDER_PRUNED => {
             management_event_valid(&event.kind, &event.data)
         }
         other => Err(format!("unsupported peer event kind '{other}'")),
@@ -790,6 +790,9 @@ async fn apply_received(
     }
     let share = share.ok_or_else(|| AppError::not_found("peer share changed"))?;
     require_operations_stable(state, share, &paths(event)).await?;
+    if event.kind == FOLDER_PRUNED {
+        return folder_pruned(state, peer, share, event).await;
+    }
     if let Some(resolution) = conflict_decision(state, share, event).await? {
         if matches!(resolution.as_str(), "keep_local" | "skip") {
             let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
@@ -900,6 +903,41 @@ async fn apply_received(
         crate::ops::announce_queued(state, accepted);
     }
     Ok(accepted.is_none())
+}
+
+/// Receiver-only compatibility: a peer prune is acknowledged only when nothing exists here.
+/// It never deletes, consults conflict decisions or is advertised to other peers; a local
+/// entry at the path keeps the event (and later overlapping events) pending with an error.
+async fn folder_pruned(
+    state: &AppState,
+    peer: &net::Peer,
+    share: &Share,
+    event: &PeerEvent,
+) -> AppResult<bool> {
+    let root = files::root(&state.db, &share.root_id).await?;
+    root.ensure_available()?;
+    let abs = root.abs(&share.root_rel(&event.data.path)?)?;
+    let present = || match abs.symlink_metadata() {
+        Ok(_) => Err(AppError::conflict(
+            "peer_folder_prune_unsupported",
+            format!(
+                "{} pruned folder '{}' in share '{}', but this instance never deletes folders for \
+                 peer prunes and the local entry still exists. Review it and move it to the ISM \
+                 trash if it should be removed; until it is gone, this event and later changes \
+                 inside it stay pending.",
+                peer.name, event.data.path, share.name
+            ),
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    };
+    present()?;
+    let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
+    present()?;
+    done_in(&mut tx, &peer.id, event, false).await?;
+    tx.commit().await?;
+    tracing::info!(peer = %peer.name, path = %event.data.path, "peer folder prune acknowledged: nothing exists locally");
+    Ok(true)
 }
 
 async fn conflict_decision(
