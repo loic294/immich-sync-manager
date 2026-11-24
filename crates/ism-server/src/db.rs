@@ -82,6 +82,42 @@ pub fn json_vec(raw: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     #[tokio::test]
+    async fn share_scan_failure_paths_migration_preserves_existing_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = super::connect(dir.path()).await.unwrap();
+        sqlx::query("ALTER TABLE share_scan_failures DROP COLUMN paths_json")
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM _sqlx_migrations WHERE version=24")
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO shares(id,name,root_id,path,peer_ids_json,enabled)
+             VALUES('archive','Archive','photos','archive','[]',1)",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO share_scan_failures VALUES('archive','permission','2026-01-02')")
+            .execute(&db)
+            .await
+            .unwrap();
+        db.close().await;
+
+        let upgraded = super::connect(dir.path()).await.unwrap();
+        let row: (String, String, String) = sqlx::query_as(
+            "SELECT reason,observed_at,paths_json FROM share_scan_failures WHERE share_id='archive'",
+        )
+        .fetch_one(&upgraded)
+        .await
+        .unwrap();
+        assert_eq!(row, ("permission".into(), "2026-01-02".into(), "[]".into()));
+        upgraded.close().await;
+    }
+
+    #[tokio::test]
     async fn share_scan_failure_migration_preserves_existing_replica_state() {
         let dir = tempfile::tempdir().unwrap();
         let db = super::connect(dir.path()).await.unwrap();
@@ -89,7 +125,7 @@ mod tests {
             .execute(&db)
             .await
             .unwrap();
-        sqlx::query("DELETE FROM _sqlx_migrations WHERE version=21")
+        sqlx::query("DELETE FROM _sqlx_migrations WHERE version IN (21,24)")
             .execute(&db)
             .await
             .unwrap();
@@ -135,10 +171,13 @@ mod tests {
             failures, 0,
             "an upgrade cannot invent historical scan failures"
         );
-        sqlx::query("INSERT INTO share_scan_failures VALUES('archive','permission','2026-01-02')")
-            .execute(&upgraded)
-            .await
-            .unwrap();
+        sqlx::query(
+            "INSERT INTO share_scan_failures(share_id,reason,observed_at)
+             VALUES('archive','permission','2026-01-02')",
+        )
+        .execute(&upgraded)
+        .await
+        .unwrap();
         sqlx::query("DELETE FROM shares WHERE id='archive'")
             .execute(&upgraded)
             .await

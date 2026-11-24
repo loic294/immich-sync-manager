@@ -542,7 +542,8 @@ pub async fn scan_share(state: &AppState, share: &Share) -> AppResult<()> {
             else {
                 return Ok(());
             };
-            let result = scan_share_reporting(state, &share, &task).await;
+            let mut failed_paths = Vec::new();
+            let result = scan_share_reporting(state, &share, &task, &mut failed_paths).await;
             match &result {
                 Ok(true) => {
                     if clear_scan_failure(&state.db, &share.id).await? > 0 {
@@ -567,14 +568,16 @@ pub async fn scan_share(state: &AppState, share: &Share) -> AppResult<()> {
                         "system"
                     };
                     tracing::warn!(share_id = %share.id, code = %error.code(), reason,
+                        paths = ?failed_paths,
                         "share scan failed; incomplete paths remain protected");
                     if let Err(persistence) = sqlx::query(
-                        "INSERT INTO share_scan_failures(share_id,reason,observed_at)
-                         SELECT id,?,? FROM shares WHERE id=? AND enabled=1
+                        "INSERT INTO share_scan_failures(share_id,reason,observed_at,paths_json)
+                         SELECT id,?,?,? FROM shares WHERE id=? AND enabled=1
                          ON CONFLICT(share_id) DO UPDATE SET reason=excluded.reason,
-                         observed_at=excluded.observed_at",
+                         observed_at=excluded.observed_at,paths_json=excluded.paths_json",
                     )
-                    .bind(reason).bind(db::now()).bind(&share.id).execute(&state.db).await {
+                    .bind(reason).bind(db::now()).bind(serde_json::to_string(&failed_paths)?)
+                    .bind(&share.id).execute(&state.db).await {
                         tracing::error!(share_id = %share.id, error = %persistence,
                             "cannot save share scan failure evidence");
                         return Err(AppError::new(
@@ -617,6 +620,7 @@ async fn scan_share_reporting(
     state: &AppState,
     share: &Share,
     task: &crate::activity::Reporter,
+    failed_paths: &mut Vec<String>,
 ) -> AppResult<bool> {
     task.phase("Checking active operations and uncertain paths");
     inbox::require_scannable(state).await?;
@@ -637,10 +641,11 @@ async fn scan_share_reporting(
     let junk = share.junk.clone();
     task.phase("Enumerating share files");
     let reporter = task.clone();
-    let (found, mut blocked, mut failure) = tokio::task::spawn_blocking(move || {
+    let (found, mut blocked, mut failure, paths) = tokio::task::spawn_blocking(move || {
         let mut found = Vec::new();
         let mut uncertain = blocked.clone();
         let mut failure = None;
+        let mut paths = Vec::new();
         for entry in walkdir::WalkDir::new(&base)
             .min_depth(1)
             .into_iter()
@@ -666,7 +671,9 @@ async fn scan_share_reporting(
                         .and_then(|p| p.strip_prefix(&base).ok())
                         .and_then(|p| p.to_str())
                     {
-                        uncertain.push(rel.replace('\\', "/"));
+                        let rel = rel.replace('\\', "/");
+                        note_scan_path_failure(&mut paths, &rel);
+                        uncertain.push(rel);
                         continue;
                     }
                     return Err(std::io::Error::other(error));
@@ -687,6 +694,7 @@ async fn scan_share_reporting(
                 Ok(meta) => meta,
                 Err(error) => {
                     note_scan_io_failure(&mut failure, error.io_error().map(std::io::Error::kind));
+                    note_scan_path_failure(&mut paths, &rel);
                     uncertain.push(rel);
                     continue;
                 }
@@ -694,10 +702,11 @@ async fn scan_share_reporting(
             found.push((rel, meta.len() as i64, files::mtime_ns(&meta)));
             reporter.progress(found.len() as u64, None, "files discovered");
         }
-        Ok::<_, std::io::Error>((found, uncertain, failure))
+        Ok::<_, std::io::Error>((found, uncertain, failure, paths))
     })
     .await
     .map_err(AppError::internal)??;
+    failed_paths.extend(paths);
     let known: Vec<(String, i64, i64, i64, i64)> = sqlx::query_as(
         "SELECT rel_path, size, mtime_ns, deleted, sha256 IS NOT NULL
          FROM replica_files WHERE share_id = ?",
@@ -743,6 +752,7 @@ async fn scan_share_reporting(
                 return Err(error);
             }
             note_scan_io_failure(&mut failure, error.io_kind());
+            note_scan_path_failure(failed_paths, &rel);
             blocked.push(rel);
         }
     }
@@ -889,6 +899,13 @@ pub async fn verify_worker(state: AppState) {
 fn note_scan_io_failure(failure: &mut Option<bool>, kind: Option<std::io::ErrorKind>) {
     let permission = kind == Some(std::io::ErrorKind::PermissionDenied);
     *failure = Some(failure.unwrap_or(true) && permission);
+}
+
+fn note_scan_path_failure(paths: &mut Vec<String>, rel: &str) {
+    let rel = if rel.is_empty() { "." } else { rel };
+    if paths.len() < 5 && !paths.iter().any(|path| path == rel) {
+        paths.push(rel.to_owned());
+    }
 }
 
 // ---------------------------------------------------------------------------------------------

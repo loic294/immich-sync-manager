@@ -80,15 +80,20 @@ subfolder, then the peers. Create the share with the same name on the other inst
 own folder. Folders may sit at different paths on each machine.
 
 Local failed share scans stay in the existing attention banners on Overview, Operations and Sync.
-They name the affected share and link to **Peers** to check its configured folder. A permission
-warning means ISM was denied read access: restore folder traversal and file read permission for
-the account running ISM. Other verified folder errors suggest checking the folder and logs;
-unknown or system errors suggest checking logs without diagnosing the folder.
+They name the affected share and configured root/subfolder, show up to five paths that could not
+be checked relative to that folder, and link to **Peers**. A permission warning means ISM was
+denied read access: restore folder traversal and file read permission for the account running ISM.
+Other verified folder errors suggest checking the folder and logs; unknown or system errors
+suggest checking logs without diagnosing the folder.
 ISM retries on watcher changes and its periodic full scan; there is no manual share-scan retry
 button. Unreadable paths are not treated as deleted.
 A failure survives retries, partial scans and restarts until a complete scan of that same share
 succeeds. Disabled shares hide their warning without erasing it; deleting a share removes its
-warning. Server logs identify the share and failure category, evidence-save failures, and recovery.
+warning. Server logs identify the share, failure category, up to five paths that could not be
+checked, evidence-save failures, and recovery. Existing failures from before the upgrade show the
+configured folder; path examples appear after the next failed scan. ISM does not change file
+permissions automatically. Check ownership and ACLs before granting access; do not make the whole
+library world-writable.
 Share-scan warnings are local to the instance running the scan; peers do not report them through
 the current cross-instance attention protocol.
 

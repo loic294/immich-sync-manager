@@ -186,13 +186,15 @@ pub(crate) async fn selected_snapshot(
     }
 
     if selection.is_none() {
-        let share_scans: Vec<(String, String, String, String)> = sqlx::query_as(
-            "SELECT s.id,s.name,f.reason,f.observed_at FROM share_scan_failures f
+        let share_scans: Vec<(String, String, String, String, String, String, String)> =
+            sqlx::query_as(
+                "SELECT s.id,s.name,f.reason,f.observed_at,s.root_id,s.path,f.paths_json
+         FROM share_scan_failures f
          JOIN shares s ON s.id=f.share_id WHERE s.enabled=1 ORDER BY s.id",
-        )
-        .fetch_all(&state.db)
-        .await?;
-        for (id, name, reason, at) in share_scans {
+            )
+            .fetch_all(&state.db)
+            .await?;
+        for (id, name, reason, at, root_id, path, paths_json) in share_scans {
             let mut item = template.clone();
             item.id = format!("share-scan:{id}");
             item.code = AttentionCode::ShareScanFailed;
@@ -200,13 +202,39 @@ pub(crate) async fn selected_snapshot(
             item.share_id = Some(id);
             item.share_name = Some(name.clone());
             item.title = format!("Shared files could not be checked: {name}");
+            let folder = if path.is_empty() {
+                format!("{root_id}:/")
+            } else {
+                format!("{root_id}:{path}")
+            };
             item.message = if reason == "permission" {
-            "Give ISM permission to read this share's folders and files. Check its folder in Peers; ISM retries automatically."
-        } else if reason == "other" {
-            "Check this share's folder in Peers and review server logs. ISM retries automatically."
-        } else {
-            "The share scan failed. Check server logs; ISM retries automatically."
-        }.into();
+                format!(
+                    "Permission was denied while checking shared folder '{folder}'. On the NAS, give the account running ISM permission to read the affected files and to read and traverse their folders. Check file ownership and ACLs if access is still denied. ISM retries automatically."
+                )
+            } else if reason == "other" {
+                format!(
+                    "Check folder '{folder}' in Peers and review server logs. ISM retries automatically."
+                )
+            } else {
+                "The share scan failed. Check server logs; ISM retries automatically.".into()
+            };
+            let paths: Vec<String> = serde_json::from_str(&paths_json)?;
+            if !paths.is_empty() {
+                item.message.push_str(&format!(
+                    " Paths that could not be checked (relative to the shared folder): {}.",
+                    paths.iter().take(5).cloned().collect::<Vec<_>>().join(", ")
+                ));
+            }
+            item.examples = paths
+                .into_iter()
+                .take(5)
+                .map(|resource| ActivityExample {
+                    resource,
+                    detail: Some(
+                        "Path that could not be checked, relative to the shared folder".into(),
+                    ),
+                })
+                .collect();
             item.href = "/peers".into();
             item.observed_at = at;
             items.push(item);

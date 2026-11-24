@@ -85,7 +85,10 @@ async fn share_scan_failure_preserves_unreadable_paths_and_independent_changes()
     let item = failure(&local.state, &share.id).await.unwrap();
     assert_eq!(item["blocks_work"], true);
     assert_eq!(item["href"], "/peers");
-    assert!(item["message"].as_str().unwrap().contains("permission"));
+    assert!(item["message"].as_str().unwrap().contains("Permission"));
+    assert!(item["message"].as_str().unwrap().contains("shared"));
+    assert!(item["message"].as_str().unwrap().contains("read"));
+    assert_eq!(item["examples"][0]["resource"], "locked");
     assert!(!item.to_string().contains("os error"));
     assert!(
         !item
@@ -155,17 +158,63 @@ async fn share_scan_failure_hash_permission_does_not_stop_independent_files() {
             .await
             .is_err()
     );
-    assert!(
-        failure(&local.state, &share.id).await.unwrap()["message"]
-            .as_str()
-            .unwrap()
-            .contains("permission")
-    );
+    let item = failure(&local.state, &share.id).await.unwrap();
+    assert!(item["message"].as_str().unwrap().contains("permission"));
+    assert_eq!(item["examples"][0]["resource"], "denied.jpg");
+    assert!(item["message"].as_str().unwrap().contains("denied.jpg"));
+    let restarted = AppState::new(
+        Config::for_tests(local._dir.path()),
+        local.state.db.clone(),
+        SecretBox::open_or_create(local._dir.path()).unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(failure(&restarted, &share.id).await.unwrap(), item);
     assert!(
         super::super::row(&local.state, &share.id, "independent.jpg")
             .await
             .unwrap()
             .is_some()
+    );
+    drop(denied);
+    super::super::scan_share(&local.state, &share)
+        .await
+        .unwrap();
+    assert!(failure(&local.state, &share.id).await.is_none());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn share_scan_failure_bounds_denied_path_examples() {
+    let (local, share) = fixture().await;
+    let mut denied = Vec::new();
+    for index in 0..7 {
+        let path = local.shared.join(format!("denied-{index}.jpg"));
+        write_old(&path, b"private");
+        denied.push(Denied::new(&path));
+    }
+    assert!(
+        super::super::scan_share(&local.state, &share)
+            .await
+            .is_err()
+    );
+    let item = failure(&local.state, &share.id).await.unwrap();
+    let examples = item["examples"].as_array().unwrap();
+    assert_eq!(examples.len(), 5);
+    for example in examples {
+        let path = example["resource"].as_str().unwrap();
+        assert!(path.starts_with("denied-"));
+        assert!(item["message"].as_str().unwrap().contains(path));
+    }
+    let stored: String =
+        sqlx::query_scalar("SELECT paths_json FROM share_scan_failures WHERE share_id=?")
+            .bind(&share.id)
+            .fetch_one(&local.state.db)
+            .await
+            .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Vec<String>>(&stored).unwrap().len(),
+        5
     );
     drop(denied);
     super::super::scan_share(&local.state, &share)
