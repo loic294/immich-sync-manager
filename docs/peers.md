@@ -227,6 +227,8 @@ source, keeping local or both requires a refreshed in-app choice; already preser
 remain included in publication. If the current peer folder overlaps the original source, the
 comparison expands to their common ancestor on both instances, including sibling files and empty
 folders. Keeping both preserves the receiving instance's complete ancestor as a conflict copy.
+Recovery evidence is refused when its lineage overlaps an unresolved or later committed folder
+prune; unrelated paths remain available.
 
 If a failed incoming folder move has lost both local paths, ISM can restore its old source from
 the peer's complete current inventory, then finish the original managed move. Downloads retain

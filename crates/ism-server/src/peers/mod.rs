@@ -1767,6 +1767,8 @@ pub struct InventoryPage {
 
 /// Kind of the event that tells peers a share became active here, so they backfill from us.
 pub(crate) const SHARE_ENABLED: &str = "share_enabled";
+/// Accepted for receipt only; this version never produces it (see `inbox::folder_pruned`).
+pub(crate) const FOLDER_PRUNED: &str = "folder_pruned";
 
 /// Marks `share` for a backfill from each of `peer_ids` and announces it, so both sides catch
 /// up with what happened while the share was not replicated between them.
