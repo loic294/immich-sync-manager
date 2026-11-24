@@ -552,24 +552,29 @@ pub(crate) fn worker_started(state: &AppState, name: &str, kind: crate::worker_e
     let state = state.clone();
     let key = format!("worker:{name}");
     tokio::spawn(async move {
-        match sqlx::query(
-            "UPDATE background_activity SET resolved=1
-             WHERE task_key=? AND status IN ('failed','interrupted') AND revision < ?",
-        )
-        .bind(&key)
-        .bind(revision)
-        .execute(&state.db)
-        .await
-        {
-            Ok(result) if result.rows_affected() > 0 => state.emit(ServerEvent::ActivityChanged),
-            Ok(_) => {}
-            Err(error) => tracing::error!(
+        if let Err(error) = resolve_worker_history(&state, &key, revision).await {
+            tracing::error!(
                 worker = %key,
                 "cannot resolve previous worker evidence: {}",
                 redact(&error.to_string())
-            ),
+            );
         }
     });
+}
+
+async fn resolve_worker_history(state: &AppState, key: &str, revision: i64) -> AppResult<()> {
+    let result = sqlx::query(
+        "UPDATE background_activity SET resolved=1
+         WHERE resolved=0 AND task_key=? AND status IN ('failed','interrupted') AND revision < ?",
+    )
+    .bind(key)
+    .bind(revision)
+    .execute(&state.db)
+    .await?;
+    if result.rows_affected() > 0 {
+        state.emit(ServerEvent::ActivityChanged);
+    }
+    Ok(())
 }
 
 pub(crate) async fn worker_stopped(state: &AppState, name: &str, message: &str) {
@@ -696,6 +701,79 @@ mod tests {
         assert_eq!(observed.phase, "Waiting for the observed scan's admission");
         assert!(current.iter().all(|row| row.task_key != "share:idle"));
         scan.finish(&Ok(())).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn worker_restart_resolves_only_older_unresolved_outcomes_and_emits_only_on_change() {
+        let (_dir, state) = harness().await;
+        let key = "worker:synthetic";
+        let failed = Task::start(&state, key, "Worker", "ISM", None)
+            .await
+            .unwrap();
+        failed
+            .finish(&Err::<(), _>(AppError::conflict("failed", "Worker failed")))
+            .await
+            .unwrap();
+        flush(&state).await.unwrap();
+        let interrupted = Task::start(&state, key, "Worker", "ISM", None)
+            .await
+            .unwrap();
+        drop(interrupted);
+        flush(&state).await.unwrap();
+        sqlx::query(
+            "CREATE TRIGGER reject_resolved_rewrite BEFORE UPDATE ON background_activity
+             WHEN OLD.resolved=1 AND NEW.resolved=1
+             BEGIN SELECT RAISE(ABORT, 'resolved history was rewritten'); END",
+        )
+        .execute(&state.db)
+        .await
+        .unwrap();
+        let restart_revision = state.activity.revision();
+        let fresh = Task::start(&state, key, "Worker", "ISM", None)
+            .await
+            .unwrap();
+        flush(&state).await.unwrap();
+        let mut events = state.events.subscribe();
+        resolve_worker_history(&state, key, restart_revision)
+            .await
+            .unwrap();
+        assert!(matches!(
+            events.try_recv().unwrap(),
+            ServerEvent::ActivityChanged
+        ));
+        assert!(events.try_recv().is_err());
+        let unresolved: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM background_activity WHERE task_key=? AND resolved=0",
+        )
+        .bind(key)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+        assert_eq!(unresolved, 1);
+        drop(fresh);
+        flush(&state).await.unwrap();
+        while events.try_recv().is_ok() {}
+        resolve_worker_history(&state, key, restart_revision)
+            .await
+            .unwrap();
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        let revision = state.activity.revision();
+        resolve_worker_history(&state, key, revision).await.unwrap();
+        assert!(matches!(
+            events.try_recv().unwrap(),
+            ServerEvent::ActivityChanged
+        ));
+        assert!(events.try_recv().is_err());
+        resolve_worker_history(&state, key, state.activity.revision())
+            .await
+            .unwrap();
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
     }
 
     #[tokio::test]
