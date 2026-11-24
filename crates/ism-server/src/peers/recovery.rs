@@ -2375,7 +2375,7 @@ async fn process(state: &AppState, kind: &str, id: &str) -> AppResult<bool> {
 }
 
 const RECOVERY_CONCURRENCY_PER_KIND: usize = 4;
-const RECOVERY_CONCURRENCY_PER_PEER: usize = 1;
+const RECOVERY_CONCURRENCY_PER_PEER: usize = 3;
 const RECOVERY_CONCURRENCY_UNATTRIBUTED: usize = RECOVERY_CONCURRENCY_PER_KIND - 1;
 const RECOVERY_KINDS: [&str; 3] = ["operation", "transfer", "conflict"];
 const FORWARD_CONCURRENCY: usize = 4;
@@ -2388,6 +2388,7 @@ async fn eligible_jobs(
     kind: Option<&str>,
     active_peers: Option<&std::collections::HashMap<Option<String>, usize>>,
     active_jobs: &[&str],
+    peer_capacity: usize,
 ) -> AppResult<Vec<EligibleJob>> {
     let mut peers = active_peers.cloned().unwrap_or_default();
     let cutoff = (chrono::Utc::now() - chrono::Duration::seconds(30)).to_rfc3339();
@@ -2400,9 +2401,7 @@ async fn eligible_jobs(
             &peers
                 .iter()
                 .filter_map(|(peer, count)| {
-                    (*count >= RECOVERY_CONCURRENCY_PER_PEER)
-                        .then_some(peer.as_ref())
-                        .flatten()
+                    (*count >= peer_capacity).then_some(peer.as_ref()).flatten()
                 })
                 .collect::<Vec<_>>(),
         )?;
@@ -2458,7 +2457,7 @@ async fn eligible_jobs(
             cursor = Some((updated, job.clone()));
             if active_peers.is_some() {
                 let capacity = if peer.is_some() {
-                    RECOVERY_CONCURRENCY_PER_PEER
+                    peer_capacity
                 } else {
                     RECOVERY_CONCURRENCY_UNATTRIBUTED
                 };
@@ -2574,7 +2573,9 @@ async fn run_job(state: &AppState, job: String, kind: String, id: String) -> App
 #[cfg(test)]
 pub async fn tick(state: &AppState) -> AppResult<()> {
     discover(state).await?;
-    for (job, kind, id, _) in eligible_jobs(state, 50, None, None, &[]).await? {
+    for (job, kind, id, _) in
+        eligible_jobs(state, 50, None, None, &[], RECOVERY_CONCURRENCY_PER_PEER).await?
+    {
         run_job(state, job, kind, id).await?;
     }
     Ok(())
@@ -2613,7 +2614,10 @@ async fn local_loop(state: AppState) {
             if let Err(error) = discover(&state).await {
                 tracing::error!("recovery queue: {}", error.message());
             } else {
-                for kind in RECOVERY_KINDS {
+                for (kind, peer_capacity) in RECOVERY_KINDS
+                    .into_iter()
+                    .flat_map(|kind| [(kind, 1), (kind, RECOVERY_CONCURRENCY_PER_PEER)])
+                {
                     let active = running
                         .values()
                         .filter(|(running_kind, _, _)| *running_kind == kind)
@@ -2640,6 +2644,7 @@ async fn local_loop(state: AppState) {
                         Some(kind),
                         Some(&active_peers),
                         &active_jobs,
+                        peer_capacity,
                     )
                     .await
                     {
@@ -3135,7 +3140,9 @@ mod policy_tests {
                 .bind(id).bind(id.strip_prefix("conflict:").unwrap()).bind(status)
                 .bind(db::now()).bind(updated).execute(&state.db).await.unwrap();
         }
-        let selected = eligible_jobs(&state, 2, None, None, &[]).await.unwrap();
+        let selected = eligible_jobs(&state, 2, None, None, &[], RECOVERY_CONCURRENCY_PER_PEER)
+            .await
+            .unwrap();
         assert_eq!(selected.len(), 2);
         sqlx::query("UPDATE sync_recovery SET updated_at=? WHERE id='conflict:waiting'")
             .bind(db::now())
@@ -3185,14 +3192,14 @@ mod policy_tests {
             .execute(&mut *tx).await.unwrap();
         tx.commit().await.unwrap();
         let active = std::collections::HashMap::new();
-        let jobs = eligible_jobs(&state, 4, Some("operation"), Some(&active), &[])
+        let jobs = eligible_jobs(&state, 4, Some("operation"), Some(&active), &[], 1)
             .await
             .unwrap();
         assert_eq!(jobs.len(), 4);
         assert_eq!(jobs.iter().filter(|job| job.3.is_none()).count(), 3);
         assert!(jobs.iter().any(|job| job.3.as_deref() == Some("peer-a")));
         let active = std::collections::HashMap::from([(None, 3)]);
-        let jobs = eligible_jobs(&state, 4, Some("operation"), Some(&active), &[])
+        let jobs = eligible_jobs(&state, 4, Some("operation"), Some(&active), &[], 1)
             .await
             .unwrap();
         assert_eq!(jobs.len(), 1);
@@ -3220,13 +3227,13 @@ mod policy_tests {
         sqlx::query("INSERT INTO sync_recovery(id,kind,target_id,state,created_at,updated_at) VALUES('operation:event','operation','event','queued',?,?)")
             .bind(db::now()).bind(db::now()).execute(&state.db).await.unwrap();
         let active = std::collections::HashMap::new();
-        let jobs = eligible_jobs(&state, 4, Some("operation"), Some(&active), &[])
+        let jobs = eligible_jobs(&state, 4, Some("operation"), Some(&active), &[], 1)
             .await
             .unwrap();
         assert_eq!(jobs[0].3.as_deref(), Some("peer-a"));
         sqlx::query("INSERT INTO pending_peer_ops(operation_id,idx,share_id,kind,vv_json,peer_id) VALUES('event',0,'share','file_changed','{}','peer-b')")
             .execute(&state.db).await.unwrap();
-        let jobs = eligible_jobs(&state, 4, Some("operation"), Some(&active), &[])
+        let jobs = eligible_jobs(&state, 4, Some("operation"), Some(&active), &[], 1)
             .await
             .unwrap();
         assert_eq!(jobs[0].3, None);

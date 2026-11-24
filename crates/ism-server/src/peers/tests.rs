@@ -9269,17 +9269,19 @@ async fn multiple_slow_conflicts_do_not_block_independent_recovery() {
     b.tasks.push(tokio::spawn(async move {
         super::recovery::run(state).await;
     }));
-    tokio::time::timeout(Duration::from_secs(3), requests.recv())
-        .await
-        .expect("conflict never requested peer evidence")
-        .expect("stalled peer stopped");
+    for _ in 0..3 {
+        tokio::time::timeout(Duration::from_secs(3), requests.recv())
+            .await
+            .expect("conflict never requested peer evidence")
+            .expect("stalled peer stopped");
+    }
     let active_conflicts: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM sync_recovery WHERE kind='conflict' AND state='fixing'",
     )
     .fetch_one(&b.state.db)
     .await
     .unwrap();
-    assert_eq!(active_conflicts, 1);
+    assert_eq!(active_conflicts, 3);
     let completed = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let status = crate::ops::load(&b.state, &operation.operation_id)
@@ -9509,15 +9511,22 @@ async fn two_slow_peers_do_not_block_another_peers_conflict() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let source_released = released.clone();
-    let stalled_peer = axum::Router::new().fallback(move || {
-        let entered = entered.clone();
-        let released = source_released.clone();
-        async move {
-            entered.send(()).unwrap();
-            released.notified().await;
-            axum::http::StatusCode::SERVICE_UNAVAILABLE
-        }
-    });
+    let stalled_peer = axum::Router::new().fallback(
+        move |axum::extract::OriginalUri(uri): axum::extract::OriginalUri| {
+            let entered = entered.clone();
+            let released = source_released.clone();
+            async move {
+                let peer = if uri.query().is_some_and(|query| query.contains("slow-d-")) {
+                    "d"
+                } else {
+                    "a"
+                };
+                entered.send(peer).unwrap();
+                released.notified().await;
+                axum::http::StatusCode::SERVICE_UNAVAILABLE
+            }
+        },
+    );
     b.tasks.push(tokio::spawn(async move {
         axum::serve(listener, stalled_peer).await.unwrap();
     }));
@@ -9532,12 +9541,14 @@ async fn two_slow_peers_do_not_block_another_peers_conflict() {
         .push(tokio::spawn(crate::ops::exec::run(b.state.clone())));
     b.tasks
         .push(tokio::spawn(super::recovery::run(b.state.clone())));
-    for _ in 0..2 {
-        tokio::time::timeout(Duration::from_secs(5), requests.recv())
-            .await
-            .unwrap()
-            .unwrap();
-    }
+    let mut stalled = std::collections::HashSet::new();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while stalled.len() < 2 {
+            stalled.insert(requests.recv().await.unwrap());
+        }
+    })
+    .await
+    .expect("both peers must have stalled HTTP requests");
     let active: Vec<(String, i64)> = sqlx::query_as(
         "SELECT c.peer_id,COUNT(*) FROM sync_recovery r JOIN conflicts c ON c.id=r.target_id
          WHERE r.kind='conflict' AND r.state='fixing' AND c.peer_id IN (?,?)
@@ -9549,7 +9560,7 @@ async fn two_slow_peers_do_not_block_another_peers_conflict() {
     .await
     .unwrap();
     assert_eq!(active.len(), 2);
-    assert!(active.iter().all(|(_, count)| *count == 1));
+    assert!(active.iter().all(|(_, count)| (1..=3).contains(count)));
     let completed = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let status: String = sqlx::query_scalar("SELECT status FROM conflicts WHERE id=?")
@@ -9573,10 +9584,6 @@ async fn two_slow_peers_do_not_block_another_peers_conflict() {
         .unwrap();
         eprintln!("recovery states: {rows:?}");
     }
-    assert!(
-        requests.try_recv().is_err(),
-        "the stalled peer exceeded its concurrency limit or a claim executed twice"
-    );
     released.notify_waiters();
     assert!(
         completed.is_ok(),
@@ -9585,5 +9592,157 @@ async fn two_slow_peers_do_not_block_another_peers_conflict() {
     assert_eq!(
         std::fs::read(b.shared.join("independent.jpg")).unwrap(),
         b"local"
+    );
+}
+
+#[tokio::test]
+async fn stalled_conflict_does_not_block_independent_conflict_from_same_peer() {
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    for path in ["held.jpg", "independent.jpg"] {
+        write_old(&a.shared.join(path), b"source version");
+        write_old(&b.shared.join(path), b"local version");
+    }
+    scan(&a).await;
+    scan(&b).await;
+    let peer = super::net::peers(&b.state).await.unwrap().remove(0);
+    let share = super::shares(&b.state).await.unwrap().remove(0);
+    let source_share = super::shares(&a.state).await.unwrap().remove(0);
+    for path in ["held.jpg", "independent.jpg"] {
+        let version = super::row(&a.state, &source_share.id, path)
+            .await
+            .unwrap()
+            .unwrap()
+            .vv;
+        super::conflict(
+            &b.state,
+            super::ConflictInput {
+                share: &share,
+                rel: path,
+                kind: "changed_on_both",
+                detail: "Choose a version".into(),
+                remote: ConflictSide {
+                    instance: "Alpha".into(),
+                    sha256: Some(crate::crypto::sha256_hex(b"source version")),
+                    size: Some(14),
+                    modified_at: None,
+                    deleted: false,
+                },
+                remote_vv: &version,
+                peer_id: &peer.id,
+                from: None,
+            },
+        )
+        .await
+        .unwrap();
+    }
+    let conflicts = admin::list_conflicts(&b.state, false).await.unwrap();
+    let conflict_id = |path: &str| {
+        conflicts
+            .iter()
+            .find(|conflict| conflict.location.path == format!("shared/{path}"))
+            .unwrap()
+            .id
+            .clone()
+    };
+    let held = conflict_id("held.jpg");
+    let independent = conflict_id("independent.jpg");
+    let submit = |id: String| ism_core::dto::RecoveryBatchInput {
+        targets: vec![ism_core::dto::RecoveryTarget {
+            kind: ism_core::dto::RecoveryKind::Conflict,
+            id,
+            peer_id: None,
+        }],
+        all: false,
+        resolution: Some(ConflictResolution::KeepLocal),
+    };
+    super::recovery::submit(&b.state, submit(held.clone()))
+        .await
+        .unwrap();
+
+    let (entered, mut requests) = tokio::sync::mpsc::unbounded_channel();
+    let released = std::sync::Arc::new(tokio::sync::Notify::new());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let upstream = a.url.clone();
+    let proxy_released = released.clone();
+    let proxy = axum::Router::new().fallback(move |request: axum::extract::Request| {
+        let upstream = upstream.clone();
+        let entered = entered.clone();
+        let released = proxy_released.clone();
+        async move {
+            let (parts, body) = request.into_parts();
+            if parts
+                .uri
+                .query()
+                .is_some_and(|query| query.contains("held.jpg"))
+            {
+                entered.send(()).unwrap();
+                released.notified().await;
+                return axum::http::Response::builder()
+                    .status(axum::http::StatusCode::SERVICE_UNAVAILABLE)
+                    .body(axum::body::Body::empty())
+                    .unwrap();
+            }
+            let response = reqwest::Client::new()
+                .request(parts.method, format!("{upstream}{}", parts.uri))
+                .headers(parts.headers)
+                .body(axum::body::to_bytes(body, 1024 * 1024).await.unwrap())
+                .send()
+                .await
+                .unwrap();
+            axum::http::Response::builder()
+                .status(response.status())
+                .body(axum::body::Body::from(response.bytes().await.unwrap()))
+                .unwrap()
+        }
+    });
+    b.tasks.push(tokio::spawn(async move {
+        axum::serve(listener, proxy).await.unwrap();
+    }));
+    sqlx::query("UPDATE peers SET url=? WHERE id=?")
+        .bind(url)
+        .bind(&peer.id)
+        .execute(&b.state.db)
+        .await
+        .unwrap();
+    b.tasks
+        .push(tokio::spawn(crate::ops::exec::run(b.state.clone())));
+    b.tasks
+        .push(tokio::spawn(super::recovery::run(b.state.clone())));
+    tokio::time::timeout(Duration::from_secs(5), requests.recv())
+        .await
+        .expect("held conflict did not contact the peer")
+        .unwrap();
+    super::recovery::submit(&b.state, submit(independent.clone()))
+        .await
+        .unwrap();
+    let completed = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let status: String = sqlx::query_scalar("SELECT status FROM conflicts WHERE id=?")
+                .bind(&independent)
+                .fetch_one(&b.state.db)
+                .await
+                .unwrap();
+            if status == "resolved" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    let held_state: String =
+        sqlx::query_scalar("SELECT state FROM sync_recovery WHERE kind='conflict' AND target_id=?")
+            .bind(&held)
+            .fetch_one(&b.state.db)
+            .await
+            .unwrap();
+    released.notify_waiters();
+    assert!(completed.is_ok(), "same-peer recovery did not progress");
+    assert_eq!(held_state, "fixing");
+    assert_eq!(
+        std::fs::read(b.shared.join("independent.jpg")).unwrap(),
+        b"local version"
     );
 }

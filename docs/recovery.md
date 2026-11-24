@@ -96,12 +96,12 @@ transfer may pass its own failed parent's path gate, but never that parent's unr
 barrier or another operation's gate. Waiting for busy work, unavailable mounts, or unavailable peer
 evidence does not consume the recovery attempt counter.
 
-Recovery runs up to four jobs per kind, with at most one job per attributed peer within a kind.
-Unattributed jobs can use up to three slots per kind. Forwarding uses up to four peers and refills
-a slot as soon as its worker finishes. These bounded limits do not guarantee immediate progress:
-four distinct stalled peers can fill a kind's slots, three stalled unattributed jobs block other
-unattributed jobs, and shared maintenance or path barriers still apply. The per-peer and
-unattributed limits trade throughput for isolation; jobs are not cancelled to free slots. Waiting
+Recovery runs up to four jobs per kind, with at most three jobs per attributed peer. Scheduling
+prefers one job per peer before filling spare slots. Unattributed jobs can use up to three slots
+per kind. Forwarding uses up to four peers and refills a slot as soon as its worker finishes.
+These bounded limits do not guarantee immediate progress: multiple stalled jobs can fill a kind's
+slots before another peer arrives, three stalled unattributed jobs block other unattributed jobs,
+and shared maintenance or path barriers still apply. Jobs are not cancelled to free slots. Waiting
 jobs retry after 30 seconds; interrupted claims are recovered before the affected queue resumes.
 
 Recovery checks retained complete staging, upload staging, local copies, and authenticated share
