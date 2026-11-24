@@ -36,8 +36,15 @@ Peer removal and committed peer/share configuration changes close existing strea
 Credentials and peer identity are also rechecked before every hint and keepalive; verification
 errors close the stream. Credential/configuration writers must call
 `AppState::peer_configuration_changed` immediately after committing their change.
-Allow long-lived, unbuffered responses through reverse proxies. No existing polling client uses
-this endpoint yet; clients without it keep their current behavior.
+Allow long-lived, unbuffered responses through reverse proxies. The peer progress/recovery client
+uses this stream instead of five-second refreshes when supported. It reads notifications independently
+of authoritative fetches and coalesces refreshes to at most once per second. Keepalives do not fetch
+state or create background task history. Closed, silent (45 seconds), or invalid streams report
+availability errors and reconnect after five seconds, fetching state again on connection.
+Only HTTP 404, 405, or 501 selects legacy five-second polling; legacy peers are probed every minute
+for an upgrade. Authentication and server errors never silently select polling. Peer removal or
+identity/credential changes cancel the client's worker. Replication, scans, transfer admission and
+recovery execution retain their independent schedulers.
 
 ## Shares
 
