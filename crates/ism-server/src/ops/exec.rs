@@ -3746,19 +3746,20 @@ async fn apply(state: &AppState, step: &Step) -> Result<Option<Undo>, Failure> {
     };
     match step {
         Step::CheckTree { path, expected } => {
-            let path = path.clone();
-            let actual = blocking(move || plan::folder_inventory(&path))
-                .await
-                .map_err(|error| match error.kind() {
-                    std::io::ErrorKind::InvalidInput | std::io::ErrorKind::NotFound => {
-                        Failure::new(
-                            "revision_changed",
-                            "folder contents can no longer be verified",
-                        )
-                    }
-                    _ => io(error),
-                })?;
-            if &actual != expected {
+            let matches = super::tree::matches_inline(
+                path.clone(),
+                expected,
+                state.version_scan_limit.clone(),
+            )
+            .await
+            .map_err(|error| match error.kind() {
+                std::io::ErrorKind::InvalidInput | std::io::ErrorKind::NotFound => Failure::new(
+                    "revision_changed",
+                    "folder contents can no longer be verified",
+                ),
+                _ => io(error),
+            })?;
+            if !matches {
                 return Err(Failure::new(
                     "revision_changed",
                     "folder contents changed during the operation",

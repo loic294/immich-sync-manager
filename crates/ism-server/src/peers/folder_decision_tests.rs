@@ -1435,7 +1435,7 @@ async fn reboot(instance: &mut Instance) {
     }
     let state = AppState::new(
         Config::for_tests(instance._dir.path()),
-        instance.state.db.clone(),
+        crate::db::connect(instance._dir.path()).await.unwrap(),
         SecretBox::open_or_create(instance._dir.path()).unwrap(),
     )
     .await
@@ -1780,12 +1780,13 @@ async fn folder_keep_remote_rejects_legacy_or_incomplete_queued_evidence() {
 }
 
 #[tokio::test]
-async fn folder_keep_remote_rebuilds_nested_tree_and_retains_trash() {
+async fn folder_keep_remote_rebuilds_nested_tree_and_retains_trash_after_restart() {
     let (mut a, mut b, id) = setup(true, true).await;
     admin::resolve(&a.state, "admin", &id, ConflictResolution::KeepRemote)
         .await
         .unwrap();
     assert_eq!(status(&a, &id).await, "resolving");
+    reboot(&mut a).await;
     preparations(&a).await;
     assert_eq!(status(&a, &id).await, "resolving");
     assert!(!a.shared.join("old").exists());
@@ -1804,6 +1805,142 @@ async fn folder_keep_remote_rebuilds_nested_tree_and_retains_trash() {
         })
     })
     .await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn folder_streaming_verification_rejects_changes_after_managed_planning() {
+    use std::os::unix::fs::PermissionsExt;
+
+    for change in [
+        "content",
+        "added_directory",
+        "removed_directory",
+        "symlink",
+        "unreadable",
+        "unreadable_addition",
+    ] {
+        let (mut a, b, id) = setup(true, true).await;
+        let original = a.shared.join("old/nested/photo.jpg");
+        let permissions = std::fs::metadata(&original).unwrap().permissions();
+        if change == "removed_directory" {
+            std::fs::create_dir(a.shared.join("old/nested/empty")).unwrap();
+        }
+        if change.starts_with("unreadable") {
+            std::fs::set_permissions(&original, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let inaccessible = std::fs::File::open(&original).is_err();
+            std::fs::set_permissions(&original, permissions.clone()).unwrap();
+            if !inaccessible {
+                eprintln!(
+                    "Skipping unreadable-file case: filesystem permits reads without mode bits"
+                );
+                continue;
+            }
+        }
+        admin::resolve(&a.state, "admin", &id, ConflictResolution::KeepRemote)
+            .await
+            .unwrap();
+        let operation: String = sqlx::query_scalar(
+            "SELECT operation_id FROM pending_peer_ops WHERE kind='move_decision_step' AND conflict_id=?",
+        )
+        .bind(&id)
+        .fetch_one(&a.state.db)
+        .await
+        .unwrap();
+        let permit = a
+            .state
+            .version_scan_limit
+            .clone()
+            .acquire_many_owned(2)
+            .await
+            .unwrap();
+        let state = a.state.clone();
+        let operation_id = operation.clone();
+        a.tasks.push(tokio::spawn(async move {
+            crate::ops::exec::run_operation(&state, &operation_id)
+                .await
+                .unwrap();
+        }));
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let checking: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM operation_items WHERE operation_id=?
+                     AND json_extract(progress_json,'$.steps[0].status')='running'
+                     AND json_type(journal_json,'$.execution_steps[0].CheckTree.expected')='array')",
+                )
+                .bind(&operation)
+                .fetch_one(&a.state.db)
+                .await
+                .unwrap();
+                if checking {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("the managed operation must reach its journaled tree check");
+        assert!(a.shared.join("old").is_dir());
+        match change {
+            "content" => std::fs::write(&original, b"changed during execution").unwrap(),
+            "added_directory" => {
+                std::fs::create_dir(a.shared.join("old/nested/added-empty")).unwrap()
+            }
+            "removed_directory" => std::fs::remove_dir(a.shared.join("old/nested/empty")).unwrap(),
+            "symlink" => {
+                std::os::unix::fs::symlink("photo.jpg", a.shared.join("old/nested/unexpected-link"))
+                    .unwrap()
+            }
+            "unreadable" => {
+                std::fs::set_permissions(&original, std::fs::Permissions::from_mode(0o000))
+                    .unwrap();
+            }
+            "unreadable_addition" => {
+                let addition = a.shared.join("old/unreviewed");
+                std::fs::create_dir(&addition).unwrap();
+                let file = addition.join("photo.jpg");
+                std::fs::write(&file, b"unreviewed addition").unwrap();
+                std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        drop(permit);
+        a.tasks.pop().unwrap().await.unwrap();
+        std::fs::set_permissions(&original, permissions).unwrap();
+        let result: (String, Option<String>) = sqlx::query_as(
+            "SELECT status,error_code FROM operation_items WHERE operation_id=? AND idx=0",
+        )
+        .bind(&operation)
+        .fetch_one(&a.state.db)
+        .await
+        .unwrap();
+        assert_eq!(result.0, "failed", "{change}");
+        assert_eq!(
+            result.1.as_deref(),
+            Some(if change.starts_with("unreadable") {
+                "io_error"
+            } else {
+                "revision_changed"
+            }),
+            "{change}",
+        );
+        let trashed: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM trash WHERE operation_id=?")
+            .bind(&operation)
+            .fetch_one(&a.state.db)
+            .await
+            .unwrap();
+        assert_eq!(trashed, 0);
+        assert!(a.shared.join("old").is_dir());
+        assert_eq!(
+            std::fs::read(a.shared.join("new/occupied.jpg")).unwrap(),
+            b"local destination"
+        );
+        assert_eq!(
+            std::fs::read(b.shared.join("new/nested/photo.jpg")).unwrap(),
+            b"remote source"
+        );
+        assert_ne!(status(&a, &id).await, "resolved");
+    }
 }
 
 #[tokio::test]
