@@ -50,6 +50,7 @@ pub struct Inner {
     pub peer_events: broadcast::Sender<()>,
     /// Changing peer credentials or configuration revokes existing streams without polling.
     pub peer_configuration: watch::Sender<()>,
+    pub peer_streams: crate::peers::notifications::Streams,
     /// Wakes the operation executor.
     pub ops_wake: Notify,
     /// Wakes the maintenance controller.
@@ -117,6 +118,7 @@ impl AppState {
             events,
             peer_events,
             peer_configuration,
+            peer_streams: crate::peers::notifications::Streams::default(),
             ops_wake: Notify::new(),
             maintenance_wake: Notify::new(),
             sync_wake: Notify::new(),
@@ -182,6 +184,7 @@ impl AppState {
 
     /// Call immediately after committing peer credentials or share configuration changes.
     pub fn peer_configuration_changed(&self) {
+        self.peer_streams.invalidate();
         self.peer_configuration.send_replace(());
     }
 

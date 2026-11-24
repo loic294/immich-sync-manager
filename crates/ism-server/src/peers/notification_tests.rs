@@ -49,7 +49,7 @@ async fn fixture(status: u16) -> (Instance, Instance, net::Peer) {
 }
 
 async fn ready(a: &Instance, peer: &net::Peer) -> bool {
-    sqlx::query_scalar::<_, bool>(
+    let snapshots = sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS(SELECT 1 FROM peer_sync_state WHERE peer_id=? AND error IS NULL)
          AND EXISTS(SELECT 1 FROM peer_recovery_state WHERE peer_id=? AND error IS NULL)",
     )
@@ -57,7 +57,207 @@ async fn ready(a: &Instance, peer: &net::Peer) -> bool {
     .bind(&peer.id)
     .fetch_one(&a.state.db)
     .await
+    .unwrap();
+    snapshots && a.state.peer_streams.fresh(&peer.id).unwrap_or(true)
+}
+
+async fn age_snapshots(a: &Instance) {
+    for table in ["peer_sync_state", "peer_recovery_state"] {
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "UPDATE {table} SET updated_at='2000-01-01T00:00:00Z'"
+        )))
+        .execute(&a.state.db)
+        .await
+        .unwrap();
+    }
+}
+
+async fn failed_remote_operation(b: &Instance) {
+    let peer = net::peers(&b.state).await.unwrap().remove(0);
+    sqlx::query(
+        "INSERT INTO operations(id,idempotency_key,principal,source,request_json,status,created_at)
+         VALUES('heartbeat-example','heartbeat',?,'peer','{}','failed',?)",
+    )
+    .bind(format!("peer:{}", peer.id))
+    .bind(crate::db::now())
+    .execute(&b.state.db)
+    .await
+    .unwrap();
+    crate::peers::recovery::discover(&b.state).await.unwrap();
+}
+
+async fn cache_available(a: &Instance, peer: &net::Peer) -> (bool, bool) {
+    let progress = activity::page(&a.state, "active", 100, 0, None)
+        .await
+        .unwrap();
+    let recovery = crate::peers::recovery::outgoing(
+        &a.state,
+        &peer.id,
+        ism_core::dto::RecoveryKind::Operation,
+        "heartbeat-example",
+    )
+    .await
     .unwrap()
+    .unwrap();
+    let list = crate::peers::recovery::page(&a.state, 100, 0)
+        .await
+        .unwrap();
+    (
+        progress.warnings.is_empty(),
+        recovery.code.as_deref() != Some("peer_recovery_unavailable")
+            && list.rows.iter().any(|row| {
+                row.target.id == "heartbeat-example"
+                    && row.code.as_deref() != Some("peer_recovery_unavailable")
+            }),
+    )
+}
+
+#[tokio::test]
+async fn notification_client_healthy_stream_keeps_old_snapshots_available() {
+    let (a, b, peer) = fixture(0).await;
+    wait("connected", || ready(&a, &peer)).await;
+    failed_remote_operation(&b).await;
+    wait("recovery snapshot", || async {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM outgoing_recovery WHERE target_id='heartbeat-example')",
+        )
+        .fetch_one(&a.state.db)
+        .await
+        .unwrap()
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    age_snapshots(&a).await;
+    assert_eq!(
+        count(&b, NOTIFICATIONS),
+        1,
+        "authenticated stream is still connected"
+    );
+    assert_eq!(
+        cache_available(&a, &peer).await,
+        (true, true),
+        "healthy idle stream must not expire progress or recovery solely by snapshot age"
+    );
+    let baseline = (count(&b, RECOVERY), count(&b, PROGRESS));
+    let history = crate::activity::page(&a.state, 100, 0)
+        .await
+        .unwrap()
+        .history
+        .len();
+    tokio::time::sleep(Duration::from_secs(31)).await;
+    assert_eq!(
+        cache_available(&a, &peer).await,
+        (true, true),
+        "live keepalives extend freshness"
+    );
+    assert_eq!((count(&b, RECOVERY), count(&b, PROGRESS)), baseline);
+    assert_eq!(
+        crate::activity::page(&a.state, 100, 0)
+            .await
+            .unwrap()
+            .history
+            .len(),
+        history
+    );
+    for table in ["peer_sync_state", "peer_recovery_state"] {
+        let timestamp: String = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT updated_at FROM {table} WHERE peer_id=?"
+        )))
+        .bind(&peer.id)
+        .fetch_one(&a.state.db)
+        .await
+        .unwrap();
+        assert_eq!(
+            timestamp, "2000-01-01T00:00:00Z",
+            "keepalives must not write heartbeat timestamps"
+        );
+    }
+}
+
+#[tokio::test]
+async fn notification_client_failed_fetch_or_connection_never_extends_freshness() {
+    let (a, b, peer) = fixture(0).await;
+    wait("connected", || ready(&a, &peer)).await;
+    failed_remote_operation(&b).await;
+    wait("receiver evidence", || async {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM outgoing_recovery WHERE target_id='heartbeat-example')",
+        )
+        .fetch_one(&a.state.db)
+        .await
+        .unwrap()
+    })
+    .await;
+    age_snapshots(&a).await;
+    assert_eq!(cache_available(&a, &peer).await, (true, true));
+
+    b.snapshot_status.store(500, Ordering::SeqCst);
+    b.state.emit(crate::state::ServerEvent::SyncChanged);
+    wait("failed re-fetch", || async {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM peer_sync_state WHERE error IS NOT NULL)",
+        )
+        .fetch_one(&a.state.db)
+        .await
+        .unwrap()
+    })
+    .await;
+    assert_eq!(cache_available(&a, &peer).await, (false, false));
+    tokio::time::sleep(Duration::from_secs(16)).await;
+    assert_eq!(
+        a.state.peer_streams.fresh(&peer.id),
+        Some(false),
+        "keepalives cannot authorize failed snapshots"
+    );
+    b.snapshot_status.store(0, Ordering::SeqCst);
+    wait("successful retry", || ready(&a, &peer)).await;
+    age_snapshots(&a).await;
+    assert_eq!(cache_available(&a, &peer).await, (true, true));
+
+    // A new stream must not reuse verification from the previous connection.
+    b.recovery_status.store(500, Ordering::SeqCst);
+    a.state.peer_configuration_changed();
+    assert_eq!(
+        a.state.peer_streams.fresh(&peer.id),
+        Some(false),
+        "configuration invalidation is immediate"
+    );
+    wait("new stream with failed initial recovery fetch", || async {
+        count(&b, NOTIFICATIONS) >= 2
+            && sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM peer_sync_state WHERE error IS NULL)
+                 AND EXISTS(SELECT 1 FROM peer_recovery_state WHERE error IS NOT NULL)",
+            )
+            .fetch_one(&a.state.db)
+            .await
+            .unwrap()
+    })
+    .await;
+    age_snapshots(&a).await;
+    assert_eq!(
+        cache_available(&a, &peer).await,
+        (false, false),
+        "both initial snapshots are required"
+    );
+    b.recovery_status.store(0, Ordering::SeqCst);
+    wait("both new snapshots verified", || ready(&a, &peer)).await;
+    age_snapshots(&a).await;
+    assert_eq!(cache_available(&a, &peer).await, (true, true));
+
+    b.notification_status.store(500, Ordering::SeqCst);
+    b.state.peer_configuration_changed();
+    wait("disconnection", || async {
+        a.state.peer_streams.fresh(&peer.id) == Some(false)
+    })
+    .await;
+    assert_eq!(cache_available(&a, &peer).await, (false, false));
+    admin::delete_peer(&a.state, &peer.id).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert_eq!(
+        a.state.peer_streams.fresh(&peer.id),
+        None,
+        "removed connection is pruned"
+    );
 }
 
 #[tokio::test]
@@ -93,6 +293,34 @@ async fn notification_client_idle_keepalive_does_not_refresh_or_create_history()
             .history
             .len(),
         history
+    );
+}
+
+#[tokio::test]
+async fn notification_client_unchanged_hint_does_not_create_success_history() {
+    let (a, b, peer) = fixture(0).await;
+    wait("connected", || ready(&a, &peer)).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let baseline = crate::activity::page(&a.state, 100, 0)
+        .await
+        .unwrap()
+        .history
+        .len();
+    let before = count(&b, PROGRESS);
+    b.state.emit(crate::state::ServerEvent::SyncChanged);
+    wait("unchanged notification fetched", || async {
+        count(&b, PROGRESS) > before
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(
+        crate::activity::page(&a.state, 100, 0)
+            .await
+            .unwrap()
+            .history
+            .len(),
+        baseline,
+        "routine successful refreshes must not create background history"
     );
 }
 
