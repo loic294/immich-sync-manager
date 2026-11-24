@@ -649,7 +649,7 @@ pub async fn refresh(state: &AppState, peer: &net::Peer) -> AppResult<()> {
     }
     // A deferred WAL read does not take the writer lock; the write path rechecks everything.
     let mut read = state.db.begin().await?;
-    let unchanged = recovery_unchanged(&mut *read, &peer.id, &snapshot, generation).await?;
+    let unchanged = recovery_unchanged(&mut read, &peer.id, &snapshot, generation).await?;
     read.rollback().await?;
     #[cfg(test)]
     let checked = std::time::Instant::now();
