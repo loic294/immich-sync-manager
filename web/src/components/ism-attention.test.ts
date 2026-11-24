@@ -13,6 +13,7 @@ const item: AttentionItem = {
   detail: 'Choose which version to keep.',
   href: '/conflicts',
   action: 'Open conflicts',
+  external: false,
   blocking: true,
   notifiable: true,
 };
@@ -51,5 +52,15 @@ describe('admin attention', () => {
     expect(bell.textContent).toContain('Some notification information is unavailable.');
     expect(banners.textContent).toContain('status information is unavailable');
     expect(banners.querySelector('button')?.textContent).toContain('Retry');
+  });
+
+  it('lets receiver links navigate outside the app router', async () => {
+    const remote = { ...item, href: 'https://receiver.example/conflicts', external: true };
+    blockers.value = [remote];
+    notifications.value = [remote];
+    const bell = await mount('ism-attention-bell');
+    const banners = await mount('ism-blocker-banners');
+    expect(bell.querySelector('a')?.getAttribute('rel')).toBe('external');
+    expect(banners.querySelector('a')?.getAttribute('rel')).toBe('external');
   });
 });

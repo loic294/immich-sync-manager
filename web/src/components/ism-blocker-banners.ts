@@ -27,7 +27,7 @@ export class IsmBlockerBanners extends IsmElement {
             <p class="font-semibold">${first.title}</p>
             <p class="text-sm">${first.detail}${entries.some((entry) => entry.stale) ? ' Some status information may be out of date.' : ''}${entries.length > 1 ? ` ${entries.length - 1} more ${entries.length === 2 ? 'item needs' : 'items need'} attention.` : ''}</p>
           </div>
-          <a class="btn btn-sm" href=${first.href}>${first.action}<ism-icon name="arrow-right" size="xs"></ism-icon></a>
+          <a class="btn btn-sm" href=${first.href} rel=${first.external ? 'external' : nothing}>${first.action}<ism-icon name="arrow-right" size="xs"></ism-icon></a>
         </section>`;
       })}
     `;

@@ -65,7 +65,7 @@ export class IsmAttentionBell extends IsmElement {
                       <p class="font-medium">${item.title}</p>
                       <p class="mt-1 text-sm text-base-content/70">${item.detail}</p>
                       ${item.stale ? html`<p class="mt-1 text-sm text-base-content/70">Last reported; current status is unavailable.</p>` : nothing}
-                      <a class="link link-primary mt-2 inline-flex items-center gap-1 text-sm font-medium" href=${item.href}>
+                      <a class="link link-primary mt-2 inline-flex items-center gap-1 text-sm font-medium" href=${item.href} rel=${item.external ? 'external' : nothing}>
                         ${item.action}<ism-icon name="arrow-right" size="xs"></ism-icon>
                       </a>
                     </div>

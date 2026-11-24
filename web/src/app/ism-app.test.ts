@@ -138,6 +138,7 @@ describe('ism-app', () => {
         detail: 'Reconnect the other instance.',
         href: '/peers',
         action: 'Open peers',
+        external: false,
         blocking: true,
         notifiable: true,
       },

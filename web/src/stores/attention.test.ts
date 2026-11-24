@@ -70,6 +70,14 @@ describe('attention snapshots', () => {
     expect(items[2]).toMatchObject({ blocking: true, notifiable: false });
   });
 
+  it('marks peer links as external while retaining their action labels', () => {
+    const [item] = buildAttention({
+      ...snapshot,
+      items: [{ ...row, owner: 'receiver', href: 'https://receiver.example/conflicts' }],
+    });
+    expect(item).toMatchObject({ external: true, action: 'Open conflicts' });
+  });
+
   it('preserves confirmed blockers and dismissed notices when evidence is partial', async () => {
     const get = vi.spyOn(api, 'get').mockResolvedValue(snapshot);
     const stop = startAttention();

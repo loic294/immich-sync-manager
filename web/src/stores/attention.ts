@@ -16,6 +16,7 @@ export interface AttentionItem {
   detail: string;
   href: string;
   action: string;
+  external: boolean;
   blocking: boolean;
   notifiable: boolean;
   stale?: boolean;
@@ -84,7 +85,7 @@ export function buildAttention(snapshot: AttentionSnapshot): AttentionItem[] {
   return snapshot.items
     .filter((entry) => entry.attention !== 'none')
     .map((entry) => {
-      const path = entry.href.split('?')[0];
+      const url = new URL(entry.href, window.location.href);
       return {
         id: entry.id,
         code: entry.code,
@@ -92,7 +93,8 @@ export function buildAttention(snapshot: AttentionSnapshot): AttentionItem[] {
         title: entry.title,
         detail: entry.message,
         href: entry.href,
-        action: ACTIONS[path] ?? 'Open details',
+        action: ACTIONS[url.pathname] ?? 'Open details',
+        external: url.origin !== window.location.origin,
         blocking: entry.blocks_work,
         notifiable: entry.attention !== 'none' && entry.acknowledged !== true,
       };
