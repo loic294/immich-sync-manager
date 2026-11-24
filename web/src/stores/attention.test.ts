@@ -122,6 +122,35 @@ describe('attention snapshots', () => {
     }
   });
 
+  it('rechecks partial snapshots at the authoritative transition before the retry interval', async () => {
+    vi.useFakeTimers();
+    const get = vi.spyOn(api, 'get').mockResolvedValue({
+      ...snapshot,
+      completeness: 'partial',
+      warnings: ['Some readiness is unknown.'],
+      items: [
+        {
+          ...row,
+          recheck_at: new Date(Date.now() + 2000).toISOString(),
+          next_at: new Date(Date.now() + 3_600_000).toISOString(),
+        },
+      ],
+    });
+    const stop = startAttention();
+    try {
+      await vi.advanceTimersByTimeAsync(0);
+      expect(attentionError.value).toBe(true);
+      expect(blockers.value).toHaveLength(1);
+      get.mockResolvedValue({ ...snapshot, items: [] });
+      await vi.advanceTimersByTimeAsync(2100);
+      expect(get).toHaveBeenCalledTimes(2);
+      expect(attentionError.value).toBe(false);
+      expect(blockers.value).toEqual([]);
+    } finally {
+      stop();
+    }
+  });
+
   it('retains and marks previous blockers when refresh fails, then retries', async () => {
     vi.useFakeTimers();
     vi.spyOn(console, 'error').mockImplementation(() => undefined);
