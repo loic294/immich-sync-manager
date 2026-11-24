@@ -96,6 +96,12 @@ transfer may pass its own failed parent's path gate, but never that parent's unr
 barrier or another operation's gate. Waiting for busy work, unavailable mounts, or unavailable peer
 evidence does not consume the recovery attempt counter.
 
+Recovery runs up to four jobs per kind, with at most three jobs attributed to one peer within a
+kind. Forwarding uses up to four peers and refills a slot as soon as its worker finishes. These are
+bounded concurrency limits, not guarantees of immediate progress: jobs without an attributable
+peer can fill a kind's slots, and shared maintenance or path barriers still apply. Waiting jobs retry
+after 30 seconds; interrupted claims are recovered before the affected queue resumes.
+
 Recovery checks retained complete staging, upload staging, local copies, and authenticated share
 peers' applicable trash inventories. It can transfer the exact verified file without restoring
 the rest of a trashed folder. It also follows authenticated committed move history. A duplicate
