@@ -1083,7 +1083,7 @@ async fn repeated_changes_to_one_path_keep_the_backlog_bounded_and_exact() {
     );
     scheduler::step(&state, i64::MAX / 2).await.unwrap();
     wait_for_sync(&state).await;
-    // Removed then added amounts to a change, which only a folder scan reconciles.
+    // Removed then added folds to a change, which requests the parent folder's scan.
     let mut bodies = scan_bodies(&server).await;
     bodies.sort_by_key(ToString::to_string);
     assert_eq!(
@@ -1176,48 +1176,120 @@ async fn a_failed_claim_retries_with_later_arrivals_folded_exactly() {
     assert_eq!(retained(&state).await, 0);
 }
 
-#[tokio::test]
-async fn unkeyed_rows_from_before_coalescing_run_first_then_keyed_work_follows() {
-    let (_dir, state, server, _fake) = setup().await;
+async fn file_api_requests(server: &wiremock::MockServer, action: &str) -> usize {
+    let path = format!("/api/libraries/lib1/files/{action}");
+    server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path() == path)
+        .count()
+}
+
+/// A request stored before keys existed, exactly as the previous release wrote it.
+async fn store_pre_migration_removal(state: &AppState, path: &str) {
     sqlx::query("INSERT INTO scan_schedule (library_id, server_id) VALUES ('lib1', 's1')")
         .execute(&state.db)
         .await
         .unwrap();
-    sqlx::query(
-        r#"INSERT INTO scan_work (library_id, work_json) VALUES ('lib1', '{"path":"/library/trip","kind":"Folder"}')"#,
-    )
-    .execute(&state.db)
-    .await
-    .unwrap();
+    sqlx::query("INSERT INTO scan_work (library_id, work_json) VALUES ('lib1', ?)")
+        .bind(json!({ "path": path, "kind": "Removed" }).to_string())
+        .execute(&state.db)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn stored_requests_from_before_the_migration_coalesce_with_new_ones() {
+    let (dir, state, server, _fake) = setup().await;
+    let (_root, base) = map_root(&state, dir.path()).await;
+    std::fs::write(base.join("trip/old.jpg"), "recreated").unwrap();
+    Mock::given(method("POST"))
+        .and(path("/api/libraries/lib1/files/remove"))
+        .respond_with(
+            ResponseTemplate::new(400)
+                .set_body_json(json!({ "message": "Removed file still exists" })),
+        )
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    let file = "/library/trip/old.jpg";
+    store_pre_migration_removal(&state, file).await;
     scheduler::request_work_at(
         &state,
         "s1",
         "lib1",
-        "new",
-        &[folder_work("/library/other")],
+        "recreated",
+        &[file_work(file, scheduler::WorkKind::Added)],
         0,
     )
     .await
     .unwrap();
+    assert_eq!(stored_rows(&state).await, 1, "rewritten in place");
+    scheduler::step(&state, i64::MAX / 2).await.unwrap();
+    wait_for_sync(&state).await;
+    // As in one combined read, removed then added folds to a change, which requests the
+    // parent folder's scan instead of a removal and a (no-op) add of the existing asset.
+    assert_eq!(
+        scan_bodies(&server).await,
+        [json!({ "path": "/library/trip" })]
+    );
+    assert_eq!(file_api_requests(&server, "remove").await, 0);
+    assert_eq!(file_api_requests(&server, "add").await, 0);
+    assert_eq!(scheduler::views(&state).await.unwrap()[0].last_error, None);
+    assert_eq!(retained(&state).await, 0);
+    wait_for_cleanup(&state).await;
+}
+
+#[tokio::test]
+async fn a_failed_pre_migration_batch_retries_with_new_requests_folded_in() {
+    let (_dir, state, server, _fake) = setup().await;
+    Mock::given(method("POST"))
+        .and(path("/api/libraries/lib1/files/remove"))
+        .respond_with(ResponseTemplate::new(500))
+        .with_priority(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    let file = "/library/trip/old.jpg";
+    store_pre_migration_removal(&state, file).await;
+    sqlx::query("UPDATE scan_schedule SET due_at = 0")
+        .execute(&state.db)
+        .await
+        .unwrap();
+    let guard = state.maintenance_lock.lock().await;
+    scheduler::step(&state, i64::MAX / 2).await.unwrap();
+    scheduler::request_work_at(
+        &state,
+        "s1",
+        "lib1",
+        "recreated",
+        &[file_work(file, scheduler::WorkKind::Added)],
+        0,
+    )
+    .await
+    .unwrap();
+    assert_eq!(stored_rows(&state).await, 2, "claimed rows never change");
+    drop(guard);
+    wait_for_sync(&state).await;
+    assert!(
+        scheduler::views(&state).await.unwrap()[0]
+            .last_error
+            .as_ref()
+            .unwrap()
+            .contains("500")
+    );
+    assert_eq!(retained(&state).await, 2);
     scheduler::step(&state, i64::MAX / 2).await.unwrap();
     wait_for_sync(&state).await;
     assert_eq!(
         scan_bodies(&server).await,
         [json!({ "path": "/library/trip" })]
     );
-    assert!(
-        due_at(&state).await.is_some(),
-        "unclaimed keyed work is due again"
-    );
-    scheduler::step(&state, i64::MAX / 2).await.unwrap();
-    wait_for_sync(&state).await;
-    assert_eq!(
-        scan_bodies(&server).await,
-        [
-            json!({ "path": "/library/trip" }),
-            json!({ "path": "/library/other" }),
-        ]
-    );
+    assert_eq!(file_api_requests(&server, "remove").await, 1);
+    assert_eq!(file_api_requests(&server, "add").await, 0);
+    assert_eq!(scheduler::views(&state).await.unwrap()[0].last_error, None);
     assert_eq!(retained(&state).await, 0);
     wait_for_cleanup(&state).await;
 }

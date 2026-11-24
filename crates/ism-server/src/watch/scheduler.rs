@@ -4,13 +4,12 @@
 //! two-minute timer. Once the write barrier allows it, file APIs handle additions/removals;
 //! only unsupported work scans affected folders. Successful synchronization announces
 //! [`ServerEvent::LibraryScanned`] even when no scan was necessary.
-
 //!
 //! The backlog stays bounded: admission coalesces each exact path into at most a couple of
 //! pending rows, a run reads its batch in pages, success acknowledges the batch with one
 //! value (`acked_through`), and acknowledged rows are deleted afterwards in small chunks.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -28,6 +27,7 @@ use crate::state::{AppState, ServerEvent};
 const MAX_REASONS: usize = 10;
 const REMOVED_FILE_EXISTS: &str = "Removed file still exists";
 const READ_PAGE: i64 = 2_000;
+const ADMIT_CHUNK: usize = 500;
 const COLLECT_CHUNK: i64 = 1_000;
 // Lets writers queued behind SQLite's busy handler in between acknowledged-row deletions.
 const COLLECT_PAUSE: Duration = Duration::from_millis(25);
@@ -256,59 +256,80 @@ pub(crate) async fn request_work_at(
     .bind(library_id)
     .fetch_one(&mut *tx)
     .await?;
+    let arrivals: Vec<_> = arrivals.into_iter().collect();
     let mut written = 0u64;
-    for (key, (path, kinds)) in &arrivals {
-        let existing: Vec<(i64, String)> = sqlx::query_as(
-            "SELECT id, work_json FROM scan_work WHERE library_id = ? AND work_key = ? AND id > ?
-             ORDER BY id",
+    // Each statement covers a chunk of keys, so a large batch costs a few statements per
+    // chunk rather than several per path while the writer lock is held.
+    for chunk in arrivals.chunks(ADMIT_CHUNK) {
+        let keys: Vec<&str> = chunk.iter().map(|(key, _)| key.as_str()).collect();
+        let existing: Vec<(i64, String, String)> = sqlx::query_as(
+            "SELECT id, work_key, work_json FROM scan_work
+             WHERE library_id = ? AND id > ? AND work_key IN (SELECT value FROM json_each(?))
+             ORDER BY work_key, id",
         )
         .bind(library_id)
-        .bind(key.as_str())
         .bind(acked_through)
+        .bind(serde_json::to_string(&keys)?)
         .fetch_all(&mut *tx)
         .await?;
-        let mut in_flight = Vec::new();
-        let mut rows = Vec::new();
-        for (id, json) in existing {
+        let mut stored: HashMap<String, Vec<(i64, WorkKind)>> = HashMap::new();
+        for (id, key, json) in existing {
             let kind = serde_json::from_str::<Work>(&json)?.kind;
-            if id <= pending_after {
-                in_flight.push(kind);
-            } else {
-                rows.push(PendingRow {
-                    id: Some(id),
-                    kind,
-                    dirty: false,
-                });
-            }
+            stored.entry(key).or_default().push((id, kind));
         }
-        for &kind in kinds {
-            admit(&in_flight, &mut rows, kind);
-        }
-        for row in rows.iter().filter(|row| row.dirty) {
-            let json = serde_json::to_string(&Work {
-                path: (*path).to_owned(),
-                kind: row.kind,
-            })?;
-            match row.id {
-                Some(id) => {
-                    sqlx::query("UPDATE scan_work SET work_json = ? WHERE id = ?")
-                        .bind(json)
-                        .bind(id)
-                        .execute(&mut *tx)
-                        .await?;
-                }
-                None => {
-                    sqlx::query(
-                        "INSERT INTO scan_work (library_id, work_json, work_key) VALUES (?, ?, ?)",
-                    )
-                    .bind(library_id)
-                    .bind(json)
-                    .bind(key.as_str())
-                    .execute(&mut *tx)
-                    .await?;
+        let mut updates: Vec<(i64, String)> = Vec::new();
+        let mut inserts: Vec<String> = Vec::new();
+        for (key, (path, kinds)) in chunk {
+            let mut in_flight = Vec::new();
+            let mut rows = Vec::new();
+            for &(id, kind) in stored.get(key).into_iter().flatten() {
+                if id <= pending_after {
+                    in_flight.push(kind);
+                } else {
+                    rows.push(PendingRow {
+                        id: Some(id),
+                        kind,
+                        dirty: false,
+                    });
                 }
             }
-            written += 1;
+            for &kind in kinds {
+                admit(&in_flight, &mut rows, kind);
+            }
+            for row in rows.iter().filter(|row| row.dirty) {
+                let json = serde_json::to_string(&Work {
+                    path: (*path).to_owned(),
+                    kind: row.kind,
+                })?;
+                match row.id {
+                    Some(id) => updates.push((id, json)),
+                    None => inserts.push(json),
+                }
+            }
+        }
+        written += (updates.len() + inserts.len()) as u64;
+        if !updates.is_empty() {
+            let updates = serde_json::to_string(&updates)?;
+            sqlx::query(
+                "UPDATE scan_work SET work_json = u.work_json
+                 FROM (SELECT json_extract(value, '$[0]') AS id,
+                              json_extract(value, '$[1]') AS work_json FROM json_each(?)) u
+                 WHERE scan_work.id = u.id",
+            )
+            .bind(&updates)
+            .execute(&mut *tx)
+            .await?;
+        }
+        if !inserts.is_empty() {
+            // Ids follow array order, which keeps each key's appended rows in arrival order.
+            sqlx::query(
+                "INSERT INTO scan_work (library_id, work_json)
+                 SELECT ?, value FROM json_each(?) ORDER BY key",
+            )
+            .bind(library_id)
+            .bind(serde_json::to_string(&inserts)?)
+            .execute(&mut *tx)
+            .await?;
         }
     }
     tx.commit().await?;
@@ -337,6 +358,7 @@ pub async fn run(state: AppState) {
                 tick
             }
         };
+        spawn_collect(&state);
         tokio::select! {
             () = tokio::time::sleep(wait.max(Duration::from_millis(10))) => {}
             () = state.scan_wake.notified() => {}
@@ -369,57 +391,118 @@ pub(crate) async fn recover(state: &AppState) -> AppResult<()> {
             "rescheduled retained stale-removal work"
         );
     }
-    let acknowledged: Vec<String> = sqlx::query_scalar(
+    spawn_collect(state);
+    Ok(())
+}
+
+/// Coalesces cleanup requests so one task per process deletes acknowledged rows.
+#[derive(Debug, Default)]
+pub struct Collector {
+    running: bool,
+    again: bool,
+}
+
+/// Releases the collector slot if the cleanup task panics.
+struct CollectorRun {
+    state: AppState,
+    stopped: bool,
+}
+
+impl Drop for CollectorRun {
+    fn drop(&mut self) {
+        if !self.stopped {
+            let mut collector = self
+                .state
+                .scan_collector
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            collector.running = false;
+        }
+    }
+}
+
+/// Starts the cleanup task unless it is running, in which case that task makes another pass.
+/// The scheduler loop calls this every tick, so a failed cleanup is retried without a restart.
+fn spawn_collect(state: &AppState) {
+    {
+        let mut collector = state
+            .scan_collector
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if collector.running {
+            collector.again = true;
+            return;
+        }
+        collector.running = true;
+    }
+    let mut run = CollectorRun {
+        state: state.clone(),
+        stopped: false,
+    };
+    tokio::spawn(async move {
+        while !run.stopped {
+            if let Err(e) = collect_acknowledged(&run.state).await {
+                tracing::warn!("acknowledged scan work cleanup failed: {}", e.message());
+            }
+            let mut collector = run
+                .state
+                .scan_collector
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if collector.again {
+                collector.again = false;
+            } else {
+                collector.running = false;
+                run.stopped = true;
+            }
+            drop(collector);
+        }
+    });
+}
+
+/// Deletes rows successful runs acknowledged, one library and one short write transaction at
+/// a time. They are not work anymore, so an interruption only leaves garbage for the next pass.
+pub(crate) async fn collect_acknowledged(state: &AppState) -> AppResult<u64> {
+    let libraries: Vec<String> = sqlx::query_scalar(
         "SELECT library_id FROM scan_schedule s WHERE EXISTS
            (SELECT 1 FROM scan_work w WHERE w.library_id = s.library_id AND w.id <= s.acked_through)",
     )
     .fetch_all(&state.db)
     .await?;
-    for library_id in acknowledged {
-        spawn_collect(state, library_id);
-    }
-    Ok(())
-}
-
-fn spawn_collect(state: &AppState, library_id: String) {
-    let state = state.clone();
-    tokio::spawn(async move {
-        if let Err(e) = collect_acknowledged(&state, &library_id).await {
-            tracing::warn!(library = %library_id, "acknowledged scan work cleanup failed: {}", e.message());
-        }
-    });
-}
-
-/// Deletes rows a successful run acknowledged, in short write transactions. They are not
-/// work anymore, so an interruption only leaves garbage that the next cleanup removes.
-pub(crate) async fn collect_acknowledged(state: &AppState, library_id: &str) -> AppResult<u64> {
     let mut total = 0;
-    loop {
-        let mut clock = WriterClock::start("collect");
-        let mut conn = state.db.acquire().await?;
-        clock.pooled();
-        let mut tx = conn.begin_with("BEGIN IMMEDIATE").await?;
-        clock.locked();
-        let deleted = sqlx::query(
-            "DELETE FROM scan_work WHERE id IN (
-               SELECT id FROM scan_work WHERE library_id = ?
-                 AND id <= (SELECT acked_through FROM scan_schedule WHERE library_id = ?)
-               ORDER BY id LIMIT ?)",
-        )
-        .bind(library_id)
-        .bind(library_id)
-        .bind(COLLECT_CHUNK)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
-        tx.commit().await?;
-        clock.report(library_id, deleted);
-        total += deleted;
-        if deleted < COLLECT_CHUNK as u64 {
-            return Ok(total);
+    for library_id in libraries {
+        loop {
+            let mut clock = WriterClock::start("collect");
+            let deleted = {
+                let mut conn = state.db.acquire().await?;
+                clock.pooled();
+                let mut tx = conn.begin_with("BEGIN IMMEDIATE").await?;
+                clock.locked();
+                let deleted = sqlx::query(
+                    "DELETE FROM scan_work WHERE id IN (
+                       SELECT id FROM scan_work WHERE library_id = ?
+                         AND id <= (SELECT acked_through FROM scan_schedule WHERE library_id = ?)
+                       ORDER BY id LIMIT ?)",
+                )
+                .bind(&library_id)
+                .bind(&library_id)
+                .bind(COLLECT_CHUNK)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+                tx.commit().await?;
+                deleted
+            };
+            clock.report(&library_id, deleted);
+            total += deleted;
+            if deleted < COLLECT_CHUNK as u64 {
+                break;
+            }
+            // The pooled connection is already returned; others can write in between.
+            tokio::time::sleep(COLLECT_PAUSE).await;
         }
-        tokio::time::sleep(COLLECT_PAUSE).await;
     }
+    Ok(total)
 }
 
 async fn recreated_file_exists(
@@ -489,17 +572,12 @@ pub(crate) async fn step(state: &AppState, now_ms: i64) -> AppResult<Option<i64>
             // The barrier release wakes the scheduler.
             continue;
         }
-        // Rows from before keyed admission are synchronized as their own batch, so keyed rows
-        // are always folded from nothing as admission assumed.
         let started = sqlx::query(
             "UPDATE scan_schedule SET due_at = NULL, running = 1, last_started_at = ?, last_error = NULL,
-             running_through = COALESCE(
-               (SELECT MAX(id) FROM scan_work WHERE library_id = ? AND work_key IS NULL AND id > scan_schedule.acked_through),
-               (SELECT MAX(id) FROM scan_work WHERE library_id = ? AND id > scan_schedule.acked_through))
+             running_through = (SELECT MAX(id) FROM scan_work WHERE library_id = ? AND id > scan_schedule.acked_through)
              WHERE library_id = ? AND due_at = ? AND running = 0",
         )
         .bind(crate::db::now())
-        .bind(&library_id)
         .bind(&library_id)
         .bind(&library_id)
         .bind(due_at)
@@ -561,109 +639,105 @@ async fn scan_reporting(
     let immich = |e: crate::immich::api::ApiError| {
         AppError::conflict("immich_error", crate::error::redact(&e.to_string()))
     };
-    let (mut after, through): (i64, Option<i64>) = sqlx::query_as(
+    let (after, through): (i64, Option<i64>) = sqlx::query_as(
         "SELECT acked_through, running_through FROM scan_schedule WHERE library_id = ?",
     )
     .bind(library_id)
     .fetch_one(&state.db)
     .await?;
     let through = through.unwrap_or(after);
-    let mut files = BTreeMap::new();
-    let mut folders = BTreeSet::new();
-    let mut recreated = Vec::new();
-    let mut read = 0u64;
-    // Claimed rows never change, so short keyset pages see the same batch as one large read.
-    task.phase("Reading the queued synchronization batch");
-    loop {
-        let page: Vec<(i64, String)> = sqlx::query_as(
-            "SELECT id, work_json FROM scan_work WHERE library_id = ? AND id > ? AND id <= ?
-             ORDER BY id LIMIT ?",
-        )
-        .bind(library_id)
-        .bind(after)
-        .bind(through)
-        .bind(READ_PAGE)
-        .fetch_all(&state.db)
-        .await?;
-        let Some(&(last, _)) = page.last() else {
-            break;
-        };
-        after = last;
-        read += page.len() as u64;
-        task.progress(read, None, "queued requests read");
-        for (_, row) in page {
-            let work: Work = serde_json::from_str(&row)?;
-            if work.kind == WorkKind::Folder {
-                folders.insert(work.path);
-            } else {
-                let kind = coalesce(files.get(&work.path).copied(), work.kind);
-                files.insert(work.path, kind);
-            }
-        }
-    }
-    if read == 0 {
+    let (requests,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM scan_work WHERE library_id = ? AND id > ? AND id <= ?",
+    )
+    .bind(library_id)
+    .bind(after)
+    .bind(through)
+    .fetch_one(&state.db)
+    .await?;
+    if requests == 0 {
         return Err(AppError::conflict(
             "missing_scan_scope",
             "synchronization has no scoped paths",
         ));
     }
-    let total = files.len() as u64;
+    // Distinct keys come from the ordered key index; counting them in the same pass as the
+    // rows would evaluate every row's generated key and sort them in a temporary B-tree.
+    let (total,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM (
+           SELECT DISTINCT work_key FROM scan_work INDEXED BY scan_work_key
+           WHERE library_id = ? AND work_key < 'folder:' AND id > ? AND id <= ?)",
+    )
+    .bind(library_id)
+    .bind(after)
+    .bind(through)
+    .fetch_one(&state.db)
+    .await?;
+    let total = total as u64;
+    let mut folders = BTreeSet::new();
+    let mut recreated = Vec::new();
+    let mut dispatched = 0u64;
+    task.phase("Synchronizing files through the Immich API");
     task.progress(0, Some(total), "paths dispatched");
-    for (index, (path, kind)) in files.into_iter().enumerate() {
-        task.phase("Synchronizing files through the Immich API");
-        task.progress(index as u64, Some(total), "paths dispatched");
-        if server.external_library_move_mode == ImmichMoveMode::DbOnly {
-            if kind == WorkKind::Removed {
-                return Err(AppError::conflict(
-                    "file_sync_unavailable",
-                    "outside removals require the external-library file remove API; folder scans cannot reconcile removals",
-                ));
+    // Claimed rows never change. Reading them in key order (files sort before folders, each by
+    // path) folds one path at a time, so only the current page and path stay in memory and
+    // files are dispatched in the same order as one large read.
+    let mut cursor = (String::new(), 0i64);
+    let mut current: Option<(String, WorkKind)> = None;
+    loop {
+        let page: Vec<(i64, String, String)> = sqlx::query_as(
+            "SELECT id, work_key, work_json FROM scan_work
+             WHERE library_id = ? AND (work_key, id) > (?, ?) AND id > ? AND id <= ?
+             ORDER BY work_key, id LIMIT ?",
+        )
+        .bind(library_id)
+        .bind(&cursor.0)
+        .bind(cursor.1)
+        .bind(after)
+        .bind(through)
+        .bind(READ_PAGE)
+        .fetch_all(&state.db)
+        .await?;
+        let done = page.len() < READ_PAGE as usize;
+        let mut ready = Vec::new();
+        for (id, key, json) in page {
+            let work: Work = serde_json::from_str(&json)?;
+            cursor = (key, id);
+            if work.kind == WorkKind::Folder {
+                folders.insert(work.path);
+                continue;
             }
-            folders.insert(Work::folder_for_file(&path)?.path);
-            continue;
-        }
-        // The add endpoint is deliberately a no-op for existing assets. There is no update
-        // endpoint; changed files (including sidecars) can only request a folder scan.
-        let result = match kind {
-            WorkKind::Added => Some(api.sync_library_file_add(library_id, &path).await),
-            WorkKind::Removed => Some(api.sync_library_file_remove(library_id, &path).await),
-            WorkKind::Changed | WorkKind::Folder => None,
-        };
-        match result {
-            Some(Ok(())) => continue,
-            Some(Err(error)) => {
-                let stale_removal = kind == WorkKind::Removed
-                    && matches!(&error, crate::immich::api::ApiError::Status {
-                        status: 400, message
-                    } if message == REMOVED_FILE_EXISTS);
-                if stale_removal
-                    && recreated_file_exists(state, server_id, library_id, &path).await?
-                {
-                    api.sync_library_file_add(library_id, &path)
-                        .await
-                        .map_err(immich)?;
-                    recreated.push(path);
-                    continue;
+            match &mut current {
+                Some((path, kind)) if *path == work.path => {
+                    *kind = coalesce(Some(*kind), work.kind);
                 }
-                let unavailable = error.is_external_library_api_unavailable()
-                    && server.external_library_move_mode == ImmichMoveMode::ApiWithDbFallback
-                    && server.external_library_api_capable != Some(true);
-                let unsupported = matches!(&error, crate::immich::api::ApiError::Status {
-                    status: 400, message
-                } if message == "Added file is not a supported image or video");
-                // Folder scans only discover files in the fork; they cannot reconcile
-                // failed removals. Keep that failure visible rather than reporting success.
-                if kind == WorkKind::Removed || !(unavailable || unsupported) {
-                    return Err(immich(error));
-                }
-                tracing::warn!(library = %library_id, "file synchronization failed; requesting a scoped fallback: {}", crate::error::redact(&error.to_string()));
+                _ => ready.extend(current.replace((work.path, work.kind))),
             }
-            None => {}
         }
-        folders.insert(Work::folder_for_file(&path)?.path);
+        if done {
+            ready.extend(current.take());
+        }
+        for (path, kind) in ready {
+            task.progress(dispatched, Some(total), "paths dispatched");
+            dispatch_file(
+                state,
+                server_id,
+                library_id,
+                &server,
+                &api,
+                path,
+                kind,
+                &mut folders,
+                &mut recreated,
+            )
+            .await?;
+            dispatched += 1;
+        }
+        if done {
+            break;
+        }
     }
     let mut scanned: Vec<String> = Vec::new();
-    task.progress(total, Some(total), "paths dispatched");
+    task.progress(dispatched, Some(total), "paths dispatched");
     if !folders.is_empty() {
         let capable = match server.external_library_api_capable {
             Some(capable) => capable,
@@ -733,6 +807,72 @@ async fn scan_reporting(
     }
 }
 
+/// Synchronizes one coalesced file request; unsupported work falls back to its folder's scan.
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_file(
+    state: &AppState,
+    server_id: &str,
+    library_id: &str,
+    server: &registry::Server,
+    api: &crate::immich::api::Api,
+    path: String,
+    kind: WorkKind,
+    folders: &mut BTreeSet<String>,
+    recreated: &mut Vec<String>,
+) -> AppResult<()> {
+    let immich = |e: crate::immich::api::ApiError| {
+        AppError::conflict("immich_error", crate::error::redact(&e.to_string()))
+    };
+    if server.external_library_move_mode == ImmichMoveMode::DbOnly {
+        if kind == WorkKind::Removed {
+            return Err(AppError::conflict(
+                "file_sync_unavailable",
+                "outside removals require the external-library file remove API; folder scans cannot reconcile removals",
+            ));
+        }
+        folders.insert(Work::folder_for_file(&path)?.path);
+        return Ok(());
+    }
+    // The add endpoint is deliberately a no-op for existing assets. There is no update
+    // endpoint; changed files (including sidecars) can only request a folder scan.
+    let result = match kind {
+        WorkKind::Added => Some(api.sync_library_file_add(library_id, &path).await),
+        WorkKind::Removed => Some(api.sync_library_file_remove(library_id, &path).await),
+        WorkKind::Changed | WorkKind::Folder => None,
+    };
+    match result {
+        Some(Ok(())) => return Ok(()),
+        Some(Err(error)) => {
+            let stale_removal = kind == WorkKind::Removed
+                && matches!(&error, crate::immich::api::ApiError::Status {
+                    status: 400, message
+                } if message == REMOVED_FILE_EXISTS);
+            if stale_removal && recreated_file_exists(state, server_id, library_id, &path).await? {
+                api.sync_library_file_add(library_id, &path)
+                    .await
+                    .map_err(immich)?;
+                recreated.push(path);
+                return Ok(());
+            }
+            let unavailable = error.is_external_library_api_unavailable()
+                && server.external_library_move_mode == ImmichMoveMode::ApiWithDbFallback
+                && server.external_library_api_capable != Some(true);
+            let unsupported = matches!(&error, crate::immich::api::ApiError::Status {
+                status: 400, message
+            } if message == "Added file is not a supported image or video");
+            // Folder scans only discover files in the fork; they cannot reconcile
+            // failed removals. Keep that failure visible rather than reporting success.
+            if kind == WorkKind::Removed || !(unavailable || unsupported) {
+                return Err(immich(error));
+            }
+            tracing::warn!(library = %library_id, "file synchronization failed; requesting a scoped fallback: {}", crate::error::redact(&error.to_string()));
+        }
+        None => {}
+    }
+    folders.insert(Work::folder_for_file(&path)?.path);
+    Ok(())
+}
+
 async fn finish(
     state: &AppState,
     server_id: &str,
@@ -763,7 +903,7 @@ async fn finish(
     let mut tx = conn.begin_with("BEGIN IMMEDIATE").await?;
     clock.locked();
     // One row update acknowledges the whole batch. Work that arrived during the run but was
-    // never claimed (legacy rows go first) is made due again if no request already did so.
+    // never claimed is made due again if no request already did so.
     sqlx::query(
         "UPDATE scan_schedule SET running = 0, last_finished_at = ?, last_error = ?,
            acked_through = CASE WHEN ? IS NULL
@@ -789,7 +929,7 @@ async fn finish(
         Some(e) => tracing::warn!(library = %library_id, "library synchronization failed: {e}"),
         None => {
             library_scanned(state, server_id, library_id);
-            spawn_collect(state, library_id.to_owned());
+            spawn_collect(state);
         }
     }
     state.emit(ServerEvent::WatchChanged);

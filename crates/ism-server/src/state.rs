@@ -69,6 +69,8 @@ pub struct Inner {
     pub sync_wake: Notify,
     /// Wakes the library scan scheduler (a scan was requested or a barrier released).
     pub scan_wake: Notify,
+    /// Single-flight state for deleting acknowledged scan work.
+    pub scan_collector: std::sync::Mutex<crate::watch::scheduler::Collector>,
     /// Wakes the watcher supervisor (mappings or watch settings changed).
     pub watch_wake: Notify,
     /// Shares with locally detected changes and when to scan them (after files settle).
@@ -139,6 +141,7 @@ impl AppState {
             maintenance_wake: Notify::new(),
             sync_wake: Notify::new(),
             scan_wake: Notify::new(),
+            scan_collector: std::sync::Mutex::default(),
             watch_wake: Notify::new(),
             share_changes: std::sync::Mutex::new(HashMap::new()),
             share_wake: Notify::new(),
