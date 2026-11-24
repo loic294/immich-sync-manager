@@ -26,6 +26,157 @@ use crate::config::Config;
 use crate::crypto::SecretBox;
 use crate::state::AppState;
 
+#[tokio::test]
+async fn inbox_admission_keeps_cross_peer_and_page_dependencies_and_rolls_back() {
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    let peer = super::net::peers(&b.state).await.unwrap().remove(0);
+    let after: i64 = sqlx::query_scalar("SELECT received_cursor FROM peers WHERE id = ?")
+        .bind(&peer.id)
+        .fetch_one(&b.state.db)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO peers(id, name, url, instance_id, secret_enc, status, created_at)
+         SELECT 'other-peer', 'Other', url, 'other-instance', secret_enc, status, created_at
+         FROM peers WHERE id = ?",
+    )
+    .bind(&peer.id)
+    .execute(&b.state.db)
+    .await
+    .unwrap();
+    let event =
+        |seq: i64, share: &str, kind: &str, path: &str, from: Option<&str>| super::PeerEvent {
+            seq,
+            origin: "synthetic-origin".into(),
+            origin_seq: seq,
+            share: share.into(),
+            kind: kind.into(),
+            data: super::EventData {
+                path: path.into(),
+                from: from.map(str::to_owned),
+                ..Default::default()
+            },
+        };
+    for (seq, share, status, path) in [
+        (1, "Family", "received", "album"),
+        (2, "Family", "done", "album/photo.jpg"),
+        (3, "Unrelated", "received", "album"),
+    ] {
+        let prior = event(seq, share, "folder_created", path, None);
+        sqlx::query(
+            "INSERT INTO peer_inbox(peer_id, seq, origin, origin_seq, share_name, event_json, status)
+             VALUES ('other-peer', ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(seq)
+        .bind(&prior.origin)
+        .bind(prior.origin_seq)
+        .bind(share)
+        .bind(serde_json::to_string(&prior).unwrap())
+        .bind(status)
+        .execute(&b.state.db)
+        .await
+        .unwrap();
+    }
+    let page = super::EventPage {
+        events: vec![
+            event(after + 1, "Family", "file_deleted", "album/photo.jpg", None),
+            event(after + 2, "Unrelated", "folder_created", "other", None),
+            event(after + 3, "Family", "folder_moved", "new", Some("album")),
+            event(after + 4, "Family", "folder_created", "independent", None),
+        ],
+        next: after + 4,
+    };
+    page.validate(after).unwrap();
+    super::inbox::admit(&b.state, &peer, after, &page)
+        .await
+        .unwrap();
+    let dependencies: Vec<(i64, String, i64)> = sqlx::query_as(
+        "SELECT seq, depends_peer_id, depends_seq FROM peer_inbox_dependencies
+         WHERE peer_id = ? ORDER BY seq, depends_peer_id, depends_seq",
+    )
+    .bind(&peer.id)
+    .fetch_all(&b.state.db)
+    .await
+    .unwrap();
+    assert_eq!(
+        dependencies,
+        vec![
+            (after + 1, "other-peer".into(), 1),
+            (after + 3, "other-peer".into(), 1),
+            (after + 3, peer.id.clone(), after + 1),
+        ]
+    );
+
+    let cursor = page.next;
+    let first = event(cursor + 1, "Family", "folder_created", "rollback", None);
+    let mut conflicting = event(cursor + 2, "Family", "folder_created", "different", None);
+    conflicting.origin_seq = first.origin_seq;
+    let invalid = super::EventPage {
+        events: vec![first, conflicting],
+        next: cursor + 2,
+    };
+    invalid.validate(cursor).unwrap();
+    let error = super::inbox::admit(&b.state, &peer, cursor, &invalid)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), "peer_event_identity");
+    let receipt: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM peer_event_receipts WHERE origin = 'synthetic-origin' AND origin_seq = ?)",
+    )
+    .bind(cursor + 1)
+    .fetch_one(&b.state.db)
+    .await
+    .unwrap();
+    assert!(!receipt);
+    let persisted: (i64, i64) = sqlx::query_as(
+        "SELECT received_cursor, (SELECT COUNT(*) FROM peer_inbox WHERE peer_id = ? AND seq > ?)
+         FROM peers WHERE id = ?",
+    )
+    .bind(&peer.id)
+    .bind(cursor)
+    .bind(&peer.id)
+    .fetch_one(&b.state.db)
+    .await
+    .unwrap();
+    assert_eq!(persisted, (cursor, 0));
+
+    sqlx::query(
+        "INSERT INTO peer_inbox(peer_id, seq, origin, origin_seq, share_name, event_json)
+         VALUES ('other-peer', 4, 'broken-origin', 1, 'Family', 'not-json')",
+    )
+    .execute(&b.state.db)
+    .await
+    .unwrap();
+    let malformed = super::EventPage {
+        events: vec![
+            event(cursor + 1, "Unrelated", "folder_created", "rollback", None),
+            event(cursor + 2, "Family", "folder_created", "later", None),
+        ],
+        next: cursor + 2,
+    };
+    assert!(
+        super::inbox::admit(&b.state, &peer, cursor, &malformed)
+            .await
+            .is_err()
+    );
+    let persisted: (i64, i64, bool) = sqlx::query_as(
+        "SELECT received_cursor,
+         (SELECT COUNT(*) FROM peer_inbox WHERE peer_id = ? AND seq > ?),
+         EXISTS(SELECT 1 FROM peer_event_receipts WHERE origin = 'synthetic-origin' AND origin_seq = ?)
+         FROM peers WHERE id = ?",
+    )
+    .bind(&peer.id)
+    .bind(cursor)
+    .bind(cursor + 1)
+    .bind(&peer.id)
+    .fetch_one(&b.state.db)
+    .await
+    .unwrap();
+    assert_eq!(persisted, (cursor, 0, false));
+}
+
 struct Instance {
     _dir: tempfile::TempDir,
     state: AppState,
