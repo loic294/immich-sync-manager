@@ -295,6 +295,16 @@ fn report_unreadable(state: &AppState, id: &str) {
     }
 }
 
+const RESOLVE_OLDER_OUTCOMES: &str =
+    "UPDATE background_activity SET resolved=1 WHERE resolved=0 AND task_key=? AND id!=?
+     AND status IN ('failed','interrupted') AND (finished_at,revision) < (?,?)";
+
+const RESOLVE_LATE_OUTCOME: &str =
+    "UPDATE background_activity SET resolved=1 WHERE resolved=0 AND id=?
+     AND status IN ('failed','interrupted') AND EXISTS (
+         SELECT 1 FROM background_activity newer WHERE newer.task_key=?
+         AND (newer.finished_at,newer.revision) > (?,?))";
+
 async fn persist(state: &AppState, pending: &Pending) -> AppResult<()> {
     let a = &pending.activity;
     let mut tx = state.db.begin().await?;
@@ -310,31 +320,20 @@ async fn persist(state: &AppState, pending: &Pending) -> AppResult<()> {
     if a.finished_at.is_some() && written != 0 {
         // Resolve in both directions so delayed/retried writes cannot reopen an older issue.
         // Registry revisions order outcomes even when finish timestamps share a millisecond.
-        sqlx::query(
-            "UPDATE background_activity SET resolved=1 WHERE task_key=? AND id!=?
-             AND status IN ('failed','interrupted')
-             AND (finished_at < ? OR (finished_at = ? AND revision < ?))",
-        )
-        .bind(&a.task_key)
-        .bind(&a.id)
-        .bind(&a.finished_at)
-        .bind(&a.finished_at)
-        .bind(pending.revision)
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query(
-            "UPDATE background_activity SET resolved=1 WHERE id=?
-             AND status IN ('failed','interrupted') AND EXISTS (
-                 SELECT 1 FROM background_activity newer WHERE newer.task_key=?
-                 AND (newer.finished_at > ? OR (newer.finished_at = ? AND newer.revision > ?)))",
-        )
-        .bind(&a.id)
-        .bind(&a.task_key)
-        .bind(&a.finished_at)
-        .bind(&a.finished_at)
-        .bind(pending.revision)
-        .execute(&mut *tx)
-        .await?;
+        sqlx::query(RESOLVE_OLDER_OUTCOMES)
+            .bind(&a.task_key)
+            .bind(&a.id)
+            .bind(&a.finished_at)
+            .bind(pending.revision)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(RESOLVE_LATE_OUTCOME)
+            .bind(&a.id)
+            .bind(&a.task_key)
+            .bind(&a.finished_at)
+            .bind(pending.revision)
+            .execute(&mut *tx)
+            .await?;
     }
     tx.commit().await?;
     Ok(())
@@ -552,24 +551,29 @@ pub(crate) fn worker_started(state: &AppState, name: &str, kind: crate::worker_e
     let state = state.clone();
     let key = format!("worker:{name}");
     tokio::spawn(async move {
-        match sqlx::query(
-            "UPDATE background_activity SET resolved=1
-             WHERE task_key=? AND status IN ('failed','interrupted') AND revision < ?",
-        )
-        .bind(&key)
-        .bind(revision)
-        .execute(&state.db)
-        .await
-        {
-            Ok(result) if result.rows_affected() > 0 => state.emit(ServerEvent::ActivityChanged),
-            Ok(_) => {}
-            Err(error) => tracing::error!(
+        if let Err(error) = resolve_worker_history(&state, &key, revision).await {
+            tracing::error!(
                 worker = %key,
                 "cannot resolve previous worker evidence: {}",
                 redact(&error.to_string())
-            ),
+            );
         }
     });
+}
+
+async fn resolve_worker_history(state: &AppState, key: &str, revision: i64) -> AppResult<()> {
+    let result = sqlx::query(
+        "UPDATE background_activity SET resolved=1
+         WHERE resolved=0 AND task_key=? AND status IN ('failed','interrupted') AND revision < ?",
+    )
+    .bind(key)
+    .bind(revision)
+    .execute(&state.db)
+    .await?;
+    if result.rows_affected() > 0 {
+        state.emit(ServerEvent::ActivityChanged);
+    }
+    Ok(())
 }
 
 pub(crate) async fn worker_stopped(state: &AppState, name: &str, message: &str) {
@@ -696,6 +700,79 @@ mod tests {
         assert_eq!(observed.phase, "Waiting for the observed scan's admission");
         assert!(current.iter().all(|row| row.task_key != "share:idle"));
         scan.finish(&Ok(())).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn worker_restart_resolves_only_older_unresolved_outcomes_and_emits_only_on_change() {
+        let (_dir, state) = harness().await;
+        let key = "worker:synthetic";
+        let failed = Task::start(&state, key, "Worker", "ISM", None)
+            .await
+            .unwrap();
+        failed
+            .finish(&Err::<(), _>(AppError::conflict("failed", "Worker failed")))
+            .await
+            .unwrap();
+        flush(&state).await.unwrap();
+        let interrupted = Task::start(&state, key, "Worker", "ISM", None)
+            .await
+            .unwrap();
+        drop(interrupted);
+        flush(&state).await.unwrap();
+        sqlx::query(
+            "CREATE TRIGGER reject_resolved_rewrite BEFORE UPDATE ON background_activity
+             WHEN OLD.resolved=1 AND NEW.resolved=1
+             BEGIN SELECT RAISE(ABORT, 'resolved history was rewritten'); END",
+        )
+        .execute(&state.db)
+        .await
+        .unwrap();
+        let restart_revision = state.activity.revision();
+        let fresh = Task::start(&state, key, "Worker", "ISM", None)
+            .await
+            .unwrap();
+        flush(&state).await.unwrap();
+        let mut events = state.events.subscribe();
+        resolve_worker_history(&state, key, restart_revision)
+            .await
+            .unwrap();
+        assert!(matches!(
+            events.try_recv().unwrap(),
+            ServerEvent::ActivityChanged
+        ));
+        assert!(events.try_recv().is_err());
+        let unresolved: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM background_activity WHERE task_key=? AND resolved=0",
+        )
+        .bind(key)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+        assert_eq!(unresolved, 1);
+        drop(fresh);
+        flush(&state).await.unwrap();
+        while events.try_recv().is_ok() {}
+        resolve_worker_history(&state, key, restart_revision)
+            .await
+            .unwrap();
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        let revision = state.activity.revision();
+        resolve_worker_history(&state, key, revision).await.unwrap();
+        assert!(matches!(
+            events.try_recv().unwrap(),
+            ServerEvent::ActivityChanged
+        ));
+        assert!(events.try_recv().is_err());
+        resolve_worker_history(&state, key, state.activity.revision())
+            .await
+            .unwrap();
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
     }
 
     #[tokio::test]
@@ -1417,8 +1494,201 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn repeated_recovery_outcomes_preserve_history_without_rewriting_resolved_failures() {
+        let (_dir, state) = harness().await;
+        sqlx::query(
+            "CREATE TRIGGER reject_resolved_rewrite BEFORE UPDATE ON background_activity
+             WHEN OLD.resolved=1 AND NEW.resolved=1
+             BEGIN SELECT RAISE(ABORT, 'resolved history was rewritten'); END",
+        )
+        .execute(&state.db)
+        .await
+        .unwrap();
+        for n in 0..8 {
+            let message = if n < 4 {
+                "Peer evidence unavailable"
+            } else {
+                "Root unavailable"
+            };
+            let result = observe(
+                &state,
+                "recovery:transfer:synthetic",
+                "Recovery execution",
+                "transfer: synthetic",
+                Some("/sync"),
+                |task| async move {
+                    task.phase("Verifying evidence and applying the recovery plan");
+                    Err::<(), _>(AppError::conflict("unavailable", message))
+                },
+            )
+            .await;
+            assert_eq!(result.unwrap_err().message(), message);
+            flush(&state).await.unwrap();
+            let snapshot = page(&state, 25, 0).await.unwrap();
+            assert_eq!(snapshot.current.len(), 1);
+            assert_eq!(snapshot.current[0].error.as_deref(), Some(message));
+            assert_eq!(snapshot.total, n);
+        }
+        let interrupted = Task::start(
+            &state,
+            "recovery:transfer:synthetic",
+            "Recovery execution",
+            "transfer: synthetic",
+            Some("/sync"),
+        )
+        .await
+        .unwrap();
+        flush(&state).await.unwrap();
+        drop(interrupted);
+        drop(state);
+        let state = AppState::new(
+            Config::for_tests(_dir.path()),
+            db::connect(_dir.path()).await.unwrap(),
+            SecretBox::open_or_create(_dir.path()).unwrap(),
+        )
+        .await
+        .unwrap();
+        recover(&state).await.unwrap();
+        let snapshot = page(&state, 25, 0).await.unwrap();
+        assert_eq!(snapshot.current.len(), 1);
+        assert_eq!(snapshot.current[0].status, BackgroundStatus::Interrupted);
+        assert_eq!(snapshot.total, 8);
+        let result = observe(
+            &state,
+            "recovery:transfer:synthetic",
+            "Recovery execution",
+            "transfer: synthetic",
+            Some("/sync"),
+            |_| async { Ok(()) },
+        )
+        .await;
+        result.unwrap();
+        flush(&state).await.unwrap();
+        let snapshot = page(&state, 25, 0).await.unwrap();
+        assert!(snapshot.current.is_empty());
+        assert_eq!(snapshot.total, 10);
+        assert_eq!(
+            snapshot
+                .history
+                .iter()
+                .filter(|a| a.status == BackgroundStatus::Failed)
+                .count(),
+            8
+        );
+        let unrelated = Task::start(&state, "unrelated", "Scan", "Archive", None)
+            .await
+            .unwrap();
+        unrelated
+            .finish(&Err::<(), _>(AppError::conflict(
+                "failed",
+                "Unrelated failure",
+            )))
+            .await
+            .unwrap();
+        flush(&state).await.unwrap();
+        sqlx::query("DROP TRIGGER reject_resolved_rewrite")
+            .execute(&state.db)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE background_activity SET finished_at='2000-01-01T00:00:00Z'")
+            .execute(&state.db)
+            .await
+            .unwrap();
+        prune(&state).await.unwrap();
+        let snapshot = page(&state, 25, 0).await.unwrap();
+        assert_eq!(snapshot.total, 0);
+        assert_eq!(snapshot.current.len(), 1);
+        assert_eq!(snapshot.current[0].task_key, "unrelated");
+    }
+
+    #[tokio::test]
+    async fn activity_resolution_seeks_past_retained_history_and_keeps_fresh_evidence() {
+        let (_dir, state) = harness().await;
+        let key = "recovery:synthetic";
+        observe(
+            &state,
+            key,
+            "Recovery execution",
+            "Synthetic",
+            None,
+            |_| async { Err::<(), _>(AppError::conflict("offline", "Peer unavailable")) },
+        )
+        .await
+        .unwrap_err();
+        flush(&state).await.unwrap();
+        sqlx::query(
+            "WITH RECURSIVE history(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM history WHERE n<3000)
+             INSERT INTO background_activity
+             SELECT 'history-'||n,task_key,status,1,revision,updated_at,finished_at,
+                    json_set(activity_json,'$.id','history-'||n)
+             FROM history CROSS JOIN background_activity WHERE task_key=?",
+        )
+        .bind(key)
+        .execute(&state.db)
+        .await
+        .unwrap();
+        for (sql, first, second, index, range) in [
+            (
+                RESOLVE_OLDER_OUTCOMES,
+                key,
+                "fresh",
+                "background_activity_unresolved_outcome",
+                "<",
+            ),
+            (
+                RESOLVE_LATE_OUTCOME,
+                "fresh",
+                key,
+                "background_activity_outcome",
+                ">",
+            ),
+        ] {
+            let plan: Vec<(i64, i64, i64, String)> =
+                sqlx::query_as(sqlx::AssertSqlSafe(format!("EXPLAIN QUERY PLAN {sql}")))
+                    .bind(first)
+                    .bind(second)
+                    .bind(db::now())
+                    .bind(state.activity.revision())
+                    .fetch_all(&state.db)
+                    .await
+                    .unwrap();
+            assert!(
+                plan.iter().any(|(_, _, _, detail)| detail.contains(index)
+                    && detail.contains(&format!("(finished_at,revision){range}"))),
+                "expected an indexed outcome range, got {plan:?}"
+            );
+        }
+        observe(
+            &state,
+            key,
+            "Recovery execution",
+            "Synthetic",
+            None,
+            |_| async { Err::<(), _>(AppError::conflict("changed", "Root unavailable")) },
+        )
+        .await
+        .unwrap_err();
+        flush(&state).await.unwrap();
+        let snapshot = page(&state, 1, 0).await.unwrap();
+        assert_eq!(snapshot.current.len(), 1);
+        assert_eq!(
+            snapshot.current[0].error.as_deref(),
+            Some("Root unavailable")
+        );
+        assert_eq!(snapshot.total, 3001);
+    }
+
+    #[tokio::test]
     async fn delayed_outcomes_resolve_by_finish_order_not_flush_order() {
         let (_dir, state) = harness().await;
+        sqlx::query(
+            "CREATE TRIGGER reject_resolved_rewrite BEFORE UPDATE ON background_activity
+             WHEN OLD.resolved=1 AND NEW.resolved=1
+             BEGIN SELECT RAISE(ABORT, 'resolved history was rewritten'); END",
+        )
+        .execute(&state.db)
+        .await
+        .unwrap();
         let failed = Task::start(&state, "scan", "Scan", "Archive", None)
             .await
             .unwrap();
@@ -1441,11 +1711,18 @@ mod tests {
         };
         persist(&state, &newer).await.unwrap();
         persist(&state, &older).await.unwrap();
+        let newest = Task::start(&state, "scan", "Scan", "Archive", None)
+            .await
+            .unwrap();
+        let newest_id = newest.id.clone();
+        newest.finish(&Ok(())).await.unwrap();
+        let newest = lock(&state.activity.0)[&newest_id].clone();
+        persist(&state, &newest).await.unwrap();
         flush(&state).await.unwrap();
         let snapshot = page(&state, 25, 0).await.unwrap();
         assert!(snapshot.current.is_empty());
-        assert_eq!(snapshot.history[0].id, success_id);
-        assert_eq!(snapshot.total, 2);
+        assert_eq!(snapshot.history[0].id, newest_id);
+        assert_eq!(snapshot.total, 3);
 
         let revision: i64 = sqlx::query_scalar("SELECT MAX(revision) FROM background_activity")
             .fetch_one(&state.db)
