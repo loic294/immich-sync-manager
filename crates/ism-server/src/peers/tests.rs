@@ -69,6 +69,81 @@ fn inventory_page(path: &str, final_page: bool) -> super::InventoryPage {
 }
 
 #[tokio::test]
+async fn backfill_generation_migration_preserves_existing_request() {
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    let peer = super::net::peers(&b.state).await.unwrap().remove(0);
+    let share = super::shares(&b.state).await.unwrap().remove(0);
+    for sql in [
+        "DROP TRIGGER share_backfill_membership_changed",
+        "ALTER TABLE share_backfills DROP COLUMN generation",
+        "DROP TABLE share_backfill_generation",
+        "DELETE FROM _sqlx_migrations WHERE version = 20",
+    ] {
+        sqlx::query(sql).execute(&b.state.db).await.unwrap();
+    }
+    sqlx::query(
+        "INSERT INTO share_backfills (share_id, peer_id, after_path, requested_at, attempted_at)
+         VALUES (?, ?, 'older.jpg', '2024-01-01', '2024-01-02')",
+    )
+    .bind(&share.id)
+    .bind(&peer.id)
+    .execute(&b.state.db)
+    .await
+    .unwrap();
+    for task in b.tasks.drain(..) {
+        task.abort();
+        let _ = task.await;
+    }
+    b.state.db.close().await;
+    let pool = crate::db::connect(b._dir.path()).await.unwrap();
+    let request: (String, i64, Option<String>) = sqlx::query_as(
+        "SELECT after_path, generation, attempted_at FROM share_backfills WHERE share_id = ? AND peer_id = ?",
+    )
+    .bind(&share.id)
+    .bind(&peer.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(request, ("older.jpg".into(), 0, Some("2024-01-02".into())));
+    sqlx::query("UPDATE shares SET enabled = 0 WHERE id = ?")
+        .bind(&share.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let restarted: (String, i64, Option<String>) = sqlx::query_as(
+        "SELECT after_path, generation, attempted_at FROM share_backfills WHERE share_id = ? AND peer_id = ?",
+    )
+    .bind(&share.id)
+    .bind(&peer.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(restarted, (String::new(), 1, None));
+    sqlx::query(
+        "UPDATE share_backfill_generation SET last_generation = 9223372036854775807 WHERE id = 1",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert!(
+        sqlx::query("UPDATE shares SET enabled = 1 WHERE id = ?")
+            .bind(&share.id)
+            .execute(&pool)
+            .await
+            .is_err()
+    );
+    let enabled: i64 = sqlx::query_scalar("SELECT enabled FROM shares WHERE id = ?")
+        .bind(&share.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(enabled, 0);
+    pool.close().await;
+}
+
+#[tokio::test]
 async fn backfill_rejects_an_http_page_from_before_restart() {
     let (mut a, mut b) = pair().await;
     stop_workers(&mut a).await;
