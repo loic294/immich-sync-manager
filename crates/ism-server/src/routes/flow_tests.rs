@@ -115,6 +115,67 @@ async fn conflict_http_filters_preserve_include_resolved_and_support_resolved_on
     assert_eq!(last.status, StatusCode::OK);
     assert_eq!(last.json()["total"], 2);
     assert_eq!(last.json()["rows"][0]["conflict"]["status"], "open");
+    for state in [
+        "needs_decision",
+        "waiting",
+        "queued",
+        "fixing",
+        "fixed",
+        "not_retryable",
+    ] {
+        sqlx::query(
+            "INSERT INTO sync_recovery(id,kind,target_id,state,created_at,updated_at)
+             VALUES ('status','conflict','open',?,?,?)
+             ON CONFLICT(kind,target_id) DO UPDATE SET state=excluded.state",
+        )
+        .bind(state)
+        .bind(crate::db::now())
+        .bind(crate::db::now())
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+        let reply = send(
+            &h.app,
+            get(
+                &format!("/api/admin/conflicts/page?status={state}&limit=1"),
+                &auth,
+            ),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::OK, "{}", reply.json());
+        assert_eq!(reply.json()["total"], 1, "{state}");
+        assert_eq!(
+            reply.json()["rows"][0]["conflict"]["recovery"]["state"],
+            state
+        );
+        let empty = send(
+            &h.app,
+            get(
+                &format!("/api/admin/conflicts/page?status={state}&folder=Archive"),
+                &auth,
+            ),
+        )
+        .await;
+        assert_eq!(empty.json()["total"], 0);
+        let resolved = send(
+            &h.app,
+            get(
+                &format!("/api/admin/conflicts/page?resolved_only=true&status={state}"),
+                &auth,
+            ),
+        )
+        .await;
+        assert_eq!(resolved.json()["total"], 0);
+    }
+    assert_eq!(
+        send(
+            &h.app,
+            get("/api/admin/conflicts/page?status=unknown", &auth)
+        )
+        .await
+        .status,
+        StatusCode::BAD_REQUEST
+    );
 }
 
 #[tokio::test]

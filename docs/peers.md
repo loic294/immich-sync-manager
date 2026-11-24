@@ -257,6 +257,9 @@ endpoint are skipped.
 ## Conflicts
 
 Use **Filters** to choose a share and then a subfolder from the conflict queue, across all pages.
+The **Status** filter selects Needs review, Waiting, Decision queued, Applying decision,
+Checking completion, or Needs attention across local and peer-owned conflicts. Switching
+**Show resolved** clears that status filter and limits the queue to resolved files.
 Folder filters include descendants and clear bulk selections when changed. **Show resolved**
 shows only resolved conflicts, not the active queue. Peer-owned filters require location metadata
 from an upgraded peer; older peers' conflicts remain visible in the unfiltered queue.

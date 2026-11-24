@@ -85,6 +85,68 @@ async function enableSelection(page: HTMLElementTagNameMap['ism-conflicts-page']
 describe('ism-conflicts-page', () => {
   afterEach(() => vi.restoreAllMocks());
 
+  it('filters by status across pages, clears selections, and resets status for resolved mode', async () => {
+    const get = vi.spyOn(api, 'get').mockImplementation(async (path, options) => {
+      if (path.endsWith('/versions')) return versions as never;
+      if (options?.query?.status) return { rows: [], total: 0, filters: [] } as never;
+      return { rows: [{ owner: 'local', conflict }], total: 501, filters: [] } as never;
+    });
+    const page = await mount('ism-conflicts-page');
+    await vi.waitFor(() => expect(page.textContent).toContain('Review queue'));
+    [...page.querySelectorAll<HTMLButtonElement>('button')]
+      .find((button) => button.textContent?.trim() === 'Filters')
+      ?.click();
+    await enableSelection(page);
+    page.querySelector<HTMLInputElement>('[aria-label="Select photos:a.jpg"]')?.click();
+    page.querySelector<HTMLButtonElement>('[aria-label="Next page"]')?.click();
+    await vi.waitFor(() => expect(page.offset).toBe(50));
+    const status = page.querySelector<HTMLSelectElement>('[aria-label="Filter by status"]');
+    if (!status) throw new Error('Status filter is missing');
+    expect([...status.options].map((option) => option.textContent)).toEqual([
+      'All statuses',
+      'Needs review',
+      'Waiting',
+      'Decision queued',
+      'Applying decision',
+      'Checking completion',
+      'Needs attention',
+    ]);
+    status.value = 'waiting';
+    status.dispatchEvent(new Event('change'));
+    await vi.waitFor(() =>
+      expect(get).toHaveBeenCalledWith('/api/admin/conflicts/page', {
+        query: {
+          resolved_only: false,
+          limit: 50,
+          offset: 0,
+          share: '',
+          folder: '',
+          status: 'waiting',
+        },
+      }),
+    );
+    await vi.waitFor(() => expect(page.textContent).toContain('No conflicts match these filters'));
+    expect(page.selected.size).toBe(0);
+    expect(page.offset).toBe(0);
+    [...page.querySelectorAll<HTMLButtonElement>('button')]
+      .find((button) => button.textContent?.trim() === 'Clear filters')
+      ?.click();
+    await vi.waitFor(() => expect(page.status).toBe(''));
+    await page.updateComplete;
+    status.value = 'needs_decision';
+    status.dispatchEvent(new Event('change'));
+    page.querySelector<HTMLInputElement>('.toggle')?.click();
+    await vi.waitFor(() =>
+      expect(get).toHaveBeenCalledWith('/api/admin/conflicts/page', {
+        query: { resolved_only: true, limit: 50, offset: 0, share: '', folder: '' },
+      }),
+    );
+    await page.updateComplete;
+    expect(page.status).toBe('');
+    expect(status.disabled).toBe(true);
+    expect(status.options[0].textContent).toBe('Resolved');
+  });
+
   it('filters across pages by share and folder and resets pagination and selections', async () => {
     const filters = [
       { share_name: 'Photos', folders: ['Trips', 'Trips/Coast'] },

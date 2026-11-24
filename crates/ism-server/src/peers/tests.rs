@@ -3800,6 +3800,7 @@ async fn conflict_page_paginates_local_and_peer_targets_without_a_cap() {
         folder: "Trips".into(),
         resolved_only: false,
         include_resolved: false,
+        status: String::new(),
     };
     let filtered = super::admin::page_conflicts(&a.state, 1, 0, &filter)
         .await
@@ -3817,6 +3818,35 @@ async fn conflict_page_paginates_local_and_peer_targets_without_a_cap() {
         last.rows[0],
         ism_core::dto::ConflictPageRow::Peer(_)
     ));
+    let review = super::admin::page_conflicts(
+        &a.state,
+        1,
+        1,
+        &super::admin::ConflictFilterQuery {
+            status: "needs_decision".into(),
+            ..filter.clone()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(review.total, 2);
+    assert_eq!(review.rows.len(), 1);
+    let waiting = super::admin::page_conflicts(
+        &a.state,
+        1,
+        0,
+        &super::admin::ConflictFilterQuery {
+            status: "waiting".into(),
+            ..filter.clone()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(waiting.total, 1);
+    assert!(
+        matches!(&waiting.rows[0], ism_core::dto::ConflictPageRow::Peer(item)
+        if item.state == ism_core::dto::RecoveryState::Waiting)
+    );
     let resolved = super::admin::page_conflicts(
         &a.state,
         50,
