@@ -1948,6 +1948,8 @@ pub async fn take_remote(state: &AppState, id: &str) -> AppResult<()> {
     } else if let Some(sha) = &c.remote.sha256 {
         // The download replaces the local copy through a managed upload (old version to the
         // ISM trash) once transfers are allowed.
+        let recovery_parents =
+            super::inbox::publication_conflict_parents(state, &c.share, id).await?;
         let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
         super::queue_transfer_in(
             &mut tx,
@@ -1959,6 +1961,51 @@ pub async fn take_remote(state: &AppState, id: &str) -> AppResult<()> {
             &vv,
         )
         .await?;
+        let replacement = if recovery_parents.is_empty() {
+            None
+        } else {
+            let rows: Vec<(String, String, i64, String)> = sqlx::query_as(
+                "SELECT id,sha256,size,vv_json FROM transfers
+                 WHERE share_id=? AND peer_id=? AND rel_path=? AND status='queued'",
+            )
+            .bind(&c.share.id)
+            .bind(&c.peer_id)
+            .bind(&c.rel)
+            .fetch_all(&mut *tx)
+            .await?;
+            let [(id, queued_sha, queued_size, raw_version)] = rows.as_slice() else {
+                return Err(AppError::conflict(
+                    "recovery_evidence_changed",
+                    "the chosen replacement transfer was not queued unambiguously",
+                ));
+            };
+            let queued_version: VersionVector = serde_json::from_str(raw_version)?;
+            if !queued_sha.eq_ignore_ascii_case(sha)
+                || c.remote.size.is_none()
+                || u64::try_from(*queued_size).ok() != c.remote.size
+                || !matches!(
+                    queued_version.compare(&vv),
+                    ism_core::version::Causality::Equal | ism_core::version::Causality::Dominates
+                )
+            {
+                return Err(AppError::conflict(
+                    "recovery_evidence_changed",
+                    "the queued transfer does not match the chosen version",
+                ));
+            }
+            Some(id.clone())
+        };
+        for parent in &recovery_parents {
+            sqlx::query(
+                "INSERT OR IGNORE INTO sync_recovery_links(recovery_id,kind,target_id)
+                 SELECT r.id,'transfer',? FROM sync_recovery r
+                 WHERE r.kind='operation' AND r.target_id=?",
+            )
+            .bind(replacement.as_deref())
+            .bind(parent)
+            .execute(&mut *tx)
+            .await?;
+        }
         sqlx::query("UPDATE conflicts SET status='resolving',resolution=COALESCE(resolution,'keep_remote') WHERE id=? AND status IN ('open','resolving')")
             .bind(id).execute(&mut *tx).await?;
         tx.commit().await?;
