@@ -542,10 +542,12 @@ async fn scan_share_reporting(
     share: &Share,
     task: &crate::activity::Reporter,
 ) -> AppResult<()> {
-    task.waiting("Waiting for the replication-operation lock");
-    let _operation_guard = state.replication_operation_lock.lock().await;
+    task.waiting("Waiting for managed operations that are changing files");
+    // Operations waiting to start (e.g. for the maintenance barrier) have changed nothing yet;
+    // none can start changing files while this is held.
+    let _operation_guard = state.replication_operation_lock.lock_scan().await;
     task.phase("Checking active operations and uncertain paths");
-    inbox::require_no_active_operations(state).await?;
+    inbox::require_scannable(state).await?;
     let mut blocked = blocked_footprints(state, share).await?;
     blocked.extend(admin::move_decision_footprints(state, share).await?);
     share.root_rel("")?;
@@ -2436,7 +2438,8 @@ async fn replicate(state: AppState) {
     }
 }
 
-/// Scans hold the operation barrier so half-done moves are never mistaken for deletes.
+/// Scans never run while a managed operation is changing files, so half-done moves are never
+/// mistaken for deletes.
 /// Rescans shares: soon after the file watcher saw an outside change below one (once the
 /// change had time to settle), and every `scan_interval_secs` as a safety net.
 pub async fn scan_worker(state: AppState) {
@@ -2507,7 +2510,7 @@ pub async fn scan_worker(state: AppState) {
 
 async fn full_scan_allowed(state: &AppState) -> AppResult<bool> {
     // Each share scan excludes uncertain footprints, including queued transfers.
-    inbox::require_no_active_operations(state).await?;
+    inbox::require_scannable(state).await?;
     Ok(true)
 }
 

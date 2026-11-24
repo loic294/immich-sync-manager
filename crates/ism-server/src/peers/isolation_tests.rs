@@ -346,3 +346,188 @@ async fn failed_folder_scan_keeps_uncertain_rows_but_publishes_independent_chang
             .any(|e| e.kind == "file_deleted" && e.data.path == "new-folder/tracked.jpg")
     );
 }
+
+#[tokio::test]
+async fn operation_waiting_for_maintenance_does_not_hold_share_scans() {
+    use ism_core::maintenance::MaintenanceState;
+    let b = instance("Beta").await;
+    for task in &b.tasks {
+        task.abort();
+    }
+    let other = b._dir.path().join("other");
+    std::fs::create_dir(&other).unwrap();
+    std::fs::write(other.join(".ism-root"), "other\n").unwrap();
+    // Server two's barrier is still being prepared, so admission keeps the operation waiting.
+    let mut preparing = MaintenanceState::default();
+    preparing.begin_prepare();
+    sqlx::query("INSERT INTO immich_servers(id,name,url,database_url_enc,direct_writes_enabled,version,compatible,maintenance_json,created_at) VALUES('two','two','https://two.example','unused',1,'3.4.1',1,?,?)")
+        .bind(serde_json::to_string(&preparing).unwrap()).bind(crate::db::now()).execute(&b.state.db).await.unwrap();
+    sqlx::query("INSERT INTO mappings(root_id,name,container_path,server_id,created_at) VALUES('other','Other',?,'two',?)")
+        .bind(other.to_string_lossy().as_ref()).bind(crate::db::now()).execute(&b.state.db).await.unwrap();
+    for (name, location) in [
+        ("Family", loc("shared")),
+        (
+            "Independent",
+            Location {
+                root_id: "other".into(),
+                path: String::new(),
+            },
+        ),
+    ] {
+        admin::create_share(
+            &b.state,
+            ShareInput {
+                name: name.into(),
+                location,
+                peer_ids: vec![],
+                enabled: true,
+            },
+        )
+        .await
+        .unwrap();
+    }
+    let shares = peers::shares(&b.state).await.unwrap();
+    let family = shares.iter().find(|s| s.name == "Family").unwrap().clone();
+    let independent = shares
+        .iter()
+        .find(|s| s.name == "Independent")
+        .unwrap()
+        .clone();
+    let accepted = crate::ops::submit(
+        &b.state,
+        &Principal::Admin {
+            username: "test".into(),
+        },
+        OperationRequest {
+            idempotency_key: "held-by-barrier".into(),
+            label: None,
+            actions: vec![OperationAction::CreateFolder {
+                target: Location {
+                    root_id: "other".into(),
+                    path: "held".into(),
+                },
+            }],
+            allow_owner_transfer: false,
+            allow_partial: false,
+        },
+    )
+    .await
+    .unwrap();
+    // Peer bookkeeping for the independent share makes it sync-managed: it needs the barrier.
+    sqlx::query("INSERT INTO pending_peer_ops(operation_id,idx,share_id,kind,vv_json,peer_id) VALUES(?,0,?,'folder_created','{}','peer-example')")
+        .bind(&accepted.operation_id).bind(&independent.id).execute(&b.state.db).await.unwrap();
+    write_old(&b.shared.join("independent.jpg"), b"photo");
+
+    let operation = crate::ops::exec::run_operation(&b.state, &accepted.operation_id);
+    tokio::pin!(operation);
+    let gate = &b.state.replication_operation_lock;
+    tokio::select! {
+        result = &mut operation => panic!("operation was not held by the barrier: {result:?}"),
+        () = async {
+            loop {
+                let status: String = sqlx::query_scalar("SELECT status FROM operations WHERE id = ?")
+                    .bind(&accepted.operation_id).fetch_one(&b.state.db).await.unwrap();
+                if status == "waiting_maintenance" {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        } => {}
+    }
+    // Keep driving the held operation while scans run beside it; it has changed nothing yet.
+    for share in [&family, &independent] {
+        tokio::select! {
+            result = &mut operation => panic!("operation was not held by the barrier: {result:?}"),
+            scanned = tokio::time::timeout(Duration::from_secs(2), peers::scan_share(&b.state, share)) => {
+                scanned.expect("a share scan waited for an operation that changed nothing").unwrap();
+            }
+        }
+    }
+    assert!(
+        peers::row(&b.state, &family.id, "independent.jpg")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    tokio::select! {
+        result = &mut operation => panic!("operation was not held by the barrier: {result:?}"),
+        waited = tokio::time::timeout(Duration::from_millis(100), gate.lock()) => {
+            assert!(waited.is_err(), "other bookkeeping must still wait");
+        }
+    }
+
+    let mut blocked = MaintenanceState::default();
+    blocked.block("test barrier");
+    crate::immich::registry::save_maintenance(&b.state, "two", &blocked)
+        .await
+        .unwrap();
+    operation.await.unwrap();
+    let _admitted = tokio::time::timeout(Duration::from_secs(1), gate.lock())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn active_operation_without_a_registration_fails_scans_closed() {
+    let b = instance("Beta").await;
+    for task in &b.tasks {
+        task.abort();
+    }
+    admin::create_share(
+        &b.state,
+        ShareInput {
+            name: "Family".into(),
+            location: loc("shared"),
+            peer_ids: vec![],
+            enabled: true,
+        },
+    )
+    .await
+    .unwrap();
+    let family = peers::shares(&b.state).await.unwrap().remove(0);
+    let accepted = crate::ops::submit(
+        &b.state,
+        &Principal::Admin {
+            username: "test".into(),
+        },
+        OperationRequest {
+            idempotency_key: "orphaned".into(),
+            label: None,
+            actions: vec![OperationAction::CreateFolder {
+                target: loc("elsewhere"),
+            }],
+            allow_owner_transfer: false,
+            allow_partial: false,
+        },
+    )
+    .await
+    .unwrap();
+    let id = accepted.operation_id;
+    // A row left running by a restart has no registration in this process.
+    sqlx::query("UPDATE operations SET status = 'running' WHERE id = ?")
+        .bind(&id)
+        .execute(&b.state.db)
+        .await
+        .unwrap();
+    let scan = tokio::time::timeout(Duration::from_secs(2), peers::scan_share(&b.state, &family));
+    let error = scan.await.expect("scan must not hang").unwrap_err();
+    assert_eq!(error.code(), "recovery_required", "{error:?}");
+
+    // A panic while running drops the registration but leaves the row active.
+    let state = b.state.clone();
+    let task_id = id.clone();
+    let panicked = tokio::spawn(async move {
+        let gate = &state.replication_operation_lock;
+        let admitted = gate.lock().await;
+        let registration = gate.register(&admitted, &task_id);
+        drop(admitted);
+        registration.begin_mutating().await;
+        panic!("synthetic operation panic");
+    })
+    .await;
+    assert!(panicked.unwrap_err().is_panic());
+    assert!(!b.state.replication_operation_lock.is_registered(&id));
+    let scan = tokio::time::timeout(Duration::from_secs(2), peers::scan_share(&b.state, &family));
+    let error = scan.await.expect("scan must not hang").unwrap_err();
+    assert_eq!(error.code(), "recovery_required", "{error:?}");
+}

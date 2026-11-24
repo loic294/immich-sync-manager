@@ -215,7 +215,9 @@ pub async fn get(state: &AppState) -> AppResult<Vec<BackgroundActivity>> {
         .lock()
         .map_err(|_| crate::error::AppError::internal("share scan schedule lock poisoned"))?
         .clone();
-    let share_gate = crate::peers::inbox::require_no_active_operations(state).await;
+    // Operations still waiting to start do not hold scans; only file changes (or operations left
+    // active by a restart) do.
+    let share_gate = crate::peers::inbox::require_scannable(state).await;
     let gate_reason = match share_gate {
         Ok(()) => None,
         Err(e) if e.code() == "recovery_required" => Some(redact(e.message())),
