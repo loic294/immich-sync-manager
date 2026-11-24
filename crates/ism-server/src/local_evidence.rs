@@ -47,6 +47,7 @@ struct Scan {
 }
 
 pub(crate) struct Selection {
+    pub peer_id: String,
     pub roots: HashSet<String>,
     pub shares: HashSet<String>,
     pub servers: HashSet<String>,
@@ -105,6 +106,7 @@ pub(crate) async fn selected_snapshot(
     let library_ids = selection
         .map(|s| serde_json::to_string(&s.libraries))
         .transpose()?;
+    let peer_id = selection.map(|s| s.peer_id.as_str());
     let mut items = Vec::new();
     let mut warnings = Vec::new();
     let template = base(state, instance_name, observed_at);
@@ -192,12 +194,15 @@ pub(crate) async fn selected_snapshot(
                     ) AS position
              FROM conflicts c JOIN shares s ON s.id=c.share_id WHERE c.status='open'
                  AND (? IS NULL OR c.share_id IN (SELECT value FROM json_each(?)))
+                 AND (? IS NULL OR c.peer_id=?)
          )
          SELECT share_id,share_name,peer_id,rel_path,count FROM decisions
          WHERE position<=5 ORDER BY share_id,peer_id,position",
     )
     .bind(&share_ids)
     .bind(&share_ids)
+    .bind(peer_id)
+    .bind(peer_id)
     .fetch_all(&state.db)
     .await?;
     for conflict in conflicts {

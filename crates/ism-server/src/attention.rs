@@ -764,6 +764,10 @@ pub async fn snapshot(state: &AppState) -> AppResult<AttentionSnapshot> {
         && items
             .iter()
             .all(|item| item.completeness == AttentionCompleteness::Complete)
+        && remote
+            .coverage
+            .iter()
+            .all(|source| source.completeness == AttentionCompleteness::Complete)
     {
         AttentionCompleteness::Complete
     } else {

@@ -77,14 +77,18 @@ continue automatically. A chosen conflict resolution is not reported as another 
 Snapshot completeness reflects the available evidence: unchecked file dependencies, timed-out
 folder checks, unreadable maintenance, and missing remote conditions keep the report partial.
 Paired instances report receiver transfers and signed, share-authorized folder, maintenance,
-conflict, and observed operation-admission conditions. Other remote operation and worker conditions
-remain unsupported and keep the snapshot partial. Reports omit paths, root/server names, raw
+conflict, and observed operation-admission conditions for queued transfers to that peer and share.
+An active operation alone does not establish blocked transfers. Other remote operation and worker
+conditions remain explicitly partial coverage, not a retryable status failure. Missing reports and
+validation failures still warn; partial coverage cannot clear a retained condition or dismissal.
+Reports omit paths, root/server names, raw
 errors and operation IDs. Remote evidence is cached only in memory (at most 64 peers, with each
 accepted report limited to 256 KiB and 500 conditions/shares), expires after 40 seconds measured
 monotonically, and is refreshed periodically and on peer invalidations. Configuration or membership
 changes invalidate cached authority. A server restart, expired report, unavailable peer or older
 peer without this endpoint shows unavailable evidence, never a cleared blocker. Attention-only
-notifications refresh independently of sync and recovery; newer hints and configuration changes
+notifications extend connection liveness without rewriting sync or recovery snapshots and refresh
+independently of sync and recovery; newer hints and configuration changes
 invalidate in-flight reports before they can become authoritative. A failed notification stream
 also invalidates remote attention until it reconnects; unsupported streams use the legacy polling
 path instead.

@@ -150,7 +150,10 @@ async function loadAttention(epoch: number) {
     ...items.filter((entry) => entry.notifiable && !dismissed.has(entry.id)),
     ...retain(notifications.value).filter((entry) => !dismissed.has(entry.id)),
   ];
-  attentionError.value = !complete;
+  attentionError.value =
+    snapshot.warnings.length > 0 ||
+    snapshot.completeness === 'unavailable' ||
+    coverage.some((entry) => entry.completeness === 'unavailable');
   window.clearTimeout(transitionTimer);
   const next = snapshot.items
     .map((entry) => {

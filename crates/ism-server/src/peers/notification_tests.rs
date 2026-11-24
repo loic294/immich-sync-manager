@@ -155,14 +155,26 @@ async fn notification_client_attention_hold_does_not_block_updates_or_publish_st
 }
 
 #[tokio::test]
-async fn notification_client_attention_only_changes_do_not_rewrite_sync_or_recovery() {
+async fn notification_client_attention_only_traffic_keeps_snapshots_fresh_without_writes() {
     let (a, b, peer) = fixture(0).await;
     wait("connected", || ready(&a, &peer)).await;
+    failed_remote_operation(&b).await;
+    wait("recovery snapshot", || async {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM outgoing_recovery WHERE target_id='heartbeat-example')",
+        )
+        .fetch_one(&a.state.db)
+        .await
+        .unwrap()
+    })
+    .await;
+    wait("receiver snapshots verified", || ready(&a, &peer)).await;
     wait("initial attention", || async {
         remote_mapping(&a, &peer).await.1
     })
     .await;
     tokio::time::sleep(Duration::from_secs(2)).await;
+    age_snapshots(&a).await;
     sqlx::query("CREATE TABLE write_audit (table_name TEXT NOT NULL)")
         .execute(&a.state.db)
         .await
@@ -189,14 +201,21 @@ async fn notification_client_attention_only_changes_do_not_rewrite_sync_or_recov
         count(&b, PROGRESS),
         count(&b, RECOVERY),
     );
-    b.state.emit(crate::state::ServerEvent::WatchChanged);
-    b.state.emit(crate::state::ServerEvent::MaintenanceChanged {
-        server_id: "example".into(),
-    });
-    wait("attention-only refresh", || async {
-        count(&b, ATTENTION) > before.0
-    })
-    .await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(31);
+    while tokio::time::Instant::now() < deadline {
+        b.state.emit(crate::state::ServerEvent::WatchChanged);
+        b.state.emit(crate::state::ServerEvent::MaintenanceChanged {
+            server_id: "example".into(),
+        });
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(
+            cache_available(&a, &peer).await,
+            (true, true),
+            "sustained attention-only frames must keep activity and recovery fresh"
+        );
+    }
+    assert!(count(&b, ATTENTION) > before.0);
+    assert_eq!(count(&b, NOTIFICATIONS), 1, "stream remains connected");
     wait("attention current", || async {
         remote_mapping(&a, &peer).await.1
     })

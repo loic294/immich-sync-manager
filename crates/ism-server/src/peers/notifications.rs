@@ -333,7 +333,7 @@ async fn subscribe(
         }
         if changed {
             hints.send_replace(Hint::Refresh(Some(connection.refresh())));
-        } else if heartbeat {
+        } else if attention || heartbeat {
             connection.heartbeat();
         }
     }

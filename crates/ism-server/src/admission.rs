@@ -76,11 +76,6 @@ impl OperationGate {
         self.operations().iter().any(|(id, _)| id == operation_id)
     }
 
-    /// Whether replica bookkeeping is waiting for an observed operation admission.
-    pub fn has_registered_operations(&self) -> bool {
-        !self.operations().is_empty()
-    }
-
     /// Whether a registered operation may be changing files (a snapshot, for reporting only).
     pub fn mutating(&self) -> bool {
         self.operations()

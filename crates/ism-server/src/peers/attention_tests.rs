@@ -129,7 +129,8 @@ async fn remote_attention_is_signed_scoped_minimal_and_authoritative_per_peer() 
             .as_array()
             .unwrap()
             .iter()
-            .any(|item| item["code"] == "transfer_dependency" && item["blocks_work"] == true)
+            .all(|item| item["code"] != "transfer_dependency"),
+        "an operation alone does not establish blocked transfers"
     );
     drop(registration);
     attention::refresh(&b.state, &peer, owner).await.unwrap();
@@ -276,6 +277,241 @@ async fn remote_attention_is_signed_scoped_minimal_and_authoritative_per_peer() 
             .coverage
             .iter()
             .filter(|source| source.peer_id.as_deref() == Some(&peer.id))
+            .all(|source| source.completeness != AttentionCompleteness::Complete)
+    );
+}
+
+#[tokio::test]
+async fn remote_attention_operation_wait_counts_only_authorized_queued_work_for_the_peer() {
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    let peer = net::peers(&b.state).await.unwrap().remove(0);
+    let receiver_peer = net::peers(&a.state).await.unwrap().remove(0);
+    let share: String = sqlx::query_scalar("SELECT id FROM shares WHERE name='Family'")
+        .fetch_one(&a.state.db)
+        .await
+        .unwrap();
+    let admitted = a.state.replication_operation_lock.lock().await;
+    let registration = a
+        .state
+        .replication_operation_lock
+        .register(&admitted, "synthetic-operation");
+    drop(admitted);
+    sqlx::query(
+        "INSERT INTO operations(id,idempotency_key,principal,source,request_json,status,created_at)
+         VALUES('synthetic-operation','synthetic-operation','example','ui','{}','running',?)",
+    )
+    .bind(crate::db::now())
+    .execute(&a.state.db)
+    .await
+    .unwrap();
+    let empty: Value = net::get_json(&b.state, &peer, PATH).await.unwrap();
+    assert!(
+        empty["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["code"] != "transfer_dependency")
+    );
+    sqlx::query(
+        "INSERT INTO shares(id,name,root_id,path,peer_ids_json,enabled)
+         SELECT 'private-share','Private share',root_id,'private-example','[]',1
+         FROM shares WHERE id=?",
+    )
+    .bind(&share)
+    .execute(&a.state.db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO peers(id,name,url,instance_id,secret_enc,status,created_at)
+         SELECT 'other-peer','Other peer','https://other.example','other-instance',
+                secret_enc,'online',created_at FROM peers WHERE id=?",
+    )
+    .bind(&receiver_peer.id)
+    .execute(&a.state.db)
+    .await
+    .unwrap();
+    for (id, peer_id, share_id) in [
+        ("other-share", receiver_peer.id.as_str(), "private-share"),
+        ("other-peer", "other-peer", share.as_str()),
+        ("relevant-one", receiver_peer.id.as_str(), share.as_str()),
+        ("relevant-two", receiver_peer.id.as_str(), share.as_str()),
+    ] {
+        sqlx::query(
+            "INSERT INTO transfers(id,peer_id,share_id,rel_path,sha256,size,vv_json,status,queued_at,updated_at)
+             VALUES(?,?,?,'example.jpg','synthetic-hash',10,'{}','queued',?,?)",
+        )
+        .bind(id)
+        .bind(peer_id)
+        .bind(share_id)
+        .bind(crate::db::now())
+        .bind(crate::db::now())
+        .execute(&a.state.db)
+        .await
+        .unwrap();
+        let report: Value = net::get_json(&b.state, &peer, PATH).await.unwrap();
+        let waits: Vec<_> = report["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|item| item["code"] == "transfer_dependency")
+            .collect();
+        if id.starts_with("other-") {
+            assert!(
+                waits.is_empty(),
+                "unrelated work cannot block this peer/share"
+            );
+        } else {
+            assert_eq!(waits.len(), 1);
+            assert_eq!(waits[0]["share_name"], "Family");
+            assert_eq!(waits[0]["blocks_work"], true);
+            assert_eq!(waits[0]["count"], if id == "relevant-one" { 1 } else { 2 });
+        }
+        assert!(!report.to_string().contains("Private share"));
+    }
+    drop(registration);
+    let unknown: Value = net::get_json(&b.state, &peer, PATH).await.unwrap();
+    let item = unknown["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["code"] == "transfer_dependency")
+        .unwrap();
+    assert_eq!(item["state"], "unavailable");
+    assert_eq!(item["blocks_work"], false);
+    assert_eq!(item["count"], 0);
+}
+
+#[tokio::test]
+async fn remote_attention_selects_conflicts_before_grouping_without_changing_local_counts() {
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    let peer = net::peers(&a.state).await.unwrap().remove(0);
+    let share: String = sqlx::query_scalar("SELECT id FROM shares WHERE name='Family'")
+        .fetch_one(&a.state.db)
+        .await
+        .unwrap();
+    for (peer_id, count) in [(peer.id.as_str(), 7), ("unrelated-peer", 12)] {
+        for index in 0..count {
+            sqlx::query(
+                "INSERT INTO conflicts(id,share_id,rel_path,kind,detail,local_json,remote_json,
+                 remote_vv_json,peer_id,status,created_at)
+                 VALUES (?,?,?,'edit','example','{}','{}','{}',?,'open',?)",
+            )
+            .bind(format!("{peer_id}-{index}"))
+            .bind(&share)
+            .bind(format!("example-{index}.jpg"))
+            .bind(peer_id)
+            .bind(crate::db::now())
+            .execute(&a.state.db)
+            .await
+            .unwrap();
+        }
+    }
+    let selection = crate::local_evidence::Selection {
+        peer_id: peer.id.clone(),
+        roots: Default::default(),
+        shares: [share].into_iter().collect(),
+        servers: Default::default(),
+        libraries: Default::default(),
+    };
+    let (selected, _) = crate::local_evidence::selected_snapshot(
+        &a.state,
+        "Example",
+        &crate::db::now(),
+        Some(&selection),
+    )
+    .await
+    .unwrap();
+    let decisions: Vec<_> = selected
+        .iter()
+        .filter(|item| item.code == AttentionCode::RecoveryDecision)
+        .collect();
+    assert_eq!(decisions.len(), 1);
+    assert_eq!(decisions[0].peer_id.as_deref(), Some(peer.id.as_str()));
+    assert_eq!(decisions[0].count, 7);
+    assert_eq!(decisions[0].examples.len(), 5);
+    let (local, _) = crate::local_evidence::snapshot(&a.state, "Example", &crate::db::now())
+        .await
+        .unwrap();
+    let mut counts: Vec<_> = local
+        .iter()
+        .filter(|item| item.code == AttentionCode::RecoveryDecision)
+        .map(|item| item.count)
+        .collect();
+    counts.sort_unstable();
+    assert_eq!(counts, [7, 12]);
+}
+
+#[tokio::test]
+async fn remote_attention_healthy_peer_has_partial_coverage_without_retry_warning() {
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    b.state = AppState::new(
+        Config::for_tests(b._dir.path()),
+        b.state.db.clone(),
+        SecretBox::open_or_create(b._dir.path()).unwrap(),
+    )
+    .await
+    .unwrap();
+    let peer = net::peers(&b.state).await.unwrap().remove(0);
+    let owner = b.state.peer_attention.begin(&peer.id).unwrap();
+    b.state
+        .peer_attention
+        .change(&peer.id, owner, Some(true))
+        .unwrap();
+    attention::refresh(&b.state, &peer, owner).await.unwrap();
+    let healthy = attention::snapshot(&b.state).await.unwrap();
+    assert!(healthy.items.is_empty());
+    assert!(
+        healthy.warnings.is_empty(),
+        "scope limits are not retryable failures"
+    );
+    assert!(crate::peers::activity::refresh_peer(&b.state, &peer).await);
+    let combined = crate::attention::snapshot(&b.state).await.unwrap();
+    assert_eq!(combined.completeness, AttentionCompleteness::Partial);
+    assert!(
+        combined
+            .items
+            .iter()
+            .all(|item| item.attention == ism_core::dto::AttentionLevel::None && !item.blocks_work),
+        "{:?}",
+        combined.items
+    );
+    assert!(combined.warnings.is_empty());
+    for code in [
+        AttentionCode::OperationRecovery,
+        AttentionCode::WorkerStopped,
+        AttentionCode::WorkerStalled,
+    ] {
+        assert!(
+            healthy
+                .coverage
+                .iter()
+                .any(|source| source.peer_id.as_deref() == Some(&peer.id)
+                    && source.code == code
+                    && source.completeness == AttentionCompleteness::Partial)
+        );
+    }
+    b.state
+        .peer_attention
+        .change(&peer.id, owner, Some(false))
+        .unwrap();
+    let stale = attention::snapshot(&b.state).await.unwrap();
+    assert!(!stale.warnings.is_empty());
+    assert!(
+        stale
+            .items
+            .iter()
+            .any(|item| item.code == AttentionCode::PeerAttentionUnavailable)
+    );
+    assert!(
+        stale
+            .coverage
+            .iter()
             .all(|source| source.completeness != AttentionCompleteness::Complete)
     );
 }

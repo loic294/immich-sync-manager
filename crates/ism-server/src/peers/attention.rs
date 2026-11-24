@@ -30,6 +30,11 @@ const CODES: &[AttentionCode] = &[
     AttentionCode::RecoveryDecision,
     AttentionCode::TransferDependency,
 ];
+const UNSUPPORTED_CODES: &[AttentionCode] = &[
+    AttentionCode::OperationRecovery,
+    AttentionCode::WorkerStopped,
+    AttentionCode::WorkerStalled,
+];
 
 #[derive(Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -336,6 +341,7 @@ pub(crate) async fn report(state: &AppState, peer: &net::Peer) -> AppResult<Repo
         })
         .collect();
     let selection = crate::local_evidence::Selection {
+        peer_id: peer.id.clone(),
         roots: shares.iter().map(|s| s.root_id.clone()).collect(),
         shares: shares.iter().map(|s| s.id.clone()).collect(),
         servers: roots.iter().filter_map(|r| r.server_id.clone()).collect(),
@@ -458,14 +464,29 @@ pub(crate) async fn report(state: &AppState, peer: &net::Peer) -> AppResult<Repo
     )
     .fetch_all(&state.db)
     .await?;
-    let observed_operation = state.replication_operation_lock.has_registered_operations();
+    let observed_operation = active
+        .iter()
+        .any(|id| state.replication_operation_lock.is_registered(id));
     let unknown_operation = active
         .iter()
         .any(|id| !state.replication_operation_lock.is_registered(id));
-    if unknown_operation {
-        incomplete.insert(AttentionCode::TransferDependency);
-    }
+    let queued: HashMap<String, i64> = sqlx::query_as::<_, (String, i64)>(
+        "SELECT share_id,COUNT(*) FROM transfers
+         WHERE peer_id=? AND status='queued' GROUP BY share_id",
+    )
+    .bind(&peer.id)
+    .fetch_all(&state.db)
+    .await?
+    .into_iter()
+    .collect();
     for share in &shares {
+        let count = queued.get(&share.id).copied().unwrap_or(0).max(0) as u64;
+        if count == 0 {
+            continue;
+        }
+        if unknown_operation {
+            incomplete.insert(AttentionCode::TransferDependency);
+        }
         for (present, unknown, key) in [
             (observed_operation, false, "operation-wait"),
             (unknown_operation, true, "operation-unverified"),
@@ -490,7 +511,7 @@ pub(crate) async fn report(state: &AppState, peer: &net::Peer) -> AppResult<Repo
                 attention: AttentionLevel::Notice,
                 blocks_work: !unknown,
                 share_name: share.name.clone(),
-                count: if unknown { 0 } else { 1 },
+                count: if unknown { 0 } else { count },
                 action: Action::Operations,
                 next_at: None,
                 recheck_at: None,
@@ -731,6 +752,7 @@ pub(crate) async fn snapshot(state: &AppState) -> AppResult<Snapshot> {
         coverage.extend(
             CODES
                 .iter()
+                .chain(UNSUPPORTED_CODES)
                 .chain([&AttentionCode::PeerAttentionUnavailable])
                 .map(|code| AttentionCoverage {
                     code: *code,
@@ -785,6 +807,7 @@ pub(crate) async fn snapshot(state: &AppState) -> AppResult<Snapshot> {
             coverage.extend(
                 CODES
                     .iter()
+                    .chain(UNSUPPORTED_CODES)
                     .chain([&AttentionCode::PeerAttentionUnavailable])
                     .map(|code| AttentionCoverage {
                         code: *code,
@@ -825,6 +848,12 @@ pub(crate) async fn snapshot(state: &AppState) -> AppResult<Snapshot> {
             peer_id: Some(peer.id.clone()),
             completeness: AttentionCompleteness::Complete,
         });
+        coverage.extend(UNSUPPORTED_CODES.iter().map(|code| AttentionCoverage {
+            code: *code,
+            owner: AttentionOwner::Receiver,
+            peer_id: Some(peer.id.clone()),
+            completeness: AttentionCompleteness::Partial,
+        }));
         for item in report.items {
             let title = if item.state == AttentionState::Unavailable {
                 "Remote condition could not be verified"
@@ -873,8 +902,6 @@ pub(crate) async fn snapshot(state: &AppState) -> AppResult<Snapshot> {
                 completeness: item.completeness, examples: Vec::new(),
             });
         }
-
-        warnings.push(format!("{} reports shared-folder conditions only; other remote operation and worker conditions are not included.", peer.name));
     }
 
     Ok(Snapshot {
@@ -942,7 +969,12 @@ mod tests {
                 .unwrap()
                 .coverage
                 .iter()
-                .all(|source| source.completeness == AttentionCompleteness::Complete)
+                .all(|source| source.completeness
+                    == if UNSUPPORTED_CODES.contains(&source.code) {
+                        AttentionCompleteness::Partial
+                    } else {
+                        AttentionCompleteness::Complete
+                    })
         );
         state
             .peer_attention

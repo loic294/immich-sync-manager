@@ -84,7 +84,12 @@ describe('attention snapshots', () => {
     try {
       await refreshAttention();
       dismissNotification('peer:beta');
-      get.mockResolvedValue({ ...snapshot, completeness: 'partial', items: [] });
+      get.mockResolvedValue({
+        ...snapshot,
+        completeness: 'partial',
+        warnings: ['Peer status could not be verified.'],
+        items: [],
+      });
       await refreshAttention();
       expect(attentionError.value).toBe(true);
       expect(blockers.value[0]).toMatchObject({ id: 'peer:beta', stale: true });
@@ -104,6 +109,72 @@ describe('attention snapshots', () => {
       get.mockResolvedValue(snapshot);
       await refreshAttention();
       expect(notifications.value).toHaveLength(1);
+    } finally {
+      stop();
+    }
+  });
+
+  it('does not advertise Retry for partial remote scope or clear unsupported blockers and dismissals', async () => {
+    const healthy: AttentionSnapshot = {
+      ...snapshot,
+      completeness: 'partial',
+      items: [],
+      coverage: [
+        { code: 'worker_stopped', owner: 'receiver', peer_id: 'beta', completeness: 'partial' },
+        {
+          code: 'mapping_unavailable',
+          owner: 'receiver',
+          peer_id: 'beta',
+          completeness: 'complete',
+        },
+      ],
+    };
+    const worker: AttentionItem = {
+      ...row,
+      id: 'receiver-worker:beta',
+      code: 'worker_stopped',
+      owner: 'receiver',
+    };
+    const get = vi.spyOn(api, 'get').mockResolvedValue(healthy);
+    let stop = startAttention();
+    try {
+      await refreshAttention();
+      expect(attentionError.value).toBe(false);
+      expect(blockers.value).toEqual([]);
+      expect(notifications.value).toEqual([]);
+      get.mockResolvedValue({ ...healthy, items: [worker] });
+      await refreshAttention();
+      dismissNotification(worker.id);
+      get.mockResolvedValue(healthy);
+      await refreshAttention();
+      expect(attentionError.value).toBe(false);
+      expect(blockers.value).toMatchObject([{ id: worker.id, stale: true }]);
+      expect(notifications.value).toEqual([]);
+      get.mockResolvedValue({
+        ...healthy,
+        warnings: ['Peer status could not be verified.'],
+        coverage: healthy.coverage.map((entry) => ({ ...entry, completeness: 'unavailable' })),
+      });
+      await refreshAttention();
+      expect(attentionError.value).toBe(true);
+      expect(blockers.value).toMatchObject([{ id: worker.id, stale: true }]);
+      stop();
+      get.mockResolvedValue(healthy);
+      stop = startAttention();
+      await refreshAttention();
+      get.mockResolvedValue({ ...healthy, items: [worker] });
+      await refreshAttention();
+      expect(attentionError.value).toBe(false);
+      expect(notifications.value).toEqual([]);
+      get.mockResolvedValue({
+        ...healthy,
+        coverage: healthy.coverage.map((entry) => ({ ...entry, completeness: 'complete' })),
+      });
+      await refreshAttention();
+      expect(blockers.value).toEqual([]);
+      get.mockResolvedValue({ ...healthy, items: [worker] });
+      await refreshAttention();
+      expect(notifications.value).toMatchObject([{ id: worker.id }]);
     } finally {
       stop();
     }
