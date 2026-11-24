@@ -11,8 +11,14 @@ export const overviewError = signal<string | undefined>(undefined);
 let pending: Promise<void> | undefined;
 let scope: LiveScope | undefined;
 let generation = 0;
+let refreshAgain = false;
 
 export function refreshOverview(): Promise<void> {
+  if (pending) {
+    refreshAgain = true;
+    return pending;
+  }
+  refreshAgain = false;
   const epoch = generation;
   pending ??= (scope ? createAdmin(scope) : admin)
     .overview()
@@ -27,7 +33,7 @@ export function refreshOverview(): Promise<void> {
     })
     .finally(() => {
       pending = undefined;
-      if (scope && epoch !== generation) void refreshOverview();
+      if (scope && (epoch !== generation || refreshAgain)) void refreshOverview();
     });
   return pending;
 }

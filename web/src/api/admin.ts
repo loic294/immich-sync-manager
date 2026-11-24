@@ -32,6 +32,7 @@ import type { RecoveryDecisionInput } from '@/api/generated/RecoveryDecisionInpu
 import type { RecoveryPage } from '@/api/generated/RecoveryPage';
 import type { RecoveryTarget } from '@/api/generated/RecoveryTarget';
 import type { RecoveryVersions } from '@/api/generated/RecoveryVersions';
+import type { RecoveryVersionsBatch } from '@/api/generated/RecoveryVersionsBatch';
 import type { ScheduleView } from '@/api/generated/ScheduleView';
 import type { SettingsInput } from '@/api/generated/SettingsInput';
 import type { SettingsView } from '@/api/generated/SettingsView';
@@ -130,6 +131,10 @@ export function createAdmin(read: Pick<ApiClient, 'get'> = api) {
         source: String(source),
         ...(target.peer_id ? { peer_id: target.peer_id } : {}),
       })}`,
+    recoveryVersionsBatch: (targets: readonly RecoveryTarget[]) =>
+      api.post<RecoveryVersionsBatch>(`${A}/recovery/versions/batch`, {
+        body: { targets, all: false, resolution: null },
+      }),
     /** Runs managed actions as the administrator (same endpoint as the client API). */
     submit: (label: string, actions: OperationAction[]) =>
       api.post<OperationAccepted>('/api/v1/operations', {
@@ -169,9 +174,23 @@ export function createAdmin(read: Pick<ApiClient, 'get'> = api) {
     readdSyncOperation: (id: string, index: number) =>
       api.post<void>(`${A}/sync/operations/${enc(id)}/${index}/readd`),
 
-    conflicts: (resolvedOnly = false, limit = 50, offset = 0, share = '', folder = '') =>
+    conflicts: (
+      resolvedOnly = false,
+      limit = 50,
+      offset = 0,
+      share = '',
+      folder = '',
+      status = '',
+    ) =>
       read.get<ConflictPage>(`${A}/conflicts/page`, {
-        query: { resolved_only: resolvedOnly, limit, offset, share, folder },
+        query: {
+          resolved_only: resolvedOnly,
+          limit,
+          offset,
+          share,
+          folder,
+          ...(status ? { status } : {}),
+        },
       }),
     resolveConflict: (id: string, resolution: ConflictResolution) =>
       api.post<void>(`${A}/conflicts/${enc(id)}/resolve`, { body: { resolution } }),

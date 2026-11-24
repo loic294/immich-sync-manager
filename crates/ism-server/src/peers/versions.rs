@@ -606,7 +606,7 @@ pub(super) async fn run(state: AppState) {
         loop {
             notifier_state.version_event_wake.notified().await;
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            notifier_state.emit(crate::state::ServerEvent::ConflictsChanged);
+            notifier_state.emit(crate::state::ServerEvent::SyncChanged);
         }
     };
     supervise_workers(state, first, second, notifier).await;
@@ -711,6 +711,290 @@ async fn within<T>(
                 "The other instance is busy. Try again in a moment.",
             ))
         })
+}
+
+pub fn validate_batch(input: &ism_core::dto::RecoveryBatchInput) -> AppResult<()> {
+    let mut unique = std::collections::HashSet::new();
+    if input.all
+        || input.resolution.is_some()
+        || input.targets.is_empty()
+        || input.targets.len() > 50
+        || input.targets.iter().any(|target| {
+            target.kind != RecoveryKind::Conflict
+                || target.id.is_empty()
+                || target.id.len() > 256
+                || !unique.insert((target.id.as_str(), target.peer_id.as_deref()))
+        })
+    {
+        return Err(AppError::bad_request(
+            "invalid_version_batch",
+            "request 1-50 distinct conflict targets",
+        ));
+    }
+    Ok(())
+}
+
+fn unavailable(target: RecoveryTarget, error: AppError) -> ism_core::dto::RecoveryVersionResult {
+    ism_core::dto::RecoveryVersionResult::Unavailable {
+        target,
+        code: error.code().into(),
+        message: error.message().into(),
+    }
+}
+
+pub async fn get_local_batch(
+    state: &AppState,
+    targets: &[RecoveryTarget],
+) -> AppResult<ism_core::dto::RecoveryVersionsBatch> {
+    use ism_core::dto::{RecoveryVersionResult, RecoveryVersionsBatch};
+    if targets.iter().any(|target| target.peer_id.is_some()) {
+        return Err(AppError::bad_request(
+            "invalid_version_batch",
+            "local evidence cannot forward peer targets",
+        ));
+    }
+    type Row = (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+    let rows: Vec<Row> = sqlx::query_as(
+        "SELECT c.status,j.state,j.error,j.error_detail,
+                (SELECT s.view_json FROM recovery_version_snapshots s
+                 WHERE s.target_id=c.id AND s.share_id=c.share_id AND s.peer_id=c.peer_id
+                 ORDER BY s.created_at DESC,s.rowid DESC LIMIT 1)
+         FROM json_each(?) d
+         LEFT JOIN conflicts c ON c.id=json_extract(d.value,'$.id')
+         LEFT JOIN conflict_evidence_jobs j ON j.target_id=c.id
+         ORDER BY CAST(d.key AS INTEGER)",
+    )
+    .bind(serde_json::to_string(targets)?)
+    .fetch_all(&state.db)
+    .await?;
+    let items = targets
+        .iter()
+        .cloned()
+        .zip(rows)
+        .map(|(target, (status, job, code, detail, json))| {
+            let result = match (status.as_deref(), job.as_deref(), json) {
+                (Some("open"), Some("ready"), Some(json)) => {
+                    serde_json::from_str::<RecoveryVersions>(&json).map_err(AppError::internal)
+                }
+                (Some("open"), Some("ready"), None) => {
+                    Err(AppError::internal("prepared conflict evidence is missing"))
+                }
+                (Some("open"), Some("blocked"), _) => Err(AppError::conflict_dynamic(
+                    code.unwrap_or_else(|| "version_evidence_blocked".into()),
+                    detail.unwrap_or_else(|| "Conflict evidence cannot be prepared.".into()),
+                )),
+                (Some("open"), Some(_), _) => Err(AppError::new(
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    "peer_busy",
+                    detail.unwrap_or_else(|| {
+                        "Conflict evidence is still being prepared. Try again shortly.".into()
+                    }),
+                )),
+                _ => Err(AppError::not_found("open conflict not found")),
+            };
+            match result {
+                Ok(versions) => RecoveryVersionResult::Ready {
+                    target,
+                    versions: Box::new(versions),
+                },
+                Err(error) => unavailable(target, error),
+            }
+        })
+        .collect();
+    Ok(RecoveryVersionsBatch { items })
+}
+
+pub async fn get_peer_batch(
+    state: &AppState,
+    peer: &net::Peer,
+    targets: &[RecoveryTarget],
+) -> AppResult<ism_core::dto::RecoveryVersionsBatch> {
+    use ism_core::dto::RecoveryVersionsBatch;
+    if targets.iter().any(|target| target.peer_id.is_some()) {
+        return Err(AppError::forbidden(
+            "recovery forwarding loops are forbidden",
+        ));
+    }
+    let allowed: std::collections::HashSet<String> = sqlx::query_scalar::<_, String>(
+        "SELECT c.id FROM json_each(?) d JOIN conflicts c ON c.id=json_extract(d.value,'$.id')
+         WHERE c.peer_id=?",
+    )
+    .bind(serde_json::to_string(targets)?)
+    .bind(&peer.id)
+    .fetch_all(&state.db)
+    .await?
+    .into_iter()
+    .collect();
+    let authorized: Vec<_> = targets
+        .iter()
+        .filter(|target| allowed.contains(&target.id))
+        .cloned()
+        .collect();
+    let mut results = get_local_batch(state, &authorized).await?.items.into_iter();
+    let items = targets
+        .iter()
+        .map(|target| {
+            if allowed.contains(&target.id) {
+                results.next().ok_or_else(|| {
+                    AppError::internal("authorized evidence batch is missing a target")
+                })
+            } else {
+                Ok(unavailable(
+                    target.clone(),
+                    AppError::forbidden("this recovery belongs to another principal"),
+                ))
+            }
+        })
+        .collect::<AppResult<Vec<_>>>()?;
+    Ok(RecoveryVersionsBatch { items })
+}
+
+pub async fn get_batch(
+    state: &AppState,
+    targets: &[RecoveryTarget],
+) -> AppResult<ism_core::dto::RecoveryVersionsBatch> {
+    use futures_util::{StreamExt, stream};
+    use ism_core::dto::{RecoveryBatchInput, RecoveryVersionResult, RecoveryVersionsBatch};
+    let local: Vec<_> = targets
+        .iter()
+        .filter(|target| target.peer_id.is_none())
+        .cloned()
+        .collect();
+    let mut items = get_local_batch(state, &local).await?.items;
+    let known: std::collections::HashSet<(String, String)> = if targets
+        .iter()
+        .any(|target| target.peer_id.is_some())
+    {
+        sqlx::query_as::<_, (String, String)>(
+            "SELECT json_extract(d.value,'$.peer_id'),json_extract(d.value,'$.id') FROM json_each(?) d
+             WHERE json_extract(d.value,'$.peer_id') IS NOT NULL AND EXISTS(
+                SELECT 1 FROM outgoing_recovery r WHERE r.peer_id=json_extract(d.value,'$.peer_id')
+                    AND r.kind='conflict' AND r.target_id=json_extract(d.value,'$.id')
+                UNION ALL SELECT 1 FROM outgoing_recovery_requests q WHERE q.peer_id=json_extract(d.value,'$.peer_id')
+                    AND q.kind='conflict' AND q.target_id=json_extract(d.value,'$.id'))",
+        ).bind(serde_json::to_string(targets)?).fetch_all(&state.db).await?.into_iter().collect()
+    } else {
+        std::collections::HashSet::new()
+    };
+    let mut groups = std::collections::BTreeMap::<String, Vec<RecoveryTarget>>::new();
+    for target in targets.iter().filter(|target| target.peer_id.is_some()) {
+        if let Some(peer) = &target.peer_id {
+            if known.contains(&(peer.clone(), target.id.clone())) {
+                groups.entry(peer.clone()).or_default().push(target.clone());
+            } else {
+                items.push(unavailable(
+                    target.clone(),
+                    AppError::not_found("receiver recovery target not found"),
+                ));
+            }
+        }
+    }
+    let mut requests = stream::iter(groups.into_iter().map(|(peer_id, targets)| async move {
+        let outcome: AppResult<RecoveryVersionsBatch> = async {
+            let peer = net::peer(state, &peer_id).await?;
+            let input = RecoveryBatchInput {
+                targets: targets
+                    .iter()
+                    .map(|target| RecoveryTarget {
+                        peer_id: None,
+                        ..target.clone()
+                    })
+                    .collect(),
+                all: false,
+                resolution: None,
+            };
+            let response = net::request(
+                state,
+                &peer.url,
+                &peer.secret,
+                reqwest::Method::POST,
+                "/api/peer/v1/recovery/versions/batch",
+                Some(serde_json::to_vec(&input)?),
+            )
+            .timeout(COMPARISON_DEADLINE)
+            .send()
+            .await
+            .map_err(|error| {
+                AppError::conflict("peer_evidence_unavailable", net::net_error(&error))
+            })?;
+            let status = response.status();
+            if !status.is_success() {
+                let body = response.text().await.map_err(|error| {
+                    AppError::conflict("peer_evidence_unavailable", net::net_error(&error))
+                })?;
+                return Err(AppError::conflict(
+                    "peer_evidence_unavailable",
+                    net::http_failure(status, &body),
+                ));
+            }
+            let mut result: RecoveryVersionsBatch = response.json().await.map_err(|error| {
+                AppError::conflict("peer_evidence_unavailable", net::net_error(&error))
+            })?;
+            if result.items.len() != targets.len() {
+                return Err(AppError::conflict(
+                    "peer_evidence_unavailable",
+                    "receiver returned an incomplete evidence batch",
+                ));
+            }
+            for (item, expected) in result.items.iter_mut().zip(&targets) {
+                let target = match item {
+                    RecoveryVersionResult::Ready { target, .. }
+                    | RecoveryVersionResult::Unavailable { target, .. } => target,
+                };
+                if target.id != expected.id
+                    || target.kind != expected.kind
+                    || target.peer_id.is_some()
+                {
+                    return Err(AppError::conflict(
+                        "peer_evidence_unavailable",
+                        "receiver returned mismatched evidence targets",
+                    ));
+                }
+                target.peer_id = Some(peer_id.clone());
+            }
+            Ok(result)
+        }
+        .await;
+        match outcome {
+            Ok(batch) => batch.items,
+            Err(error) => targets
+                .into_iter()
+                .map(|target| {
+                    unavailable(
+                        target,
+                        AppError::new(error.status(), "peer_evidence_unavailable", error.message()),
+                    )
+                })
+                .collect(),
+        }
+    }))
+    .buffer_unordered(2);
+    while let Some(group) = requests.next().await {
+        items.extend(group);
+    }
+    let mut by_target = std::collections::HashMap::new();
+    for item in items {
+        let target = match &item {
+            RecoveryVersionResult::Ready { target, .. }
+            | RecoveryVersionResult::Unavailable { target, .. } => target,
+        };
+        by_target.insert((target.id.clone(), target.peer_id.clone()), item);
+    }
+    let items = targets
+        .iter()
+        .map(|target| {
+            by_target
+                .remove(&(target.id.clone(), target.peer_id.clone()))
+                .ok_or_else(|| AppError::internal("evidence batch is missing a target"))
+        })
+        .collect::<AppResult<Vec<_>>>()?;
+    Ok(RecoveryVersionsBatch { items })
 }
 
 pub async fn get(state: &AppState, target: &RecoveryTarget) -> AppResult<RecoveryVersions> {

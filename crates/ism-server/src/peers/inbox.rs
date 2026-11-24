@@ -173,7 +173,9 @@ pub(super) async fn admit_inventory(
     request: &BackfillRequest,
     page: &InventoryPage,
 ) -> AppResult<()> {
-    let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
+    let mut clock = db::WriterClock::start("peer_inventory_receipt", page.entries.len() as u64);
+    let mut conn = clock.acquire(&state.db).await?;
+    let mut tx = clock.begin(&mut conn).await?;
     let current = backfill_share_in(&mut tx, state, &request.share_id).await?;
     if !current.as_ref().is_some_and(|current| {
         current.includes(&peer.id)
@@ -223,7 +225,8 @@ pub(super) async fn admit_inventory(
     if changed.rows_affected() != 1 {
         return Err(backfill_changed());
     }
-    tx.commit().await?;
+    clock.commit(tx).await?;
+    drop(conn);
     Ok(())
 }
 
@@ -466,7 +469,9 @@ pub(super) async fn admit(
     after: i64,
     page: &EventPage,
 ) -> AppResult<()> {
-    let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
+    let mut clock = db::WriterClock::start("peer_event_receipt", page.events.len() as u64);
+    let mut conn = clock.acquire(&state.db).await?;
+    let mut tx = clock.begin(&mut conn).await?;
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM peer_inbox WHERE peer_id = ?")
         .bind(&peer.id)
         .fetch_one(&mut *tx)
@@ -571,7 +576,8 @@ pub(super) async fn admit(
         ));
     }
     advance_in(&mut tx, &peer.id).await?;
-    tx.commit().await?;
+    clock.commit(tx).await?;
+    drop(conn);
     Ok(())
 }
 

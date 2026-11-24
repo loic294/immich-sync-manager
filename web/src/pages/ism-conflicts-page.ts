@@ -37,7 +37,14 @@ const RESOLUTIONS: readonly { value: ConflictResolution; hint: string }[] = [
     hint: 'Preserve both versions and synchronize the decision.',
   },
 ];
-const MAX_OFF_PAGE_REVIEWS = 50;
+const STATUS_FILTERS = [
+  ['needs_decision', 'Needs review'],
+  ['waiting', 'Waiting'],
+  ['queued', 'Decision queued'],
+  ['fixing', 'Applying decision'],
+  ['fixed', 'Checking completion'],
+  ['not_retryable', 'Needs attention'],
+] as const;
 
 /** A paginated conflict queue with an automatically prepared review for the selected item. */
 export class IsmConflictsPage extends IsmPage {
@@ -55,6 +62,7 @@ export class IsmConflictsPage extends IsmPage {
     filtersOpen: { state: true },
     share: { state: true },
     folder: { state: true },
+    status: { state: true },
   };
 
   declare conflicts: ConflictPageRow[];
@@ -70,6 +78,7 @@ export class IsmConflictsPage extends IsmPage {
   declare filtersOpen: boolean;
   declare share: string;
   declare folder: string;
+  declare status: string;
   private readonly review = new VersionReview(this);
 
   constructor() {
@@ -86,17 +95,19 @@ export class IsmConflictsPage extends IsmPage {
     this.filtersOpen = false;
     this.share = '';
     this.folder = '';
+    this.status = '';
   }
 
   protected override async load() {
-    const { limit, offset, includeResolved, share, folder } = this;
-    const page = await this.data.conflicts(includeResolved, limit, offset, share, folder);
+    const { limit, offset, includeResolved, share, folder, status } = this;
+    const page = await this.data.conflicts(includeResolved, limit, offset, share, folder, status);
     if (
       limit !== this.limit ||
       offset !== this.offset ||
       includeResolved !== this.includeResolved ||
       share !== this.share ||
-      folder !== this.folder
+      folder !== this.folder ||
+      status !== this.status
     )
       return;
     this.filters = page.filters;
@@ -162,7 +173,7 @@ export class IsmConflictsPage extends IsmPage {
   private filterControls() {
     if (!this.filtersOpen) return nothing;
     const folders = this.filters?.find((filter) => filter.share_name === this.share)?.folders ?? [];
-    return html`<div id="conflict-filters" class="flex w-full flex-wrap items-end gap-3 rounded-box border border-base-300 bg-base-100 p-3">
+    return html`<div id="conflict-filters" class="grid w-full grid-cols-1 items-end gap-3 rounded-box border border-base-300 bg-base-100 p-3 sm:grid-cols-2 lg:grid-cols-[1fr_1fr_1fr_auto]">
       <label class="flex min-w-0 flex-1 flex-col gap-1 text-sm">
         Share
         <select class="select select-sm w-full" aria-label="Filter by share"
@@ -192,9 +203,30 @@ export class IsmConflictsPage extends IsmPage {
           }
         </select>
       </label>
+      <label class="flex min-w-0 flex-1 flex-col gap-1 text-sm">
+        Status
+        <select class="select select-sm w-full" aria-label="Filter by status" ?disabled=${this.includeResolved}
+          @change=${(e: Event) => {
+            this.status = (e.target as HTMLSelectElement).value;
+            this.filter(this.share, this.folder);
+          }}>
+          <option value="" ?selected=${!this.status}>${this.includeResolved ? 'Resolved' : 'All statuses'}</option>
+          ${
+            !this.includeResolved
+              ? STATUS_FILTERS.map(
+                  ([value, label]) => html`<option value=${value}
+            ?selected=${value === this.status}>${label}</option>`,
+                )
+              : nothing
+          }
+        </select>
+      </label>
       <button type="button" class="btn btn-ghost btn-sm max-sm:min-h-11"
-        ?disabled=${!this.share && !this.folder} @click=${() => this.filter('')}>Clear filters</button>
-      <p class="w-full text-xs text-base-content/70">Folders include their subfolders. Changing filters clears the selection.</p>
+        ?disabled=${!this.share && !this.folder && !this.status} @click=${() => {
+          this.status = '';
+          this.filter('');
+        }}>Clear filters</button>
+      <p class="col-span-full text-xs text-base-content/70">Folders include their subfolders. Changing filters clears the selection.</p>
     </div>`;
   }
 
@@ -212,9 +244,9 @@ export class IsmConflictsPage extends IsmPage {
 
   private preparationTargets(visible: readonly ConflictPageRow[]) {
     const current = new Map(visible.filter(canChoose).map((conflict) => [key(conflict), conflict]));
-    const other = [...this.selected.values()]
-      .filter((conflict) => canChoose(conflict) && !current.has(key(conflict)))
-      .slice(0, MAX_OFF_PAGE_REVIEWS);
+    const other = [...this.selected.values()].filter(
+      (conflict) => canChoose(conflict) && !current.has(key(conflict)),
+    );
     return [...current.values(), ...other].map(target);
   }
 
@@ -394,7 +426,6 @@ export class IsmConflictsPage extends IsmPage {
       ${
         chosen.length
           ? html`<span class="text-sm text-base-content/70">${reviewed} of ${chosen.length} ready</span>
-        ${chosen.length > MAX_OFF_PAGE_REVIEWS && reviewed < chosen.length ? html`<span class="text-sm text-base-content/70">Revisit other pages to refresh remaining selections.</span>` : nothing}
         ${RESOLUTIONS.map(
           (
             r,
@@ -415,7 +446,7 @@ export class IsmConflictsPage extends IsmPage {
               <ism-icon name="circle-check" size="xl" class="text-success"></ism-icon>
               <h2 class="card-title">${this.includeResolved ? 'No resolved conflicts' : 'No conflicts'}</h2>
               <p class="text-sm text-base-content/70">${
-                this.share || this.folder
+                this.share || this.folder || this.status
                   ? 'No conflicts match these filters. Choose another folder or clear the filters.'
                   : this.includeResolved
                     ? 'Resolved conflicts will appear here.'
@@ -454,7 +485,7 @@ export class IsmConflictsPage extends IsmPage {
             this.filtersOpen = !this.filtersOpen;
           }}>
           <ism-icon name="list-filter" size="sm"></ism-icon>
-          Filters${this.share ? html`<span class="badge badge-primary badge-sm">${this.folder ? 2 : 1}</span>` : nothing}
+          Filters${this.share || this.status ? html`<span class="badge badge-primary badge-sm">${Number(!!this.share) + Number(!!this.folder) + Number(!!this.status)}</span>` : nothing}
         </button>
         ${
           this.conflicts.length || this.selected.size
@@ -472,6 +503,7 @@ export class IsmConflictsPage extends IsmPage {
             .checked=${this.includeResolved}
             @change=${(e: Event) => {
               this.includeResolved = (e.target as HTMLInputElement).checked;
+              this.status = '';
               this.filter(this.share, this.folder);
             }}
           />
@@ -533,6 +565,10 @@ function conflictStatus(row: ConflictPageRow): { label: string; tone: string } {
     case 'not_retryable':
       return { label: 'Needs attention', tone: 'blocked' };
     default:
+      if (row.owner === 'local' && row.conflict.status === 'open')
+        return { label: 'Needs review', tone: 'open' };
+      if (row.owner === 'local' && row.conflict.status === 'resolving')
+        return { label: 'Applying decision', tone: 'resolving' };
       return row.owner === 'local'
         ? { label: humanize(row.conflict.status), tone: row.conflict.status }
         : { label: 'Needs attention', tone: 'blocked' };

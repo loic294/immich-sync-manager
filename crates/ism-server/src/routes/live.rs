@@ -7,7 +7,7 @@ use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::http::{HeaderMap, Request, header};
+use axum::http::{HeaderMap, HeaderValue, Request, header};
 use axum::response::{IntoResponse, Response};
 use futures_util::SinkExt;
 use serde::Deserialize;
@@ -16,7 +16,7 @@ use tokio::sync::broadcast::error::RecvError;
 use tokio::time::Instant;
 use tower::ServiceExt;
 
-use crate::auth::{Admin, session_user};
+use crate::auth::{Admin, CSRF_HEADER, session_user};
 use crate::error::{AppError, AppResult};
 use crate::state::{AppState, ServerEvent};
 
@@ -27,13 +27,22 @@ const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum Command {
-    Subscribe { id: u32, url: String },
-    Refresh { id: u32 },
-    Unsubscribe { id: u32 },
+    Subscribe {
+        id: u32,
+        url: String,
+        body: Option<Value>,
+    },
+    Refresh {
+        id: u32,
+    },
+    Unsubscribe {
+        id: u32,
+    },
 }
 
 struct Subscription {
     url: String,
+    body: Option<Value>,
     last: Option<Value>,
     dirty: bool,
     force: bool,
@@ -105,7 +114,12 @@ fn recheck(url: &str, data: &Value) -> Option<Instant> {
     next.map(|delay| Instant::now() + delay.max(Duration::from_secs(1)))
 }
 
-async fn snapshot(router: &Router, headers: &HeaderMap, url: &str) -> AppResult<Value> {
+async fn snapshot(
+    router: &Router,
+    headers: &HeaderMap,
+    url: &str,
+    body: Option<&Value>,
+) -> AppResult<Value> {
     if !url.starts_with('/') || url.starts_with("//") || url.len() > 4096 {
         return Err(AppError::bad_request(
             "invalid_subscription",
@@ -113,11 +127,21 @@ async fn snapshot(router: &Router, headers: &HeaderMap, url: &str) -> AppResult<
         ));
     }
     let mut request = Request::builder()
+        .method(if body.is_some() { "POST" } else { "GET" })
         .uri(url)
-        .body(Body::empty())
+        .body(body.map_or_else(Body::empty, |body| Body::from(body.to_string())))
         .map_err(|_| AppError::bad_request("invalid_subscription", "invalid snapshot URL"))?;
     // Dispatch only through the read-only router, with the original session checked on every read.
     *request.headers_mut() = headers.clone();
+    if body.is_some() {
+        request.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        request
+            .headers_mut()
+            .insert(CSRF_HEADER, HeaderValue::from_static("1"));
+    }
     let response = router.clone().oneshot(request).await.unwrap();
     let status = response.status().as_u16();
     let body = to_bytes(response.into_body(), MAX_SNAPSHOT_BYTES)
@@ -167,7 +191,7 @@ pub(super) async fn live(
     }
     let router = super::admin::live_reads().with_state(state.clone());
     let mut rx = state.events.subscribe();
-    Ok(ws.max_message_size(8192).on_upgrade(move |mut socket| async move {
+    Ok(ws.max_message_size(64 * 1024).on_upgrade(move |mut socket| async move {
         if !send(&mut socket, &json!({ "type": "ready", "protocol": 1 })).await { return; }
         let mut subscriptions = BTreeMap::<u32, Subscription>::new();
         let mut refresh = tokio::time::interval(REFRESH_INTERVAL);
@@ -198,7 +222,7 @@ pub(super) async fn live(
                 message = socket.recv() => match message {
                     Some(Ok(Message::Text(text))) => {
                         match serde_json::from_str::<Command>(&text) {
-                            Ok(Command::Subscribe { id, url }) => {
+                            Ok(Command::Subscribe { id, url, body }) => {
                                 if subscriptions.len() >= MAX_SUBSCRIPTIONS && !subscriptions.contains_key(&id) {
                                     if !send(&mut socket, &json!({
                                         "type": "snapshot", "id": id, "status": 429,
@@ -206,7 +230,7 @@ pub(super) async fn live(
                                     })).await { break; }
                                 } else {
                                     subscriptions.insert(id, Subscription {
-                                        url, last: None, dirty: true, force: true, recheck: None,
+                                        url, body, last: None, dirty: true, force: true, recheck: None,
                                     });
                                 }
                             }
@@ -235,7 +259,7 @@ pub(super) async fn live(
                         }
                         subscription.dirty = false;
                         let result = tokio::time::timeout(
-                            Duration::from_secs(15), snapshot(&router, &headers, &subscription.url),
+                            Duration::from_secs(15), snapshot(&router, &headers, &subscription.url, subscription.body.as_ref()),
                         ).await.unwrap_or_else(|_| Err(AppError::new(
                             axum::http::StatusCode::GATEWAY_TIMEOUT, "snapshot_timeout", "Live snapshot timed out.",
                         )));

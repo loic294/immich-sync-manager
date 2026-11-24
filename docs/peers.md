@@ -257,6 +257,9 @@ endpoint are skipped.
 ## Conflicts
 
 Use **Filters** to choose a share and then a subfolder from the conflict queue, across all pages.
+The **Status** filter selects Needs review, Waiting, Decision queued, Applying decision,
+Checking completion, or Needs attention across local and peer-owned conflicts. Switching
+**Show resolved** clears that status filter and limits the queue to resolved files.
 Folder filters include descendants and clear bulk selections when changed. **Show resolved**
 shows only resolved conflicts, not the active queue. Peer-owned filters require location metadata
 from an upgraded peer; older peers' conflicts remain visible in the unfiltered queue.
@@ -268,6 +271,15 @@ a comparison, and equal values have no badge.
 Both conflict API endpoints retain `include_resolved=true` as open plus resolved results.
 The paginated endpoint also accepts `resolved_only=true`, used by **Show resolved**; it takes
 precedence when both flags are set.
+
+Version evidence is fetched in batches of at most 50 explicit targets, with at most two
+browser requests in flight. Local snapshots are read together; peer-owned targets are
+grouped into one signed batch per receiver. Both instances must support
+`POST /recovery/versions/batch` under their admin/peer API prefixes. Each result preserves
+the complete target and its own ready evidence or error; an unavailable file does not
+discard other results. Evidence-ready notifications retry unavailable comparisons without
+invalidating ready or in-flight reviews. Actual conflict changes still invalidate revisions.
+Selected targets on other pages continue preparing through the same bounded queue.
 
 The **Conflicts** page lists each conflict with both versions (size, checksum, time) and, for moves,
 the path the peer moved from. ISM records a conflict when:

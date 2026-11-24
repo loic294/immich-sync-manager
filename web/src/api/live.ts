@@ -43,7 +43,21 @@ export class LiveScope implements Pick<ApiClient, 'get'> {
     const relative = path.startsWith('/api/admin/') ? path.slice('/api/admin'.length) : '';
     const subscribable = LIVE_PATHS.has(relative) || /^\/operations\/[^/]+\/detail$/.test(relative);
     const url = withQuery(subscribable ? relative : path, options?.query);
-    const existing = this.entries.get(url);
+    return this.read<T>(url, subscribable, () => api.get<T>(path, options));
+  }
+
+  snapshot<T>(url: string, initial: () => Promise<T>, body: object): Promise<T> {
+    return this.read(url, true, initial, body);
+  }
+
+  private read<T>(
+    url: string,
+    subscribable: boolean,
+    initial: () => Promise<T>,
+    body?: object,
+  ): Promise<T> {
+    const key = body ? `${url}\n${JSON.stringify(body)}` : url;
+    const existing = this.entries.get(key);
     if (existing) {
       if (existing.error) return Promise.reject(existing.error);
       return existing.loaded
@@ -63,7 +77,7 @@ export class LiveScope implements Pick<ApiClient, 'get'> {
       stop: () => {},
       cancel: () => reject(new DOMException('Live view closed.', 'AbortError')),
     };
-    this.entries.set(url, entry);
+    this.entries.set(key, entry);
     let settled = false;
     let pushed = false;
     let deadline: number | undefined;
@@ -73,7 +87,7 @@ export class LiveScope implements Pick<ApiClient, 'get'> {
       cancel();
     };
     const accept = (snapshot: Snapshot | Error) => {
-      if (this.entries.get(url) !== entry) return;
+      if (this.entries.get(key) !== entry) return;
       window.clearTimeout(deadline);
       const loaded = settled;
       settled = true;
@@ -110,15 +124,19 @@ export class LiveScope implements Pick<ApiClient, 'get'> {
             ),
           30_000,
         );
-      entry.stop = events.subscribe(url, (snapshot) => {
-        pushed = true;
-        accept(snapshot);
-      });
+      entry.stop = events.subscribe(
+        url,
+        (snapshot) => {
+          pushed = true;
+          accept(snapshot);
+        },
+        body,
+      );
     }
     // The shell starts live updates before mounting views. Standalone/initial reads can use HTTP,
     // but a failed live connection never falls back to repeated HTTP requests.
     if (!subscribable || !events.running) {
-      void api.get<unknown>(path, options).then(
+      void initial().then(
         (data) => {
           if (!pushed) accept({ status: 200, data });
         },

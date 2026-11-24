@@ -21,6 +21,7 @@ describe('live snapshot reads', () => {
     expect(subscribe).toHaveBeenCalledWith(
       '/sync/page?status=active&offset=250',
       expect.any(Function),
+      undefined,
     );
     push?.({ status: 200, data: { rows: [{ bytes_done: 1 }], total: 501 } });
     await expect(first).resolves.toEqual({ rows: [{ bytes_done: 1 }], total: 501 });

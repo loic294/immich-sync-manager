@@ -10,7 +10,7 @@ import { startTheme } from '@/app/theme';
 import { IsmElement } from '@/base/ism-element';
 import { attentionError, blockers, startAttention } from '@/stores/attention';
 import { currentPath, linkTo, startNavSync } from '@/stores/nav';
-import { startOverview } from '@/stores/overview';
+import { overviewError, startOverview } from '@/stores/overview';
 import { logout, refreshSession, session, sessionError } from '@/stores/session';
 import '@/app/ism-theme-toggle';
 import '@/components/ism-attention-bell';
@@ -151,6 +151,10 @@ export class IsmApp extends IsmElement {
 
   private renderConnectionBanner() {
     const state = events.connection.value;
+    if (state !== 'reconnecting' && overviewError.value)
+      return html`<div role="alert" class="alert alert-error flex-none rounded-none">
+        <span>Overview unavailable: ${overviewError.value} Last known counters may be stale.</span>
+      </div>`;
     if (state !== 'reconnecting') return nothing;
     return html`
       <div role="alert" class="alert alert-warning flex-none rounded-none">

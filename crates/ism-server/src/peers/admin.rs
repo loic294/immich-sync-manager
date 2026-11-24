@@ -1252,12 +1252,21 @@ pub async fn list_conflicts(
     .await
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct ConflictFilterQuery {
     pub include_resolved: bool,
     pub resolved_only: bool,
     pub share: String,
     pub folder: String,
+    pub status: String,
+}
+
+macro_rules! conflict_status_sql {
+    () => {
+        "CASE WHEN c.status='resolved' THEN 'resolved'
+         ELSE COALESCE(r.state,CASE c.status WHEN 'open' THEN 'needs_decision'
+              WHEN 'resolving' THEN 'fixing' ELSE 'not_retryable' END) END"
+    };
 }
 
 async fn local_conflicts_page(
@@ -1280,13 +1289,15 @@ async fn local_conflicts_page(
         String,
         Option<String>,
     );
-    let rows: Vec<R> = sqlx::query_as(
+    let rows: Vec<R> = sqlx::query_as(concat!(
         "SELECT c.id, c.share_id, c.rel_path, c.kind, c.detail, c.local_json, c.remote_json, c.peer_id, c.status, c.created_at, c.remote_from
          FROM conflicts c JOIN shares s ON s.id=c.share_id
+         LEFT JOIN sync_recovery r ON r.kind='conflict' AND r.target_id=c.id
          WHERE (CASE WHEN ? THEN c.status='resolved' ELSE c.status!='resolved' OR ? END)
          AND (?='' OR s.name=?) AND (?='' OR c.rel_path=? OR substr(c.rel_path,1,length(?)+1)=? || '/')
+         AND (?='' OR ", conflict_status_sql!(), "=?)
          ORDER BY c.created_at DESC, c.id DESC LIMIT ? OFFSET ?",
-    )
+    ))
     .bind(filter.resolved_only)
     .bind(include_resolved)
     .bind(&filter.share)
@@ -1295,6 +1306,8 @@ async fn local_conflicts_page(
     .bind(&filter.folder)
     .bind(&filter.folder)
     .bind(&filter.folder)
+    .bind(&filter.status)
+    .bind(&filter.status)
     .bind(limit)
     .bind(offset)
     .fetch_all(&state.db)
@@ -1349,13 +1362,19 @@ pub async fn page_conflicts(
     use ism_core::dto::ConflictFilter;
     use std::collections::{BTreeMap, BTreeSet};
 
-    let scopes: Vec<(String, String)> = sqlx::query_as(
+    let scopes: Vec<(String, String)> = sqlx::query_as(concat!(
         "SELECT s.name,c.rel_path FROM conflicts c JOIN shares s ON s.id=c.share_id
+         LEFT JOIN sync_recovery r ON r.kind='conflict' AND r.target_id=c.id
          WHERE CASE WHEN ? THEN c.status='resolved' ELSE c.status!='resolved' OR ? END
+         AND (?='' OR ",
+        conflict_status_sql!(),
+        "=?)
          ORDER BY s.name,c.rel_path",
-    )
+    ))
     .bind(filter.resolved_only)
     .bind(filter.include_resolved)
+    .bind(&filter.status)
+    .bind(&filter.status)
     .fetch_all(&state.db)
     .await?;
     let matches = |share: &str, path: &str| {
@@ -1376,6 +1395,18 @@ pub async fn page_conflicts(
     } else {
         super::recovery::peer_conflicts(state).await?
     };
+    peer.retain(|row| {
+        filter.status.is_empty()
+            || filter.status
+                == match row.state {
+                    ism_core::dto::RecoveryState::NeedsDecision => "needs_decision",
+                    ism_core::dto::RecoveryState::Waiting => "waiting",
+                    ism_core::dto::RecoveryState::Queued => "queued",
+                    ism_core::dto::RecoveryState::Fixing => "fixing",
+                    ism_core::dto::RecoveryState::Fixed => "fixed",
+                    ism_core::dto::RecoveryState::NotRetryable => "not_retryable",
+                }
+    });
     let mut folders: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for (share, path) in scopes.iter().map(|(s, p)| (s.as_str(), p.as_str())).chain(
         peer.iter()

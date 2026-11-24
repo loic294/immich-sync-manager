@@ -38,7 +38,7 @@ export interface EventsClient {
   readonly connection: ReadonlySignal<ConnectionState>;
   readonly running: boolean;
   on(handler: (event: ChangeEvent) => void): () => void;
-  subscribe(url: string, handler: (snapshot: Snapshot | Error) => void): () => void;
+  subscribe(url: string, handler: (snapshot: Snapshot | Error) => void, body?: object): () => void;
   start(): void;
   stop(): void;
   emit(event: ChangeEvent): void;
@@ -73,7 +73,13 @@ export function createEventsClient(
   let nextId = 1;
   const subscriptions = new Map<
     string,
-    { id: number; handlers: Set<(snapshot: Snapshot | Error) => void>; latest?: Snapshot }
+    {
+      id: number;
+      url: string;
+      body?: object;
+      handlers: Set<(snapshot: Snapshot | Error) => void>;
+      latest?: Snapshot;
+    }
   >();
 
   function unavailable() {
@@ -142,8 +148,15 @@ export function createEventsClient(
             failures = 0;
             window.clearTimeout(handshakeTimer);
             emit({ type: 'resync' });
-            for (const [url, subscription] of subscriptions)
-              socket.send(JSON.stringify({ type: 'subscribe', id: subscription.id, url }));
+            for (const subscription of subscriptions.values())
+              socket.send(
+                JSON.stringify({
+                  type: 'subscribe',
+                  id: subscription.id,
+                  url: subscription.url,
+                  ...(subscription.body ? { body: subscription.body } : {}),
+                }),
+              );
             return;
           }
           if (
@@ -188,19 +201,28 @@ export function createEventsClient(
     get running() {
       return active;
     },
-    subscribe(url, handler) {
-      let subscription = subscriptions.get(url);
+    subscribe(url, handler, body) {
+      const key = body ? `${url}\n${JSON.stringify(body)}` : url;
+      let subscription = subscriptions.get(key);
       if (!subscription) {
-        subscription = { id: nextId++, handlers: new Set() };
-        subscriptions.set(url, subscription);
-        if (ready) source?.send(JSON.stringify({ type: 'subscribe', id: subscription.id, url }));
+        subscription = { id: nextId++, url, ...(body ? { body } : {}), handlers: new Set() };
+        subscriptions.set(key, subscription);
+        if (ready)
+          source?.send(
+            JSON.stringify({
+              type: 'subscribe',
+              id: subscription.id,
+              url,
+              ...(body ? { body } : {}),
+            }),
+          );
       }
       subscription.handlers.add(handler);
       if (subscription.latest) notify(handler, subscription.latest);
       return () => {
         subscription.handlers.delete(handler);
         if (subscription.handlers.size > 0) return;
-        subscriptions.delete(url);
+        subscriptions.delete(key);
         if (ready) source?.send(JSON.stringify({ type: 'unsubscribe', id: subscription.id }));
       };
     },

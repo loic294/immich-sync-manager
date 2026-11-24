@@ -11,14 +11,14 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use ism_core::dto::{ImmichMoveMode, ScanScheduleView};
 use ism_core::maintenance::IdleConfirmation;
 use serde::{Deserialize, Serialize};
-use sqlx::Connection;
 
 use super::selfwrite::now_ms;
+use crate::db::WriterClock;
 use crate::error::{AppError, AppResult};
 use crate::files;
 use crate::immich::registry;
@@ -37,55 +37,6 @@ const ADMIT_WINDOW: i64 = 8;
 const COLLECT_CHUNK: i64 = 1_000;
 // Lets writers queued behind SQLite's busy handler in between acknowledged-row deletions.
 const COLLECT_PAUSE: Duration = Duration::from_millis(25);
-const SLOW_WRITER_HOLD: Duration = Duration::from_millis(250);
-const SLOW_WRITER_WAIT: Duration = Duration::from_secs(1);
-
-/// Times one scan-backlog write transaction: waiting for a pooled connection, waiting for
-/// SQLite's writer lock, and holding it until commit.
-struct WriterClock {
-    op: &'static str,
-    started: Instant,
-    pooled: Option<Instant>,
-    locked: Option<Instant>,
-}
-
-impl WriterClock {
-    fn start(op: &'static str) -> Self {
-        Self {
-            op,
-            started: Instant::now(),
-            pooled: None,
-            locked: None,
-        }
-    }
-
-    fn pooled(&mut self) {
-        self.pooled = Some(Instant::now());
-    }
-
-    fn locked(&mut self) {
-        self.locked = Some(Instant::now());
-    }
-
-    fn report(&self, library_id: &str, items: u64) {
-        let pooled = self.pooled.unwrap_or(self.started);
-        let locked = self.locked.unwrap_or(pooled);
-        let pool_wait = pooled.duration_since(self.started);
-        let lock_wait = locked.duration_since(pooled);
-        let held = locked.elapsed();
-        let (pool_wait_ms, lock_wait_ms, held_ms) = (
-            pool_wait.as_millis() as u64,
-            lock_wait.as_millis() as u64,
-            held.as_millis() as u64,
-        );
-        if held >= SLOW_WRITER_HOLD || pool_wait + lock_wait >= SLOW_WRITER_WAIT {
-            tracing::warn!(op = self.op, library = %library_id, items, pool_wait_ms, lock_wait_ms, held_ms, "slow scan backlog write");
-        } else {
-            tracing::debug!(op = self.op, library = %library_id, items, pool_wait_ms, lock_wait_ms, held_ms, "scan backlog write");
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) enum WorkKind {
     Added,
@@ -286,11 +237,9 @@ pub(crate) async fn request_work_at(
             .1
             .push(item.kind);
     }
-    let mut clock = WriterClock::start("admit");
-    let mut conn = state.db.acquire().await?;
-    clock.pooled();
-    let mut tx = conn.begin_with("BEGIN IMMEDIATE").await?;
-    clock.locked();
+    let mut clock = WriterClock::start("scan_backlog_admit", work.len() as u64);
+    let mut conn = clock.acquire(&state.db).await?;
+    let mut tx = clock.begin(&mut conn).await?;
     let reasons: Option<String> = sqlx::query_scalar(
         "SELECT reasons_json FROM scan_schedule WHERE library_id = ? AND due_at IS NOT NULL",
     )
@@ -426,8 +375,7 @@ pub(crate) async fn request_work_at(
             .await?;
         }
     }
-    tx.commit().await?;
-    clock.report(library_id, work.len() as u64);
+    clock.commit(tx).await?;
     if unreadable_paths > 0 {
         tracing::warn!(library = %library_id, paths = unreadable_paths, "appended new work after unreadable stored requests without coalescing it");
     }
@@ -570,12 +518,10 @@ pub(crate) async fn collect_acknowledged(state: &AppState) -> AppResult<u64> {
     let mut total = 0;
     for library_id in libraries {
         loop {
-            let mut clock = WriterClock::start("collect");
+            let mut clock = WriterClock::start("scan_backlog_collect", COLLECT_CHUNK as u64);
             let deleted = {
-                let mut conn = state.db.acquire().await?;
-                clock.pooled();
-                let mut tx = conn.begin_with("BEGIN IMMEDIATE").await?;
-                clock.locked();
+                let mut conn = clock.acquire(&state.db).await?;
+                let mut tx = clock.begin(&mut conn).await?;
                 let deleted = sqlx::query(
                     "DELETE FROM scan_work WHERE id IN (
                        SELECT id FROM scan_work WHERE library_id = ?
@@ -588,10 +534,10 @@ pub(crate) async fn collect_acknowledged(state: &AppState) -> AppResult<u64> {
                 .execute(&mut *tx)
                 .await?
                 .rows_affected();
-                tx.commit().await?;
+                clock.items(deleted);
+                clock.commit(tx).await?;
                 deleted
             };
-            clock.report(&library_id, deleted);
             total += deleted;
             if deleted < COLLECT_CHUNK as u64 {
                 break;
@@ -1074,15 +1020,16 @@ async fn finish(
         return Ok(());
     }
     let error = result.as_ref().err().map(|e| e.message().to_owned());
-    let mut clock = WriterClock::start(if error.is_none() {
-        "acknowledge"
-    } else {
-        "retain"
-    });
-    let mut conn = state.db.acquire().await?;
-    clock.pooled();
-    let mut tx = conn.begin_with("BEGIN IMMEDIATE").await?;
-    clock.locked();
+    let mut clock = WriterClock::start(
+        if error.is_none() {
+            "scan_backlog_acknowledge"
+        } else {
+            "scan_backlog_retain"
+        },
+        1,
+    );
+    let mut conn = clock.acquire(&state.db).await?;
+    let mut tx = clock.begin(&mut conn).await?;
     // One row update acknowledges the whole batch. Work that arrived during the run but was
     // never claimed is made due again if no request already did so.
     sqlx::query(
@@ -1104,8 +1051,7 @@ async fn finish(
     .bind(library_id)
     .execute(&mut *tx)
     .await?;
-    tx.commit().await?;
-    clock.report(library_id, 1);
+    clock.commit(tx).await?;
     match error {
         Some(e) => tracing::warn!(library = %library_id, "library synchronization failed: {e}"),
         None => {

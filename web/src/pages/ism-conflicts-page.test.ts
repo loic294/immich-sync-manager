@@ -1,7 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { admin } from '@/api/admin';
 import { api } from '@/api/client';
 import { events } from '@/api/events';
 import type { ConflictView } from '@/api/generated/ConflictView';
+import type { RecoveryTarget } from '@/api/generated/RecoveryTarget';
 import { confirmAction } from '@/components/confirm';
 import { mount } from '@/test/helpers';
 import { mockLiveSnapshots } from '@/test/live';
@@ -85,10 +87,145 @@ async function enableSelection(page: HTMLElementTagNameMap['ism-conflicts-page']
 
 describe('ism-conflicts-page', () => {
   let live: ReturnType<typeof mockLiveSnapshots>;
+  function pushVersions(current: typeof versions) {
+    live.push('/recovery/versions/batch', (body: object) => ({
+      items: (body as { targets: RecoveryTarget[] }).targets.map((target) => ({
+        state: 'ready',
+        target,
+        versions: current,
+      })),
+    }));
+  }
   beforeEach(() => {
     live = mockLiveSnapshots();
+    vi.spyOn(globalThis, 'fetch').mockImplementation(
+      async () => new Response(new Blob(['synthetic preview'], { type: 'image/png' })),
+    );
+    vi.spyOn(admin, 'recoveryVersionsBatch').mockImplementation(async (targets) => ({
+      items: await Promise.all(
+        targets.map(async (target) => {
+          try {
+            return {
+              state: 'ready' as const,
+              target,
+              versions: await admin.recoveryVersions(target),
+            };
+          } catch (error) {
+            return {
+              state: 'unavailable' as const,
+              target,
+              code: 'peer_busy',
+              message: error instanceof Error ? error.message : String(error),
+            };
+          }
+        }),
+      ),
+    }));
   });
   afterEach(() => vi.restoreAllMocks());
+
+  it('keeps bulk readiness through preparation notifications but rechecks genuinely changed revisions', async () => {
+    const rows = Array.from({ length: 51 }, (_, index) => ({
+      owner: 'local',
+      conflict: {
+        ...conflict,
+        id: `bulk-${index}`,
+        location: { root_id: 'photos', path: `bulk-${index}.jpg` },
+      },
+    }));
+    let releaseLast!: () => void;
+    const last = new Promise<void>((resolve) => {
+      releaseLast = resolve;
+    });
+    vi.spyOn(api, 'get').mockImplementation(async (path, options) => {
+      if (!path.endsWith('/versions')) return { rows, total: 51, filters: [] } as never;
+      if (options?.query?.id === 'bulk-50') await last;
+      return versions as never;
+    });
+    const page = await mount('ism-conflicts-page');
+    await vi.waitFor(() => expect(page.textContent).toContain('Select multiple'));
+    await enableSelection(page);
+    for (const checkbox of page.querySelectorAll<HTMLInputElement>(
+      'input[aria-label^="Select photos:"]',
+    ))
+      checkbox.click();
+    await vi.waitFor(() => expect(page.textContent).toContain('50 of 51 ready'));
+    for (let index = 0; index < 4; index++) {
+      events.emit({ type: 'sync_changed' });
+      await page.updateComplete;
+      expect(page.textContent).toContain('50 of 51 ready');
+    }
+    releaseLast();
+    await vi.waitFor(() => expect(page.textContent).toContain('51 of 51 ready'));
+    events.emit({ type: 'conflicts_changed' });
+    pushVersions({ ...versions, revision: 'd'.repeat(64) });
+    await vi.waitFor(() => expect(page.textContent).toContain('51 of 51 ready'));
+    await vi.waitFor(() =>
+      expect(page.querySelector('ism-recovery-versions')?.versions?.revision).toBe('d'.repeat(64)),
+    );
+  });
+
+  it('filters by status across pages, clears selections, and resets status for resolved mode', async () => {
+    const get = vi.spyOn(api, 'get').mockImplementation(async (path, options) => {
+      if (path.endsWith('/versions')) return versions as never;
+      if (options?.query?.status) return { rows: [], total: 0, filters: [] } as never;
+      return { rows: [{ owner: 'local', conflict }], total: 501, filters: [] } as never;
+    });
+    const page = await mount('ism-conflicts-page');
+    await vi.waitFor(() => expect(page.textContent).toContain('Review queue'));
+    [...page.querySelectorAll<HTMLButtonElement>('button')]
+      .find((button) => button.textContent?.trim() === 'Filters')
+      ?.click();
+    await enableSelection(page);
+    page.querySelector<HTMLInputElement>('[aria-label="Select photos:a.jpg"]')?.click();
+    page.querySelector<HTMLButtonElement>('[aria-label="Next page"]')?.click();
+    await vi.waitFor(() => expect(page.offset).toBe(50));
+    const status = page.querySelector<HTMLSelectElement>('[aria-label="Filter by status"]');
+    if (!status) throw new Error('Status filter is missing');
+    expect([...status.options].map((option) => option.textContent)).toEqual([
+      'All statuses',
+      'Needs review',
+      'Waiting',
+      'Decision queued',
+      'Applying decision',
+      'Checking completion',
+      'Needs attention',
+    ]);
+    status.value = 'waiting';
+    status.dispatchEvent(new Event('change'));
+    await vi.waitFor(() =>
+      expect(get).toHaveBeenCalledWith('/api/admin/conflicts/page', {
+        query: {
+          resolved_only: false,
+          limit: 50,
+          offset: 0,
+          share: '',
+          folder: '',
+          status: 'waiting',
+        },
+      }),
+    );
+    await vi.waitFor(() => expect(page.textContent).toContain('No conflicts match these filters'));
+    expect(page.selected.size).toBe(0);
+    expect(page.offset).toBe(0);
+    [...page.querySelectorAll<HTMLButtonElement>('button')]
+      .find((button) => button.textContent?.trim() === 'Clear filters')
+      ?.click();
+    await vi.waitFor(() => expect(page.status).toBe(''));
+    await page.updateComplete;
+    status.value = 'needs_decision';
+    status.dispatchEvent(new Event('change'));
+    page.querySelector<HTMLInputElement>('.toggle')?.click();
+    await vi.waitFor(() =>
+      expect(get).toHaveBeenCalledWith('/api/admin/conflicts/page', {
+        query: { resolved_only: true, limit: 50, offset: 0, share: '', folder: '' },
+      }),
+    );
+    await page.updateComplete;
+    expect(page.status).toBe('');
+    expect(status.disabled).toBe(true);
+    expect(status.options[0].textContent).toBe('Resolved');
+  });
 
   it('filters across pages by share and folder and resets pagination and selections', async () => {
     const filters = [
@@ -420,7 +557,7 @@ describe('ism-conflicts-page', () => {
     page.querySelector<HTMLButtonElement>('[aria-label="Next page"]')?.click();
     await vi.waitFor(() => expect(page.textContent).toContain('b.jpg'));
     revision = 'd'.repeat(64);
-    live.push('/recovery/versions', { ...versions, revision });
+    pushVersions({ ...versions, revision });
     await page.updateComplete;
     await vi.waitFor(() => expect(page.textContent).toContain('1 of 1 ready'));
     [...page.querySelectorAll<HTMLButtonElement>('[aria-label="Batch conflict decisions"] button')]
@@ -445,7 +582,7 @@ describe('ism-conflicts-page', () => {
     const page = await mount('ism-conflicts-page');
     await vi.waitFor(() => expect(page.querySelector('ism-recovery-versions')).not.toBeNull());
     const preview = page.querySelector('ism-recovery-versions');
-    live.fail('/recovery/versions', 'Live evidence unavailable');
+    live.fail('/recovery/versions/batch', 'Live evidence unavailable');
     await vi.waitFor(() => expect(page.textContent).toContain('Live evidence unavailable'));
     await page.updateComplete;
     expect(page.querySelector('ism-recovery-versions')).toBe(preview);
@@ -454,7 +591,7 @@ describe('ism-conflicts-page', () => {
         (button) => button.textContent?.trim() === 'Keep both',
       )?.disabled,
     ).toBe(true);
-    live.push('/recovery/versions', versions);
+    pushVersions(versions);
     await vi.waitFor(() =>
       expect(
         [...page.querySelectorAll<HTMLButtonElement>('button')].find(
@@ -465,7 +602,7 @@ describe('ism-conflicts-page', () => {
     expect(page.querySelector('ism-recovery-versions')).toBe(preview);
   });
 
-  it('bounds off-page refreshes and preserves the remaining selections', async () => {
+  it('refreshes every selected off-page target without requiring a return to its page', async () => {
     vi.spyOn(api, 'post').mockResolvedValue({ items: [] } as never);
     const get = vi.spyOn(api, 'get').mockImplementation(async (path, options) => {
       if (path.endsWith('/versions')) return versions as never;
@@ -500,14 +637,14 @@ describe('ism-conflicts-page', () => {
       expect(get.mock.calls.filter(([path]) => path.endsWith('/versions'))).toHaveLength(101),
     );
     events.emit({ type: 'conflicts_changed' });
-    live.push('/recovery/versions', versions);
+    pushVersions(versions);
     expect(
       [...live.handlers.keys()].filter((url) => url.startsWith('/recovery/versions')),
-    ).toHaveLength(51);
+    ).toHaveLength(3);
     expect(get.mock.calls.filter(([path]) => path.endsWith('/versions'))).toHaveLength(101);
     await vi.waitFor(() => expect(page.textContent).not.toContain('Comparing versions…'));
-    await vi.waitFor(() => expect(page.textContent).toContain('50 of 100 ready'));
-    expect(page.textContent).toContain('Revisit other pages to refresh remaining selections');
+    await vi.waitFor(() => expect(page.textContent).toContain('100 of 100 ready'));
+    expect(page.textContent).not.toContain('Revisit other pages to refresh remaining selections');
     expect(page.textContent).toContain('100 total selected');
     [...page.querySelectorAll<HTMLButtonElement>('[aria-label="Batch conflict decisions"] button')]
       .find((button) => button.textContent?.trim() === 'Keep both')
@@ -515,9 +652,7 @@ describe('ism-conflicts-page', () => {
     await vi.waitFor(() =>
       expect(vi.mocked(confirmAction)).toHaveBeenLastCalledWith(
         expect.objectContaining({
-          message: expect.stringContaining(
-            '50 selected conflicts are not ready and will remain selected. Revisit their pages',
-          ),
+          message: expect.not.stringContaining('selected conflicts are not ready'),
         }),
       ),
     );
@@ -638,7 +773,7 @@ describe('ism-conflicts-page', () => {
     const page = await mount('ism-conflicts-page');
     await vi.waitFor(() => expect(page.textContent).toContain('Temporary peer failure'));
     fail = false;
-    live.push('/recovery/versions', versions);
+    pushVersions(versions);
     await vi.waitFor(() => expect(page.querySelector('ism-recovery-versions')).not.toBeNull());
   });
 
@@ -653,7 +788,7 @@ describe('ism-conflicts-page', () => {
     const page = await mount('ism-conflicts-page');
     await vi.waitFor(() => expect(page.textContent).toContain('Evidence is being prepared'));
     ready = true;
-    live.push('/recovery/versions', versions);
+    pushVersions(versions);
     await vi.waitFor(() => expect(page.querySelector('ism-recovery-versions')).not.toBeNull());
   });
 });

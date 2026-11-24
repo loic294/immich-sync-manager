@@ -1525,6 +1525,8 @@ struct ConflictsQuery {
     share: String,
     #[serde(default)]
     folder: String,
+    #[serde(default)]
+    status: String,
 }
 
 async fn list_conflicts(
@@ -1540,6 +1542,23 @@ async fn conflicts_page(
     Admin(_): Admin,
     Query(q): Query<ConflictsQuery>,
 ) -> AppResult<Response> {
+    if ![
+        "",
+        "needs_decision",
+        "waiting",
+        "queued",
+        "fixing",
+        "fixed",
+        "not_retryable",
+        "resolved",
+    ]
+    .contains(&q.status.as_str())
+    {
+        return Err(AppError::bad_request(
+            "invalid_conflict_status",
+            "unknown conflict status filter",
+        ));
+    }
     let limit = q.limit.unwrap_or(50);
     let offset = q.offset.unwrap_or(0);
     if !(1..=5000).contains(&limit) || offset < 0 {
@@ -1558,6 +1577,7 @@ async fn conflicts_page(
                 resolved_only: q.resolved_only,
                 share: q.share,
                 folder: q.folder,
+                status: q.status,
             },
         )
         .await?,

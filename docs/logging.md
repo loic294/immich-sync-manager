@@ -46,6 +46,18 @@ exact matching item count, and returned row count (at most five). The count incl
 uploads still awaiting an asset ID; the row limit applies only to examples. This is a fresh database
 snapshot, not a cache. Its duration alone does not identify a SQLite lock holder.
 
+Instrumented immediate SQLite transactions log `pool_wait_ms`, `begin_wait_ms`, `body_ms`, and
+`commit_ms` separately, with a static `op` name and an `items` count. This covers peer event and
+inventory receipts, peer activity and outgoing recovery snapshots, and scan-backlog writes.
+Peer counts describe incoming page/snapshot rows, not rows actually written; scan collection
+reports deleted rows. Successful transactions log at `debug`, or `warn` when combined pool/BEGIN
+wait reaches one second or body plus commit reaches 250 milliseconds. Failed or abandoned writes
+warn once with the last entered `stage` (`pool`, `begin`, `body`, or `commit`), including cancellation.
+These diagnostics omit SQL, error text, identifiers, paths and payloads. They do not add database
+writes or change transaction boundaries or durability. An unfinished body's timing does not
+measure completion of SQLx's asynchronous rollback; BEGIN wait indicates contention, not the
+identity of the writer holding the lock.
+
 ## Persistent history in the UI
 
 Runtime logs complement, rather than replace, ISM's persistent records in the database on `/data`:
