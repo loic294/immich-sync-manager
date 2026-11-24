@@ -200,9 +200,11 @@ pub(crate) async fn selected_snapshot(
         item.share_name = Some(name.clone());
         item.title = format!("Shared files could not be checked: {name}");
         item.message = if reason == "permission" {
-            "Give ISM permission to read this share's folders and files. Check its folder in Peers; ISM retries automatically. Other shares can still sync."
+            "Give ISM permission to read this share's folders and files. Check its folder in Peers; ISM retries automatically."
+        } else if reason == "other" {
+            "Check this share's folder in Peers and review server logs. ISM retries automatically."
         } else {
-            "Check this share's folder in Peers and review server logs. ISM retries automatically. Other shares can still sync."
+            "The share scan failed. Check server logs; ISM retries automatically."
         }.into();
         item.href = "/peers".into();
         item.observed_at = at;

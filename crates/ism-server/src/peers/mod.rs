@@ -561,8 +561,15 @@ pub async fn scan_share(state: &AppState, share: &Share) -> AppResult<()> {
                         || error.code() == "share_scan_permission_denied"
                     {
                         "permission"
-                    } else {
+                    } else if error.io_kind().is_some()
+                        || matches!(
+                            error.code(),
+                            "scan_incomplete" | "root_unavailable" | "share_scan_folder_missing"
+                        )
+                    {
                         "other"
+                    } else {
+                        "system"
                     };
                     tracing::warn!(share_id = %share.id, code = %error.code(), reason,
                         "share scan failed; incomplete paths remain protected");
@@ -606,10 +613,11 @@ async fn scan_share_reporting(
     root.ensure_available()?;
     let base = root.abs(&share.path)?;
     if !fs::metadata(&base)?.is_dir() {
-        return Err(AppError::not_found(format!(
-            "share folder '{}' does not exist",
-            share.path
-        )));
+        return Err(AppError::new(
+            axum::http::StatusCode::NOT_FOUND,
+            "share_scan_folder_missing",
+            format!("share folder '{}' does not exist", share.path),
+        ));
     }
     let junk = share.junk.clone();
     task.phase("Enumerating share files");

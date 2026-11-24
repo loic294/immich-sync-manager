@@ -282,6 +282,44 @@ async fn share_scan_failure_reports_persistence_failure_and_retries_saving() {
 }
 
 #[tokio::test]
+async fn share_scan_failure_reports_database_failure_without_folder_diagnosis() {
+    let (local, share) = fixture().await;
+    sqlx::query(
+        "CREATE TRIGGER reject_scan_publish BEFORE UPDATE OF last_scan_at ON shares
+         BEGIN SELECT RAISE(ABORT, 'synthetic database failure'); END",
+    )
+    .execute(&local.state.db)
+    .await
+    .unwrap();
+    assert!(
+        super::super::scan_share(&local.state, &share)
+            .await
+            .is_err()
+    );
+    let item = failure(&local.state, &share.id).await.unwrap();
+    let message = item["message"].as_str().unwrap();
+    assert!(message.contains("logs"), "{message}");
+    assert!(!message.contains("folder"), "{message}");
+    assert!(!message.contains("permission"), "{message}");
+    assert!(!message.contains("Other shares"), "{message}");
+    let reason: String =
+        sqlx::query_scalar("SELECT reason FROM share_scan_failures WHERE share_id=?")
+            .bind(&share.id)
+            .fetch_one(&local.state.db)
+            .await
+            .unwrap();
+    assert_eq!(reason, "system");
+    sqlx::query("DROP TRIGGER reject_scan_publish")
+        .execute(&local.state.db)
+        .await
+        .unwrap();
+    super::super::scan_share(&local.state, &share)
+        .await
+        .unwrap();
+    assert!(failure(&local.state, &share.id).await.is_none());
+}
+
+#[tokio::test]
 async fn share_scan_failure_does_not_publish_or_clear_after_disable_while_waiting() {
     let (local, share) = fixture().await;
     std::fs::remove_dir(&local.shared).unwrap();

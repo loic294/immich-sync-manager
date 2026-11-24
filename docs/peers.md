@@ -64,9 +64,10 @@ own folder. Folders may sit at different paths on each machine.
 Local failed share scans stay in the existing attention banners on Overview, Operations and Sync.
 They name the affected share and link to **Peers** to check its configured folder. A permission
 warning means ISM was denied read access: restore folder traversal and file read permission for
-the account running ISM. Other failures use a general folder/logs remedy, not a permission claim.
+the account running ISM. Other verified folder errors suggest checking the folder and logs;
+unknown or system errors suggest checking logs without diagnosing the folder.
 ISM retries on watcher changes and its periodic full scan; there is no manual share-scan retry
-button. Unreadable paths are not treated as deleted, and independent paths and shares can continue.
+button. Unreadable paths are not treated as deleted.
 A failure survives retries, partial scans and restarts until a complete scan of that same share
 succeeds. Disabled shares hide their warning without erasing it; deleting a share removes its
 warning. Server logs identify the share and failure category, evidence-save failures, and recovery.
