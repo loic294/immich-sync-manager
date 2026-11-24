@@ -721,8 +721,6 @@ async fn pull_reporting(
     } else {
         Ok(())
     };
-    task.waiting("Waiting for the replication-operation lock before applying events");
-    let _guard = state.replication_operation_lock.lock().await;
     task.phase("Verifying and applying received events");
     let applied = replay(state, peer, task)
         .await
@@ -755,8 +753,8 @@ async fn replay(
     task: &crate::activity::Reporter,
 ) -> AppResult<usize> {
     // Rotate blocked rows fairly, but preserve dependencies explicitly rather than by cursor.
-    let mut rows: Vec<(i64, String, Option<String>, String)> = sqlx::query_as(
-        "SELECT seq, event_json, operation_id, status FROM peer_inbox
+    let mut seqs: Vec<i64> = sqlx::query_scalar(
+        "SELECT seq FROM peer_inbox
          WHERE peer_id = ? AND status != 'done'
          ORDER BY attempted_at IS NOT NULL, attempted_at, seq LIMIT ?",
     )
@@ -764,13 +762,29 @@ async fn replay(
     .bind(EVENT_BATCH)
     .fetch_all(&state.db)
     .await?;
-    rows.sort_by_key(|row| row.0);
-    let all = shares(state).await?;
+    seqs.sort_unstable();
     let mut applied = 0;
     let mut first_error = None;
-    let total = rows.len() as u64;
-    for (done, (seq, raw, operation_id, status)) in rows.into_iter().enumerate() {
+    let total = seqs.len() as u64;
+    for (done, seq) in seqs.into_iter().enumerate() {
+        task.waiting("Waiting for the replication-operation lock before applying events");
+        // Admitted per event, not per batch: queued managed operations (which the footprint
+        // checks below wait for) must be able to claim the gate between events.
+        let _guard = state.replication_operation_lock.lock().await;
+        task.phase("Verifying and applying received events");
         task.progress(done as u64, Some(total), "events checked");
+        let row: Option<(String, Option<String>, String)> = sqlx::query_as(
+            "SELECT event_json, operation_id, status FROM peer_inbox
+             WHERE peer_id = ? AND seq = ? AND status != 'done'",
+        )
+        .bind(&peer.id)
+        .bind(seq)
+        .fetch_optional(&state.db)
+        .await?;
+        let Some((raw, operation_id, status)) = row else {
+            continue;
+        };
+        let all = shares(state).await?;
         sqlx::query("UPDATE peer_inbox SET attempted_at = ? WHERE peer_id = ? AND seq = ?")
             .bind(db::now())
             .bind(&peer.id)

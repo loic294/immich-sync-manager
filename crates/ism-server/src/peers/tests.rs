@@ -1719,6 +1719,149 @@ async fn recovery_batch_preserves_decisions_and_never_dismisses_unverified_work(
 }
 
 #[tokio::test]
+async fn inbox_replay_lets_queued_operations_claim_the_gate_between_events() {
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    let peer = super::net::peers(&b.state).await.unwrap().remove(0);
+    let cursor: i64 = sqlx::query_scalar("SELECT received_cursor FROM peers WHERE id = ?")
+        .bind(&peer.id)
+        .fetch_one(&b.state.db)
+        .await
+        .unwrap();
+    for path in ["blocked-folder", "second-folder", "third-folder"] {
+        super::append_local(
+            &a.state,
+            "Family",
+            "folder_created",
+            &super::EventData {
+                path: path.into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    sqlx::query("INSERT INTO immich_servers(id,name,url,maintenance_json,created_at) VALUES('gate-server','Gate','https://gate.example','{}',?)")
+        .bind(crate::db::now())
+        .execute(&b.state.db)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE mappings SET server_id = 'gate-server' WHERE root_id = 'photos'")
+        .execute(&b.state.db)
+        .await
+        .unwrap();
+    let accepted = crate::ops::insert(
+        &b.state,
+        &Principal::Peer {
+            peer_id: peer.id.clone(),
+        },
+        &OperationRequest {
+            idempotency_key: "gate-fairness".into(),
+            label: None,
+            actions: vec![OperationAction::CreateFolder {
+                target: Location {
+                    root_id: "photos".into(),
+                    path: "shared/blocked-folder".into(),
+                },
+            }],
+            allow_owner_transfer: false,
+            allow_partial: false,
+        },
+    )
+    .await
+    .unwrap();
+    let maintenance = b.state.maintenance_lock.lock().await;
+    let held = b.state.replication_operation_lock.lock().await;
+    let pulling = {
+        let state = b.state.clone();
+        let peer = peer.clone();
+        tokio::spawn(async move { super::pull(&state, &peer).await })
+    };
+    let task_key = format!("pull:{}", peer.id);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let count: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM peer_inbox WHERE peer_id = ? AND seq > ?")
+                    .bind(&peer.id)
+                    .bind(cursor)
+                    .fetch_one(&b.state.db)
+                    .await
+                    .unwrap();
+            let activity = crate::activity::page(&b.state, 10, 0).await.unwrap();
+            if count == 3
+                && activity.current.iter().any(|row| {
+                    row.task_key == task_key
+                        && row.phase
+                            == "Waiting for the replication-operation lock before applying events"
+                })
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the pull must receive the batch and wait for the gate");
+
+    let operation = crate::ops::exec::run_operation(&b.state, &accepted.operation_id);
+    tokio::pin!(operation);
+    tokio::select! {
+        biased;
+        result = &mut operation => panic!("operation bypassed the held gate: {result:?}"),
+        () = tokio::task::yield_now() => {}
+    }
+    drop(held);
+
+    let claimed = async {
+        loop {
+            let status: String = sqlx::query_scalar("SELECT status FROM operations WHERE id = ?")
+                .bind(&accepted.operation_id)
+                .fetch_one(&b.state.db)
+                .await
+                .unwrap();
+            if status == "waiting_maintenance" {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    };
+    tokio::select! {
+        biased;
+        result = &mut operation => panic!("operation did not wait for maintenance: {result:?}"),
+        result = tokio::time::timeout(Duration::from_secs(5), claimed) => {
+            result.expect("the queued operation was not claimed");
+        }
+    }
+    let attempted: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM peer_inbox WHERE peer_id = ? AND seq > ? AND attempted_at IS NOT NULL",
+    )
+    .bind(&peer.id)
+    .bind(cursor)
+    .fetch_one(&b.state.db)
+    .await
+    .unwrap();
+    assert_eq!(attempted, 1, "the queued operation must run between events");
+    let error: String = sqlx::query_scalar(
+        "SELECT error FROM peer_inbox WHERE peer_id = ? AND seq > ? ORDER BY seq LIMIT 1",
+    )
+    .bind(&peer.id)
+    .bind(cursor)
+    .fetch_one(&b.state.db)
+    .await
+    .unwrap();
+    assert_eq!(
+        error,
+        "peer footprint waits for unresolved managed operations"
+    );
+
+    pulling.abort();
+    let _ = pulling.await;
+    drop(maintenance);
+}
+
+#[tokio::test]
 async fn peer_original_deletion_preserves_the_surviving_orphan_sidecar() {
     let (mut a, mut b) = pair().await;
     stop_workers(&mut a).await;
