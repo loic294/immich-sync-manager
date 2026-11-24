@@ -1039,19 +1039,39 @@ async fn path_after_event(
     event: Option<(&str, i64)>,
 ) -> AppResult<(String, Option<i64>)> {
     RelPath::parse(rel).map_err(|e| AppError::invalid_location(e.to_string()))?;
-    let events: Vec<(i64, String, String)> = sqlx::query_as(
-        "SELECT seq,kind,data_json FROM event_log
-         WHERE share_name = ? AND kind IN ('file_changed','file_moved','folder_created','folder_moved') ORDER BY seq",
+    const LINEAGE_PAGE: usize = 128;
+    let watermark: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(seq),0) FROM event_log")
+        .fetch_one(&state.db)
+        .await?;
+    let invalid: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM event_log WHERE share_name=?
+         AND kind IN ('file_changed','file_moved','folder_created','folder_moved')
+         AND CASE WHEN json_valid(data_json) THEN
+             json_type(data_json) IS NOT 'object'
+             OR json_type(data_json,'$.path') IS NOT 'text'
+             OR (json_type(data_json,'$.from') IS NOT NULL
+                 AND json_type(data_json,'$.from') NOT IN ('text','null'))
+             OR (json_type(data_json,'$.vv') IS NOT NULL
+                 AND json_type(data_json,'$.vv') IS NOT 'object')
+             ELSE 1 END
+         AND seq<=?)",
     )
     .bind(&share.name)
-    .fetch_all(&state.db)
+    .bind(watermark)
+    .fetch_one(&state.db)
     .await?;
+    if invalid {
+        return Err(AppError::conflict(
+            "recovery_evidence_missing",
+            "the share contains an invalid committed event",
+        ));
+    }
     let mut path = rel.to_owned();
     let mut lineage = version.clone();
     let mut anchor = None;
     if let Some((origin, seq)) = event {
-        anchor=sqlx::query_scalar("SELECT seq FROM event_log WHERE share_name=? AND origin=? AND origin_seq=? AND json_extract(data_json,'$.path')=?")
-            .bind(&share.name).bind(origin).bind(seq).bind(rel).fetch_optional(&state.db).await?;
+        anchor=sqlx::query_scalar("SELECT seq FROM event_log WHERE share_name=? AND origin=? AND origin_seq=? AND json_extract(data_json,'$.path')=? AND seq<=?")
+            .bind(&share.name).bind(origin).bind(seq).bind(rel).bind(watermark).fetch_optional(&state.db).await?;
         if anchor.is_none() {
             return Err(AppError::conflict(
                 "recovery_evidence_missing",
@@ -1059,24 +1079,77 @@ async fn path_after_event(
             ));
         }
     }
-    for (seq, kind, data) in &events {
-        if matches!(kind.as_str(), "file_changed" | "file_moved")
-            && event.is_none()
-            && *version != VersionVector::default()
-        {
-            let event: super::EventData = serde_json::from_str(data)?;
-            if event.path == rel && event.vv == *version {
-                anchor = Some(*seq);
+    if event.is_none() && *version != VersionVector::default() {
+        let mut before = watermark;
+        loop {
+            let candidates: Vec<(i64, String)> = sqlx::query_as(
+                "SELECT seq,data_json FROM event_log WHERE share_name=?
+                 AND kind IN ('file_changed','file_moved') AND json_valid(data_json)
+                 AND json_extract(data_json,'$.path')=? AND seq<=?
+                 ORDER BY seq DESC LIMIT ?",
+            )
+            .bind(&share.name)
+            .bind(rel)
+            .bind(before)
+            .bind(LINEAGE_PAGE as i64)
+            .fetch_all(&state.db)
+            .await?;
+            for (seq, data) in &candidates {
+                let candidate: super::EventData = serde_json::from_str(data)?;
+                if candidate.vv == *version {
+                    anchor = Some(*seq);
+                    break;
+                }
             }
+            if anchor.is_some() || candidates.len() < LINEAGE_PAGE {
+                break;
+            }
+            let Some((last, _)) = candidates.last() else {
+                break;
+            };
+            if *last == i64::MIN {
+                break;
+            }
+            before = last - 1;
+            tokio::task::yield_now().await;
         }
     }
     let mut last_move_seq = anchor;
-    for (seq, kind, data) in events {
-        if matches!(kind.as_str(), "file_changed" | "folder_created")
-            || anchor.is_some_and(|anchor| seq <= anchor)
-        {
-            continue;
+    let mut after = anchor.unwrap_or(0);
+    let mut examined: usize = 0;
+    loop {
+        let mut ancestors = vec![path.clone()];
+        ancestors.extend(
+            path.match_indices('/')
+                .map(|(index, _)| path[..index].to_owned()),
+        );
+        let next: Option<(i64, String, String)> = sqlx::query_as(
+            "SELECT seq,kind,data_json FROM event_log
+             WHERE share_name=?1 AND kind IN ('file_moved','folder_moved') AND json_valid(data_json)
+               AND seq>?2 AND seq<=?6 AND kind='file_moved' AND json_extract(data_json,'$.from')=?3
+             UNION ALL
+             SELECT seq,kind,data_json FROM event_log
+             WHERE share_name=?1 AND kind IN ('file_moved','folder_moved') AND json_valid(data_json)
+               AND seq>?2 AND seq<=?6 AND ?5 AND kind='folder_moved' AND json_extract(data_json,'$.from')
+                   IN (SELECT value FROM json_each(?4))
+             ORDER BY seq LIMIT 1",
+        )
+        .bind(&share.name)
+        .bind(after)
+        .bind(&path)
+        .bind(serde_json::to_string(&ancestors)?)
+        .bind(anchor.is_some())
+        .bind(watermark)
+        .fetch_optional(&state.db)
+        .await?;
+        let Some((seq, kind, data)) = next else {
+            break;
+        };
+        examined += 1;
+        if examined.is_multiple_of(LINEAGE_PAGE) {
+            tokio::task::yield_now().await;
         }
+        after = seq;
         let event: super::EventData = serde_json::from_str(&data)?;
         // Folder events have no file version vector. Their committed ordering after the
         // matching content announcement supplies the lineage; an unanchored guess is refused.
@@ -1135,15 +1208,40 @@ pub async fn evidence_at_event(
     root.ensure_available()?;
     let (path, last_move_seq) = path_after_event(state, &share, rel, version, event).await?;
     let abs = root.abs(&share.root_rel(&path)?)?;
+    let permit = state
+        .version_scan_limit
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(AppError::internal)?;
     match std::fs::symlink_metadata(&abs) {
         Ok(metadata) if metadata.is_dir() => {
-            let inventory = crate::ops::plan::folder_inventory(&abs)?;
-            if files::revision(&std::fs::symlink_metadata(&abs)?) != files::revision(&metadata) {
-                return Err(AppError::conflict(
-                    "revision_changed",
-                    "folder changed during verification",
-                ));
-            }
+            let folder = abs.clone();
+            let inventory = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                let inventory = crate::ops::plan::folder_inventory_bounded(&folder, 10_000)
+                    .map_err(|error| {
+                        if error.kind() == std::io::ErrorKind::InvalidData {
+                            AppError::conflict(
+                                "version_evidence_too_large",
+                                "folder exceeds the 10,000-entry version evidence limit",
+                            )
+                        } else {
+                            error.into()
+                        }
+                    })?;
+                if files::revision(&std::fs::symlink_metadata(&folder)?)
+                    != files::revision(&metadata)
+                {
+                    return Err(AppError::conflict(
+                        "revision_changed",
+                        "folder changed during verification",
+                    ));
+                }
+                Ok(inventory)
+            })
+            .await
+            .map_err(AppError::internal)??;
             return Ok(FileEvidence {
                 path,
                 sha256: None,
@@ -1160,10 +1258,12 @@ pub async fn evidence_at_event(
         Err(e) => return Err(e.into()),
     }
     let fingerprint_path = abs.clone();
-    let fingerprint =
-        tokio::task::spawn_blocking(move || files::replacement_fingerprint(&fingerprint_path))
-            .await
-            .map_err(AppError::internal)??;
+    let fingerprint = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        files::replacement_fingerprint(&fingerprint_path)
+    })
+    .await
+    .map_err(AppError::internal)??;
     let row = super::row(state, &share.id, &path).await?;
     if let Some((_, hash)) = &fingerprint
         && row
@@ -2260,6 +2360,9 @@ pub async fn tick(state: &AppState) -> AppResult<()> {
                 )
             }
         };
+        if kind == "conflict" && status == "needs_decision" {
+            super::versions::reprepare(state, &id).await?;
+        }
         sqlx::query(
             "UPDATE sync_recovery SET state=?,code=?,detail=?,updated_at=?,attempts=attempts+?
              WHERE id=? AND state='fixing'",
