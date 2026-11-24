@@ -29,6 +29,33 @@ struct Reply {
 }
 
 #[tokio::test]
+async fn conflict_versions_batch_http_bounds_and_per_target_errors() {
+    let h = harness().await;
+    let auth = [("cookie", h.cookie.as_str()), ("x-ism-request", "1")];
+    let target = json!({"kind":"conflict","id":"missing","peer_id":null});
+    let path = "/api/admin/recovery/versions/batch";
+    let input = json!({"targets":[target],"all":false,"resolution":null});
+    let reply = send(&h.app, json_req("POST", path, &auth, &input)).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.json());
+    assert_eq!(reply.json()["items"][0]["target"], target);
+    assert_eq!(reply.json()["items"][0]["state"], "unavailable");
+    assert_eq!(reply.json()["items"][0]["code"], "not_found");
+    for bad in [
+        json!({"targets":[],"all":false,"resolution":null}),
+        json!({"targets":[target],"all":true,"resolution":null}),
+        json!({"targets":[target,target],"all":false,"resolution":null}),
+        json!({"targets":[{"kind":"operation","id":"missing","peer_id":null}],"all":false,"resolution":null}),
+        json!({"targets":[target],"all":false,"resolution":"keep_both"}),
+        json!({"targets": (0..51).map(|i| json!({"kind":"conflict","id":format!("example-{i}"),"peer_id":null})).collect::<Vec<_>>(),
+            "all":false,"resolution":null}),
+    ] {
+        let reply = send(&h.app, json_req("POST", path, &auth, &bad)).await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.json());
+        assert_eq!(reply.json()["error"]["code"], "invalid_version_batch");
+    }
+}
+
+#[tokio::test]
 async fn conflict_http_filters_preserve_include_resolved_and_support_resolved_only() {
     let h = harness().await;
     h.map_root().await;

@@ -1,4 +1,5 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { admin } from '@/api/admin';
 import { api } from '@/api/client';
 import { events } from '@/api/events';
 import type { ConflictView } from '@/api/generated/ConflictView';
@@ -83,7 +84,75 @@ async function enableSelection(page: HTMLElementTagNameMap['ism-conflicts-page']
 }
 
 describe('ism-conflicts-page', () => {
+  beforeEach(() => {
+    vi.spyOn(admin, 'recoveryVersionsBatch').mockImplementation(async (targets) => ({
+      items: await Promise.all(
+        targets.map(async (target) => {
+          try {
+            return {
+              state: 'ready' as const,
+              target,
+              versions: await admin.recoveryVersions(target),
+            };
+          } catch (error) {
+            return {
+              state: 'unavailable' as const,
+              target,
+              code: 'peer_busy',
+              message: error instanceof Error ? error.message : String(error),
+            };
+          }
+        }),
+      ),
+    }));
+  });
   afterEach(() => vi.restoreAllMocks());
+
+  it('keeps bulk readiness through preparation notifications but rechecks genuinely changed revisions', async () => {
+    const rows = Array.from({ length: 51 }, (_, index) => ({
+      owner: 'local',
+      conflict: {
+        ...conflict,
+        id: `bulk-${index}`,
+        location: { root_id: 'photos', path: `bulk-${index}.jpg` },
+      },
+    }));
+    let releaseLast!: () => void;
+    const last = new Promise<void>((resolve) => {
+      releaseLast = resolve;
+    });
+    let releaseRefresh!: () => void;
+    const refresh = new Promise<void>((resolve) => {
+      releaseRefresh = resolve;
+    });
+    let changed = false;
+    vi.spyOn(api, 'get').mockImplementation(async (path, options) => {
+      if (!path.endsWith('/versions')) return { rows, total: 51, filters: [] } as never;
+      if (changed) await refresh;
+      else if (options?.query?.id === 'bulk-50') await last;
+      return { ...versions, revision: changed ? 'd'.repeat(64) : versions.revision } as never;
+    });
+    const page = await mount('ism-conflicts-page');
+    await enableSelection(page);
+    for (const checkbox of page.querySelectorAll<HTMLInputElement>(
+      'input[aria-label^="Select photos:"]',
+    ))
+      checkbox.click();
+    await vi.waitFor(() => expect(page.textContent).toContain('50 of 51 ready'));
+    for (let index = 0; index < 4; index++) {
+      events.emit({ type: 'sync_changed' });
+      await page.updateComplete;
+      expect(page.textContent).toContain('50 of 51 ready');
+    }
+    releaseLast();
+    await vi.waitFor(() => expect(page.textContent).toContain('51 of 51 ready'));
+    changed = true;
+    events.emit({ type: 'conflicts_changed' });
+    await vi.waitFor(() => expect(page.textContent).toContain('0 of 51 ready'));
+    releaseRefresh();
+    await vi.waitFor(() => expect(page.textContent).toContain('51 of 51 ready'));
+    expect(page.querySelector('ism-recovery-versions')?.versions?.revision).toBe('d'.repeat(64));
+  });
 
   it('filters by status across pages, clears selections, and resets status for resolved mode', async () => {
     const get = vi.spyOn(api, 'get').mockImplementation(async (path, options) => {
@@ -526,7 +595,7 @@ describe('ism-conflicts-page', () => {
     expect(page.querySelector('ism-recovery-versions')).toBe(preview);
   });
 
-  it('bounds off-page refreshes and preserves the remaining selections', async () => {
+  it('refreshes every selected off-page target without requiring a return to its page', async () => {
     vi.spyOn(api, 'post').mockResolvedValue({ items: [] } as never);
     const get = vi.spyOn(api, 'get').mockImplementation(async (path, options) => {
       if (path.endsWith('/versions')) return versions as never;
@@ -562,10 +631,10 @@ describe('ism-conflicts-page', () => {
     );
     events.emit({ type: 'conflicts_changed' });
     await vi.waitFor(() =>
-      expect(get.mock.calls.filter(([path]) => path.endsWith('/versions'))).toHaveLength(152),
+      expect(get.mock.calls.filter(([path]) => path.endsWith('/versions'))).toHaveLength(202),
     );
-    await vi.waitFor(() => expect(page.textContent).toContain('50 of 100 ready'));
-    expect(page.textContent).toContain('Revisit other pages to refresh remaining selections');
+    await vi.waitFor(() => expect(page.textContent).toContain('100 of 100 ready'));
+    expect(page.textContent).not.toContain('Revisit other pages to refresh remaining selections');
     expect(page.textContent).toContain('100 total selected');
     [...page.querySelectorAll<HTMLButtonElement>('[aria-label="Batch conflict decisions"] button')]
       .find((button) => button.textContent?.trim() === 'Keep both')
@@ -573,9 +642,7 @@ describe('ism-conflicts-page', () => {
     await vi.waitFor(() =>
       expect(vi.mocked(confirmAction)).toHaveBeenLastCalledWith(
         expect.objectContaining({
-          message: expect.stringContaining(
-            '50 selected conflicts are not ready and will remain selected. Revisit their pages',
-          ),
+          message: expect.not.stringContaining('selected conflicts are not ready'),
         }),
       ),
     );

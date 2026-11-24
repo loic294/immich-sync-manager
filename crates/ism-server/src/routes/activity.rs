@@ -37,6 +37,7 @@ pub fn router() -> Router<AppState> {
         .route("/sync/thumbnail", get(sync_thumbnail))
         .route("/recovery/page", get(recovery_page))
         .route("/recovery/versions", get(recovery_versions))
+        .route("/recovery/versions/batch", post(recovery_versions_batch))
         .route("/recovery/preview", get(recovery_preview))
         .route("/recovery/decisions", post(recovery_decisions))
         .route("/recovery", post(recover))
@@ -276,6 +277,17 @@ async fn recovery_versions(
 ) -> AppResult<Json<ism_core::dto::RecoveryVersions>> {
     Ok(Json(
         crate::peers::versions::get_bounded(&state, &query.target()).await?,
+    ))
+}
+
+async fn recovery_versions_batch(
+    State(state): State<AppState>,
+    Admin(_): Admin,
+    Json(input): Json<ism_core::dto::RecoveryBatchInput>,
+) -> AppResult<Json<ism_core::dto::RecoveryVersionsBatch>> {
+    crate::peers::versions::validate_batch(&input)?;
+    Ok(Json(
+        crate::peers::versions::get_batch(&state, &input.targets).await?,
     ))
 }
 

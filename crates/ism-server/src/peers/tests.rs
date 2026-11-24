@@ -3128,6 +3128,224 @@ async fn authenticated_evidence_follows_bounded_ordered_move_lineage() {
 }
 
 #[tokio::test]
+async fn conflict_evidence_ready_notification_does_not_invalidate_bulk_reviews() {
+    let mut node = instance("Evidence").await;
+    stop_workers(&mut node).await;
+    let mut events = node.state.events.subscribe();
+    node.tasks
+        .push(tokio::spawn(super::versions::run(node.state.clone())));
+    node.state.version_event_wake.notify_one();
+    let event = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let event = events.recv().await.unwrap();
+            if matches!(
+                event,
+                crate::state::ServerEvent::SyncChanged
+                    | crate::state::ServerEvent::ConflictsChanged
+            ) {
+                break event;
+            }
+        }
+    })
+    .await
+    .expect("prepared evidence should notify the review queue");
+    assert!(
+        matches!(event, crate::state::ServerEvent::SyncChanged),
+        "readiness must retry unavailable comparisons, not invalidate completed or in-flight reviews"
+    );
+}
+
+#[tokio::test]
+async fn conflict_versions_batch_reads_snapshots_and_forwards_once_per_peer() {
+    use ism_core::dto::{RecoveryKind, RecoveryTarget, RecoveryVersionResult};
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    let share = super::shares(&b.state).await.unwrap().remove(0);
+    let source = super::net::peers(&b.state).await.unwrap().remove(0);
+    let side = serde_json::json!({
+        "instance": "Example", "sha256": null, "size": null, "modified_at": null, "deleted": false,
+    })
+    .to_string();
+    let mut targets = Vec::new();
+    for index in 0..50 {
+        let id = format!("batch-{index}");
+        sqlx::query(
+            "INSERT INTO conflicts(id,share_id,rel_path,kind,detail,local_json,remote_json,remote_vv_json,peer_id,status,created_at)
+             VALUES(?,? ,?,'changed_on_both','',?,?,'{}',?,'open',?)",
+        ).bind(&id).bind(&share.id).bind(format!("{id}.jpg")).bind(&side).bind(&side)
+            .bind(&source.id).bind(crate::db::now()).execute(&b.state.db).await.unwrap();
+        if index < 49 {
+            let versions = serde_json::json!({
+                "share": share.name, "revision": format!("revision-{index}"), "receiving": [],
+                "source": { "instance": "Example", "path": format!("{id}.jpg"), "state": "file", "files": [], "directories": [] },
+            });
+            sqlx::query(
+                "INSERT INTO recovery_version_snapshots(target_id,revision,share_id,peer_id,view_json,created_at) VALUES(?,?,?,?,?,?)",
+            ).bind(&id).bind(format!("revision-{index}")).bind(&share.id).bind(&source.id)
+                .bind(versions.to_string()).bind(crate::db::now()).execute(&b.state.db).await.unwrap();
+            sqlx::query("UPDATE conflict_evidence_jobs SET state='ready' WHERE target_id=?")
+                .bind(&id)
+                .execute(&b.state.db)
+                .await
+                .unwrap();
+        }
+        targets.push(RecoveryTarget {
+            kind: RecoveryKind::Conflict,
+            id,
+            peer_id: None,
+        });
+    }
+    let local = super::versions::get_local_batch(&b.state, &targets)
+        .await
+        .unwrap();
+    assert_eq!(local.items.len(), 50);
+    assert!(
+        local.items[..49]
+            .iter()
+            .all(|item| matches!(item, RecoveryVersionResult::Ready { .. }))
+    );
+    assert!(
+        matches!(&local.items[49], RecoveryVersionResult::Unavailable { code, .. } if code == "peer_busy")
+    );
+    let receiver = super::net::peers(&a.state).await.unwrap().remove(0);
+    super::recovery::refresh(&a.state, &receiver).await.unwrap();
+    let remote_targets: Vec<_> = targets
+        .iter()
+        .map(|target| RecoveryTarget {
+            peer_id: Some(receiver.id.clone()),
+            ..target.clone()
+        })
+        .collect();
+    let before = *b
+        .requests
+        .lock()
+        .unwrap()
+        .get("/api/peer/v1/recovery/versions/batch")
+        .unwrap_or(&0);
+    let remote = super::versions::get_batch(&a.state, &remote_targets)
+        .await
+        .unwrap();
+    assert_eq!(
+        b.requests
+            .lock()
+            .unwrap()
+            .get("/api/peer/v1/recovery/versions/batch"),
+        Some(&(before + 1))
+    );
+    assert_eq!(remote.items.len(), 50);
+    for (item, expected) in remote.items.iter().zip(&remote_targets) {
+        let target = match item {
+            RecoveryVersionResult::Ready { target, .. }
+            | RecoveryVersionResult::Unavailable { target, .. } => target,
+        };
+        assert_eq!(target, expected);
+    }
+    assert!(
+        remote.items[..49]
+            .iter()
+            .all(|item| matches!(item, RecoveryVersionResult::Ready { .. }))
+    );
+    assert!(
+        matches!(&remote.items[49], RecoveryVersionResult::Unavailable { code, .. } if code == "peer_busy")
+    );
+    let mut mixed = targets[..2].to_vec();
+    mixed.extend(remote_targets[..2].iter().cloned());
+    mixed.push(RecoveryTarget {
+        kind: RecoveryKind::Conflict,
+        id: "missing".into(),
+        peer_id: None,
+    });
+    let results = super::versions::get_batch(&a.state, &mixed).await.unwrap();
+    assert!(
+        matches!(results.items.last().unwrap(), RecoveryVersionResult::Unavailable { code, .. } if code == "not_found")
+    );
+    let remote_missing = RecoveryTarget {
+        kind: RecoveryKind::Conflict,
+        id: "missing".into(),
+        peer_id: Some(receiver.id.clone()),
+    };
+    let mut remote_mixed = remote_targets[..2].to_vec();
+    remote_mixed.push(remote_missing);
+    let results = super::versions::get_batch(&a.state, &remote_mixed)
+        .await
+        .unwrap();
+    assert!(
+        results.items[..2]
+            .iter()
+            .all(|item| matches!(item, RecoveryVersionResult::Ready { .. }))
+    );
+    assert!(
+        matches!(results.items.last().unwrap(), RecoveryVersionResult::Unavailable { code, .. } if code == "not_found")
+    );
+    let input = serde_json::json!({
+        "targets": [targets[0], {"kind":"conflict","id":"missing","peer_id":null}],
+        "all": false, "resolution": null,
+    });
+    let body = serde_json::to_vec(&input).unwrap();
+    let path = "/api/peer/v1/recovery/versions/batch";
+    let request = || {
+        super::net::request(
+            &a.state,
+            &receiver.url,
+            &receiver.secret,
+            reqwest::Method::POST,
+            path,
+            Some(body.clone()),
+        )
+    };
+    let response = request().send().await.unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let result: ism_core::dto::RecoveryVersionsBatch = response.json().await.unwrap();
+    assert!(matches!(
+        &result.items[0],
+        RecoveryVersionResult::Ready { .. }
+    ));
+    assert!(
+        matches!(&result.items[1], RecoveryVersionResult::Unavailable { code, .. } if code == "forbidden")
+    );
+    let tampered = request().body("{}").send().await.unwrap();
+    assert_eq!(tampered.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let loops = serde_json::to_vec(&serde_json::json!({
+        "targets": [remote_targets[0]], "all": false, "resolution": null,
+    }))
+    .unwrap();
+    let response = super::net::request(
+        &a.state,
+        &receiver.url,
+        &receiver.secret,
+        reqwest::Method::POST,
+        path,
+        Some(loops),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
+
+    let fake = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path(path))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "items": [{"state":"unavailable","target":{"kind":"conflict","id":"wrong-target","peer_id":null},
+                "code":"peer_busy","message":"Still preparing"}],
+        }))).mount(&fake).await;
+    sqlx::query("UPDATE peers SET url=? WHERE id=?")
+        .bind(fake.uri())
+        .bind(&receiver.id)
+        .execute(&a.state.db)
+        .await
+        .unwrap();
+    let result = super::versions::get_batch(&a.state, &remote_targets[..1])
+        .await
+        .unwrap();
+    assert!(
+        matches!(&result.items[0], RecoveryVersionResult::Unavailable { target, code, .. }
+        if target == &remote_targets[0] && code == "peer_evidence_unavailable")
+    );
+}
+
+#[tokio::test]
 async fn conflict_evidence_is_prepared_retried_and_survives_restart() {
     use ism_core::dto::{RecoveryKind, RecoveryTarget};
     use std::sync::atomic::Ordering;

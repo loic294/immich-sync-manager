@@ -9,11 +9,11 @@ export function targetKey(target: RecoveryTarget) {
   return JSON.stringify([target.kind, target.id, target.peer_id]);
 }
 
-const CONCURRENCY = 4;
+const CONCURRENCY = 2;
+const BATCH_SIZE = 50;
 
 /**
- * Per-target version comparisons. Each comparison loads, fails and retries on its own, so a
- * slow or failing target never blocks or discards the others.
+ * Bounded batch reads with per-target readiness, errors and revision invalidation.
  */
 export class VersionReview implements ReactiveController {
   readonly versions = new Map<string, RecoveryVersions>();
@@ -24,6 +24,7 @@ export class VersionReview implements ReactiveController {
   private readonly retryWhenSettled = new Set<string>();
   private readonly queue: { target: RecoveryTarget; resolve: () => void }[] = [];
   private active = 0;
+  private pumpScheduled = false;
 
   constructor(private readonly host: ReactiveControllerHost) {
     host.addController(this);
@@ -94,41 +95,68 @@ export class VersionReview implements ReactiveController {
       this.errors.delete(id);
       pending.push(new Promise((resolve) => this.queue.push({ target, resolve })));
     }
-    this.pump();
+    this.schedulePump();
     this.host.requestUpdate();
     await Promise.all(pending);
   }
 
+  private schedulePump() {
+    if (this.pumpScheduled) return;
+    this.pumpScheduled = true;
+    queueMicrotask(() => {
+      this.pumpScheduled = false;
+      this.pump();
+    });
+  }
+
   private pump() {
     while (this.active < CONCURRENCY && this.queue.length) {
-      const job = this.queue.shift();
-      if (!job) break;
+      const jobs = this.queue.splice(0, BATCH_SIZE);
       this.active++;
-      void this.fetch(job.target).finally(() => {
+      void this.fetch(jobs.map((job) => job.target)).finally(() => {
         this.active--;
-        job.resolve();
-        this.pump();
+        for (const job of jobs) job.resolve();
+        this.schedulePump();
       });
     }
   }
 
-  private async fetch(target: RecoveryTarget) {
-    const id = targetKey(target);
+  private async fetch(targets: RecoveryTarget[]) {
     try {
-      const current = await admin.recoveryVersions(target);
-      if (!this.invalidated.has(id)) {
-        this.versions.set(id, current);
-        this.stale.delete(id);
+      const current = await admin.recoveryVersionsBatch(targets);
+      const items = new Map(current.items.map((item) => [targetKey(item.target), item]));
+      if (
+        current.items.length !== targets.length ||
+        items.size !== targets.length ||
+        targets.some((target) => !items.has(targetKey(target)))
+      )
+        throw new Error('The evidence batch did not match the requested files. Try again.');
+      for (const target of targets) {
+        const id = targetKey(target);
+        const item = items.get(id);
+        if (!item || this.invalidated.has(id)) continue;
+        if (item.state === 'ready') {
+          this.versions.set(id, item.versions);
+          this.stale.delete(id);
+        } else {
+          this.errors.set(id, item.message);
+        }
       }
     } catch (error) {
-      if (!this.invalidated.has(id))
-        this.errors.set(id, error instanceof Error ? error.message : String(error));
-    } finally {
-      this.loading.delete(id);
-      this.invalidated.delete(id);
-      if (this.retryWhenSettled.delete(id) && !this.has(target)) {
-        void this.compare([target]);
+      for (const target of targets) {
+        const id = targetKey(target);
+        if (!this.invalidated.has(id))
+          this.errors.set(id, error instanceof Error ? error.message : String(error));
       }
+    } finally {
+      const retry: RecoveryTarget[] = [];
+      for (const target of targets) {
+        const id = targetKey(target);
+        this.loading.delete(id);
+        this.invalidated.delete(id);
+        if (this.retryWhenSettled.delete(id) && !this.has(target)) retry.push(target);
+      }
+      if (retry.length) void this.compare(retry);
       this.host.requestUpdate();
     }
   }

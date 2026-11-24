@@ -272,6 +272,15 @@ Both conflict API endpoints retain `include_resolved=true` as open plus resolved
 The paginated endpoint also accepts `resolved_only=true`, used by **Show resolved**; it takes
 precedence when both flags are set.
 
+Version evidence is fetched in batches of at most 50 explicit targets, with at most two
+browser requests in flight. Local snapshots are read together; peer-owned targets are
+grouped into one signed batch per receiver. Both instances must support
+`POST /recovery/versions/batch` under their admin/peer API prefixes. Each result preserves
+the complete target and its own ready evidence or error; an unavailable file does not
+discard other results. Evidence-ready notifications retry unavailable comparisons without
+invalidating ready or in-flight reviews. Actual conflict changes still invalidate revisions.
+Selected targets on other pages continue preparing through the same bounded queue.
+
 The **Conflicts** page lists each conflict with both versions (size, checksum, time) and, for moves,
 the path the peer moved from. ISM records a conflict when:
 - `changed_on_both`: both sides changed the file since they last agreed;

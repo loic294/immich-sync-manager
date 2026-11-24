@@ -37,7 +37,6 @@ const RESOLUTIONS: readonly { value: ConflictResolution; hint: string }[] = [
     hint: 'Preserve both versions and synchronize the decision.',
   },
 ];
-const MAX_OFF_PAGE_REVIEWS = 50;
 const STATUS_FILTERS = [
   ['needs_decision', 'Needs review'],
   ['waiting', 'Waiting'],
@@ -268,9 +267,9 @@ export class IsmConflictsPage extends IsmPage {
 
   private preparationTargets(visible: readonly ConflictPageRow[]) {
     const current = new Map(visible.filter(canChoose).map((conflict) => [key(conflict), conflict]));
-    const other = [...this.selected.values()]
-      .filter((conflict) => canChoose(conflict) && !current.has(key(conflict)))
-      .slice(0, MAX_OFF_PAGE_REVIEWS);
+    const other = [...this.selected.values()].filter(
+      (conflict) => canChoose(conflict) && !current.has(key(conflict)),
+    );
     return [...current.values(), ...other].map(target);
   }
 
@@ -450,7 +449,6 @@ export class IsmConflictsPage extends IsmPage {
       ${
         chosen.length
           ? html`<span class="text-sm text-base-content/70">${reviewed} of ${chosen.length} ready</span>
-        ${chosen.length > MAX_OFF_PAGE_REVIEWS && reviewed < chosen.length ? html`<span class="text-sm text-base-content/70">Revisit other pages to refresh remaining selections.</span>` : nothing}
         ${RESOLUTIONS.map(
           (
             r,

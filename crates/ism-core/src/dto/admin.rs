@@ -758,6 +758,27 @@ pub struct RecoveryVersions {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(tag = "state", rename_all = "snake_case")]
+#[ts(export)]
+pub enum RecoveryVersionResult {
+    Ready {
+        target: RecoveryTarget,
+        versions: Box<RecoveryVersions>,
+    },
+    Unavailable {
+        target: RecoveryTarget,
+        code: String,
+        message: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct RecoveryVersionsBatch {
+    pub items: Vec<RecoveryVersionResult>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct RecoveryDecision {
     pub target: RecoveryTarget,

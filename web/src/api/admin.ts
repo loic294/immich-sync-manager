@@ -32,6 +32,7 @@ import type { RecoveryDecisionInput } from '@/api/generated/RecoveryDecisionInpu
 import type { RecoveryPage } from '@/api/generated/RecoveryPage';
 import type { RecoveryTarget } from '@/api/generated/RecoveryTarget';
 import type { RecoveryVersions } from '@/api/generated/RecoveryVersions';
+import type { RecoveryVersionsBatch } from '@/api/generated/RecoveryVersionsBatch';
 import type { ScheduleView } from '@/api/generated/ScheduleView';
 import type { SettingsInput } from '@/api/generated/SettingsInput';
 import type { SettingsView } from '@/api/generated/SettingsView';
@@ -117,6 +118,10 @@ export const admin = {
         id: target.id,
         ...(target.peer_id ? { peer_id: target.peer_id } : {}),
       },
+    }),
+  recoveryVersionsBatch: (targets: readonly RecoveryTarget[]) =>
+    api.post<RecoveryVersionsBatch>(`${A}/recovery/versions/batch`, {
+      body: { targets, all: false, resolution: null },
     }),
   recoveryPreview: (target: RecoveryTarget, revision: string, path: string, source: boolean) =>
     `${A}/recovery/preview?${new URLSearchParams({

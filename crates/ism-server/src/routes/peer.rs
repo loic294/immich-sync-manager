@@ -36,6 +36,7 @@ pub fn router() -> Router<AppState> {
         .route("/recovery", get(recovery_page).post(recovery))
         .route("/recovery/file", get(recovery_file))
         .route("/recovery/versions", get(recovery_versions))
+        .route("/recovery/versions/batch", post(recovery_versions_batch))
         .route("/recovery/preview", get(recovery_preview))
         .route("/recovery/decisions", post(recovery_decisions))
 }
@@ -64,6 +65,36 @@ async fn recovery_versions(
     )
     .await?;
     Ok(Json(peers::versions::get_bounded(&state, &target).await?))
+}
+
+async fn recovery_versions_batch(
+    State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> AppResult<Json<ism_core::dto::RecoveryVersionsBatch>> {
+    let sender = headers
+        .get(PEER_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| AppError::unauthorized("missing peer id"))?;
+    let peer = net::peers(&state)
+        .await?
+        .into_iter()
+        .find(|peer| peer.instance_id.as_deref() == Some(sender))
+        .ok_or_else(|| AppError::unauthorized("unknown peer"))?;
+    verify_peer_signature(
+        &peer.secret,
+        "POST",
+        uri.path_and_query().map_or(uri.path(), |pq| pq.as_str()),
+        &headers,
+        &body,
+    )?;
+    let input: ism_core::dto::RecoveryBatchInput = serde_json::from_slice(&body)
+        .map_err(|error| AppError::bad_request("invalid_version_batch", error.to_string()))?;
+    peers::versions::validate_batch(&input)?;
+    Ok(Json(
+        peers::versions::get_peer_batch(&state, &peer, &input.targets).await?,
+    ))
 }
 
 async fn recovery_preview(
