@@ -1183,11 +1183,34 @@ async fn reviewed_batch_admission_queues_without_contacting_the_peer() {
 #[tokio::test]
 async fn recovery_previews_are_owner_scoped_current_and_independent_of_immich_indexing() {
     use ism_core::dto::{RecoveryKind, RecoveryTarget};
+
+    fn jpeg(width: u32, height: u32, noisy: bool) -> Vec<u8> {
+        let mut seed = 0x1234_5678_u32;
+        let image = image::RgbImage::from_fn(width, height, |_, _| {
+            if noisy {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                image::Rgb([seed as u8, (seed >> 8) as u8, (seed >> 16) as u8])
+            } else {
+                image::Rgb([200, 30, 20])
+            }
+        });
+        let mut bytes = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut bytes, 95)
+            .encode_image(&image)
+            .unwrap();
+        bytes
+    }
+
     let (mut a, mut b) = pair().await;
     stop_workers(&mut a).await;
     stop_workers(&mut b).await;
-    write_old(&a.shared.join("preview.jpg"), b"source preview");
-    write_old(&b.shared.join("preview.jpg"), b"receiving preview");
+    let source = jpeg(3000, 2200, true);
+    assert!(source.len() > 4 * 1024 * 1024);
+    let receiving = jpeg(24, 16, false);
+    write_old(&a.shared.join("preview.jpg"), &source);
+    write_old(&b.shared.join("preview.jpg"), &receiving);
     scan(&a).await;
     scan(&b).await;
     let source_peer = super::net::peers(&b.state).await.unwrap().remove(0);
@@ -1204,10 +1227,8 @@ async fn recovery_previews_are_owner_scoped_current_and_independent_of_immich_in
     let reviewed = super::versions::get(&b.state, &target).await.unwrap();
     assert!(reviewed.source.files[0].modified_at.is_some());
     let receiver = super::net::peers(&a.state).await.unwrap().remove(0);
-    for (source, expected) in [
-        (false, b"receiving preview".as_slice()),
-        (true, b"source preview".as_slice()),
-    ] {
+    let mut receiving_preview = Vec::new();
+    for source in [false, true] {
         let query = reqwest::Url::parse_with_params(
             "http://ism.example",
             [
@@ -1235,7 +1256,24 @@ async fn recovery_previews_are_owner_scoped_current_and_independent_of_immich_in
             response.headers().get("cache-control").unwrap(),
             "private, no-store"
         );
-        assert_eq!(response.bytes().await.unwrap().as_ref(), expected);
+        assert_eq!(
+            response.headers().get("x-content-type-options").unwrap(),
+            "nosniff"
+        );
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            "image/jpeg"
+        );
+        let bytes = response.bytes().await.unwrap();
+        assert!(bytes.len() <= 4 * 1024 * 1024);
+        let image = image::load_from_memory(&bytes).unwrap();
+        if source {
+            assert_eq!(image.width(), 1024);
+            assert!(image.height() <= 1024);
+        } else {
+            assert_eq!((image.width(), image.height()), (24, 16));
+            receiving_preview = bytes.to_vec();
+        }
     }
     super::recovery::refresh(&a.state, &receiver).await.unwrap();
     let mut query = super::versions::PreviewQuery {
@@ -1250,12 +1288,27 @@ async fn recovery_previews_are_owner_scoped_current_and_independent_of_immich_in
     };
     let response = super::versions::preview(&a.state, &query).await.unwrap();
     assert_eq!(
-        axum::body::to_bytes(response.into_body(), 1024)
+        axum::body::to_bytes(response.into_body(), 4 * 1024 * 1024)
             .await
             .unwrap()
             .as_ref(),
-        b"receiving preview"
+        receiving_preview.as_slice()
     );
+    query.source = true;
+    let response = super::versions::preview(&a.state, &query).await.unwrap();
+    assert_eq!(
+        response.headers().get("cache-control").unwrap(),
+        "private, no-store"
+    );
+    assert_eq!(
+        response.headers().get("x-content-type-options").unwrap(),
+        "nosniff"
+    );
+    let bytes = axum::body::to_bytes(response.into_body(), 4 * 1024 * 1024)
+        .await
+        .unwrap();
+    assert_eq!(image::load_from_memory(&bytes).unwrap().width(), 1024);
+    query.source = false;
     query.target.peer_id = None;
     query.path = "../outside.jpg".into();
     assert_eq!(

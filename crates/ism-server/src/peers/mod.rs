@@ -11,6 +11,7 @@ pub mod admin;
 pub mod inbox;
 pub mod net;
 pub(crate) mod notifications;
+mod preview_image;
 pub mod recovery;
 pub mod retained;
 pub mod transfer;

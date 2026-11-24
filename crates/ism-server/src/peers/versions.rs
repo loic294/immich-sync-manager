@@ -7,7 +7,7 @@ use ism_core::dto::{
 };
 use serde::Deserialize;
 
-use super::{Share, admin, net};
+use super::{Share, admin, net, preview_image};
 use crate::error::{AppError, AppResult};
 use crate::files;
 use crate::state::AppState;
@@ -440,7 +440,7 @@ pub async fn preview(state: &AppState, query: &PreviewQuery) -> AppResult<Respon
             ),
             None,
         )
-        .timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(45))
         .send()
         .await
         .map_err(|error| AppError::conflict("preview_unavailable", net::net_error(&error)))?;
@@ -468,7 +468,7 @@ pub async fn preview(state: &AppState, query: &PreviewQuery) -> AppResult<Respon
             .find(|file| file.path == query.path)
     }
     .ok_or_else(|| AppError::not_found("file is outside this version decision"))?;
-    let mime = match query
+    let avif = match query
         .path
         .rsplit('.')
         .next()
@@ -476,10 +476,8 @@ pub async fn preview(state: &AppState, query: &PreviewQuery) -> AppResult<Respon
         .to_ascii_lowercase()
         .as_str()
     {
-        "jpg" | "jpeg" => "image/jpeg",
-        "png" => "image/png",
-        "webp" => "image/webp",
-        "avif" => "image/avif",
+        "jpg" | "jpeg" | "png" | "webp" => false,
+        "avif" => true,
         _ => return Err(AppError::not_found("this file has no image preview")),
     };
     let share = super::shares(state)
@@ -489,6 +487,25 @@ pub async fn preview(state: &AppState, query: &PreviewQuery) -> AppResult<Respon
         .ok_or_else(|| {
             AppError::conflict("peer_share_changed", "the preview share is unavailable")
         })?;
+    let max_input = if avif {
+        preview_image::MAX_AVIF_INPUT
+    } else {
+        preview_image::MAX_INPUT
+    };
+    let size_error = || {
+        AppError::conflict(
+            "preview_unavailable",
+            if avif {
+                "AVIF previews larger than 4 MiB are not supported."
+            } else {
+                "Image exceeds the 64 MiB preview input limit."
+            },
+        )
+    };
+    if selected.size.is_some_and(|size| size > max_input as u64) {
+        return Err(size_error());
+    }
+    let permit = preview_image::acquire()?;
     let bytes = if query.source {
         let peer = net::peer(state, &peer_id).await?;
         let url = reqwest::Url::parse_with_params(
@@ -508,7 +525,7 @@ pub async fn preview(state: &AppState, query: &PreviewQuery) -> AppResult<Respon
             &format!("/api/peer/v1/content?{}", url.query().unwrap_or_default()),
             None,
         )
-        .timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
         .send()
         .await
         .map_err(|error| AppError::conflict("preview_unavailable", net::net_error(&error)))?;
@@ -520,11 +537,8 @@ pub async fn preview(state: &AppState, query: &PreviewQuery) -> AppResult<Respon
         }
         let mut bytes = Vec::new();
         while let Some(chunk) = response.chunk().await.map_err(AppError::internal)? {
-            if bytes.len() + chunk.len() > 4 * 1024 * 1024 {
-                return Err(AppError::conflict(
-                    "preview_unavailable",
-                    "image exceeds the bounded preview size",
-                ));
+            if chunk.len() > max_input - bytes.len() {
+                return Err(size_error());
             }
             bytes.extend_from_slice(&chunk);
         }
@@ -536,23 +550,15 @@ pub async fn preview(state: &AppState, query: &PreviewQuery) -> AppResult<Respon
         let file = tokio::fs::File::open(&path).await?;
         use tokio::io::AsyncReadExt;
         let mut bytes = Vec::new();
-        file.take(4 * 1024 * 1024 + 1)
+        file.take(max_input as u64 + 1)
             .read_to_end(&mut bytes)
             .await?;
-        if bytes.len() > 4 * 1024 * 1024 {
-            return Err(AppError::conflict(
-                "preview_unavailable",
-                "image exceeds the bounded preview size",
-            ));
+        if bytes.len() > max_input {
+            return Err(size_error());
         }
         bytes
     };
-    if crate::crypto::sha256_hex(&bytes) != selected.sha256 {
-        return Err(AppError::conflict(
-            "preview_changed",
-            "refresh current versions",
-        ));
-    }
+    let (mime, bytes) = preview_image::render(bytes, selected.sha256.clone(), permit, avif).await?;
     Ok((
         [
             (header::CONTENT_TYPE, mime),
