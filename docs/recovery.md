@@ -30,6 +30,9 @@ decision. Folder comparisons include empty
 directories; changed content or directory structure requires a refreshed decision. Preview
 availability does not determine whether repair can proceed.
 
+If a folder restoration reopens with new evidence, it needs a new reviewed decision.
+Completion or cleanup from an older generation cannot settle the reopened decision.
+
 ISM prepares version evidence automatically when it detects a conflict and stores it across
 restarts. Preparation uses bounded workers and retries when a peer or filesystem is unavailable;
 reconnecting a peer wakes its pending work. Supported JPEG, PNG, WebP and AVIF files up to 4 MiB
