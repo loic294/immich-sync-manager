@@ -10,7 +10,7 @@ pub mod activity;
 pub mod admin;
 pub mod inbox;
 pub mod net;
-mod notifications;
+pub(crate) mod notifications;
 pub mod recovery;
 pub mod retained;
 pub mod transfer;

@@ -31,6 +31,7 @@ pub async fn run(state: AppState) {
             } => {
                 match net::peers(&state).await {
                     Ok(peers) => {
+                        state.peer_streams.retain(&peers);
                         running.retain(|id, (old, handle)| {
                             let keep = !reconfigured && peers.iter().any(|peer| peer.id == *id
                                 && peer.url == old.url && peer.secret == old.secret
@@ -77,42 +78,18 @@ pub async fn run(state: AppState) {
 
 pub(super) async fn refresh_peer(state: &AppState, peer: &net::Peer) -> bool {
     let mut success = true;
-    if let Err(error) = crate::activity::observe(
-        state,
-        format!("recovery-refresh:{}", peer.id),
-        "Peer recovery refresh",
-        &peer.name,
-        Some("/sync"),
-        |task| async move {
-            task.phase("Fetching current recovery evidence from peer");
-            super::recovery::refresh(state, peer).await
-        },
-    )
-    .await
-    {
+    if let Err(error) = super::recovery::refresh(state, peer).await {
         success = false;
         tracing::warn!(peer=%peer.id,"cannot refresh recovery: {}",error.message());
         if let Err(error) = super::recovery::unavailable(state, &peer.id, &error).await {
             tracing::error!("cannot persist recovery availability: {}", error.message());
         }
     }
-    if let Err(error) = crate::activity::observe(
-        state,
-        format!("activity-refresh:{}", peer.id),
-        "Peer transfer activity refresh",
-        &peer.name,
-        Some("/sync"),
-        |task| async move {
-            task.phase("Fetching receiver-owned transfer progress");
-            refresh(state, peer)
-                .await
-                .map_err(|e| AppError::conflict("activity_refresh", crate::error::redact(&e)))
-        },
-    )
-    .await
-    {
+    if let Err(error) = refresh(state, peer).await {
         success = false;
-        unavailable(state, &peer.id, error.message()).await;
+        let error = crate::error::redact(&error);
+        tracing::warn!(peer=%peer.id, "cannot refresh activity: {error}");
+        unavailable(state, &peer.id, &error).await;
     }
     success
 }
@@ -342,19 +319,22 @@ pub async fn page(
     )
     .await?;
     let mut progress = progress(&mut tx, None).await?;
-    type CachedProgress = (String, Option<String>, Option<String>, Option<String>);
+    type CachedProgress = (
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
     let cached: Vec<CachedProgress> = sqlx::query_as(
-        "SELECT p.name,c.progress_json,c.error,c.updated_at FROM peers p
+        "SELECT p.id,p.name,c.progress_json,c.error,c.updated_at FROM peers p
          LEFT JOIN peer_sync_state c ON c.peer_id = p.id ORDER BY p.name",
     )
     .fetch_all(&mut *tx)
     .await?;
     let mut warnings = Vec::new();
-    for (peer, json, error, updated) in cached {
-        let fresh = updated
-            .as_deref()
-            .and_then(db::parse_ts)
-            .is_some_and(|at| chrono::Utc::now() - at <= chrono::Duration::seconds(30));
+    for (id, peer, json, error, updated) in cached {
+        let fresh = super::notifications::snapshot_fresh(state, &id, updated.as_deref());
         let error =
             error.or_else(|| (!fresh).then(|| "No recent status from the receiver.".into()));
         if let Some(json) = json {

@@ -233,13 +233,16 @@ fn mirrored_view(
     json: &str,
     error: Option<String>,
     updated: Option<String>,
+    stream_fresh: Option<bool>,
 ) -> AppResult<RecoveryView> {
     let mut item: RecoveryView = serde_json::from_str(json)?;
     item.target.peer_id = Some(peer);
-    let fresh = updated
-        .as_deref()
-        .and_then(db::parse_ts)
-        .is_some_and(|at| chrono::Utc::now() - at <= chrono::Duration::seconds(30));
+    let fresh = stream_fresh.unwrap_or_else(|| {
+        updated
+            .as_deref()
+            .and_then(db::parse_ts)
+            .is_some_and(|at| chrono::Utc::now() - at <= chrono::Duration::seconds(30))
+    });
     if let Some(error) =
         error.or_else(|| (!fresh).then(|| "No recent recovery state from the receiver.".into()))
     {
@@ -258,13 +261,14 @@ fn outgoing_view(
     error: Option<String>,
     updated: Option<String>,
     pending: bool,
+    stream_fresh: Option<bool>,
 ) -> AppResult<RecoveryView> {
     if pending {
         let mut item: RecoveryView = serde_json::from_str(json)?;
         item.target.peer_id = Some(peer);
         Ok(item)
     } else {
-        mirrored_view(peer, json, error, updated)
+        mirrored_view(peer, json, error, updated, stream_fresh)
     }
 }
 
@@ -290,7 +294,14 @@ pub(super) async fn outgoing(
     .fetch_optional(&state.db)
     .await?;
     row.map(|(json, error, updated, pending)| {
-        outgoing_view(peer.into(), &json, error, updated, pending)
+        outgoing_view(
+            peer.into(),
+            &json,
+            error,
+            updated,
+            pending,
+            state.peer_streams.fresh(peer),
+        )
     })
     .transpose()
 }
@@ -416,7 +427,8 @@ pub async fn page(state: &AppState, limit: i64, offset: i64) -> AppResult<Recove
         .map_err(AppError::internal)?
         .saturating_sub(items.len());
     for (peer, json, error, updated, pending) in outgoing.into_iter().skip(skip).take(remaining) {
-        items.push(outgoing_view(peer, &json, error, updated, pending)?);
+        let fresh = state.peer_streams.fresh(&peer);
+        items.push(outgoing_view(peer, &json, error, updated, pending, fresh)?);
     }
     Ok(RecoveryPage { total, rows: items })
 }
@@ -2538,7 +2550,7 @@ mod policy_tests {
             peer_instance: Some("Alpha".into()),
         };
         let json = serde_json::to_string(&item).unwrap();
-        let current = mirrored_view("peer".into(), &json, None, Some(db::now())).unwrap();
+        let current = mirrored_view("peer".into(), &json, None, Some(db::now()), None).unwrap();
         assert_eq!(current.state, RecoveryState::NeedsDecision);
         assert_eq!(current.target.peer_id.as_deref(), Some("peer"));
         let stale = mirrored_view(
@@ -2546,6 +2558,7 @@ mod policy_tests {
             &json,
             None,
             Some((chrono::Utc::now() - chrono::Duration::minutes(1)).to_rfc3339()),
+            None,
         )
         .unwrap();
         assert_eq!(stale.state, RecoveryState::Waiting);
@@ -2556,6 +2569,7 @@ mod policy_tests {
             &json,
             Some("Receiver unreachable".into()),
             Some(db::now()),
+            None,
         )
         .unwrap();
         assert_eq!(offline.state, RecoveryState::Waiting);
