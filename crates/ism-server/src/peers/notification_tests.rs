@@ -1011,7 +1011,7 @@ async fn sustained_progress_hints_faster_than_activity_fetches_keep_sync_fresh()
     let (transfer, remote_peer) = running_transfer(&b, 100_000_000).await;
     // Hints coalesce every 250ms on the receiver; each activity response takes longer.
     b.activity_delay.store(700, Ordering::SeqCst);
-    let stop = std::sync::std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let progress = tokio::spawn({
         let state = b.state.clone();
         let stop = stop.clone();
