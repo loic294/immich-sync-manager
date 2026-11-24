@@ -365,6 +365,21 @@ async fn read_page(
         ));
     }
     let manifest = recall(pool, owner, location, id, revision).await?;
+    if let Some(after) = after {
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM folder_review_entries WHERE manifest_id=? AND name=?)",
+        )
+        .bind(id)
+        .bind(after)
+        .fetch_one(pool)
+        .await?;
+        if !exists {
+            return Err(AppError::bad_request(
+                "bad_review_cursor",
+                "the cursor must identify an entry in this folder review",
+            ));
+        }
+    }
     let mut entries = rows(pool, id, after, limit + 1).await?;
     let next_after = if entries.len() > limit {
         entries.truncate(limit);

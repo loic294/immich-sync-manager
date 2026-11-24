@@ -268,6 +268,18 @@ async fn wrong_owner_location_revision_and_incomplete_reviews_fail_closed() {
             .is_err()
         );
     }
+    let bad_cursor = read_page(
+        &pool,
+        OWNER,
+        &location,
+        &manifest.id,
+        &manifest.revision,
+        Some("not-in-this-review"),
+        500,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(bad_cursor.code(), "bad_review_cursor");
     sqlx::query(
         "INSERT INTO folder_review_manifests(id,owner,root_id,path,state,expires_at)
          VALUES ('unfinished',?,'photos','photos','building','2099-01-01')",

@@ -53,7 +53,8 @@ and a second full-tree comparison must succeed before a manifest is published.
 
 Ready manifests are immutable. Pages contain at most 500 entries, ordered by binary relative
 path, with a keyset cursor and one content-bound revision for the entire tree. This is a page
-size, not a total-entry cap. The lookup also binds the authenticated local owner, root and
+size, not a total-entry cap. A continuation cursor must name an entry in that same manifest;
+an invalid cursor is an error, not an empty final page. The lookup also binds the authenticated local owner, root and
 folder path. A peer cannot obtain or authorize receiver-owned data through this layer.
 Ready evidence survives restart. Interrupted staging remains unreadable and is rebuilt under
 a new ID; cleanup removes only expired manifests, so opening another connection cannot delete
