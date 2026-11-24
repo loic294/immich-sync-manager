@@ -14,15 +14,29 @@ const MAX_DECODED_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_OUTPUT: usize = 4 * 1024 * 1024;
 const EDGE: u32 = 1024;
 static PREVIEWS: Semaphore = Semaphore::const_new(2);
+static WAITING: Semaphore = Semaphore::const_new(32);
 
-pub(super) fn acquire() -> AppResult<SemaphorePermit<'static>> {
-    PREVIEWS.try_acquire().map_err(|_| {
+pub(super) async fn acquire() -> AppResult<SemaphorePermit<'static>> {
+    acquire_from(&PREVIEWS, &WAITING, std::time::Duration::from_secs(30)).await
+}
+
+async fn acquire_from<'a>(
+    previews: &'a Semaphore,
+    waiting: &Semaphore,
+    timeout: std::time::Duration,
+) -> AppResult<SemaphorePermit<'a>> {
+    let busy = || {
         AppError::new(
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
             "preview_busy",
             "Too many previews are being prepared. Try again shortly.",
         )
-    })
+    };
+    let _waiting = waiting.try_acquire().map_err(|_| busy())?;
+    tokio::time::timeout(timeout, previews.acquire())
+        .await
+        .map_err(|_| busy())?
+        .map_err(|_| busy())
 }
 
 pub(super) async fn render(
@@ -119,6 +133,49 @@ fn decode(bytes: &[u8]) -> AppResult<(&'static str, Vec<u8>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn concurrent_previews_wait_without_an_unbounded_queue() {
+        let previews = Semaphore::new(1);
+        let waiting = Semaphore::new(1);
+        let held = previews.try_acquire().unwrap();
+        let work = acquire_from(&previews, &waiting, std::time::Duration::from_secs(1));
+        tokio::pin!(work);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut work)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            acquire_from(&previews, &waiting, std::time::Duration::from_secs(1))
+                .await
+                .unwrap_err()
+                .code(),
+            "preview_busy"
+        );
+        drop(held);
+        assert!(work.await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_queued_preview_releases_its_place() {
+        let previews = Semaphore::new(1);
+        let waiting = Semaphore::new(1);
+        let _held = previews.try_acquire().unwrap();
+        let mut work = Box::pin(acquire_from(
+            &previews,
+            &waiting,
+            std::time::Duration::from_secs(1),
+        ));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut work)
+                .await
+                .is_err()
+        );
+        assert_eq!(waiting.available_permits(), 0);
+        drop(work);
+        assert_eq!(waiting.available_permits(), 1);
+    }
 
     #[tokio::test]
     async fn refuses_changed_or_corrupt_content() {

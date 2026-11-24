@@ -505,7 +505,7 @@ pub async fn preview(state: &AppState, query: &PreviewQuery) -> AppResult<Respon
     if selected.size.is_some_and(|size| size > max_input as u64) {
         return Err(size_error());
     }
-    let permit = preview_image::acquire()?;
+    let permit = preview_image::acquire().await?;
     let bytes = if query.source {
         let peer = net::peer(state, &peer_id).await?;
         let url = reqwest::Url::parse_with_params(
