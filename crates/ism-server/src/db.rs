@@ -103,7 +103,10 @@ impl WriterClock {
     }
 
     fn report(&mut self, success: bool) {
-        let end = Instant::now();
+        self.report_at(Instant::now(), success);
+    }
+
+    fn report_at(&mut self, end: Instant, success: bool) {
         self.finished = Some(end);
         let [pool, begin, body, commit] = self.times(end);
         let (pool_wait_ms, begin_wait_ms, body_ms, commit_ms) = (
@@ -253,15 +256,66 @@ mod tests {
     }
 
     fn writer_logs() -> (Arc<Mutex<Vec<u8>>>, tracing::Dispatch) {
+        writer_logs_at(tracing::Level::WARN)
+    }
+
+    fn writer_logs_at(level: tracing::Level) -> (Arc<Mutex<Vec<u8>>>, tracing::Dispatch) {
         let logs = Arc::new(Mutex::new(Vec::new()));
         let writer = logs.clone();
         let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::WARN)
+            .with_max_level(level)
             .with_ansi(false)
             .without_time()
             .with_writer(move || LogWriter(writer.clone()))
             .finish();
         (logs, tracing::Dispatch::new(subscriber))
+    }
+
+    fn classify(pool_ms: u64, begin_ms: u64, body_ms: u64, commit_ms: u64) -> String {
+        let ms = Duration::from_millis;
+        let mut clock = WriterClock::start("test_threshold", 2);
+        let started = clock.started;
+        clock.pooled = Some(started + ms(pool_ms));
+        clock.locked = Some(started + ms(pool_ms + begin_ms));
+        clock.committing = Some(started + ms(pool_ms + begin_ms + body_ms));
+        let end = started + ms(pool_ms + begin_ms + body_ms + commit_ms);
+        let (logs, subscriber) = writer_logs_at(tracing::Level::DEBUG);
+        tracing::dispatcher::with_default(&subscriber, || clock.report_at(end, true));
+        drop(clock);
+        String::from_utf8(logs.lock().unwrap().clone()).unwrap()
+    }
+
+    #[test]
+    fn writer_clock_classifies_cumulative_hold_and_wait_thresholds() {
+        let slow = classify(0, 0, 125, 125);
+        assert!(
+            slow.contains("WARN") && slow.contains("slow SQLite write"),
+            "{slow}"
+        );
+        assert!(
+            slow.contains("body_ms=125") && slow.contains("commit_ms=125"),
+            "{slow}"
+        );
+
+        let fast = classify(0, 0, 124, 125);
+        assert!(!fast.contains("WARN"), "{fast}");
+        assert!(
+            fast.contains("DEBUG") && fast.contains("SQLite write"),
+            "{fast}"
+        );
+
+        let waited = classify(600, 400, 0, 0);
+        assert!(
+            waited.contains("WARN") && waited.contains("slow SQLite write"),
+            "{waited}"
+        );
+        assert!(waited.contains("pool_wait_ms=600") && waited.contains("begin_wait_ms=400"));
+
+        let short_wait = classify(599, 400, 0, 0);
+        assert!(!short_wait.contains("WARN"), "{short_wait}");
+        for logs in [slow, fast, waited, short_wait] {
+            assert_eq!(logs.lines().count(), 1, "{logs}");
+        }
     }
 
     #[tokio::test]
