@@ -458,6 +458,108 @@ async fn recovery_missing_folder_reopens_choice_if_restored_tree_changes() {
 }
 
 #[tokio::test]
+async fn interrupted_initial_restoration_conflict_is_reassociated_before_resume() {
+    let (mut a, b, operation) = missing_folder().await;
+    admin::restore_missing_folder(&a.state, &operation)
+        .await
+        .unwrap();
+    a.tasks
+        .push(tokio::spawn(super::super::transfer::run(a.state.clone())));
+    for _ in 0..200 {
+        let received: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM uploads WHERE status='receiving')")
+                .fetch_one(&a.state.db)
+                .await
+                .unwrap();
+        if received {
+            break;
+        }
+        a.state.sync_wake.notify_waiters();
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    stop_workers(&mut a).await;
+    write_old(
+        &b.shared.join("new/nested/photo.jpg"),
+        b"changed peer bytes",
+    );
+    scan(&b).await;
+    sqlx::query(
+        "CREATE TRIGGER test_fail_restoration_link BEFORE UPDATE OF conflict_id ON pending_peer_ops
+         WHEN NEW.kind='folder_restore' AND NEW.conflict_id IS NOT NULL
+         BEGIN SELECT RAISE(ABORT,'synthetic link failure'); END",
+    )
+    .execute(&a.state.db)
+    .await
+    .unwrap();
+    assert!(
+        admin::validate_folder_restore(&a.state, &operation)
+            .await
+            .is_err()
+    );
+    let orphans: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM conflicts WHERE kind='folder_restore' AND status='open'",
+    )
+    .fetch_one(&a.state.db)
+    .await
+    .unwrap();
+    assert_eq!(
+        orphans, 0,
+        "failed linking must roll back conflict creation"
+    );
+    sqlx::query("DROP TRIGGER test_fail_restoration_link")
+        .execute(&a.state.db)
+        .await
+        .unwrap();
+    assert_eq!(
+        admin::validate_folder_restore(&a.state, &operation)
+            .await
+            .unwrap_err()
+            .code(),
+        "choose_version"
+    );
+    let conflict: String = sqlx::query_scalar(
+        "SELECT id FROM conflicts WHERE kind='folder_restore' AND status='open'",
+    )
+    .fetch_one(&a.state.db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE pending_peer_ops SET conflict_id=NULL,vv_json=json_remove(vv_json,'$.conflict_id')
+         WHERE kind='folder_restore' AND conflict_id=?",
+    )
+    .bind(&conflict)
+    .execute(&a.state.db)
+    .await
+    .unwrap();
+    write_old(&b.shared.join("new/nested/photo.jpg"), b"remote source");
+    scan(&b).await;
+    reboot(&mut a).await;
+    assert_eq!(
+        admin::validate_folder_restore(&a.state, &operation)
+            .await
+            .unwrap_err()
+            .code(),
+        "choose_version"
+    );
+    let linked: Option<String> = sqlx::query_scalar(
+        "SELECT conflict_id FROM pending_peer_ops WHERE kind='folder_restore' AND operation_id=?",
+    )
+    .bind(format!("folder-restore:{operation}"))
+    .fetch_one(&a.state.db)
+    .await
+    .unwrap();
+    assert_eq!(linked.as_deref(), Some(conflict.as_str()));
+    assert_eq!(status(&a, &conflict).await, "open");
+    assert!(!a.shared.join("new").exists());
+    let operation_status: String = sqlx::query_scalar("SELECT status FROM operations WHERE id=?")
+        .bind(&operation)
+        .fetch_one(&a.state.db)
+        .await
+        .unwrap();
+    assert_ne!(operation_status, "completed");
+}
+
+#[tokio::test]
 async fn resolved_restoration_reopens_with_a_fresh_reviewed_decision_before_cleanup() {
     use ism_core::dto::{
         RecoveryDecision, RecoveryDecisionInput, RecoveryKind, RecoveryState, RecoveryTarget,

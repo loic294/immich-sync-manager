@@ -15,7 +15,7 @@ use crate::files;
 use crate::peers::{self, Share};
 use crate::state::AppState;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Restoration {
     operation_id: String,
     share_id: String,
@@ -33,7 +33,7 @@ struct Restoration {
     evidence_generation: u64,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Generation {
     resolution: ConflictResolution,
     remote: Evidence,
@@ -94,18 +94,6 @@ async fn local_inventory(
             ))
         }))
         .collect()
-}
-
-async fn save(state: &AppState, plan: &Restoration) -> AppResult<()> {
-    sqlx::query(
-        "UPDATE pending_peer_ops SET vv_json=?,conflict_id=? WHERE operation_id=? AND kind='folder_restore'",
-    )
-    .bind(serde_json::to_string(plan)?)
-    .bind(&plan.conflict_id)
-    .bind(format!("folder-restore:{}", plan.operation_id))
-    .execute(&state.db)
-    .await?;
-    Ok(())
 }
 
 fn context(plan: &Restoration, share: Share) -> super::Conflict {
@@ -222,29 +210,63 @@ async fn request_choice(
         }
         tx.commit().await?;
     } else {
-        peers::conflict(
-            state,
-            peers::ConflictInput {
-                share: &share,
-                rel: &plan.target,
-                kind: "folder_restore",
-                detail: "Choose between the verified retained restoration and current peer files"
-                    .into(),
-                remote: context(plan, share.clone()).remote,
-                remote_vv: &current.version,
-                peer_id: &plan.peer_id,
-                from: Some(&plan.source),
-            },
-        )
-        .await?;
-        plan.conflict_id = sqlx::query_scalar(
-            "SELECT id FROM conflicts WHERE share_id=? AND rel_path=? AND kind='folder_restore' AND status='open'",
+        let local = peers::row(state, &share.id, &plan.target).await?;
+        let local = peers::side(&state.instance_name().await, local.as_ref());
+        let remote = context(plan, share.clone()).remote;
+        let id = crate::crypto::new_id("cf");
+        let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
+        let active: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM conflicts WHERE share_id=? AND rel_path=? AND status IN ('open','resolving'))",
         )
         .bind(&plan.share_id)
         .bind(&plan.target)
-        .fetch_optional(&state.db)
+        .fetch_one(&mut *tx)
         .await?;
-        save(state, plan).await?;
+        if active {
+            return Err(unverified(
+                "an existing conflict must be reviewed before restoration",
+            ));
+        }
+        sqlx::query(
+            "INSERT INTO conflicts(id,share_id,rel_path,kind,detail,local_json,remote_json,remote_vv_json,peer_id,status,created_at,remote_from)
+             VALUES(?,?,?,'folder_restore','Choose between the verified retained restoration and current peer files',?,?,?,?,'open',?,?)",
+        )
+        .bind(&id).bind(&plan.share_id).bind(&plan.target)
+        .bind(serde_json::to_string(&local)?).bind(serde_json::to_string(&remote)?)
+        .bind(serde_json::to_string(&current.version)?).bind(&plan.peer_id)
+        .bind(crate::db::now()).bind(&plan.source)
+        .execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM transfers WHERE share_id=? AND rel_path=? AND status='queued'")
+            .bind(&plan.share_id)
+            .bind(&plan.target)
+            .execute(&mut *tx)
+            .await?;
+        plan.conflict_id = Some(id);
+        let updated = sqlx::query(
+            "UPDATE pending_peer_ops SET vv_json=?,conflict_id=? WHERE operation_id=? AND kind='folder_restore'",
+        )
+        .bind(serde_json::to_string(&plan)?).bind(&plan.conflict_id)
+        .bind(format!("folder-restore:{}", plan.operation_id)).execute(&mut *tx).await?;
+        if updated.rows_affected() != 1 {
+            return Err(unverified(
+                "restoration disappeared while requesting a decision",
+            ));
+        }
+        sqlx::query(
+            "INSERT OR IGNORE INTO sync_recovery_links(recovery_id,kind,target_id)
+             SELECT id,'conflict',? FROM sync_recovery WHERE kind='operation' AND target_id=?",
+        )
+        .bind(&plan.conflict_id)
+        .bind(&plan.operation_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE sync_recovery SET state='needs_decision',code='choose_version',
+             detail='Peer tree changed; choose the retained version, current peer version, or both in ISM',updated_at=?
+             WHERE kind='operation' AND target_id=? AND state!='fixed'",
+        )
+        .bind(crate::db::now()).bind(&plan.operation_id).execute(&mut *tx).await?;
+        tx.commit().await?;
     }
     sqlx::query(
         "INSERT OR IGNORE INTO sync_recovery_links(recovery_id,kind,target_id)
@@ -457,7 +479,16 @@ pub(crate) async fn restoration_resume_allowed_locked(
         return Ok(false);
     }
     match &plan.conflict_id {
-        None => Ok(plan.generations.is_empty()),
+        None => {
+            let active: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM conflicts WHERE share_id=? AND rel_path=? AND status IN ('open','resolving'))",
+            )
+            .bind(&plan.share_id)
+            .bind(&plan.target)
+            .fetch_one(&state.db)
+            .await?;
+            Ok(plan.generations.is_empty() && !active)
+        }
         Some(id) if !plan.generations.is_empty() => Ok(sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM conflicts WHERE id=? AND status='resolving')",
         )
@@ -466,6 +497,97 @@ pub(crate) async fn restoration_resume_allowed_locked(
         .await?),
         Some(_) => Ok(false),
     }
+}
+
+async fn reassociate_orphan(state: &AppState, plan: &mut Restoration) -> AppResult<()> {
+    if plan.conflict_id.is_some() {
+        return Ok(());
+    }
+    let _guard = state.replication_operation_lock.lock().await;
+    let latest = load(state, &plan.operation_id)
+        .await?
+        .ok_or_else(|| unverified("restoration disappeared during conflict recovery"))?;
+    if serde_json::to_value(&latest)? != serde_json::to_value(&*plan)? {
+        return Err(AppError::conflict(
+            "recovery_evidence_changed",
+            "the restoration changed during conflict recovery",
+        ));
+    }
+    let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
+    let conflicts: Vec<(String, String, String, Option<String>, String)> = sqlx::query_as(
+        "SELECT id,kind,peer_id,remote_from,status FROM conflicts
+         WHERE share_id=? AND rel_path=? AND status IN ('open','resolving')",
+    )
+    .bind(&plan.share_id)
+    .bind(&plan.target)
+    .fetch_all(&mut *tx)
+    .await?;
+    if conflicts.is_empty() {
+        return Ok(());
+    }
+    let candidates: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pending_peer_ops WHERE kind='folder_restore'
+         AND share_id=? AND peer_id=? AND from_path=? AND to_path=?",
+    )
+    .bind(&plan.share_id)
+    .bind(&plan.peer_id)
+    .bind(&plan.source)
+    .bind(&plan.target)
+    .fetch_one(&mut *tx)
+    .await?;
+    if let [(id, kind, peer, from, status)] = conflicts.as_slice()
+        && kind == "folder_restore"
+        && peer == &plan.peer_id
+        && from.as_deref() == Some(plan.source.as_str())
+        && status == "open"
+        && candidates == 1
+    {
+        let linked: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM pending_peer_ops WHERE kind='folder_restore' AND conflict_id=?)",
+        )
+        .bind(id).fetch_one(&mut *tx).await?;
+        if !linked {
+            plan.conflict_id = Some(id.clone());
+            plan.evidence_generation = plan
+                .evidence_generation
+                .checked_add(1)
+                .ok_or_else(|| unverified("restoration evidence generation exhausted"))?;
+            let updated = sqlx::query(
+                "UPDATE pending_peer_ops SET conflict_id=?,vv_json=? WHERE operation_id=? AND kind='folder_restore' AND conflict_id IS NULL",
+            )
+            .bind(id).bind(serde_json::to_string(&plan)?)
+            .bind(format!("folder-restore:{}", plan.operation_id)).execute(&mut *tx).await?;
+            if updated.rows_affected() != 1 {
+                return Err(unverified("restoration changed during conflict recovery"));
+            }
+            sqlx::query(
+                "INSERT OR IGNORE INTO sync_recovery_links(recovery_id,kind,target_id)
+                 SELECT id,'conflict',? FROM sync_recovery WHERE kind='operation' AND target_id=?",
+            )
+            .bind(id)
+            .bind(&plan.operation_id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "UPDATE sync_recovery SET state='needs_decision',code='choose_version',
+                 detail='Review the existing restoration conflict in ISM',updated_at=?
+                 WHERE kind='operation' AND target_id=? AND state!='fixed'",
+            )
+            .bind(crate::db::now())
+            .bind(&plan.operation_id)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            state.emit(crate::state::ServerEvent::ConflictsChanged);
+            return Err(AppError::conflict(
+                "choose_version",
+                "Review the existing restoration conflict in ISM",
+            ));
+        }
+    }
+    Err(unverified(
+        "an existing conflict cannot be safely associated with this restoration",
+    ))
 }
 
 async fn bound_share(state: &AppState, plan: &Restoration) -> AppResult<Share> {
@@ -876,6 +998,7 @@ async fn validate_manifest_for_resume(
     let mut plan = load(state, operation_id)
         .await?
         .ok_or_else(|| unverified("folder restoration manifest is missing"))?;
+    reassociate_orphan(state, &mut plan).await?;
     let share = bound_share(state, &plan).await?;
     let c = super::Conflict {
         id: operation_id.into(),
@@ -976,6 +1099,9 @@ async fn validate_manifest_for_resume(
 }
 
 async fn process_one(state: &AppState, plan: &Restoration) -> AppResult<()> {
+    let mut latest = plan.clone();
+    reassociate_orphan(state, &mut latest).await?;
+    let plan = &latest;
     let completed: bool =
         sqlx::query_scalar("SELECT status='completed' FROM operations WHERE id=?")
             .bind(&plan.operation_id)
@@ -1089,7 +1215,10 @@ async fn cleanup_finished_plan(
         "SELECT p.vv_json FROM pending_peer_ops p
          LEFT JOIN conflicts c ON c.id=p.conflict_id
          WHERE p.operation_id=? AND p.kind='folder_restore'
-         AND (p.conflict_id IS NULL OR c.status='resolved')",
+         AND ((p.conflict_id IS NULL AND NOT EXISTS(
+             SELECT 1 FROM conflicts other
+             WHERE other.share_id=p.share_id AND other.rel_path=p.to_path
+             AND other.status IN ('open','resolving'))) OR c.status='resolved')",
     )
     .bind(&sentinel)
     .fetch_optional(&mut *tx)
