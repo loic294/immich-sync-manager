@@ -2139,6 +2139,179 @@ async fn activity_pages_are_bounded_stable_and_handling_does_not_resolve_recover
 }
 
 #[tokio::test]
+async fn recovery_filters_page_and_fix_only_matching_local_and_peer_issues() {
+    let h = harness().await;
+    h.map_root().await;
+    let secret = h
+        .state
+        .secrets
+        .encrypt(crate::peers::net::SECRET_PURPOSE, "synthetic-key")
+        .unwrap();
+    sqlx::query("INSERT INTO peers(id,name,url,instance_id,secret_enc,status,created_at) VALUES('peer1','Remote','https://peer.example','remote',?,'online',?)")
+        .bind(secret).bind(crate::db::now()).execute(&h.state.db).await.unwrap();
+    sqlx::query("INSERT INTO shares(id,name,root_id,path,peer_ids_json,enabled) VALUES('share1','Photos','photos','2024','[\"peer1\"]',1)")
+        .execute(&h.state.db).await.unwrap();
+    for (id, path) in [
+        ("a", "Trips/a.jpg"),
+        ("b", "Trips/Coast/b.jpg"),
+        ("outside", "Trips-extra/c.jpg"),
+        ("uncoded", "Trips/uncoded.jpg"),
+    ] {
+        sqlx::query(
+            "INSERT INTO transfers(id,peer_id,share_id,rel_path,sha256,size,vv_json,status,queued_at,updated_at)
+             VALUES(?,'peer1','share1',?,'hash',1,'{}','failed',?,?)",
+        )
+        .bind(id)
+        .bind(path)
+        .bind(crate::db::now())
+        .bind(crate::db::now())
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    }
+    crate::peers::recovery::discover(&h.state).await.unwrap();
+    sqlx::query("UPDATE sync_recovery SET state='waiting',code=CASE WHEN target_id='uncoded' THEN NULL ELSE 'peer_unreachable' END")
+        .execute(&h.state.db).await.unwrap();
+    sqlx::query("INSERT INTO peer_recovery_state(peer_id,updated_at) VALUES('peer1',?)")
+        .bind(crate::db::now())
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    for (id, scope) in [
+        (
+            "remote",
+            json!([{"share_name":"Photos","path":"Trips/Coast/remote.jpg"}]),
+        ),
+        ("legacy", json!([])),
+    ] {
+        let view = json!({
+            "target":{"kind":"transfer","id":id,"peer_id":null},
+            "title":format!("{id}.jpg"),"state":"waiting","code":"peer_unreachable",
+            "detail":null,"can_fix":true,"can_dismiss":false,"replacement_operation_id":null,
+            "scopes":scope
+        });
+        sqlx::query("INSERT INTO outgoing_recovery(peer_id,kind,target_id,view_json) VALUES('peer1','transfer',?,?)")
+            .bind(id).bind(view.to_string()).execute(&h.state.db).await.unwrap();
+    }
+    let legacy_conflict = json!({
+        "target":{"kind":"conflict","id":"legacy-conflict","peer_id":null},
+        "title":"Trips/legacy.jpg","state":"needs_decision","code":"choose_version",
+        "detail":null,"can_fix":false,"can_dismiss":false,"replacement_operation_id":null,
+        "conflict_scope":{"share_name":"Photos","path":"Trips/legacy.jpg"}
+    });
+    sqlx::query("INSERT INTO outgoing_recovery(peer_id,kind,target_id,view_json) VALUES('peer1','conflict','legacy-conflict',?)")
+        .bind(legacy_conflict.to_string()).execute(&h.state.db).await.unwrap();
+
+    let filter =
+        "share=Photos&folder=Trips&issue_type=code%3Apeer_unreachable&status=waiting&kind=transfer";
+    let mut ids = Vec::new();
+    for offset in 0..3 {
+        let response = send(
+            &h.app,
+            get(
+                &format!("/api/admin/recovery/page?{filter}&limit=1&offset={offset}"),
+                &h.admin(),
+            ),
+        )
+        .await;
+        assert_eq!(response.status, StatusCode::OK, "{:?}", response.json());
+        let body = response.json();
+        assert_eq!(body["total"], 3);
+        ids.push(body["rows"][0]["target"]["id"].as_str().unwrap().to_owned());
+        assert!(
+            body["filters"][0]["folders"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("Trips/Coast"))
+        );
+        assert!(
+            body["issue_types"]
+                .as_array()
+                .unwrap()
+                .contains(&Value::Null)
+        );
+    }
+    assert_eq!(ids, ["a", "b", "remote"]);
+    let uncoded = send(
+        &h.app,
+        get(
+            "/api/admin/recovery/page?share=Photos&folder=Trips&issue_type=none",
+            &h.admin(),
+        ),
+    )
+    .await;
+    assert_eq!(uncoded.json()["total"], 1);
+    assert_eq!(uncoded.json()["rows"][0]["target"]["id"], "uncoded");
+    let legacy = send(
+        &h.app,
+        get(
+            "/api/admin/recovery/page?share=Photos&folder=Trips&kind=conflict",
+            &h.admin(),
+        ),
+    )
+    .await;
+    assert_eq!(legacy.json()["total"], 1);
+    assert_eq!(legacy.json()["rows"][0]["target"]["id"], "legacy-conflict");
+
+    let invalid = send(
+        &h.app,
+        get("/api/admin/recovery/page?folder=Trips", &h.admin()),
+    )
+    .await;
+    assert_eq!(invalid.status, StatusCode::BAD_REQUEST);
+    let invalid = send(
+        &h.app,
+        get("/api/admin/recovery/page?status=unknown", &h.admin()),
+    )
+    .await;
+    assert_eq!(invalid.status, StatusCode::BAD_REQUEST);
+    let invalid = send(
+        &h.app,
+        json_req(
+            "POST",
+            &format!("/api/admin/recovery?{filter}"),
+            &h.admin(),
+            &json!({"targets":[{"kind":"transfer","id":"outside","peer_id":null}],"all":false,"resolution":null}),
+        ),
+    )
+    .await;
+    assert_eq!(invalid.status, StatusCode::BAD_REQUEST);
+
+    let fixed = send(
+        &h.app,
+        json_req(
+            "POST",
+            &format!("/api/admin/recovery?{filter}"),
+            &h.admin(),
+            &json!({"targets":[],"all":true,"resolution":null}),
+        ),
+    )
+    .await;
+    assert_eq!(fixed.status, StatusCode::OK, "{:?}", fixed.json());
+    assert_eq!(fixed.json()["items"].as_array().unwrap().len(), 3);
+    let rows: Vec<(String, String)> =
+        sqlx::query_as("SELECT target_id,state FROM sync_recovery ORDER BY target_id")
+            .fetch_all(&h.state.db)
+            .await
+            .unwrap();
+    assert_eq!(
+        rows,
+        [
+            ("a".into(), "queued".into()),
+            ("b".into(), "queued".into()),
+            ("outside".into(), "waiting".into()),
+            ("uncoded".into(), "waiting".into()),
+        ]
+    );
+    let forwarded: Vec<String> =
+        sqlx::query_scalar("SELECT target_id FROM outgoing_recovery_requests")
+            .fetch_all(&h.state.db)
+            .await
+            .unwrap();
+    assert_eq!(forwarded, ["remote"]);
+}
+
+#[tokio::test]
 async fn activity_details_include_original_sidecars_and_live_step_states() {
     let h = harness().await;
     h.map_root().await;

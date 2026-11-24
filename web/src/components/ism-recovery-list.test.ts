@@ -13,6 +13,7 @@ const ISSUE: RecoveryView = {
   can_fix: true,
   can_dismiss: false,
   replacement_operation_id: null,
+  scopes: [],
 };
 
 describe('sync recovery', () => {
@@ -24,7 +25,15 @@ describe('sync recovery', () => {
     await page.reload();
     await page.updateComplete;
     expect(get).toHaveBeenCalledWith('/api/admin/recovery/page', {
-      query: { limit: 25, offset: 0 },
+      query: {
+        limit: 25,
+        offset: 0,
+        share: '',
+        folder: '',
+        issue_type: '',
+        status: '',
+        kind: '',
+      },
     });
     expect(page.querySelector('ism-pagination')?.limit).toBe(25);
   });
@@ -177,6 +186,143 @@ describe('sync recovery', () => {
       }),
     );
     expect(page.textContent).toContain('Issues are handled per file');
+  });
+
+  it('filters the whole queue and limits Fix all to the matching issues', async () => {
+    const filters = [
+      { share_name: 'Photos', folders: ['Trips', 'Trips/Coast'] },
+      { share_name: 'Scans', folders: ['Archive'] },
+    ];
+    const get = vi.spyOn(api, 'get').mockImplementation(async (_path, options) => {
+      return {
+        rows: [ISSUE],
+        total: options?.query?.share ? 34 : 701,
+        filters,
+        issue_types: [null, 'version_conflict', 'choose_version', 'constructor'],
+      } as never;
+    });
+    const post = vi.spyOn(api, 'post').mockResolvedValue({ items: [ISSUE] } as never);
+    const page = await mount('ism-recovery-list');
+    await page.reload();
+    await page.updateComplete;
+    page.querySelector<HTMLInputElement>('tbody input')?.click();
+    page
+      .querySelector('ism-pagination')
+      ?.dispatchEvent(new CustomEvent('page-change', { detail: { limit: 25, offset: 25 } }));
+    await page.reload();
+    await page.updateComplete;
+    expect(page.selected.size).toBe(1);
+    expect(page.offset).toBe(25);
+    [...page.querySelectorAll<HTMLButtonElement>('button')]
+      .find((button) => button.textContent?.trim() === 'Filters')
+      ?.click();
+    await page.updateComplete;
+    expect(
+      page.querySelector<HTMLSelectElement>('[aria-label="Filter by subfolder"]')?.disabled,
+    ).toBe(true);
+    expect(
+      page.querySelector<HTMLSelectElement>('[aria-label="Filter by issue type"]')?.textContent,
+    ).toContain('Constructor');
+
+    const setFilter = async (label: string, value: string) => {
+      const select = page.querySelector<HTMLSelectElement>(`[aria-label="${label}"]`);
+      if (!select) throw new Error(`${label} is missing`);
+      select.value = value;
+      select.dispatchEvent(new Event('change'));
+      await page.reload();
+      await page.updateComplete;
+    };
+    await setFilter('Filter by share', 'Photos');
+    expect(page.offset).toBe(0);
+    expect(page.selected.size).toBe(0);
+    const folder = page.querySelector<HTMLSelectElement>('[aria-label="Filter by subfolder"]');
+    if (!folder) throw new Error('Folder filter is missing');
+    expect([...folder.options].map((option) => option.textContent)).toEqual([
+      'All folders',
+      'Trips',
+      'Trips/Coast',
+    ]);
+    await setFilter('Filter by subfolder', 'Trips/Coast');
+    await setFilter('Filter by issue type', 'code:version_conflict');
+    await setFilter('Filter by recovery status', 'needs_decision');
+    await setFilter('Filter by item kind', 'conflict');
+    const query = {
+      share: 'Photos',
+      folder: 'Trips/Coast',
+      issue_type: 'code:version_conflict',
+      status: 'needs_decision',
+      kind: 'conflict',
+    };
+    expect(get).toHaveBeenCalledWith('/api/admin/recovery/page', {
+      query: { limit: 25, offset: 0, ...query },
+    });
+    expect(page.textContent).toContain('Fix all 34 matching issues');
+    expect(page.querySelector('[aria-controls="recovery-filters"]')?.textContent).toContain('5');
+    [...page.querySelectorAll<HTMLButtonElement>('button')]
+      .find((button) => button.textContent?.includes('Fix all 34 matching'))
+      ?.click();
+    await vi.waitFor(() =>
+      expect(post).toHaveBeenCalledWith('/api/admin/recovery', {
+        body: { targets: [], all: true, resolution: null },
+        query,
+      }),
+    );
+    await vi.waitFor(() => expect(page.busy).toBeUndefined());
+    await setFilter('Filter by share', 'Scans');
+    expect(page.folder).toBe('');
+    [...page.querySelectorAll<HTMLButtonElement>('button')]
+      .find((button) => button.textContent?.trim() === 'Clear filters')
+      ?.click();
+    await page.reload();
+    await page.updateComplete;
+    expect(page.filtering).toBe(false);
+    expect(page.textContent).toContain('Fix all 701 issues');
+    expect(page.share).toBe('');
+    expect(page.issueType).toBe('');
+    expect(page.status).toBe('');
+    expect(page.kind).toBe('');
+  });
+
+  it('discards an old page while filters are changing and keeps Fix all disabled', async () => {
+    let release: ((value: unknown) => void) | undefined;
+    vi.spyOn(api, 'get').mockImplementation(async (_path, options) => {
+      if (options?.query?.offset === 25) {
+        return (await new Promise<unknown>((resolve) => {
+          release = resolve;
+        })) as never;
+      }
+      return {
+        rows: options?.query?.share ? [] : [ISSUE],
+        total: options?.query?.share ? 0 : 701,
+        filters: [{ share_name: 'Photos', folders: ['Trips'] }],
+        issue_types: ['peer_unreachable'],
+      } as never;
+    });
+    const page = await mount('ism-recovery-list');
+    await page.reload();
+    [...page.querySelectorAll<HTMLButtonElement>('button')]
+      .find((button) => button.textContent?.trim() === 'Filters')
+      ?.click();
+    await page.updateComplete;
+    page
+      .querySelector('ism-pagination')
+      ?.dispatchEvent(new CustomEvent('page-change', { detail: { limit: 25, offset: 25 } }));
+    await vi.waitFor(() => expect(release).toBeDefined());
+    const share = page.querySelector<HTMLSelectElement>('[aria-label="Filter by share"]');
+    if (!share) throw new Error('Share filter is missing');
+    share.value = 'Photos';
+    share.dispatchEvent(new Event('change'));
+    await page.updateComplete;
+    const fixAll = [...page.querySelectorAll<HTMLButtonElement>('button')].find((button) =>
+      button.textContent?.includes('Fix all'),
+    );
+    expect(fixAll?.disabled).toBe(true);
+    release?.({ rows: [ISSUE], total: 701, filters: [], issue_types: [] });
+    await vi.waitFor(() => expect(page.filtering).toBe(false));
+    await page.updateComplete;
+    expect(page.rows).toEqual([]);
+    expect(page.total).toBe(0);
+    expect(page.textContent).toContain('No sync issues match these filters');
   });
 
   it('keeps selected issues updated when recovery eligibility changes', async () => {

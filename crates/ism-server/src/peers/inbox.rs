@@ -1187,7 +1187,7 @@ pub(super) async fn verify_content(
     Ok(true)
 }
 
-fn collect_locations(value: &Value, out: &mut Vec<Location>) -> AppResult<()> {
+pub(super) fn collect_locations(value: &Value, out: &mut Vec<Location>) -> AppResult<()> {
     if let Some(root_id) = value.get("root_id").and_then(Value::as_str)
         && let Some(path) = value.get("path").and_then(Value::as_str)
     {
@@ -1213,7 +1213,7 @@ fn collect_locations(value: &Value, out: &mut Vec<Location>) -> AppResult<()> {
     Ok(())
 }
 
-fn share_path(share: &Share, location: &Location) -> Option<String> {
+pub(super) fn share_path(share: &Share, location: &Location) -> Option<String> {
     if location.root_id != share.root_id {
         return None;
     }

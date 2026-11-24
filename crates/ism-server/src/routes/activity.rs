@@ -251,23 +251,50 @@ async fn operation_detail(
     }))
 }
 
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct RecoveryPageQuery {
+    limit: Option<i64>,
+    offset: Option<i64>,
+    share: String,
+    folder: String,
+    issue_type: String,
+    status: String,
+    kind: String,
+}
+
 async fn recovery_page(
     State(state): State<AppState>,
     Admin(_): Admin,
-    Query(q): Query<PageQuery>,
+    Query(q): Query<RecoveryPageQuery>,
 ) -> AppResult<Json<ism_core::dto::RecoveryPage>> {
-    let (limit, offset) = q.bounds()?;
+    let (limit, offset) = PageQuery {
+        limit: q.limit,
+        offset: q.offset,
+        ..Default::default()
+    }
+    .bounds()?;
+    let filter = crate::peers::recovery_filters::RecoveryFilter {
+        share: q.share,
+        folder: q.folder,
+        issue_type: q.issue_type,
+        status: q.status,
+        kind: q.kind,
+    };
     Ok(Json(
-        crate::peers::recovery::page(&state, limit, offset).await?,
+        crate::peers::recovery::page_filtered(&state, limit, offset, &filter).await?,
     ))
 }
 
 async fn recover(
     State(state): State<AppState>,
     Admin(_): Admin,
+    Query(filter): Query<crate::peers::recovery_filters::RecoveryFilter>,
     Json(input): Json<ism_core::dto::RecoveryBatchInput>,
 ) -> AppResult<Json<ism_core::dto::RecoveryBatchResult>> {
-    Ok(Json(crate::peers::recovery::submit(&state, input).await?))
+    Ok(Json(
+        crate::peers::recovery::submit_filtered(&state, input, &filter).await?,
+    ))
 }
 
 async fn recovery_versions(

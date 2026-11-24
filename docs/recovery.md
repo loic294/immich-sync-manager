@@ -27,8 +27,13 @@ Resolving genuinely unresolved predecessors still requires updating each of thos
 | **Not retryable** | Recovery verified that no complete copy remains in available peers, staging, or applicable ISM trash. |
 
 Batch admission returns an outcome for each target. A queued request is not reported as fixed.
-Selections persist across pages, and **Fix all** snapshots the outstanding local and mirrored
-receiver-owned issues, up to 5000 per batch. Outgoing actions are authenticated and forwarded
+The **Needs attention** filters cover the entire queue by share, subfolder, issue type (reason),
+recovery status, and item kind. Subfolders include their descendants. Changing a filter clears
+the selection; otherwise, selections persist across pages. **Fix all** snapshots only matching
+local and mirrored receiver-owned issues, up to 5000 per batch. An operation matching a location
+filter may affect other locations as well. Issues without a known location, including transfers
+and operations reported by older peers, appear only when no location filter is selected.
+Outgoing actions are authenticated and forwarded
 to the receiver; each peer can act only on its own work. Requests survive receiver
 unavailability and restart. Version choices reuse the owner-scoped comparisons already reviewed
 in the current page tab. Admission saves the selected revisions in one local batch transaction,

@@ -14,6 +14,7 @@ pub mod net;
 pub(crate) mod notifications;
 mod preview_image;
 pub mod recovery;
+pub(crate) mod recovery_filters;
 pub mod retained;
 pub mod transfer;
 pub mod versions;

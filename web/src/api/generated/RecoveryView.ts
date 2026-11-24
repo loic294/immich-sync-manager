@@ -3,4 +3,4 @@ import type { ConflictScope } from "./ConflictScope";
 import type { RecoveryState } from "./RecoveryState";
 import type { RecoveryTarget } from "./RecoveryTarget";
 
-export type RecoveryView = { target: RecoveryTarget, title: string, state: RecoveryState, code: string | null, detail: string | null, can_fix: boolean, can_dismiss: boolean, replacement_operation_id: string | null, local_instance?: string, peer_instance?: string, conflict_scope?: ConflictScope, };
+export type RecoveryView = { target: RecoveryTarget, title: string, state: RecoveryState, code: string | null, detail: string | null, can_fix: boolean, can_dismiss: boolean, replacement_operation_id: string | null, local_instance?: string, peer_instance?: string, conflict_scope?: ConflictScope, scopes: Array<ConflictScope>, };

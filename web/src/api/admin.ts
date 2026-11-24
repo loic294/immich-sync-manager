@@ -47,6 +47,14 @@ import type { WatchSettingsInput } from '@/api/generated/WatchSettingsInput';
 const A = '/api/admin';
 const enc = encodeURIComponent;
 
+export interface RecoveryFilters {
+  share: string;
+  folder: string;
+  issue_type: string;
+  status: string;
+  kind: string;
+}
+
 /** Typed wrappers over the administration API. */
 export const admin = {
   backgroundActivity: (limit = 25, offset = 0) =>
@@ -106,9 +114,13 @@ export const admin = {
     api.get<OperationPage>(`${A}/operations/page`, { query: { status, limit, offset } }),
   operationDetail: (id: string) => api.get<OperationDetail>(`${A}/operations/${enc(id)}/detail`),
   markOperationHandled: (id: string) => api.post<void>(`${A}/operations/${enc(id)}/handled`),
-  recoveryPage: (limit = 250, offset = 0) =>
-    api.get<RecoveryPage>(`${A}/recovery/page`, { query: { limit, offset } }),
-  fixIssues: (body: RecoveryBatchInput) => api.post<RecoveryBatchResult>(`${A}/recovery`, { body }),
+  recoveryPage: (limit = 250, offset = 0, filters?: RecoveryFilters) =>
+    api.get<RecoveryPage>(`${A}/recovery/page`, { query: { limit, offset, ...filters } }),
+  fixIssues: (body: RecoveryBatchInput, filters?: RecoveryFilters) =>
+    api.post<RecoveryBatchResult>(`${A}/recovery`, {
+      body,
+      ...(filters ? { query: { ...filters } } : {}),
+    }),
   decideIssues: (body: RecoveryDecisionInput) =>
     api.post<RecoveryBatchResult>(`${A}/recovery/decisions`, { body }),
   recoveryVersions: (target: RecoveryTarget) =>

@@ -701,6 +701,8 @@ pub struct RecoveryView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub conflict_scope: Option<ConflictScope>,
+    #[serde(default)]
+    pub scopes: Vec<ConflictScope>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -725,6 +727,10 @@ pub struct RecoveryBatchResult {
 pub struct RecoveryPage {
     pub rows: Vec<RecoveryView>,
     pub total: i64,
+    #[serde(default)]
+    pub filters: Vec<ConflictFilter>,
+    #[serde(default)]
+    pub issue_types: Vec<Option<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -943,7 +949,7 @@ pub struct ConflictPage {
     pub filters: Vec<ConflictFilter>,
 }
 
-/// Share-relative location for conflict filtering, including peer-owned decisions.
+/// Share-relative location for filtering sync issues and peer-owned decisions.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct ConflictScope {

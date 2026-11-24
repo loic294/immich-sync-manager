@@ -4096,6 +4096,149 @@ async fn conflict_page_paginates_local_and_peer_targets_without_a_cap() {
 }
 
 #[tokio::test]
+async fn recovery_filter_scopes_follow_peer_permissions_and_upload_locations() {
+    use ism_core::dto::{RecoveryBatchInput, RecoveryBatchResult, RecoveryKind, RecoveryTarget};
+
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    let source = super::net::peers(&b.state).await.unwrap().remove(0);
+    let receiver = super::net::peers(&a.state).await.unwrap().remove(0);
+    sqlx::query("INSERT INTO shares(id,name,root_id,path,peer_ids_json,enabled) VALUES('private','Private','photos','private','[]',1)")
+        .execute(&b.state.db).await.unwrap();
+    let request = serde_json::json!({
+        "actions":[
+            {"kind":"move","source":{"root_id":"photos","path":"shared/Trips/Coast/a.jpg"},
+             "target":{"root_id":"photos","path":"private/Hidden/a.jpg"}},
+            {"kind":"publish_upload","upload_id":"upload-scope"}
+        ]
+    });
+    sqlx::query("INSERT INTO operations(id,idempotency_key,principal,source,request_json,status,created_at) VALUES('scope-operation','scope-operation',?,'peer',?,'failed',?)")
+        .bind(format!("peer:{}", source.id))
+        .bind(request.to_string())
+        .bind(crate::db::now())
+        .execute(&b.state.db)
+        .await
+        .unwrap();
+    let upload = serde_json::json!({
+        "target":{"root_id":"photos","path":"shared/Archive"},
+        "files":[{"name":"photo.jpg"}]
+    });
+    sqlx::query("INSERT INTO uploads(id,principal,request_json,status,operation_id,created_at) VALUES('upload-scope',?,?,'failed','scope-operation',?)")
+        .bind(format!("peer:{}", source.id))
+        .bind(upload.to_string())
+        .bind(crate::db::now())
+        .execute(&b.state.db)
+        .await
+        .unwrap();
+
+    let local = super::recovery::page_filtered(
+        &b.state,
+        25,
+        0,
+        &super::recovery_filters::RecoveryFilter {
+            share: "Private".into(),
+            folder: "Hidden".into(),
+            kind: "operation".into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(local.total, 1);
+    let peer = super::recovery::peer_page(&b.state, &source).await.unwrap();
+    assert_eq!(peer.rows.len(), 1);
+    let locations = &peer.rows[0].scopes;
+    assert!(
+        locations
+            .iter()
+            .any(|scope| scope.share_name == "Family" && scope.path == "Trips/Coast/a.jpg")
+    );
+    assert!(
+        locations
+            .iter()
+            .any(|scope| scope.share_name == "Family" && scope.path == "Archive/photo.jpg")
+    );
+    assert!(locations.iter().all(|scope| scope.share_name != "Private"));
+
+    super::recovery::refresh(&a.state, &receiver).await.unwrap();
+    let filtered = super::recovery::page_filtered(
+        &a.state,
+        25,
+        0,
+        &super::recovery_filters::RecoveryFilter {
+            share: "Family".into(),
+            folder: "Archive".into(),
+            kind: "operation".into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(filtered.total, 1);
+    assert_eq!(
+        filtered.rows[0].target.peer_id.as_deref(),
+        Some(receiver.id.as_str())
+    );
+
+    let request = RecoveryBatchInput {
+        targets: vec![RecoveryTarget {
+            kind: RecoveryKind::Operation,
+            id: "scope-operation".into(),
+            peer_id: None,
+        }],
+        all: false,
+        resolution: None,
+    };
+    let result: RecoveryBatchResult = super::net::request(
+        &a.state,
+        &receiver.url,
+        &receiver.secret,
+        reqwest::Method::POST,
+        "/api/peer/v1/recovery",
+        Some(serde_json::to_vec(&request).unwrap()),
+    )
+    .send()
+    .await
+    .unwrap()
+    .error_for_status()
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    assert!(
+        result.items[0]
+            .scopes
+            .iter()
+            .any(|scope| scope.share_name == "Family" && scope.path == "Archive/photo.jpg")
+    );
+    assert!(
+        result.items[0]
+            .scopes
+            .iter()
+            .all(|scope| scope.share_name != "Private")
+    );
+
+    sqlx::query(
+        "INSERT INTO conflicts(id,share_id,rel_path,kind,detail,local_json,remote_json,remote_vv_json,peer_id,status,created_at)
+         VALUES('private-conflict','private','Hidden/photo.jpg','changed_on_both','','{}','{}','{}',?,'open',?)",
+    )
+    .bind(&source.id)
+    .bind(crate::db::now())
+    .execute(&b.state.db)
+    .await
+    .unwrap();
+    let peer = super::recovery::peer_page(&b.state, &source).await.unwrap();
+    let conflict = peer
+        .rows
+        .iter()
+        .find(|row| row.target.id == "private-conflict")
+        .unwrap();
+    assert!(conflict.scopes.is_empty());
+    assert!(conflict.conflict_scope.is_none());
+}
+
+#[tokio::test]
 async fn recovery_versions_are_current_owner_scoped_and_stale_decisions_do_not_execute() {
     use ism_core::dto::{
         RecoveryDecision, RecoveryDecisionInput, RecoveryKind, RecoveryState, RecoveryTarget,

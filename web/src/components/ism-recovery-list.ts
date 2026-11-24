@@ -1,5 +1,6 @@
 import { html, nothing } from 'lit';
-import { admin } from '@/api/admin';
+import { admin, type RecoveryFilters } from '@/api/admin';
+import type { ConflictFilter } from '@/api/generated/ConflictFilter';
 import type { RecoveryBatchResult } from '@/api/generated/RecoveryBatchResult';
 import type { RecoveryState } from '@/api/generated/RecoveryState';
 import type { RecoveryView } from '@/api/generated/RecoveryView';
@@ -8,6 +9,7 @@ import type { PageChange } from '@/components/ism-pagination';
 import '@/components/ism-pagination';
 import { targetKey as key } from '@/components/version-review';
 import { linkTo } from '@/stores/nav';
+import { humanize } from '@/util/format';
 
 const LABELS: Record<RecoveryState, string> = {
   queued: 'Fix queued',
@@ -26,6 +28,36 @@ const BADGES: Record<RecoveryState, string> = {
   fixed: 'badge badge-success badge-soft',
   not_retryable: 'badge badge-error badge-soft',
 };
+
+const ISSUE_TYPES: Readonly<Record<string, string>> = {
+  choose_version: 'Version choice needed',
+  version_conflict: 'Files changed after review',
+  peer_unreachable: 'Other instance unreachable',
+  peer_recovery_unavailable: 'Recovery information unavailable',
+  peer_evidence_unavailable: 'Version information unavailable',
+  peer_share_changed: 'Shared folder changed',
+  root_unavailable: 'Shared storage unavailable',
+  maintenance_blocked: 'Server maintenance',
+  direct_writes_unavailable: 'Direct writes unavailable',
+  peer_busy: 'Other instance busy',
+  recovery_plan_unchanged: 'Fix needs new information',
+  recovery_worker_failed: 'Fix stopped unexpectedly',
+  invalid_saved_recovery: 'Unreadable saved issue',
+  recovery_exhausted: 'No complete copy available',
+  recovery_evidence_missing: 'Missing file information',
+  recovery_evidence_changed: 'File information changed',
+  revision_changed: 'File revision changed',
+  recovery_changed: 'Recovery changed',
+  peer_content_changed: 'Other instance content changed',
+  awaiting_receiver: 'Waiting for the other instance',
+  awaiting_completion: 'Fix in progress',
+};
+
+function issueTypeLabel(value: string): string {
+  if (value === 'none') return 'No specific reason';
+  const code = value.startsWith('code:') ? value.slice(5) : value;
+  return Object.hasOwn(ISSUE_TYPES, code) ? ISSUE_TYPES[code] : humanize(code);
+}
 
 function issueGuidance(row: RecoveryView): string {
   if (row.state === 'fixing') return 'ISM is checking and fixing this issue.';
@@ -90,6 +122,15 @@ export class IsmRecoveryList extends IsmPage {
     offset: { state: true },
     selected: { state: true },
     result: { state: true },
+    filters: { state: true },
+    issueTypes: { state: true },
+    filtersOpen: { state: true },
+    filtering: { state: true },
+    share: { state: true },
+    folder: { state: true },
+    issueType: { state: true },
+    status: { state: true },
+    kind: { state: true },
   };
 
   declare rows: RecoveryView[];
@@ -98,6 +139,15 @@ export class IsmRecoveryList extends IsmPage {
   declare offset: number;
   declare selected: Map<string, RecoveryView>;
   declare result: RecoveryBatchResult | undefined;
+  declare filters: ConflictFilter[];
+  declare issueTypes: Array<string | null>;
+  declare filtersOpen: boolean;
+  declare filtering: boolean;
+  declare share: string;
+  declare folder: string;
+  declare issueType: string;
+  declare status: string;
+  declare kind: string;
   protected override reloadOn = ['sync_changed', 'operation_updated', 'conflicts_changed'] as const;
   protected override liveReloadInterval = 1000;
 
@@ -108,12 +158,53 @@ export class IsmRecoveryList extends IsmPage {
     this.limit = 25;
     this.offset = 0;
     this.selected = new Map();
+    this.filters = [];
+    this.issueTypes = [];
+    this.filtersOpen = false;
+    this.filtering = false;
+    this.share = '';
+    this.folder = '';
+    this.issueType = '';
+    this.status = '';
+    this.kind = '';
+  }
+
+  private filterQuery(): RecoveryFilters {
+    return {
+      share: this.share,
+      folder: this.folder,
+      issue_type: this.issueType,
+      status: this.status,
+      kind: this.kind,
+    };
+  }
+
+  private filterCount() {
+    return [this.share, this.folder, this.issueType, this.status, this.kind].filter(Boolean).length;
   }
 
   protected override async load() {
     const { limit, offset } = this;
-    const page = await admin.recoveryPage(limit, offset);
-    if (limit !== this.limit || offset !== this.offset) return;
+    const filters = this.filterQuery();
+    const page = await admin.recoveryPage(limit, offset, filters);
+    if (
+      limit !== this.limit ||
+      offset !== this.offset ||
+      filters.share !== this.share ||
+      filters.folder !== this.folder ||
+      filters.issue_type !== this.issueType ||
+      filters.status !== this.status ||
+      filters.kind !== this.kind
+    )
+      return;
+    this.filters = page.filters ?? [];
+    this.issueTypes = page.issue_types ?? [];
+    if (offset > 0 && offset >= page.total) {
+      this.offset = Math.max(0, Math.ceil(page.total / limit) - 1) * limit;
+      void this.reload();
+      return;
+    }
+    this.filtering = false;
     this.rows = page.rows;
     this.total = page.total;
     const selected = new Map(this.selected);
@@ -121,6 +212,79 @@ export class IsmRecoveryList extends IsmPage {
       if (selected.has(key(row.target))) selected.set(key(row.target), row);
     }
     this.selected = selected;
+  }
+
+  private updateFilters(changes: Partial<RecoveryFilters>) {
+    this.share = changes.share ?? this.share;
+    this.folder = changes.folder ?? this.folder;
+    this.issueType = changes.issue_type ?? this.issueType;
+    this.status = changes.status ?? this.status;
+    this.kind = changes.kind ?? this.kind;
+    this.offset = 0;
+    this.selected = new Map();
+    this.result = undefined;
+    this.rows = [];
+    this.total = 0;
+    this.filtering = true;
+    void this.reload();
+  }
+
+  private filterControls() {
+    if (!this.filtersOpen) return nothing;
+    const folders = this.filters.find((filter) => filter.share_name === this.share)?.folders ?? [];
+    const issueTypes = this.issueTypes
+      .map((code) => (code === null ? 'none' : `code:${code}`))
+      .sort((a, b) => issueTypeLabel(a).localeCompare(issueTypeLabel(b)));
+    return html`<div id="recovery-filters" class="grid w-full grid-cols-1 items-end gap-3 rounded-box border border-base-300 bg-base-100 p-3 sm:grid-cols-2 lg:grid-cols-3">
+      <label class="flex min-w-0 flex-col gap-1 text-sm">
+        Share
+        <select class="select select-sm w-full" aria-label="Filter by share" ?disabled=${!!this.busy}
+          @change=${(event: Event) => this.updateFilters({ share: (event.target as HTMLSelectElement).value, folder: '' })}>
+          <option value="" ?selected=${!this.share}>All shares</option>
+          ${this.filters.map((filter) => html`<option value=${filter.share_name} ?selected=${filter.share_name === this.share}>${filter.share_name}</option>`)}
+          ${this.share && !this.filters.some((filter) => filter.share_name === this.share) ? html`<option value=${this.share} selected>${this.share}</option>` : nothing}
+        </select>
+      </label>
+      <label class="flex min-w-0 flex-col gap-1 text-sm">
+        Subfolder
+        <select class="select select-sm w-full" aria-label="Filter by subfolder" ?disabled=${!this.share || !!this.busy}
+          @change=${(event: Event) => this.updateFilters({ folder: (event.target as HTMLSelectElement).value })}>
+          <option value="" ?selected=${!this.folder}>All folders</option>
+          ${folders.map((folder) => html`<option value=${folder} ?selected=${folder === this.folder}>${folder}</option>`)}
+          ${this.folder && !folders.includes(this.folder) ? html`<option value=${this.folder} selected>${this.folder}</option>` : nothing}
+        </select>
+      </label>
+      <label class="flex min-w-0 flex-col gap-1 text-sm">
+        Issue type
+        <select class="select select-sm w-full" aria-label="Filter by issue type" ?disabled=${!!this.busy}
+          @change=${(event: Event) => this.updateFilters({ issue_type: (event.target as HTMLSelectElement).value })}>
+          <option value="" ?selected=${!this.issueType}>All issue types</option>
+          ${issueTypes.map((value) => html`<option value=${value} ?selected=${value === this.issueType}>${issueTypeLabel(value)}</option>`)}
+          ${this.issueType && !issueTypes.includes(this.issueType) ? html`<option value=${this.issueType} selected>${issueTypeLabel(this.issueType)}</option>` : nothing}
+        </select>
+      </label>
+      <label class="flex min-w-0 flex-col gap-1 text-sm">
+        Recovery status
+        <select class="select select-sm w-full" aria-label="Filter by recovery status" ?disabled=${!!this.busy}
+          @change=${(event: Event) => this.updateFilters({ status: (event.target as HTMLSelectElement).value })}>
+          <option value="" ?selected=${!this.status}>All statuses</option>
+          ${Object.entries(LABELS).map(([value, label]) => html`<option value=${value} ?selected=${value === this.status}>${label}</option>`)}
+        </select>
+      </label>
+      <label class="flex min-w-0 flex-col gap-1 text-sm">
+        Item kind
+        <select class="select select-sm w-full" aria-label="Filter by item kind" ?disabled=${!!this.busy}
+          @change=${(event: Event) => this.updateFilters({ kind: (event.target as HTMLSelectElement).value })}>
+          <option value="" ?selected=${!this.kind}>All item kinds</option>
+          <option value="conflict" ?selected=${this.kind === 'conflict'}>Conflict</option>
+          <option value="transfer" ?selected=${this.kind === 'transfer'}>File transfer</option>
+          <option value="operation" ?selected=${this.kind === 'operation'}>Operation</option>
+        </select>
+      </label>
+      <button type="button" class="btn btn-ghost btn-sm max-sm:min-h-11" ?disabled=${!!this.busy || !this.filterCount()}
+        @click=${() => this.updateFilters({ share: '', folder: '', issue_type: '', status: '', kind: '' })}>Clear filters</button>
+      <p class="col-span-full text-xs text-base-content/70">Folders include their subfolders. Changing filters clears the selection. Issues without a known location only appear without location filters.</p>
+    </div>`;
   }
 
   private select(row: RecoveryView, checked: boolean) {
@@ -134,7 +298,10 @@ export class IsmRecoveryList extends IsmPage {
     const ok = await this.act(
       'fix',
       async () => {
-        this.result = await admin.fixIssues({ targets: all ? [] : targets, all, resolution: null });
+        this.result = await admin.fixIssues(
+          { targets: all ? [] : targets, all, resolution: null },
+          all && this.filterCount() ? this.filterQuery() : undefined,
+        );
       },
       'Fix requested. ISM will check eligible issues.',
     );
@@ -151,13 +318,20 @@ export class IsmRecoveryList extends IsmPage {
         <div><h2 class="text-base font-semibold">Sync issues</h2>
           <p class="text-sm text-base-content/70">Issues are handled per file whenever it is safe to do so.</p></div>
         <div class="flex flex-wrap items-center gap-2">
+          <button type="button" class="btn btn-sm max-sm:min-h-11" aria-expanded=${this.filtersOpen}
+            aria-controls="recovery-filters" @click=${() => {
+              this.filtersOpen = !this.filtersOpen;
+            }}><ism-icon name="list-filter" size="sm"></ism-icon>
+            Filters${this.filterCount() ? html`<span class="badge badge-primary badge-sm">${this.filterCount()}</span>` : nothing}
+          </button>
           <span role="status" class="text-sm">${this.selected.size} selected</span>
-          <button class="btn btn-primary btn-sm max-sm:min-h-11" ?disabled=${!!this.busy || !canFixSelected}
+          <button class="btn btn-primary btn-sm max-sm:min-h-11" ?disabled=${!!this.busy || this.filtering || !canFixSelected}
             @click=${() => this.fix()}>${this.spin('fix')}Fix selected</button>
-          <button class="btn btn-sm max-sm:min-h-11" ?disabled=${!!this.busy || !this.total}
-            @click=${() => this.fix(true)}>Fix all ${this.total} issues</button>
+          <button class="btn btn-sm max-sm:min-h-11" ?disabled=${!!this.busy || this.filtering || !this.total}
+            @click=${() => this.fix(true)}>Fix all ${this.total} ${this.filterCount() ? 'matching ' : ''}issues</button>
         </div>
       </div>
+      ${this.filterControls()}
       ${
         offPage.length
           ? html`<details>
@@ -230,7 +404,7 @@ export class IsmRecoveryList extends IsmPage {
               }</td>
           </tr>`,
           )}
-          ${this.rows.length ? nothing : html`<tr><td colspan="4" class="p-6 text-center">No outstanding sync issues.</td></tr>`}
+          ${this.rows.length ? nothing : html`<tr><td colspan="4" class="p-6 text-center">${this.filtering ? 'Loading issues…' : this.filterCount() ? 'No sync issues match these filters. Clear the filters to see all issues.' : 'No outstanding sync issues.'}</td></tr>`}
           </tbody>
         </table>
       </div>

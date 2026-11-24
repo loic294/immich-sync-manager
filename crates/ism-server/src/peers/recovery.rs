@@ -203,6 +203,7 @@ fn view(row: ViewRow) -> AppResult<RecoveryView> {
         replacement_operation_id,
         local_instance: None,
         conflict_scope: None,
+        scopes: Vec::new(),
         peer_instance: None,
     })
 }
@@ -485,29 +486,28 @@ pub async fn discover_targets(state: &AppState, targets: &[(RecoveryKind, &str)]
 }
 
 pub async fn page(state: &AppState, limit: i64, offset: i64) -> AppResult<RecoveryPage> {
+    page_filtered(state, limit, offset, &Default::default()).await
+}
+
+pub async fn page_filtered(
+    state: &AppState,
+    limit: i64,
+    offset: i64,
+    filter: &super::recovery_filters::RecoveryFilter,
+) -> AppResult<RecoveryPage> {
+    filter.validate()?;
     discover(state).await?;
     let mut tx = state.db.begin().await?;
-    let local_total: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM sync_recovery WHERE state != 'fixed'")
-            .fetch_one(&mut *tx)
-            .await?;
     let rows: Vec<ViewRow> = sqlx::query_as(
         "SELECT kind,target_id,state,code,detail,replacement_operation_id,
             COALESCE((SELECT label FROM operations WHERE r.kind='operation' AND id=r.target_id),
                      (SELECT rel_path FROM transfers WHERE r.kind='transfer' AND id=r.target_id),
                      (SELECT rel_path FROM conflicts WHERE r.kind='conflict' AND id=r.target_id),target_id)
          FROM sync_recovery r
-         WHERE state != 'fixed' ORDER BY created_at,id LIMIT ? OFFSET ?",
+         WHERE state != 'fixed' ORDER BY created_at,id",
     )
-    .bind(limit)
-    .bind(offset)
     .fetch_all(&mut *tx)
     .await?;
-    tx.commit().await?;
-    let mut items = Vec::new();
-    for row in rows {
-        items.push(decorate(state, view(row)?).await?);
-    }
     type OutgoingRow = (String, String, Option<String>, Option<String>, bool);
     let outgoing: Vec<OutgoingRow> = sqlx::query_as(
         "SELECT q.peer_id,q.view_json,s.error,q.updated_at,q.state!='accepted' AS pending
@@ -518,20 +518,39 @@ pub async fn page(state: &AppState, limit: i64, offset: i64) -> AppResult<Recove
              WHERE q.peer_id=r.peer_id AND q.kind=r.kind AND q.target_id=r.target_id)
          ORDER BY 1,2",
     )
-    .fetch_all(&state.db)
+    .fetch_all(&mut *tx)
     .await?;
-    let total = local_total + i64::try_from(outgoing.len()).map_err(AppError::internal)?;
-    let skip = usize::try_from((offset - local_total).max(0)).map_err(AppError::internal)?;
-    let remaining = usize::try_from(limit)
-        .map_err(AppError::internal)?
-        .saturating_sub(items.len());
-    for (peer, json, error, updated, pending) in outgoing.into_iter().skip(skip).take(remaining) {
+    tx.commit().await?;
+    let mut local = rows.into_iter().map(view).collect::<AppResult<Vec<_>>>()?;
+    super::recovery_filters::attach_local_scopes(state, &mut local).await?;
+    let mut remote = Vec::with_capacity(outgoing.len());
+    for (peer, json, error, updated, pending) in outgoing {
         let fresh = state
             .peer_streams
             .fresh(&peer, super::notifications::Snapshot::Recovery);
-        items.push(outgoing_view(peer, &json, error, updated, pending, fresh)?);
+        remote.push(outgoing_view(peer, &json, error, updated, pending, fresh)?);
     }
-    Ok(RecoveryPage { total, rows: items })
+    let (filters, issue_types) = super::recovery_filters::facets(local.iter().chain(&remote));
+    local.retain(|row| filter.matches(row));
+    remote.retain(|row| filter.matches(row));
+    let local_total = i64::try_from(local.len()).map_err(AppError::internal)?;
+    let total = local_total + i64::try_from(remote.len()).map_err(AppError::internal)?;
+    let skip = usize::try_from(offset).map_err(AppError::internal)?;
+    let limit = usize::try_from(limit).map_err(AppError::internal)?;
+    let mut items = Vec::new();
+    for row in local.into_iter().skip(skip).take(limit) {
+        items.push(decorate(state, row).await?);
+    }
+    let remote_skip =
+        usize::try_from(offset.saturating_sub(local_total).max(0)).map_err(AppError::internal)?;
+    let remaining = limit.saturating_sub(items.len());
+    items.extend(remote.into_iter().skip(remote_skip).take(remaining));
+    Ok(RecoveryPage {
+        total,
+        rows: items,
+        filters,
+        issue_types,
+    })
 }
 
 pub(super) async fn peer_conflicts(state: &AppState) -> AppResult<Vec<RecoveryView>> {
@@ -599,9 +618,12 @@ pub async fn peer_page(state: &AppState, peer: &net::Peer) -> AppResult<Recovery
             rows.push(item);
         }
     }
+    super::recovery_filters::attach_peer_scopes(state, peer, &mut rows).await?;
     Ok(RecoveryPage {
         total: i64::try_from(rows.len()).map_err(AppError::internal)?,
         rows,
+        filters: Vec::new(),
+        issue_types: Vec::new(),
     })
 }
 
@@ -881,6 +903,7 @@ pub async fn submit(state: &AppState, input: RecoveryBatchInput) -> AppResult<Re
                     replacement_operation_id: None,
                     local_instance: None,
                     conflict_scope: None,
+                    scopes: Vec::new(),
                     peer_instance: None,
                 });
             }
@@ -889,6 +912,33 @@ pub async fn submit(state: &AppState, input: RecoveryBatchInput) -> AppResult<Re
     state.emit(ServerEvent::SyncChanged);
     state.sync_wake.notify_one();
     Ok(RecoveryBatchResult { items })
+}
+
+pub async fn submit_filtered(
+    state: &AppState,
+    mut input: RecoveryBatchInput,
+    filter: &super::recovery_filters::RecoveryFilter,
+) -> AppResult<RecoveryBatchResult> {
+    filter.validate()?;
+    if !filter.is_active() {
+        return submit(state, input).await;
+    }
+    if !input.all || !input.targets.is_empty() {
+        return Err(AppError::bad_request(
+            "invalid_recovery_filter",
+            "filters can only be used with all outstanding issues",
+        ));
+    }
+    let snapshot = page_filtered(state, 5001, 0, filter).await?;
+    if snapshot.total > 5000 {
+        return Err(AppError::bad_request(
+            "recovery_batch_limit",
+            "select up to 5000 issues per batch",
+        ));
+    }
+    input.targets = snapshot.rows.into_iter().map(|row| row.target).collect();
+    input.all = false;
+    submit(state, input).await
 }
 
 async fn submit_one(
@@ -1104,6 +1154,7 @@ async fn queue_local_decisions(
             replacement_operation_id: None,
             local_instance: Some(local_instance.clone()),
             conflict_scope,
+            scopes: Vec::new(),
             peer_instance,
         };
         if let Some((code, detail)) = error {
@@ -1243,6 +1294,7 @@ pub async fn submit_decisions(
                     replacement_operation_id: None,
                     local_instance: None,
                     conflict_scope: None,
+                    scopes: Vec::new(),
                     peer_instance: None,
                 });
                 item.state = if error.code() == "version_conflict" {
@@ -4526,6 +4578,7 @@ mod policy_tests {
             replacement_operation_id: None,
             local_instance: None,
             conflict_scope: None,
+            scopes: Vec::new(),
             peer_instance: None,
         };
         sqlx::query("INSERT INTO outgoing_recovery_requests(peer_id,kind,target_id,state,view_json,updated_at) VALUES('peer','transfer','missing',?,?,?)")
@@ -4988,6 +5041,7 @@ mod policy_tests {
                 replacement_operation_id: None,
                 local_instance: None,
                 conflict_scope: None,
+                scopes: Vec::new(),
                 peer_instance: None,
             };
             sqlx::query("INSERT INTO outgoing_recovery_requests(peer_id,kind,target_id,state,view_json,updated_at) VALUES(?,'transfer',?,'queued',?,?)")
@@ -5073,6 +5127,7 @@ mod policy_tests {
             replacement_operation_id: None,
             local_instance: None,
             conflict_scope: None,
+            scopes: Vec::new(),
             peer_instance: None,
         };
         sqlx::query("INSERT INTO outgoing_recovery_requests(peer_id,kind,target_id,state,view_json,updated_at) VALUES('peer','transfer','missing','queued',?,?)")
@@ -5153,6 +5208,7 @@ mod policy_tests {
             replacement_operation_id: None,
             local_instance: Some("Beta".into()),
             conflict_scope: None,
+            scopes: Vec::new(),
             peer_instance: Some("Alpha".into()),
         };
         let json = serde_json::to_string(&item).unwrap();

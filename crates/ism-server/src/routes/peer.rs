@@ -153,9 +153,9 @@ async fn recovery_decisions(
         },
     )
     .await?;
-    Ok(Json(
-        peers::recovery::submit_decisions(&state, input).await?,
-    ))
+    let mut result = peers::recovery::submit_decisions(&state, input).await?;
+    peers::recovery_filters::attach_peer_scopes(&state, &peer, &mut result.items).await?;
+    Ok(Json(result))
 }
 
 async fn recovery_page(
@@ -222,7 +222,9 @@ async fn recovery(
     )?;
     let input: ism_core::dto::RecoveryBatchInput = serde_json::from_slice(&body)?;
     peers::recovery::authorize_peer(&state, &peer, &input).await?;
-    Ok(Json(peers::recovery::submit(&state, input).await?))
+    let mut result = peers::recovery::submit(&state, input).await?;
+    peers::recovery_filters::attach_peer_scopes(&state, &peer, &mut result.items).await?;
+    Ok(Json(result))
 }
 
 #[derive(Deserialize)]
