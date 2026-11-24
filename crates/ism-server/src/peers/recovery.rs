@@ -655,7 +655,9 @@ pub async fn refresh(state: &AppState, peer: &net::Peer) -> AppResult<()> {
         refresh_timing::record(&peer.id, started, fetched, checked, None);
         return Ok(());
     }
-    let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
+    let mut clock = db::WriterClock::start("outgoing_recovery_snapshot", snapshot.len() as u64);
+    let mut conn = clock.acquire(&state.db).await?;
+    let mut tx = clock.begin(&mut conn).await?;
     #[cfg(test)]
     let locked = std::time::Instant::now();
     let existing: Vec<(String, String, String)> =
@@ -722,7 +724,8 @@ pub async fn refresh(state: &AppState, peer: &net::Peer) -> AppResult<()> {
         .execute(&mut *tx)
         .await?;
     }
-    tx.commit().await?;
+    clock.commit(tx).await?;
+    drop(conn);
     #[cfg(test)]
     refresh_timing::record(
         &peer.id,

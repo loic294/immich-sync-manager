@@ -635,11 +635,10 @@ pub async fn refresh(state: &AppState, peer: &net::Peer) -> Result<(), String> {
         let shares = super::shares(state)
             .await
             .map_err(|e| e.message().to_owned())?;
-        let mut tx = state
-            .db
-            .begin_with("BEGIN IMMEDIATE")
-            .await
-            .map_err(|e| e.to_string())?;
+        let mut clock =
+            db::WriterClock::start("peer_activity_snapshot", batch.changes.len() as u64);
+        let mut conn = clock.acquire(&state.db).await.map_err(|e| e.to_string())?;
+        let mut tx = clock.begin(&mut conn).await.map_err(|e| e.to_string())?;
         for change in &mut batch.changes {
             if let Some(row) = &mut change.activity {
                 if row.id != change.id
@@ -706,7 +705,8 @@ pub async fn refresh(state: &AppState, peer: &net::Peer) -> Result<(), String> {
             ).bind(&peer.id).bind(batch.cursor).bind(json).bind(updated_at)
             .execute(&mut *tx).await.map_err(|e| e.to_string())?;
         }
-        tx.commit().await.map_err(|e| e.to_string())?;
+        clock.commit(tx).await.map_err(|e| e.to_string())?;
+        drop(conn);
         if changed {
             state.emit_ui(ServerEvent::SyncChanged);
         }
