@@ -1736,6 +1736,212 @@ async fn content_wait_drops_a_footprint_error_once_the_footprint_is_released() {
 }
 
 #[tokio::test]
+async fn independent_transfer_candidate_cost_grows_linearly_with_unrelated_conflicts() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    async fn measure(
+        state: &AppState,
+        share: &super::Share,
+        peer_id: &str,
+        transfer_id: &str,
+        opcodes: &AtomicUsize,
+    ) -> usize {
+        for _ in 0..2 {
+            opcodes.store(0, Ordering::Relaxed);
+            let eligible = super::transfer::eligibility(
+                state,
+                share,
+                peer_id,
+                transfer_id,
+                "independent/photo.jpg",
+                0,
+                &crate::db::now(),
+            )
+            .await
+            .unwrap();
+            assert!(matches!(eligible, super::transfer::Eligibility::Ready(_)));
+        }
+        opcodes.load(Ordering::Relaxed)
+    }
+
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    let peer = super::net::peers(&b.state).await.unwrap().remove(0);
+    let share = super::shares(&b.state).await.unwrap().remove(0);
+    let db = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(b.state.db.connect_options().as_ref().clone())
+        .await
+        .unwrap();
+    let state = AppState::new(
+        b.state.config.clone(),
+        db,
+        SecretBox::open_or_create(b._dir.path()).unwrap(),
+    )
+    .await
+    .unwrap();
+    let mut vv = VersionVector::default();
+    vv.increment("measurement-source");
+    let hash = "a".repeat(64);
+    super::queue_transfer(
+        &state,
+        &peer.id,
+        &share,
+        "independent/photo.jpg",
+        &hash,
+        1,
+        &vv,
+    )
+    .await
+    .unwrap();
+    let transfer: String = sqlx::query_scalar("SELECT id FROM transfers")
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    let opcodes = Arc::new(AtomicUsize::new(0));
+    {
+        let mut connection = state.db.acquire().await.unwrap();
+        let counter = opcodes.clone();
+        connection
+            .lock_handle()
+            .await
+            .unwrap()
+            .set_progress_handler(1, move || {
+                counter.fetch_add(1, Ordering::Relaxed);
+                true
+            });
+    }
+    let mut measurements = vec![(
+        0,
+        measure(&state, &share, &peer.id, &transfer, &opcodes).await,
+    )];
+    for batch in 0..2 {
+        for index in batch * 128..(batch + 1) * 128 {
+            let path = format!("unrelated/{index}/photo.jpg");
+            super::conflict(
+                &state,
+                super::ConflictInput {
+                    share: &share,
+                    rel: &path,
+                    kind: "changed_on_both",
+                    detail: "synthetic measurement conflict".into(),
+                    remote: ConflictSide {
+                        instance: "Measurement source".into(),
+                        sha256: Some(hash.clone()),
+                        size: Some(1),
+                        modified_at: None,
+                        deleted: false,
+                    },
+                    remote_vv: &vv,
+                    peer_id: &peer.id,
+                    from: None,
+                },
+            )
+            .await
+            .unwrap();
+            let event = super::PeerEvent {
+                seq: 1000 + index,
+                origin: "measurement-source".into(),
+                origin_seq: 1000 + index,
+                share: share.name.clone(),
+                kind: "file_changed".into(),
+                data: super::EventData {
+                    path,
+                    sha256: Some(hash.clone()),
+                    size: Some(1),
+                    vv: vv.clone(),
+                    ..Default::default()
+                },
+            };
+            sqlx::query(
+                "INSERT INTO peer_inbox(peer_id,seq,origin,origin_seq,share_name,event_json,error)
+                 VALUES (?,?,?,?,?,?,'peer effect waits for conflict resolution')",
+            )
+            .bind(&peer.id)
+            .bind(event.seq)
+            .bind(&event.origin)
+            .bind(event.origin_seq)
+            .bind(&share.name)
+            .bind(serde_json::to_string(&event).unwrap())
+            .execute(&state.db)
+            .await
+            .unwrap();
+        }
+        measurements.push((
+            (batch + 1) * 128,
+            measure(&state, &share, &peer.id, &transfer, &opcodes).await,
+        ));
+    }
+    eprintln!("unrelated conflicts / SQLite VM instructions: {measurements:?}");
+    assert!(measurements[0].1 > 0, "the work counter must be active");
+    let first = measurements[1].1 - measurements[0].1;
+    let second = measurements[2].1 - measurements[1].1;
+    assert!(
+        second * 2 <= first * 3,
+        "each further unrelated conflict must not make a non-overlapping candidate dearer: {measurements:?}"
+    );
+    let mut event: super::PeerEvent = serde_json::from_str(
+        &sqlx::query_scalar::<_, String>(
+            "SELECT event_json FROM peer_inbox WHERE peer_id=? AND seq=1000",
+        )
+        .bind(&peer.id)
+        .fetch_one(&state.db)
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+    event.data.path = "independent/photo.jpg".into();
+    sqlx::query("UPDATE peer_inbox SET event_json=? WHERE peer_id=? AND seq=1000")
+        .bind(serde_json::to_string(&event).unwrap())
+        .bind(&peer.id)
+        .execute(&state.db)
+        .await
+        .unwrap();
+    let eligible = super::transfer::eligibility(
+        &state,
+        &share,
+        &peer.id,
+        &transfer,
+        "independent/photo.jpg",
+        0,
+        &crate::db::now(),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        eligible,
+        super::transfer::Eligibility::Waiting { blocked: true, .. }
+    ));
+
+    event.data.path = "unrelated/0/photo.jpg".into();
+    event.data.sha256 = None;
+    sqlx::query("UPDATE peer_inbox SET event_json=? WHERE peer_id=? AND seq=1000")
+        .bind(serde_json::to_string(&event).unwrap())
+        .bind(&peer.id)
+        .execute(&state.db)
+        .await
+        .unwrap();
+    let error = super::require_stable_share(&state, &share, &["independent/photo.jpg"])
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), "invalid_peer_event");
+
+    sqlx::query("UPDATE peer_inbox SET event_json='{' WHERE peer_id=? AND seq=1000")
+        .bind(&peer.id)
+        .execute(&state.db)
+        .await
+        .unwrap();
+    assert!(
+        super::require_stable_share(&state, &share, &["independent/photo.jpg"])
+            .await
+            .is_err()
+    );
+    state.db.close().await;
+}
+
+#[tokio::test]
 async fn recovery_batch_preserves_decisions_and_never_dismisses_unverified_work() {
     let (mut a, mut b) = pair().await;
     stop_workers(&mut a).await;

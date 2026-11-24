@@ -1636,6 +1636,7 @@ async fn require_stable_share_effects(
     .bind(&share.name)
     .fetch_all(&state.db)
     .await?;
+    let mut transfers_checked = false;
     for (raw, operation) in events {
         if operation
             .as_ref()
@@ -1643,17 +1644,24 @@ async fn require_stable_share_effects(
         {
             continue;
         }
-        require_unresolved_transfers(state, share, paths).await?;
+        if !transfers_checked {
+            require_unresolved_transfers(state, share, paths).await?;
+            transfers_checked = true;
+        }
         let event: PeerEvent = serde_json::from_str(&raw)?;
-        if conflict_decision(state, share, &event).await?.is_some() {
+        event_valid(&event)?;
+        if event.kind == SHARE_ENABLED {
             continue;
         }
-        if event.kind != SHARE_ENABLED
-            && (paths.is_empty()
-                || paths
-                    .iter()
-                    .any(|p| self::paths(&event).iter().any(|b| overlaps(p, b))))
+        let event_paths = self::paths(&event);
+        if !paths.is_empty()
+            && !paths
+                .iter()
+                .any(|p| event_paths.iter().any(|b| overlaps(p, b)))
         {
+            continue;
+        }
+        if conflict_decision(state, share, &event).await?.is_none() {
             return Err(AppError::conflict(
                 "recovery_required",
                 "peer publication waits for a dependent inbox effect",
