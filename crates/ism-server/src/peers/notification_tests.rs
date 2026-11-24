@@ -885,7 +885,7 @@ async fn sustained_progress_hints_faster_than_activity_fetches_keep_sync_fresh()
     let (transfer, remote_peer) = running_transfer(&b, 100_000_000).await;
     // Hints coalesce every 250ms on the receiver; each activity response takes longer.
     b.activity_delay.store(700, Ordering::SeqCst);
-    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop = std::sync::std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let progress = tokio::spawn({
         let state = b.state.clone();
         let stop = stop.clone();
@@ -1026,6 +1026,174 @@ async fn receiver_activity_does_not_wait_for_unrelated_recovery_discovery() {
         transfer.as_str(),
         "{row}"
     );
+    let unrelated: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM sync_recovery WHERE target_id='unrelated-example')",
+    )
+    .fetch_one(&b.state.db)
+    .await
+    .unwrap();
+    assert!(
+        !unrelated,
+        "page-scoped discovery leaves unrelated backlog alone"
+    );
+    crate::peers::recovery::discover(&b.state).await.unwrap();
+    let unrelated: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM sync_recovery WHERE target_id='unrelated-example')",
+    )
+    .fetch_one(&b.state.db)
+    .await
+    .unwrap();
+    assert!(unrelated, "global discovery shares the same eligibility");
+}
+
+async fn competing_writer(
+    state: AppState,
+    peer: String,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Duration {
+    let mut worst = Duration::ZERO;
+    while !stop.load(Ordering::SeqCst) {
+        let started = std::time::Instant::now();
+        sqlx::query("UPDATE peers SET last_error=? WHERE id=?")
+            .bind(crate::db::now())
+            .bind(&peer)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        worst = worst.max(started.elapsed());
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    worst
+}
+
+/// Prints SQLx timings for the receiver's 500-change page; run at the serialized Cargo gate with
+/// `cargo test -p ism-server measure_activity_page_discovery -- --ignored --nocapture`.
+#[tokio::test]
+#[ignore = "manual SQLx contention measurement"]
+async fn measure_activity_page_discovery() {
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    let remote_peer = net::peers(&b.state).await.unwrap().remove(0);
+    let share = crate::peers::shares(&b.state).await.unwrap().remove(0);
+    for i in 0..500 {
+        crate::peers::queue_transfer(
+            &b.state,
+            &remote_peer.id,
+            &share,
+            &format!("measure-{i}.jpg"),
+            &crate::crypto::sha256_hex(format!("synthetic-{i}").as_bytes()),
+            1000,
+            &VersionVector::default(),
+        )
+        .await
+        .unwrap();
+    }
+    sqlx::query(
+        "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i < 4999)
+         INSERT INTO operations(id,idempotency_key,principal,source,request_json,status,created_at)
+         SELECT 'backlog-' || i,'backlog-' || i,?,'peer','{}','failed',? FROM n",
+    )
+    .bind(format!("peer:{}", remote_peer.id))
+    .bind(crate::db::now())
+    .execute(&b.state.db)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE peers SET status='online',last_seen_at=?")
+        .bind(crate::db::now())
+        .execute(&b.state.db)
+        .await
+        .unwrap();
+    let hold = Duration::from_millis(250);
+    for scenario in ["500 healthy rows", "500 failed rows, undiscovered"] {
+        if scenario.starts_with("500 failed") {
+            sqlx::query("UPDATE transfers SET status='failed',error='synthetic'")
+                .execute(&b.state.db)
+                .await
+                .unwrap();
+        }
+        let before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sync_recovery")
+            .fetch_one(&b.state.db)
+            .await
+            .unwrap();
+        // Competing writer committing every 2 ms while the page is produced.
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let idle_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let idle = tokio::spawn(competing_writer(
+            b.state.clone(),
+            remote_peer.id.clone(),
+            idle_stop.clone(),
+        ));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        idle_stop.store(true, Ordering::SeqCst);
+        let idle = idle.await.unwrap();
+        let competitor = tokio::spawn(competing_writer(
+            b.state.clone(),
+            remote_peer.id.clone(),
+            stop.clone(),
+        ));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let started = std::time::Instant::now();
+        let page = activity::changes(&b.state, &remote_peer.id, 0)
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        stop.store(true, Ordering::SeqCst);
+        let worst = competitor.await.unwrap();
+        let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sync_recovery")
+            .fetch_one(&b.state.db)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&page).unwrap()["changes"]
+                .as_array()
+                .unwrap()
+                .len(),
+            500
+        );
+        println!(
+            "{scenario}: page={elapsed:?} competitor-max={worst:?} (idle {idle:?}) inserted={}",
+            after - before
+        );
+    }
+    // Held writer: a page whose rows are all discovered needs no writer; fresh failures wait.
+    for scenario in [
+        "discovered page, held writer",
+        "newly failed page, held writer",
+    ] {
+        if scenario.starts_with("newly") {
+            sqlx::query("DELETE FROM sync_recovery WHERE kind='transfer'")
+                .execute(&b.state.db)
+                .await
+                .unwrap();
+        }
+        let mut writer = b.state.db.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        sqlx::query("UPDATE peers SET last_error='held' WHERE id=?")
+            .bind(&remote_peer.id)
+            .execute(&mut *writer)
+            .await
+            .unwrap();
+        let pending = tokio::spawn({
+            let state = b.state.clone();
+            let peer = remote_peer.id.clone();
+            async move {
+                let started = std::time::Instant::now();
+                activity::changes(&state, &peer, 0).await.unwrap();
+                started.elapsed()
+            }
+        });
+        tokio::time::sleep(hold).await;
+        writer.rollback().await.unwrap();
+        let elapsed = pending.await.unwrap();
+        let backlog: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sync_recovery WHERE target_id LIKE 'backlog-%'",
+        )
+        .fetch_one(&b.state.db)
+        .await
+        .unwrap();
+        println!("{scenario} {hold:?}: page={elapsed:?} unrelated-backlog-inserted={backlog}");
+    }
 }
 
 #[tokio::test]

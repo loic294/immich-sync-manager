@@ -228,42 +228,6 @@ pub async fn get(
     }
 }
 
-/// Like `get`, but discovers only when this target is recoverable and still undiscovered.
-/// Unrelated undiscovered work no longer makes the caller wait for the SQLite writer.
-pub async fn get_discovered(
-    state: &AppState,
-    kind: RecoveryKind,
-    target_id: &str,
-) -> AppResult<Option<RecoveryView>> {
-    if let Some(item) = get(state, kind, target_id).await? {
-        return Ok(Some(item));
-    }
-    let sql = match kind {
-        RecoveryKind::Operation => {
-            "SELECT EXISTS(SELECT 1 FROM operations o WHERE o.id=?
-                 AND o.status IN ('failed','partial','recovery_required') AND (
-                     o.principal LIKE 'peer:%' OR EXISTS (
-                         SELECT 1 FROM operation_items i WHERE i.operation_id = o.id
-                         AND i.error_code = 'peer_bookkeeping_failed')))"
-        }
-        RecoveryKind::Transfer => {
-            "SELECT EXISTS(SELECT 1 FROM transfers WHERE id=? AND status='failed')"
-        }
-        RecoveryKind::Conflict => {
-            "SELECT EXISTS(SELECT 1 FROM conflicts WHERE id=? AND status='open')"
-        }
-    };
-    let recoverable: bool = sqlx::query_scalar(sql)
-        .bind(target_id)
-        .fetch_one(&state.db)
-        .await?;
-    if !recoverable {
-        return Ok(None);
-    }
-    discover(state).await?;
-    get(state, kind, target_id).await
-}
-
 fn mirrored_view(
     peer: String,
     json: &str,
@@ -365,59 +329,145 @@ async fn decorate(state: &AppState, mut item: RecoveryView) -> AppResult<Recover
     Ok(item)
 }
 
+// Eligibility is shared by global and target-scoped discovery so both always agree.
+macro_rules! operation_recoverable {
+    () => {
+        "o.status IN ('failed','partial','recovery_required') AND (
+             o.principal LIKE 'peer:%' OR EXISTS (
+                 SELECT 1 FROM operation_items i WHERE i.operation_id = o.id
+                 AND i.error_code = 'peer_bookkeeping_failed'))"
+    };
+}
+macro_rules! transfer_recoverable {
+    () => {
+        "t.status = 'failed'"
+    };
+}
+macro_rules! conflict_recoverable {
+    () => {
+        "c.status = 'open'"
+    };
+}
+// `$o`, `$t` and `$c` narrow each kind; an empty literal means every row.
+macro_rules! missing_sql {
+    ($o:literal, $t:literal, $c:literal) => {
+        concat!(
+            "SELECT EXISTS(SELECT 1 FROM operations o WHERE ",
+            $o,
+            operation_recoverable!(),
+            " AND NOT EXISTS (SELECT 1 FROM sync_recovery r
+                 WHERE r.kind='operation' AND r.target_id=o.id))
+             OR EXISTS(SELECT 1 FROM transfers t WHERE ",
+            $t,
+            transfer_recoverable!(),
+            " AND NOT EXISTS (SELECT 1 FROM sync_recovery r
+                 WHERE r.kind='transfer' AND r.target_id=t.id))
+             OR EXISTS(SELECT 1 FROM conflicts c WHERE ",
+            $c,
+            conflict_recoverable!(),
+            " AND NOT EXISTS (SELECT 1 FROM sync_recovery r
+                 WHERE r.kind='conflict' AND r.target_id=c.id))"
+        )
+    };
+}
+macro_rules! insert_sql {
+    ($o:literal, $t:literal, $c:literal) => {
+        [
+            concat!(
+                "INSERT OR IGNORE INTO sync_recovery (id,kind,target_id,created_at,updated_at)
+                 SELECT 'operation:' || o.id,'operation',o.id,?,? FROM operations o WHERE ",
+                $o,
+                operation_recoverable!()
+            ),
+            concat!(
+                "INSERT OR IGNORE INTO sync_recovery (id,kind,target_id,created_at,updated_at)
+                 SELECT 'transfer:' || t.id,'transfer',t.id,?,? FROM transfers t WHERE ",
+                $t,
+                transfer_recoverable!()
+            ),
+            concat!(
+                "INSERT OR IGNORE INTO sync_recovery
+                     (id,kind,target_id,state,code,created_at,updated_at)
+                 SELECT 'conflict:' || c.id,'conflict',c.id,'needs_decision','choose_version',?,?
+                 FROM conflicts c WHERE ",
+                $c,
+                conflict_recoverable!()
+            ),
+        ]
+    };
+}
+const SCOPED_MISSING: &str = missing_sql!(
+    "o.id IN (SELECT value FROM json_each(?)) AND ",
+    "t.id IN (SELECT value FROM json_each(?)) AND ",
+    "c.id IN (SELECT value FROM json_each(?)) AND "
+);
+const SCOPED_INSERTS: [&str; 3] = insert_sql!(
+    "o.id IN (SELECT value FROM json_each(?)) AND ",
+    "t.id IN (SELECT value FROM json_each(?)) AND ",
+    "c.id IN (SELECT value FROM json_each(?)) AND "
+);
+
 pub async fn discover(state: &AppState) -> AppResult<()> {
     // Reads run on every page load; only take the write lock when something is missing.
-    let missing: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM operations o
-             WHERE o.status IN ('failed','partial','recovery_required') AND (
-                 o.principal LIKE 'peer:%' OR EXISTS (
-                     SELECT 1 FROM operation_items i WHERE i.operation_id = o.id
-                     AND i.error_code = 'peer_bookkeeping_failed'))
-             AND NOT EXISTS (SELECT 1 FROM sync_recovery r
-                 WHERE r.kind='operation' AND r.target_id=o.id))
-         OR EXISTS(SELECT 1 FROM transfers t WHERE t.status='failed'
-             AND NOT EXISTS (SELECT 1 FROM sync_recovery r
-                 WHERE r.kind='transfer' AND r.target_id=t.id))
-         OR EXISTS(SELECT 1 FROM conflicts c WHERE c.status='open'
-             AND NOT EXISTS (SELECT 1 FROM sync_recovery r
-                 WHERE r.kind='conflict' AND r.target_id=c.id))",
-    )
-    .fetch_one(&state.db)
-    .await?;
+    let missing: bool = sqlx::query_scalar(missing_sql!("", "", ""))
+        .fetch_one(&state.db)
+        .await?;
     if !missing {
         return Ok(());
     }
     let now = db::now();
     let mut tx = state.db.begin().await?;
-    sqlx::query(
-        "INSERT OR IGNORE INTO sync_recovery (id,kind,target_id,created_at,updated_at)
-         SELECT 'operation:' || o.id,'operation',o.id,?,? FROM operations o
-         WHERE o.status IN ('failed','partial','recovery_required') AND (
-             o.principal LIKE 'peer:%' OR EXISTS (
-                 SELECT 1 FROM operation_items i WHERE i.operation_id = o.id
-                 AND i.error_code = 'peer_bookkeeping_failed'))",
-    )
-    .bind(&now)
-    .bind(&now)
-    .execute(&mut *tx)
-    .await?;
-    sqlx::query(
-        "INSERT OR IGNORE INTO sync_recovery (id,kind,target_id,created_at,updated_at)
-         SELECT 'transfer:' || id,'transfer',id,?,? FROM transfers WHERE status = 'failed'",
-    )
-    .bind(&now)
-    .bind(&now)
-    .execute(&mut *tx)
-    .await?;
-    sqlx::query(
-        "INSERT OR IGNORE INTO sync_recovery (id,kind,target_id,state,code,created_at,updated_at)
-         SELECT 'conflict:' || id,'conflict',id,'needs_decision','choose_version',?,?
-         FROM conflicts WHERE status = 'open'",
-    )
-    .bind(&now)
-    .bind(&now)
-    .execute(&mut *tx)
-    .await?;
+    for sql in insert_sql!("", "", "") {
+        sqlx::query(sql)
+            .bind(&now)
+            .bind(&now)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    state.emit(ServerEvent::SyncChanged);
+    Ok(())
+}
+
+/// Discovers only the given targets, with the same eligibility as [`discover`]. One read decides
+/// whether any of them is missing; only then does it take the writer, and it inserts nothing else.
+pub async fn discover_targets(state: &AppState, targets: &[(RecoveryKind, &str)]) -> AppResult<()> {
+    if targets.is_empty() {
+        return Ok(());
+    }
+    let ids = |want: RecoveryKind| {
+        serde_json::to_string(
+            &targets
+                .iter()
+                .filter(|(kind, _)| *kind == want)
+                .map(|(_, id)| *id)
+                .collect::<Vec<_>>(),
+        )
+    };
+    let scopes = [
+        ids(RecoveryKind::Operation)?,
+        ids(RecoveryKind::Transfer)?,
+        ids(RecoveryKind::Conflict)?,
+    ];
+    let missing: bool = sqlx::query_scalar(SCOPED_MISSING)
+        .bind(&scopes[0])
+        .bind(&scopes[1])
+        .bind(&scopes[2])
+        .fetch_one(&state.db)
+        .await?;
+    if !missing {
+        return Ok(());
+    }
+    let now = db::now();
+    let mut tx = state.db.begin().await?;
+    for (sql, scope) in SCOPED_INSERTS.into_iter().zip(&scopes) {
+        sqlx::query(sql)
+            .bind(&now)
+            .bind(&now)
+            .bind(scope)
+            .execute(&mut *tx)
+            .await?;
+    }
     tx.commit().await?;
     state.emit(ServerEvent::SyncChanged);
     Ok(())

@@ -537,13 +537,26 @@ pub async fn changes(state: &AppState, peer: &str, after: i64) -> AppResult<Chan
     .await?;
     let progress = progress(&mut tx, Some(peer)).await?;
     tx.commit().await?;
+    let target = |row: &SyncActivity| {
+        row.operation_id.as_ref().map_or(
+            (ism_core::dto::RecoveryKind::Transfer, row.id.clone()),
+            |id| (ism_core::dto::RecoveryKind::Operation, id.clone()),
+        )
+    };
+    let targets: Vec<_> = rows.iter().map(target).collect();
+    // Returned rows must carry their recovery, so discovery for them fails closed; it is bounded
+    // to this page so unrelated backlog never holds the response behind the SQLite writer.
+    super::recovery::discover_targets(
+        state,
+        &targets
+            .iter()
+            .map(|(kind, id)| (*kind, id.as_str()))
+            .collect::<Vec<_>>(),
+    )
+    .await?;
     let mut decorated = Vec::new();
-    for mut row in rows {
-        let (kind, id) = row.operation_id.as_ref().map_or(
-            (ism_core::dto::RecoveryKind::Transfer, row.id.as_str()),
-            |id| (ism_core::dto::RecoveryKind::Operation, id.as_str()),
-        );
-        row.recovery = super::recovery::get_discovered(state, kind, id).await?;
+    for (mut row, (kind, id)) in rows.into_iter().zip(targets) {
+        row.recovery = super::recovery::get(state, kind, &id).await?;
         decorated.push(row);
     }
     let mut rows: HashMap<_, _> = decorated

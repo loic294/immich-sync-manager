@@ -53,9 +53,11 @@ successful fetch began after a hint issued within the last ten seconds, so the s
 by at most that long; it never replaces a newer verified fetch. Sustained hints can keep recovery
 waiting for a quiet moment. Disconnects and configuration changes invalidate both verifications;
 a failed fetch for the latest hint revokes only its own snapshot. Keepalives alone never authorize
-failed or previous snapshots. The receiver's progress endpoint records missing recovery only for the
-rows it returns, so unrelated undiscovered recovery does not wait for its database writer; a returned
-row that needs recovery still waits (or fails) rather than omitting it.
+failed or previous snapshots. The receiver's progress endpoint checks the page it returns (at most
+500 rows) in one read and, only if one of them is missing recovery, records just those rows, with
+the same eligibility as global discovery. Unrelated undiscovered recovery is never inserted there
+and never makes it wait for the database writer; a returned row that needs recovery still waits
+(or fails) rather than omitting it.
 Progress and recovery have independently coalesced, single-flight refreshes (recovery within ten
 seconds), so a stalled endpoint does not delay later hints for the other snapshot. Refreshes write
 only changed mirror rows, and rewrite an unchanged
