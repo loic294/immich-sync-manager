@@ -2609,7 +2609,7 @@ async fn add_waiting_scan_units(
             share,
             &format!("scan/c{unit}/photo.jpg"),
             order + 1,
-            1,
+            1_440,
         )
         .await;
         queue_scan_row(
