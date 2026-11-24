@@ -181,7 +181,7 @@ pub(super) async fn run(state: &AppState, peer: &net::Peer) {
         peer_id: peer.id.clone(),
         owner,
     };
-    let (sender, mut hints) = watch::channel(Hint::Waiting);
+    let (sender, hints) = watch::channel(Hint::Waiting);
     let (attention_sender, mut attention_hints) = watch::channel(());
     let reader = async move {
         let client = match reqwest::Client::builder().connect_timeout(RETRY).build() {
@@ -218,41 +218,6 @@ pub(super) async fn run(state: &AppState, peer: &net::Peer) {
             }
         }
     };
-    let consumer = async {
-        let mut retry: Option<Option<Refresh>> = None;
-        loop {
-            let hint = tokio::select! {
-                result = hints.changed() => {
-                    if result.is_err() { break; }
-                    hints.borrow_and_update().clone()
-                }
-                _ = tokio::time::sleep(RETRY), if retry.is_some() => Hint::Refresh(retry.take().flatten()),
-            };
-            retry = None;
-            match hint {
-                Hint::Waiting => {}
-                Hint::Refresh(refresh) => {
-                    let success = activity::refresh_peer(state, peer, refresh.as_ref()).await;
-                    if !success {
-                        retry = Some(refresh);
-                    }
-                    // Hints received during a slow fetch collapse to one further refresh.
-                    tokio::time::sleep(COALESCE).await;
-                }
-                Hint::Error(error) => {
-                    tracing::warn!(peer=%peer.id, "peer notifications unavailable: {error}");
-                    let error = AppError::conflict("peer_notifications_unavailable", error);
-                    if let Err(error) = recovery::unavailable(state, &peer.id, &error).await {
-                        tracing::error!(
-                            "cannot persist recovery availability: {}",
-                            error.message()
-                        );
-                    }
-                    activity::unavailable(state, &peer.id, error.message()).await;
-                }
-            }
-        }
-    };
     let attention = async {
         let mut poll = tokio::time::interval(super::attention::POLL);
         poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -270,7 +235,58 @@ pub(super) async fn run(state: &AppState, peer: &net::Peer) {
             tokio::time::sleep(COALESCE).await;
         }
     };
-    tokio::join!(reader, consumer, attention);
+    tokio::join!(
+        reader,
+        consume(state, peer, Snapshot::Activity, hints.clone()),
+        consume(state, peer, Snapshot::Recovery, hints),
+        attention
+    );
+}
+
+async fn consume(
+    state: &AppState,
+    peer: &net::Peer,
+    snapshot: Snapshot,
+    mut hints: watch::Receiver<Hint>,
+) {
+    let mut retry: Option<Option<Refresh>> = None;
+    loop {
+        let hint = tokio::select! {
+            result = hints.changed() => {
+                if result.is_err() { break; }
+                hints.borrow_and_update().clone()
+            }
+            _ = tokio::time::sleep(RETRY), if retry.is_some() => Hint::Refresh(retry.take().flatten()),
+        };
+        retry = None;
+        match hint {
+            Hint::Waiting => {}
+            Hint::Refresh(refresh) => {
+                if !activity::refresh_snapshot(state, peer, snapshot, refresh.as_ref()).await {
+                    retry = Some(refresh);
+                }
+                // Hints received during a slow fetch collapse to one further refresh.
+                tokio::time::sleep(COALESCE).await;
+            }
+            Hint::Error(error) => {
+                tracing::warn!(peer=%peer.id, "peer notifications unavailable: {error}");
+                let error = AppError::conflict("peer_notifications_unavailable", error);
+                match snapshot {
+                    Snapshot::Recovery => {
+                        if let Err(error) = recovery::unavailable(state, &peer.id, &error).await {
+                            tracing::error!(
+                                "cannot persist recovery availability: {}",
+                                error.message()
+                            );
+                        }
+                    }
+                    Snapshot::Activity => {
+                        activity::unavailable(state, &peer.id, error.message()).await;
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn attention_changed(

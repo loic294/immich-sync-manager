@@ -76,47 +76,46 @@ pub async fn run(state: AppState) {
     }
 }
 
-pub(super) async fn refresh_peer(
+pub(super) async fn refresh_snapshot(
     state: &AppState,
     peer: &net::Peer,
+    snapshot: super::notifications::Snapshot,
     verification: Option<&super::notifications::Refresh>,
 ) -> bool {
-    // A stalled receiver endpoint must not delay the other snapshot.
-    let recovery = async {
-        let result = super::recovery::refresh(state, peer).await;
-        if let Some(verification) = verification
-            && verification.complete(super::notifications::Snapshot::Recovery, result.is_ok())
-            && result.is_ok()
-        {
-            state.emit_ui(ServerEvent::SyncChanged);
+    let success = match snapshot {
+        super::notifications::Snapshot::Recovery => {
+            match super::recovery::refresh(state, peer).await {
+                Ok(()) => true,
+                Err(error) => {
+                    tracing::warn!(peer=%peer.id,"cannot refresh recovery: {}",error.message());
+                    if let Err(error) = super::recovery::unavailable(state, &peer.id, &error).await
+                    {
+                        tracing::error!(
+                            "cannot persist recovery availability: {}",
+                            error.message()
+                        );
+                    }
+                    false
+                }
+            }
         }
-        let Err(error) = result else {
-            return true;
-        };
-        tracing::warn!(peer=%peer.id,"cannot refresh recovery: {}",error.message());
-        if let Err(error) = super::recovery::unavailable(state, &peer.id, &error).await {
-            tracing::error!("cannot persist recovery availability: {}", error.message());
-        }
-        false
+        super::notifications::Snapshot::Activity => match refresh(state, peer).await {
+            Ok(()) => true,
+            Err(error) => {
+                let error = crate::error::redact(&error);
+                tracing::warn!(peer=%peer.id, "cannot refresh activity: {error}");
+                unavailable(state, &peer.id, &error).await;
+                false
+            }
+        },
     };
-    let activity = async {
-        let result = refresh(state, peer).await;
-        if let Some(verification) = verification
-            && verification.complete(super::notifications::Snapshot::Activity, result.is_ok())
-            && result.is_ok()
-        {
-            state.emit_ui(ServerEvent::SyncChanged);
-        }
-        let Err(error) = result else {
-            return true;
-        };
-        let error = crate::error::redact(&error);
-        tracing::warn!(peer=%peer.id, "cannot refresh activity: {error}");
-        unavailable(state, &peer.id, &error).await;
-        false
-    };
-    let (recovery, activity) = tokio::join!(recovery, activity);
-    recovery && activity
+    if let Some(verification) = verification
+        && verification.complete(snapshot, success)
+        && success
+    {
+        state.emit_ui(ServerEvent::SyncChanged);
+    }
+    success
 }
 
 const CTE: &str = "

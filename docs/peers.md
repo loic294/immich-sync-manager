@@ -50,8 +50,9 @@ connection and its latest hint. Activity and recovery verify independently: a st
 fetch does not suppress current transfer rates or ETA. New hints, disconnects and configuration changes
 invalidate both verifications; a fetch failure revokes only its own snapshot. Keepalives alone never
 authorize failed or previous snapshots.
-Progress and recovery are fetched concurrently (recovery within ten seconds), so a stalled endpoint
-does not delay the other snapshot. Refreshes write only changed mirror rows, and rewrite an unchanged
+Progress and recovery have independently coalesced, single-flight refreshes (recovery within ten
+seconds), so a stalled endpoint does not delay later hints for the other snapshot. Refreshes write
+only changed mirror rows, and rewrite an unchanged
 snapshot's timestamp at most every ten seconds; an unchanged recent snapshot uses only a read
 and does not wait for the database writer lock. A recovery snapshot clears accepted Fix requests only
 when they were accepted before its request started; later acceptances wait for the next snapshot.

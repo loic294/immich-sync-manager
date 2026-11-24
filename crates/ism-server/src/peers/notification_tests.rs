@@ -796,18 +796,49 @@ async fn notification_client_stalled_recovery_keeps_sync_page_fresh_without_veri
         Some(false),
         "recovery stays unverified while its snapshot is held"
     );
-    b.state.emit(crate::state::ServerEvent::SyncChanged);
-    wait(
-        "new hint revokes the earlier activity verification",
-        || async { a.state.peer_streams.fresh(&peer.id, Snapshot::Activity) == Some(false) },
-    )
-    .await;
-    let page = activity::page(&a.state, "active", 100, 0, None)
+    let held_requests = count(&b, RECOVERY);
+    activity::record_progress(&b.state, &transfer, &remote_peer.id, 200, 100)
         .await
         .unwrap();
-    assert!(!page.warnings.is_empty());
-    assert_eq!(page.progress.bytes_per_second, 0.0);
-    assert_eq!(page.progress.eta_seconds, None);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let page = activity::page(&a.state, "active", 100, 0, None)
+                .await
+                .unwrap();
+            if a.state.peer_streams.fresh(&peer.id, Snapshot::Activity) == Some(true)
+                && page.warnings.is_empty()
+                && page.progress.bytes_done == 200
+                && page.progress.bytes_per_second > 0.0
+                && page.progress.eta_seconds.is_some()
+                && page
+                    .rows
+                    .iter()
+                    .any(|row| row.outgoing && row.bytes_done == 200)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("a new activity hint must refresh the Sync page while recovery remains held");
+    assert_eq!(
+        count(&b, RECOVERY),
+        held_requests,
+        "recovery stays single-flight while its previous response is held"
+    );
+    assert_eq!(cache_available(&a, &peer).await, (true, false));
+    b.recovery_hold.armed.store(true, Ordering::SeqCst);
+    b.recovery_hold.release.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), b.recovery_hold.entered.notified())
+        .await
+        .expect("the newer recovery snapshot should be requested");
+    assert_eq!(
+        a.state.peer_streams.fresh(&peer.id, Snapshot::Recovery),
+        Some(false),
+        "the old response must not verify recovery for the newer hint"
+    );
+    assert_eq!(cache_available(&a, &peer).await, (true, false));
     b.recovery_hold.release.notify_one();
     wait("verified after the stalled recovery completes", || {
         ready(&a, &peer)
