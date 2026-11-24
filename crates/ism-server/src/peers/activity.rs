@@ -17,61 +17,104 @@ const CHANGE_LIMIT: i64 = 500;
 pub async fn run(state: AppState) {
     // Spawned workers keep progressing during peer-list queries; dropping the set aborts them.
     let mut active = tokio::task::JoinSet::new();
-    let mut running = HashMap::new();
+    let mut running: HashMap<String, (net::Peer, tokio::task::AbortHandle)> = HashMap::new();
     let mut interval = tokio::time::interval(Duration::from_secs(5));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut configuration = state.peer_configuration.subscribe();
     loop {
         tokio::select! {
-            _ = interval.tick() => {
+            reconfigured = async {
+                tokio::select! {
+                    _ = interval.tick() => false,
+                    _ = configuration.changed() => true,
+                }
+            } => {
                 match net::peers(&state).await {
                     Ok(peers) => {
+                        running.retain(|id, (old, handle)| {
+                            let keep = !reconfigured && peers.iter().any(|peer| peer.id == *id
+                                && peer.url == old.url && peer.secret == old.secret
+                                && peer.instance_id == old.instance_id && peer.name == old.name);
+                            if !keep { handle.abort(); }
+                            keep
+                        });
                         for peer in peers {
                             if !running.contains_key(&peer.id) {
                                 let id = peer.id.clone();
                                 let state = state.clone();
+                                let current = peer.clone();
+                                let mut configuration = configuration.clone();
                                 let worker = active.spawn(async move {
-                                    if let Err(error)=crate::activity::observe(&state, format!("recovery-refresh:{}",peer.id),
-                                        "Peer recovery refresh", &peer.name, Some("/sync"), |task| {
-                                            let (state,peer)=(&state,&peer);
-                                            async move {
-                                            task.phase("Fetching current recovery evidence from peer");
-                                            super::recovery::refresh(state,peer).await
-                                        }}).await {
-                                        tracing::warn!(peer=%peer.id,"cannot refresh recovery: {}",error.message());
-                                        if let Err(error)=super::recovery::unavailable(&state,&peer.id,&error).await {
-                                            tracing::error!("cannot persist recovery availability: {}",error.message());
-                                        }
+                                    tokio::select! {
+                                        biased;
+                                        _ = configuration.changed() => {}
+                                        _ = super::notifications::run(&state, &peer) => {}
                                     }
-                                    if let Err(error) = crate::activity::observe(&state, format!("activity-refresh:{}",peer.id),
-                                        "Peer transfer activity refresh", &peer.name, Some("/sync"), |task| {
-                                            let (state,peer)=(&state,&peer);
-                                            async move {
-                                            task.phase("Fetching receiver-owned transfer progress");
-                                            refresh(state,peer).await
-                                                .map_err(|e| AppError::conflict("activity_refresh",crate::error::redact(&e)))
-                                        }}).await {
-                                        unavailable(&state, &peer.id, error.message()).await;
-                                    }
-                                    peer.id
                                 });
-                                running.insert(id, worker.id());
+                                running.insert(id, (current, worker));
                             }
                         }
                     }
                     Err(error) => tracing::error!("cannot load peers for sync activity: {}", error.message()),
                 }
             }
-            Some(result) = active.join_next(), if !active.is_empty() => {
+            Some(result) = active.join_next_with_id(), if !active.is_empty() => {
                 match result {
-                    Ok(id) => { running.remove(&id); }
+                    Ok((id, ())) => {
+                        running.retain(|_, (_, handle)| handle.id() != id);
+                    }
                     Err(error) => {
-                        running.retain(|_, id| *id != error.id());
-                        tracing::error!("peer activity worker failed: {error}");
+                        running.retain(|_, (_, handle)| handle.id() != error.id());
+                        if !error.is_cancelled() {
+                            tracing::error!("peer activity worker failed: {error}");
+                        }
                     }
                 }
             }
         }
     }
+}
+
+pub(super) async fn refresh_peer(state: &AppState, peer: &net::Peer) -> bool {
+    let mut success = true;
+    if let Err(error) = crate::activity::observe(
+        state,
+        format!("recovery-refresh:{}", peer.id),
+        "Peer recovery refresh",
+        &peer.name,
+        Some("/sync"),
+        |task| async move {
+            task.phase("Fetching current recovery evidence from peer");
+            super::recovery::refresh(state, peer).await
+        },
+    )
+    .await
+    {
+        success = false;
+        tracing::warn!(peer=%peer.id,"cannot refresh recovery: {}",error.message());
+        if let Err(error) = super::recovery::unavailable(state, &peer.id, &error).await {
+            tracing::error!("cannot persist recovery availability: {}", error.message());
+        }
+    }
+    if let Err(error) = crate::activity::observe(
+        state,
+        format!("activity-refresh:{}", peer.id),
+        "Peer transfer activity refresh",
+        &peer.name,
+        Some("/sync"),
+        |task| async move {
+            task.phase("Fetching receiver-owned transfer progress");
+            refresh(state, peer)
+                .await
+                .map_err(|e| AppError::conflict("activity_refresh", crate::error::redact(&e)))
+        },
+    )
+    .await
+    {
+        success = false;
+        unavailable(state, &peer.id, error.message()).await;
+    }
+    success
 }
 
 const CTE: &str = "

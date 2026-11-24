@@ -66,12 +66,31 @@ pub fn request(
     path_and_query: &str,
     body: Option<Vec<u8>>,
 ) -> reqwest::RequestBuilder {
+    request_with_client(
+        &state.http,
+        state,
+        peer_url,
+        secret,
+        method,
+        path_and_query,
+        body,
+    )
+}
+
+pub(super) fn request_with_client(
+    client: &reqwest::Client,
+    state: &AppState,
+    peer_url: &str,
+    secret: &str,
+    method: Method,
+    path_and_query: &str,
+    body: Option<Vec<u8>>,
+) -> reqwest::RequestBuilder {
     let ts = chrono::Utc::now().timestamp();
     let body = body.unwrap_or_default();
     let sig = crate::crypto::sign_request(secret, method.as_str(), path_and_query, ts, &body);
     let url = format!("{}{}", peer_url.trim_end_matches('/'), path_and_query);
-    let mut req = state
-        .http
+    let mut req = client
         .request(method, url)
         .header(PEER_HEADER, &state.instance_id)
         .header(TIMESTAMP_HEADER, ts.to_string())
@@ -125,7 +144,7 @@ pub async fn get_json_within<T: serde::de::DeserializeOwned>(
 }
 
 /// A proxy's HTML error page (or an empty body) is reduced to its status reason.
-fn http_failure(status: reqwest::StatusCode, body: &str) -> String {
+pub(super) fn http_failure(status: reqwest::StatusCode, body: &str) -> String {
     let detail: String = if body.trim_start().starts_with('<') || body.trim().is_empty() {
         status.canonical_reason().unwrap_or("error").to_owned()
     } else {
