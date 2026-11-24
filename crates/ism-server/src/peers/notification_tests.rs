@@ -877,6 +877,132 @@ async fn running_transfer(b: &Instance, size: u64) -> (String, String) {
 }
 
 #[tokio::test]
+async fn activity_repeated_updates_coalesce_and_preserve_paging_and_deletion() {
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    let peer = net::peers(&a.state).await.unwrap().remove(0);
+    let (transfer, remote_peer) = running_transfer(&b, 1000).await;
+    for done in [100, 200] {
+        activity::record_progress(&b.state, &transfer, &remote_peer, done, 100)
+            .await
+            .unwrap();
+    }
+    let events: Vec<(i64, String)> =
+        sqlx::query_as("SELECT seq,transfer_id FROM sync_changes WHERE peer_id=? ORDER BY seq")
+            .bind(&remote_peer)
+            .fetch_all(&b.state.db)
+            .await
+            .unwrap();
+    assert_eq!(
+        events.len(),
+        1,
+        "triggers coalesce repeated transfer updates"
+    );
+    let cursor = events[0].0;
+    let page =
+        serde_json::to_value(activity::changes(&b.state, &remote_peer, 0).await.unwrap()).unwrap();
+    assert_eq!(page["cursor"], cursor);
+    assert_eq!(page["changes"].as_array().unwrap().len(), 1);
+    assert_eq!(page["changes"][0]["id"], transfer);
+    assert_eq!(page["changes"][0]["activity"]["bytes_done"], 200);
+    activity::refresh(&a.state, &peer).await.unwrap();
+    let mirrored: String =
+        sqlx::query_scalar("SELECT activity_json FROM outgoing_sync WHERE peer_id=? AND id=?")
+            .bind(&peer.id)
+            .bind(&transfer)
+            .fetch_one(&a.state.db)
+            .await
+            .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&mirrored).unwrap()["bytes_done"],
+        200
+    );
+
+    // Exactly one page of genuine tombstones, then a later update to the live transfer.
+    sqlx::query(
+        "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i<499)
+         INSERT INTO sync_changes(transfer_id,peer_id) SELECT 'deleted-example-' || i,? FROM n",
+    )
+    .bind(&remote_peer)
+    .execute(&b.state.db)
+    .await
+    .unwrap();
+    let boundary: i64 = sqlx::query_scalar("SELECT MAX(seq) FROM sync_changes WHERE peer_id=?")
+        .bind(&remote_peer)
+        .fetch_one(&b.state.db)
+        .await
+        .unwrap();
+    for done in [300, 400] {
+        activity::record_progress(&b.state, &transfer, &remote_peer, done, 100)
+            .await
+            .unwrap();
+    }
+    let page = serde_json::to_value(
+        activity::changes(&b.state, &remote_peer, cursor)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(page["cursor"], boundary);
+    assert_eq!(page["more"], true);
+    let changes = page["changes"].as_array().unwrap();
+    assert_eq!(changes.len(), 500);
+    for (i, change) in changes.iter().enumerate() {
+        assert_eq!(change["id"], format!("deleted-example-{i}"));
+        assert!(change["activity"].is_null());
+    }
+    let page = serde_json::to_value(
+        activity::changes(&b.state, &remote_peer, boundary)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(page["more"], false);
+    assert_eq!(page["changes"].as_array().unwrap().len(), 1);
+    assert_eq!(page["changes"][0]["id"], transfer);
+    assert_eq!(page["changes"][0]["activity"]["bytes_done"], 400);
+    activity::refresh(&a.state, &peer).await.unwrap();
+    let mirrored: String =
+        sqlx::query_scalar("SELECT activity_json FROM outgoing_sync WHERE peer_id=? AND id=?")
+            .bind(&peer.id)
+            .bind(&transfer)
+            .fetch_one(&a.state.db)
+            .await
+            .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&mirrored).unwrap()["bytes_done"],
+        400
+    );
+
+    let before_delete = page["cursor"].as_i64().unwrap();
+    sqlx::query("DELETE FROM transfers WHERE id=?")
+        .bind(&transfer)
+        .execute(&b.state.db)
+        .await
+        .unwrap();
+    let page = serde_json::to_value(
+        activity::changes(&b.state, &remote_peer, before_delete)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(page["cursor"].as_i64().unwrap() > before_delete);
+    assert_eq!(page["changes"].as_array().unwrap().len(), 1);
+    assert_eq!(page["changes"][0]["id"], transfer);
+    assert!(page["changes"][0]["activity"].is_null());
+    activity::refresh(&a.state, &peer).await.unwrap();
+    let remaining: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM outgoing_sync WHERE peer_id=? AND id=?")
+            .bind(&peer.id)
+            .bind(&transfer)
+            .fetch_one(&a.state.db)
+            .await
+            .unwrap();
+    assert_eq!(remaining, 0, "a genuine tombstone removes the mirror");
+}
+
+#[tokio::test]
 async fn sustained_progress_hints_faster_than_activity_fetches_keep_sync_fresh() {
     let (mut a, mut b) = pair().await;
     stop_workers(&mut a).await;
