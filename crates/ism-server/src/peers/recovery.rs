@@ -433,6 +433,46 @@ pub async fn page(state: &AppState, limit: i64, offset: i64) -> AppResult<Recove
     Ok(RecoveryPage { total, rows: items })
 }
 
+pub(super) async fn peer_conflicts_page(
+    state: &AppState,
+    limit: i64,
+    offset: i64,
+) -> AppResult<RecoveryPage> {
+    type OutgoingRow = (String, String, String, Option<String>, Option<String>, bool);
+    let mut tx = state.db.begin().await?;
+    let total: i64 = sqlx::query_scalar(
+        "SELECT (SELECT COUNT(*) FROM outgoing_recovery_requests WHERE kind='conflict') +
+         (SELECT COUNT(*) FROM outgoing_recovery r WHERE r.kind='conflict'
+          AND NOT EXISTS(SELECT 1 FROM outgoing_recovery_requests q
+              WHERE q.peer_id=r.peer_id AND q.kind=r.kind AND q.target_id=r.target_id))",
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+    let rows: Vec<OutgoingRow> = sqlx::query_as(
+        "SELECT q.peer_id,q.target_id,q.view_json,s.error,q.updated_at,q.state!='accepted' AS pending
+         FROM outgoing_recovery_requests q LEFT JOIN peer_recovery_state s ON s.peer_id=q.peer_id
+         WHERE q.kind='conflict'
+         UNION ALL SELECT r.peer_id,r.target_id,r.view_json,s.error,s.updated_at,0 FROM outgoing_recovery r
+         LEFT JOIN peer_recovery_state s ON s.peer_id=r.peer_id
+         WHERE r.kind='conflict' AND NOT EXISTS(SELECT 1 FROM outgoing_recovery_requests q
+             WHERE q.peer_id=r.peer_id AND q.kind=r.kind AND q.target_id=r.target_id)
+         ORDER BY 1,2 LIMIT ? OFFSET ?",
+    )
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    let rows = rows
+        .into_iter()
+        .map(|(peer, _, json, error, updated, pending)| {
+            let fresh = state.peer_streams.fresh(&peer);
+            outgoing_view(peer, &json, error, updated, pending, fresh)
+        })
+        .collect::<AppResult<Vec<_>>>()?;
+    Ok(RecoveryPage { rows, total })
+}
+
 async fn exists(state: &AppState, target: &RecoveryTarget) -> AppResult<bool> {
     let sql = match target.kind {
         RecoveryKind::Operation => "SELECT EXISTS(SELECT 1 FROM operations WHERE id = ?)",

@@ -1395,6 +1395,68 @@ async fn recovery_outgoing_fix_is_persisted_offline_and_replayed_after_restart()
 }
 
 #[tokio::test]
+async fn conflict_page_paginates_local_and_peer_targets_without_a_cap() {
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    let share = super::shares(&a.state).await.unwrap().remove(0);
+    let peer = super::net::peers(&a.state).await.unwrap().remove(0);
+    let side = serde_json::to_string(&ConflictSide {
+        instance: "Example".into(),
+        sha256: None,
+        size: None,
+        deleted: false,
+        modified_at: None,
+    })
+    .unwrap();
+    sqlx::query(
+        "WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n<501)
+         INSERT INTO conflicts(id,share_id,rel_path,kind,detail,local_json,remote_json,remote_vv_json,peer_id,status,created_at)
+         SELECT 'page-' || n,?, 'photo-' || n || '.jpg','changed_on_both','',?,?,'{}',?,'open','2026-01-01T00:00:00Z' FROM seq",
+    )
+    .bind(&share.id)
+    .bind(&side)
+    .bind(&side)
+    .bind(&peer.id)
+    .execute(&a.state.db)
+    .await
+    .unwrap();
+    let view = serde_json::json!({
+        "target": { "kind": "conflict", "id": "page-1", "peer_id": null },
+        "title": "peer-photo.jpg", "state": "needs_decision", "code": "choose_version",
+        "detail": null, "can_fix": false, "can_dismiss": false, "replacement_operation_id": null
+    });
+    sqlx::query(
+        "INSERT INTO outgoing_recovery(peer_id,kind,target_id,view_json) VALUES (?, 'conflict', 'page-1', ?)",
+    )
+    .bind(&peer.id)
+    .bind(view.to_string())
+    .execute(&a.state.db)
+    .await
+    .unwrap();
+    let first = super::admin::page_conflicts(&a.state, false, 500, 0)
+        .await
+        .unwrap();
+    assert_eq!(first.total, 502);
+    assert_eq!(first.rows.len(), 500);
+    let second = super::admin::page_conflicts(&a.state, false, 500, 500)
+        .await
+        .unwrap();
+    assert_eq!(second.total, 502);
+    assert!(matches!(
+        second.rows.first(),
+        Some(ism_core::dto::ConflictPageRow::Local(_))
+    ));
+    match second.rows.last().unwrap() {
+        ism_core::dto::ConflictPageRow::Peer(item) => {
+            assert_eq!(item.target.id, "page-1");
+            assert_eq!(item.target.peer_id.as_deref(), Some(peer.id.as_str()));
+        }
+        _ => panic!("expected peer-owned conflict"),
+    }
+}
+
+#[tokio::test]
 async fn recovery_versions_are_current_owner_scoped_and_stale_decisions_do_not_execute() {
     use ism_core::dto::{
         RecoveryDecision, RecoveryDecisionInput, RecoveryKind, RecoveryState, RecoveryTarget,
@@ -1458,6 +1520,22 @@ async fn recovery_versions_are_current_owner_scoped_and_stale_decisions_do_not_e
     );
     let receiver = super::net::peers(&a.state).await.unwrap().remove(0);
     super::recovery::refresh(&a.state, &receiver).await.unwrap();
+    let page = super::admin::page_conflicts(&a.state, false, 1, 0)
+        .await
+        .unwrap();
+    assert_eq!(page.total, 1);
+    match &page.rows[0] {
+        ism_core::dto::ConflictPageRow::Peer(item) => {
+            assert_eq!(item.target.id, target.id);
+            assert_eq!(item.target.peer_id.as_deref(), Some(receiver.id.as_str()));
+        }
+        _ => panic!("expected peer-owned conflict"),
+    }
+    let after = super::admin::page_conflicts(&a.state, false, 1, 1)
+        .await
+        .unwrap();
+    assert_eq!(after.total, 1);
+    assert!(after.rows.is_empty());
     let forwarded = super::versions::get(
         &a.state,
         &RecoveryTarget {
