@@ -305,9 +305,10 @@ const RESOLVE_LATE_OUTCOME: &str =
          SELECT 1 FROM background_activity newer WHERE newer.task_key=?
          AND (newer.finished_at,newer.revision) > (?,?))";
 
-async fn persist(state: &AppState, pending: &Pending) -> AppResult<()> {
+const PERSIST_BATCH_SIZE: usize = 16;
+
+async fn persist_row(conn: &mut sqlx::SqliteConnection, pending: &Pending) -> AppResult<()> {
     let a = &pending.activity;
-    let mut tx = state.db.begin().await?;
     let written = sqlx::query(
         "INSERT INTO background_activity(id,task_key,status,revision,updated_at,finished_at,activity_json)
          VALUES (?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET status=excluded.status,
@@ -316,7 +317,7 @@ async fn persist(state: &AppState, pending: &Pending) -> AppResult<()> {
     )
     .bind(&a.id).bind(&a.task_key).bind(status(a)).bind(pending.revision)
     .bind(&a.updated_at).bind(&a.finished_at).bind(serde_json::to_string(a)?)
-    .execute(&mut *tx).await?.rows_affected();
+    .execute(&mut *conn).await?.rows_affected();
     if a.finished_at.is_some() && written != 0 {
         // Resolve in both directions so delayed/retried writes cannot reopen an older issue.
         // Registry revisions order outcomes even when finish timestamps share a millisecond.
@@ -325,18 +326,30 @@ async fn persist(state: &AppState, pending: &Pending) -> AppResult<()> {
             .bind(&a.id)
             .bind(&a.finished_at)
             .bind(pending.revision)
-            .execute(&mut *tx)
+            .execute(&mut *conn)
             .await?;
         sqlx::query(RESOLVE_LATE_OUTCOME)
             .bind(&a.id)
             .bind(&a.task_key)
             .bind(&a.finished_at)
             .bind(pending.revision)
-            .execute(&mut *tx)
+            .execute(&mut *conn)
             .await?;
+    }
+    Ok(())
+}
+
+async fn persist_batch(state: &AppState, pending: &[Pending]) -> AppResult<()> {
+    let mut tx = state.db.begin().await?;
+    for item in pending {
+        persist_row(&mut tx, item).await?;
     }
     tx.commit().await?;
     Ok(())
+}
+
+async fn persist(state: &AppState, pending: &Pending) -> AppResult<()> {
+    persist_batch(state, std::slice::from_ref(pending)).await
 }
 
 pub async fn recover(state: &AppState) -> AppResult<()> {
@@ -380,8 +393,8 @@ async fn flush(state: &AppState) -> AppResult<()> {
         .filter(|p| p.revision != p.saved_revision || p.activity.finished_at.is_some())
         .cloned()
         .collect();
-    for item in &pending {
-        if let Err(error) = persist(state, item).await {
+    for batch in pending.chunks(PERSIST_BATCH_SIZE) {
+        if let Err(error) = persist_batch(state, batch).await {
             tracing::error!(
                 "background activity persistence failed: {}",
                 error.message()
@@ -393,19 +406,21 @@ async fn flush(state: &AppState) -> AppResult<()> {
             state.emit(ServerEvent::ActivityChanged);
             return Err(error);
         }
-        {
-            let mut registry = lock(&state.activity.0);
-            if let Some(p) = registry.get_mut(&item.activity.id) {
-                p.saved_revision = p.saved_revision.max(item.revision);
-            }
-        }
-        if item.activity.finished_at.is_some() {
-            let mut registry = lock(&state.activity.0);
-            if registry
-                .get(&item.activity.id)
-                .is_some_and(|p| p.revision == item.revision)
+        for item in batch {
             {
-                registry.remove(&item.activity.id);
+                let mut registry = lock(&state.activity.0);
+                if let Some(p) = registry.get_mut(&item.activity.id) {
+                    p.saved_revision = p.saved_revision.max(item.revision);
+                }
+            }
+            if item.activity.finished_at.is_some() {
+                let mut registry = lock(&state.activity.0);
+                if registry
+                    .get(&item.activity.id)
+                    .is_some_and(|p| p.revision == item.revision)
+                {
+                    registry.remove(&item.activity.id);
+                }
             }
         }
     }
@@ -1818,6 +1833,49 @@ mod tests {
         assert_eq!(snapshot.history[0].status, BackgroundStatus::Completed);
         assert_eq!(snapshot.total, 1);
         assert!(snapshot.warnings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_activity_flush_batch_does_not_partially_persist() {
+        let (_dir, state) = harness().await;
+        let tasks = ["batch-first", "batch-second", "batch-third"]
+            .into_iter()
+            .map(|key| Task::start(&state, key, "Test activity", "Synthetic", None));
+        let tasks = futures_util::future::try_join_all(tasks).await.unwrap();
+        let pending: Vec<_> = lock(&state.activity.0)
+            .values()
+            .map(|item| item.activity.task_key.clone())
+            .collect();
+        let failing_key = pending.last().unwrap();
+        sqlx::query("CREATE TABLE rejected_activity_keys(task_key TEXT PRIMARY KEY)")
+            .execute(&state.db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO rejected_activity_keys(task_key) VALUES (?)")
+            .bind(failing_key)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TRIGGER reject_one_activity BEFORE INSERT ON background_activity
+             WHEN EXISTS(SELECT 1 FROM rejected_activity_keys WHERE task_key = NEW.task_key)
+             BEGIN SELECT RAISE(FAIL, 'synthetic batch failure'); END",
+        )
+        .execute(&state.db)
+        .await
+        .unwrap();
+
+        assert!(flush(&state).await.is_err());
+        let persisted: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM background_activity")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+        let unsaved = lock(&state.activity.0)
+            .values()
+            .filter(|item| item.revision != item.saved_revision)
+            .count();
+        assert_eq!(persisted, 0);
+        assert_eq!(unsaved, tasks.len());
     }
 
     #[tokio::test]
