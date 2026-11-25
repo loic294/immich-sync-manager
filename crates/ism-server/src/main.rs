@@ -21,6 +21,9 @@ mod queue_evidence;
 mod routes;
 mod settings;
 mod state;
+#[cfg(test)]
+mod test_support;
+mod wait_log;
 mod watch;
 mod worker_evidence;
 

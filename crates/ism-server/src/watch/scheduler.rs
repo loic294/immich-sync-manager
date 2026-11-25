@@ -1032,7 +1032,7 @@ async fn finish(
     let mut tx = clock.begin(&mut conn).await?;
     // One row update acknowledges the whole batch. Work that arrived during the run but was
     // never claimed is made due again if no request already did so.
-    sqlx::query(
+    let scheduled: Option<Option<i64>> = sqlx::query_scalar(
         "UPDATE scan_schedule SET running = 0, last_finished_at = ?, last_error = ?,
            acked_through = CASE WHEN ? IS NULL
              THEN MAX(acked_through, COALESCE(running_through, acked_through)) ELSE acked_through END,
@@ -1041,7 +1041,7 @@ async fn finish(
                  AND w.id > COALESCE(scan_schedule.running_through, scan_schedule.acked_through))
              THEN ? ELSE due_at END,
            running_through = NULL
-         WHERE library_id = ?",
+         WHERE library_id = ? RETURNING due_at",
     )
     .bind(crate::db::now())
     .bind(&error)
@@ -1049,11 +1049,36 @@ async fn finish(
     .bind(&error)
     .bind(now_ms())
     .bind(library_id)
-    .execute(&mut *tx)
+    .fetch_optional(&mut *tx)
     .await?;
     clock.commit(tx).await?;
     match error {
-        Some(e) => tracing::warn!(library = %library_id, "library synchronization failed: {e}"),
+        Some(e) => {
+            let (next_retry, retry_not_before) = match scheduled {
+                Some(Some(ms)) => match chrono::DateTime::from_timestamp_millis(ms) {
+                    Some(at) => (
+                        "when scheduled and maintenance permits",
+                        Some(crate::db::ts(at)),
+                    ),
+                    None => (
+                        "invalid scheduled time; inspect synchronization state",
+                        None,
+                    ),
+                },
+                Some(None) => (
+                    "no retry currently scheduled; a later request may requeue",
+                    None,
+                ),
+                None => (
+                    "failure was not saved; check current synchronization state",
+                    None,
+                ),
+            };
+            tracing::warn!(
+                library = %library_id, next_retry, retry_not_before,
+                "library synchronization failed: {}", crate::error::redact(&e)
+            );
+        }
         None => {
             library_scanned(state, server_id, library_id);
             spawn_collect(state);
@@ -1138,6 +1163,53 @@ pub async fn views(state: &AppState) -> AppResult<Vec<ScanScheduleView>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn failed_sync_logs_its_library_reason_and_retry_state() {
+        use tracing::instrument::WithSubscriber;
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::state::AppState::new(
+            crate::config::Config::for_tests(dir.path()),
+            crate::db::connect(dir.path()).await.unwrap(),
+            crate::crypto::SecretBox::open_or_create(dir.path()).unwrap(),
+        )
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO immich_servers(id,name,url,maintenance_json,created_at) VALUES('server','Server','https://immich.example','{}',?)")
+            .bind(crate::db::now()).execute(&state.db).await.unwrap();
+        let due = 1_893_456_000_000_i64;
+        for (library, scheduled) in [("scheduled", Some(due)), ("unscheduled", None)] {
+            sqlx::query("INSERT INTO scan_schedule(library_id,server_id,running,due_at) VALUES(?,'server',1,?)")
+                .bind(library).bind(scheduled).execute(&state.db).await.unwrap();
+            let (output, subscriber) = crate::test_support::logs();
+            finish(
+                &state,
+                "server",
+                library,
+                Err(crate::error::AppError::conflict(
+                    "synthetic",
+                    "The library is unavailable",
+                )),
+            )
+            .with_subscriber(subscriber)
+            .await
+            .unwrap();
+            let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+            assert!(logs.contains(&format!("library={library}")), "{logs}");
+            assert!(logs.contains("The library is unavailable"), "{logs}");
+            if let Some(due) = scheduled {
+                let next = crate::db::ts(chrono::DateTime::from_timestamp_millis(due).unwrap());
+                assert!(logs.contains(&next), "{logs}");
+                assert!(
+                    logs.contains("when scheduled and maintenance permits"),
+                    "{logs}"
+                );
+            } else {
+                assert!(logs.contains("no retry currently scheduled"), "{logs}");
+            }
+        }
+    }
 
     const FILE_KINDS: [WorkKind; 3] = [WorkKind::Added, WorkKind::Changed, WorkKind::Removed];
 

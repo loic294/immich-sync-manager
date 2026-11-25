@@ -250,8 +250,26 @@ async fn submit_locked(
         }
     }
     tx.commit().await?;
+    for item in &preview.items {
+        if let Some(blocker) = item.blockers.first() {
+            log_item_failure(
+                &accepted.operation_id,
+                i64::from(item.index),
+                &blocker.code,
+                &blocker.message,
+            );
+        }
+    }
     announce_queued(state, &accepted);
     Ok(accepted)
+}
+
+fn log_item_failure(operation: &str, item: i64, code: &str, message: &str) {
+    tracing::warn!(
+        operation = %operation, item, code = %code,
+        next_retry = "no automatic operation retry; review recovery or submit again",
+        "operation item failed: {}", crate::error::redact(message)
+    );
 }
 
 /// Queues an operation without a preview (internal use, e.g. upload publishing).

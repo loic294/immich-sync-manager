@@ -236,40 +236,11 @@ pub fn json_vec(raw: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::WriterClock;
+    use crate::test_support::{logs as writer_logs, logs_at as writer_logs_at};
     use sqlx::Connection;
     use sqlx::sqlite::SqlitePoolOptions;
-    use std::io::Write;
-    use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tracing::instrument::WithSubscriber;
-
-    struct LogWriter(Arc<Mutex<Vec<u8>>>);
-    impl Write for LogWriter {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    fn writer_logs() -> (Arc<Mutex<Vec<u8>>>, tracing::Dispatch) {
-        writer_logs_at(tracing::Level::WARN)
-    }
-
-    fn writer_logs_at(level: tracing::Level) -> (Arc<Mutex<Vec<u8>>>, tracing::Dispatch) {
-        let logs = Arc::new(Mutex::new(Vec::new()));
-        let writer = logs.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(level)
-            .with_ansi(false)
-            .without_time()
-            .with_writer(move || LogWriter(writer.clone()))
-            .finish();
-        (logs, tracing::Dispatch::new(subscriber))
-    }
 
     fn classify(pool_ms: u64, begin_ms: u64, body_ms: u64, commit_ms: u64) -> String {
         let ms = Duration::from_millis;

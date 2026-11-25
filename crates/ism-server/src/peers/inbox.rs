@@ -5,6 +5,232 @@ use serde_json::Value;
 
 const INBOX_LIMIT: i64 = 10_000;
 
+fn event_wait_key(peer: &str, seq: i64) -> String {
+    format!("peer-event:{peer:?}:{seq}")
+}
+
+fn inventory_wait_key(peer: &str, share: &str, path: &str) -> String {
+    format!("peer-inventory:{peer:?}:{share:?}:{path:?}")
+}
+
+fn report_event_wait(
+    state: &AppState,
+    peer: &str,
+    seq: i64,
+    path: Option<&str>,
+    reason: &str,
+    next_retry: &str,
+    message: &str,
+) {
+    if state
+        .wait_logs
+        .take_report(&event_wait_key(peer, seq), reason, None, None)
+    {
+        tracing::info!(
+            peer = %peer, event_seq = seq, path = path.map(crate::error::redact),
+            reason, next_retry, "{message}"
+        );
+    }
+}
+
+fn report_content_wait(state: &AppState, peer: &str, seq: i64, path: Option<&str>) {
+    report_event_wait(
+        state,
+        peer,
+        seq,
+        path,
+        "Matching file content has not been verified",
+        "when peer events are next replayed and prerequisites permit",
+        "peer event waiting for matching file content",
+    );
+}
+
+fn report_event_error(
+    state: &AppState,
+    peer: &str,
+    seq: i64,
+    error: &str,
+    path: Option<&str>,
+    changed: bool,
+) {
+    let first_observation =
+        state
+            .wait_logs
+            .take_report(&event_wait_key(peer, seq), error, None, None);
+    if changed || first_observation {
+        tracing::warn!(
+            peer = %peer, event_seq = seq, path = path.map(crate::error::redact),
+            next_retry = "when peer events are next replayed and prerequisites permit",
+            "peer effect deferred: {}", crate::error::redact(error)
+        );
+    }
+}
+
+fn report_inventory_error(
+    state: &AppState,
+    peer: &str,
+    share: &str,
+    path: &str,
+    error: &str,
+    code: Option<&str>,
+    changed: bool,
+) {
+    let first_observation =
+        state
+            .wait_logs
+            .take_report(&inventory_wait_key(peer, share, path), error, None, None);
+    if changed || first_observation {
+        tracing::warn!(
+            peer = %peer, share = %share, path = %crate::error::redact(path),
+            code = code.unwrap_or("not_recorded"),
+            next_retry = "when peer inventory is next replayed and prerequisites permit",
+            "peer inventory deferred: {}", crate::error::redact(error)
+        );
+    }
+}
+
+fn report_inventory_wait(
+    state: &AppState,
+    peer: &str,
+    share: &str,
+    path: &str,
+    reason: &str,
+    next_retry: &str,
+) {
+    if state
+        .wait_logs
+        .take_report(&inventory_wait_key(peer, share, path), reason, None, None)
+    {
+        tracing::info!(
+            peer = %peer, share = %share, path = %crate::error::redact(path),
+            reason, next_retry, "peer inventory waiting"
+        );
+    }
+}
+
+pub(super) async fn report_retained_waits(state: &AppState) -> AppResult<()> {
+    type EventRow = (
+        i64,
+        String,
+        i64,
+        String,
+        Option<String>,
+        Option<String>,
+        String,
+        i64,
+    );
+    let mut after = i64::MIN;
+    loop {
+        let rows: Vec<EventRow> = sqlx::query_as(
+            "SELECT i.rowid,i.peer_id,i.seq,i.status,i.operation_id,i.error,p.status,
+                    EXISTS(SELECT 1 FROM peer_inbox_dependencies d JOIN peer_inbox b
+                           ON b.peer_id=d.depends_peer_id AND b.seq=d.depends_seq
+                           WHERE d.peer_id=i.peer_id AND d.seq=i.seq AND b.status!='done')
+             FROM peer_inbox i JOIN peers p ON p.id=i.peer_id
+             WHERE i.rowid>? AND i.status!='done' ORDER BY i.rowid LIMIT 256",
+        )
+        .bind(after)
+        .fetch_all(&state.db)
+        .await?;
+        let Some(last) = rows.last() else { break };
+        after = last.0;
+        for (_, peer, seq, status, operation, error, peer_status, dependency) in rows {
+            if let Some(error) = error {
+                report_event_error(state, &peer, seq, &error, None, false);
+            } else if let Some(operation) = operation {
+                report_event_wait(
+                    state,
+                    &peer,
+                    seq,
+                    None,
+                    &format!("Waiting for managed operation {operation}"),
+                    "when peer events are replayed after the operation finishes or is recovered",
+                    "peer event waiting for a managed operation",
+                );
+            } else if dependency != 0 {
+                report_event_wait(
+                    state,
+                    &peer,
+                    seq,
+                    None,
+                    "An earlier overlapping peer event has not finished",
+                    "when peer events are replayed after the earlier event finishes",
+                    "peer event waiting for an earlier overlapping peer event",
+                );
+            } else if status == "awaiting_content" {
+                report_content_wait(state, &peer, seq, None);
+            } else if status == "applying" {
+                report_event_wait(
+                    state,
+                    &peer,
+                    seq,
+                    None,
+                    "The associated managed operation is missing",
+                    "no automatic retry can be verified; inspect the operation",
+                    "peer event waiting for a managed operation",
+                );
+            } else if peer_status != "online" {
+                report_event_wait(
+                    state,
+                    &peer,
+                    seq,
+                    None,
+                    "Peer is not marked online",
+                    "when the peer is online and the event is replayed",
+                    "peer event waiting for peer",
+                );
+            }
+        }
+    }
+
+    type InventoryRow = (
+        i64,
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        String,
+    );
+    let mut after = i64::MIN;
+    loop {
+        let rows: Vec<InventoryRow> = sqlx::query_as(
+            "SELECT i.rowid,i.peer_id,i.share_id,i.path,i.operation_id,i.error,p.status
+             FROM peer_backfill_inbox i JOIN peers p ON p.id=i.peer_id
+             WHERE i.rowid>? ORDER BY i.rowid LIMIT 256",
+        )
+        .bind(after)
+        .fetch_all(&state.db)
+        .await?;
+        let Some(last) = rows.last() else { break };
+        after = last.0;
+        for (_, peer, share, path, operation, error, peer_status) in rows {
+            if let Some(error) = error {
+                report_inventory_error(state, &peer, &share, &path, &error, None, false);
+            } else if let Some(operation) = operation {
+                report_inventory_wait(
+                    state,
+                    &peer,
+                    &share,
+                    &path,
+                    &format!("Waiting for managed operation {operation}"),
+                    "when peer inventory is replayed after the operation finishes or is recovered",
+                );
+            } else if peer_status != "online" {
+                report_inventory_wait(
+                    state,
+                    &peer,
+                    &share,
+                    &path,
+                    "Peer is not marked online",
+                    "when the peer is online and inventory is replayed",
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(super) struct BackfillRequest {
     pub(super) share_id: String,
     pub(super) after: String,
@@ -291,8 +517,26 @@ async fn replay_inventory(
         match result {
             Ok(done) => applied += usize::from(done),
             Err(error) => {
-                sqlx::query("UPDATE peer_backfill_inbox SET error = ? WHERE peer_id = ? AND share_id = ? AND path = ?")
-                    .bind(error.message()).bind(&peer.id).bind(&share_id).bind(&path).execute(&state.db).await?;
+                let updated = sqlx::query(
+                    "UPDATE peer_backfill_inbox SET error = ?
+                     WHERE peer_id = ? AND share_id = ? AND path = ? AND error IS NOT ?",
+                )
+                .bind(error.message())
+                .bind(&peer.id)
+                .bind(&share_id)
+                .bind(&path)
+                .bind(error.message())
+                .execute(&state.db)
+                .await?;
+                report_inventory_error(
+                    state,
+                    &peer.id,
+                    &share_id,
+                    &path,
+                    error.message(),
+                    Some(error.code()),
+                    updated.rows_affected() != 0,
+                );
             }
         }
     }
@@ -388,6 +632,14 @@ async fn apply_inventory(
     }
     tx.commit().await?;
     if let Some(accepted) = &accepted {
+        report_inventory_wait(
+            state,
+            &peer.id,
+            &share.id,
+            &entry.path,
+            &format!("Waiting for managed operation {}", accepted.operation_id),
+            "after the managed operation finishes or is recovered",
+        );
         crate::ops::announce_queued(state, accepted);
     }
     Ok(accepted.is_none() && !ignored)
@@ -483,6 +735,7 @@ pub(super) async fn admit(
         ));
     }
     let mut previous_by_share: HashMap<String, Vec<(String, i64, PeerEvent)>> = HashMap::new();
+    let mut waiting_events = Vec::new();
     for event in &page.events {
         event_valid(event)?;
         validate_identity(&mut tx, state, event).await?;
@@ -534,6 +787,7 @@ pub(super) async fn admit(
         .bind(serde_json::to_string(event)?)
         .execute(&mut *tx)
         .await?;
+        let mut has_dependency = false;
         for (other_peer, seq, previous) in older.iter() {
             if previous.kind == SHARE_ENABLED || event.kind == SHARE_ENABLED {
                 continue;
@@ -558,7 +812,11 @@ pub(super) async fn admit(
                 .bind(*seq)
                 .execute(&mut *tx)
                 .await?;
+                has_dependency = true;
             }
+        }
+        if has_dependency {
+            waiting_events.push(event);
         }
         older.push((peer.id.clone(), event.seq, event.clone()));
     }
@@ -578,6 +836,17 @@ pub(super) async fn admit(
     advance_in(&mut tx, &peer.id).await?;
     clock.commit(tx).await?;
     drop(conn);
+    for event in waiting_events {
+        report_event_wait(
+            state,
+            &peer.id,
+            event.seq,
+            Some(&event.data.path),
+            "An earlier overlapping peer event has not finished",
+            "after the earlier event finishes",
+            "peer event waiting for an earlier overlapping peer event",
+        );
+    }
     Ok(())
 }
 
@@ -753,7 +1022,13 @@ async fn pull_reporting(
     }
 }
 
-async fn record_error(state: &AppState, peer_id: &str, seq: i64, error: &str) -> AppResult<bool> {
+async fn record_error(
+    state: &AppState,
+    peer_id: &str,
+    seq: i64,
+    error: &str,
+    path: Option<&str>,
+) -> AppResult<bool> {
     let updated = sqlx::query(
         "UPDATE peer_inbox SET error = ? WHERE peer_id = ? AND seq = ? AND error IS NOT ?",
     )
@@ -763,7 +1038,9 @@ async fn record_error(state: &AppState, peer_id: &str, seq: i64, error: &str) ->
     .bind(error)
     .execute(&state.db)
     .await?;
-    Ok(updated.rows_affected() != 0)
+    let changed = updated.rows_affected() != 0;
+    report_event_error(state, peer_id, seq, error, path, changed);
+    Ok(changed)
 }
 
 /// A retry that passed its checks and is merely waiting must not keep an earlier reason.
@@ -824,7 +1101,7 @@ async fn replay(
             .await?;
         if let Some(operation_id) = operation_id {
             if let Err(error) = operation_finished(state, &operation_id, &[]).await {
-                record_error(state, &peer.id, seq, error.message()).await?;
+                record_error(state, &peer.id, seq, error.message(), None).await?;
                 if first_error.is_none() {
                     first_error = Some(error);
                 }
@@ -837,7 +1114,7 @@ async fn replay(
                         "recovery_required",
                         format!("peer operation {operation_id} needs attention ({status})"),
                     );
-                    record_error(state, &peer.id, seq, error.message()).await?;
+                    record_error(state, &peer.id, seq, error.message(), None).await?;
                     if first_error.is_none() {
                         first_error = Some(error);
                     }
@@ -852,7 +1129,14 @@ async fn replay(
             && let Err(error) =
                 super::admin::accept_dominating_decision(state, peer, share, &event).await
         {
-            record_error(state, &peer.id, seq, error.message()).await?;
+            record_error(
+                state,
+                &peer.id,
+                seq,
+                error.message(),
+                Some(&event.data.path),
+            )
+            .await?;
             if first_error.is_none() {
                 first_error = Some(error);
             }
@@ -868,6 +1152,15 @@ async fn replay(
         .fetch_one(&state.db)
         .await?;
         if blocked {
+            report_event_wait(
+                state,
+                &peer.id,
+                seq,
+                Some(&event.data.path),
+                "An earlier overlapping peer event has not finished",
+                "when peer events are replayed after the earlier event finishes",
+                "peer event waiting for an earlier overlapping peer event",
+            );
             continue;
         }
         let result = if status == "awaiting_content" {
@@ -882,11 +1175,21 @@ async fn replay(
                     && !all
                         .iter()
                         .any(|share| share.name == event.share && share.includes(&peer.id)) => {}
-            Ok(false) => clear_error(state, &peer.id, seq).await?,
-            Err(error) => {
-                if record_error(state, &peer.id, seq, error.message()).await? {
-                    tracing::warn!(peer = %peer.name, path = %event.data.path, "peer effect deferred: {}", error.message());
+            Ok(false) => {
+                clear_error(state, &peer.id, seq).await?;
+                if status == "awaiting_content" {
+                    report_content_wait(state, &peer.id, event.seq, Some(&event.data.path));
                 }
+            }
+            Err(error) => {
+                record_error(
+                    state,
+                    &peer.id,
+                    seq,
+                    error.message(),
+                    Some(&event.data.path),
+                )
+                .await?;
                 if first_error.is_none() {
                     first_error = Some(error);
                 }
@@ -943,7 +1246,11 @@ async fn apply_received(
         if event.kind == "file_changed" {
             sqlx::query("UPDATE peer_inbox SET status = 'awaiting_content', error = NULL WHERE peer_id = ? AND seq = ?")
                 .bind(&peer.id).bind(event.seq).execute(&state.db).await?;
-            return verify_content(state, peer, all, event).await;
+            let result = verify_content(state, peer, all, event).await;
+            if matches!(result, Ok(false)) {
+                report_content_wait(state, &peer.id, event.seq, Some(&event.data.path));
+            }
+            return result;
         }
     }
     if event.kind == SHARE_ENABLED {
@@ -972,6 +1279,15 @@ async fn apply_received(
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 queue_folder_event(state, peer, share, event, peer.cursor).await?;
+                report_event_wait(
+                    state,
+                    &peer.id,
+                    event.seq,
+                    Some(&event.data.path),
+                    "Waiting for a managed folder operation",
+                    "after the managed folder operation finishes or is recovered",
+                    "peer event waiting for a managed operation",
+                );
                 return Ok(false);
             }
             Err(e) => return Err(e.into()),
@@ -1020,6 +1336,7 @@ async fn apply_received(
         batch,
     )
     .await?;
+    let mut awaiting_content = false;
     if let Some(accepted) = &accepted {
         sqlx::query("UPDATE peer_inbox SET status = 'applying', operation_id = ?, error = NULL WHERE peer_id = ? AND seq = ?")
             .bind(&accepted.operation_id).bind(&peer.id).bind(event.seq).execute(&mut *tx).await?;
@@ -1035,12 +1352,25 @@ async fn apply_received(
         sqlx::query(
             "UPDATE peer_inbox SET status = 'awaiting_content', error = NULL WHERE peer_id = ? AND seq = ?",
         ).bind(&peer.id).bind(event.seq).execute(&mut *tx).await?;
+        awaiting_content = true;
     } else {
         done_in(&mut tx, &peer.id, event, true).await?;
     }
     tx.commit().await?;
     if let Some(accepted) = &accepted {
+        report_event_wait(
+            state,
+            &peer.id,
+            event.seq,
+            Some(&event.data.path),
+            &format!("Waiting for managed operation {}", accepted.operation_id),
+            "after the managed operation finishes or is recovered",
+            "peer event waiting for a managed operation",
+        );
         crate::ops::announce_queued(state, accepted);
+    }
+    if awaiting_content {
+        report_content_wait(state, &peer.id, event.seq, Some(&event.data.path));
     }
     Ok(accepted.is_none())
 }
@@ -1777,4 +2107,262 @@ pub(super) async fn processing_error(state: &AppState, peer_id: &str) -> AppResu
         "SELECT error FROM peer_inbox WHERE peer_id = ? AND status != 'done' AND error IS NOT NULL
          UNION ALL SELECT error FROM peer_backfill_inbox WHERE peer_id = ? AND error IS NOT NULL LIMIT 1",
     ).bind(peer_id).bind(peer_id).fetch_optional(&state.db).await?)
+}
+
+#[cfg(test)]
+mod tests {
+    #[tokio::test]
+    async fn retained_peer_waits_are_reported_when_the_peer_is_offline() {
+        use tracing::instrument::WithSubscriber;
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::state::AppState::new(
+            crate::config::Config::for_tests(dir.path()),
+            crate::db::connect(dir.path()).await.unwrap(),
+            crate::crypto::SecretBox::open_or_create(dir.path()).unwrap(),
+        )
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO peers(id,name,url,secret_enc,status,created_at) VALUES('peer','Peer','https://peer.example','unused','offline',?)")
+            .bind(crate::db::now()).execute(&state.db).await.unwrap();
+        sqlx::query("INSERT INTO shares(id,name,root_id,path,peer_ids_json,enabled) VALUES('share','Archive','photos','','[\"peer\"]',1)")
+            .execute(&state.db).await.unwrap();
+        sqlx::query("INSERT INTO operations(id,idempotency_key,principal,source,request_json,status,created_at) VALUES('op','op','admin:test','admin','{}','queued',?)")
+            .bind(crate::db::now()).execute(&state.db).await.unwrap();
+        for (seq, status, operation, error) in [
+            (7, "received", None, Some("A retained failure")),
+            (8, "awaiting_content", None, None),
+            (9, "applying", Some("op"), None),
+            (10, "received", None, None),
+        ] {
+            sqlx::query("INSERT INTO peer_inbox(peer_id,seq,origin,origin_seq,share_name,event_json,status,operation_id,error) VALUES('peer',?,'origin',?,'Archive','{}',?,?,?)")
+                .bind(seq).bind(seq).bind(status).bind(operation).bind(error)
+                .execute(&state.db).await.unwrap();
+        }
+        sqlx::query("INSERT INTO peer_inbox_dependencies(peer_id,seq,depends_peer_id,depends_seq) VALUES('peer',10,'peer',8)")
+            .execute(&state.db).await.unwrap();
+        sqlx::query("INSERT INTO peer_backfill_inbox(peer_id,share_id,path,entry_json,error) VALUES('peer','share','photo.example.jpg','{}','An inventory failure')")
+            .execute(&state.db).await.unwrap();
+
+        let (output, subscriber) = crate::test_support::logs_at(tracing::Level::INFO);
+        let worker =
+            tokio::spawn(super::super::transfer::run(state.clone()).with_subscriber(subscriber));
+        let found = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+                if logs.contains("event_seq=7")
+                    && logs.contains("A retained failure")
+                    && logs.contains("event_seq=8")
+                    && logs.contains("matching file content")
+                    && logs.contains("event_seq=9")
+                    && logs.contains("managed operation")
+                    && logs.contains("event_seq=10")
+                    && logs.contains("earlier overlapping peer event")
+                    && logs.contains("photo.example.jpg")
+                    && logs.contains("An inventory failure")
+                    && logs.contains("next_retry")
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        worker.abort();
+        let _ = worker.await;
+        let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert!(found.is_ok(), "{logs}");
+    }
+
+    #[tokio::test]
+    async fn admitted_event_logs_its_dependency_after_receipt_commits() {
+        use tracing::instrument::WithSubscriber;
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::state::AppState::new(
+            crate::config::Config::for_tests(dir.path()),
+            crate::db::connect(dir.path()).await.unwrap(),
+            crate::crypto::SecretBox::open_or_create(dir.path()).unwrap(),
+        )
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO peers(id,name,url,secret_enc,status,created_at) VALUES('peer','Peer','https://peer.example','unused','online',?)")
+            .bind(crate::db::now()).execute(&state.db).await.unwrap();
+        let peer = super::net::Peer {
+            id: "peer".into(),
+            name: "Peer".into(),
+            url: "https://peer.example".into(),
+            instance_id: Some("example".into()),
+            secret: "synthetic".into(),
+            cursor: 0,
+        };
+        let event = |seq, kind: &str, path: &str| super::PeerEvent {
+            seq,
+            origin: "origin".into(),
+            origin_seq: seq,
+            share: "Archive".into(),
+            kind: kind.into(),
+            data: super::EventData {
+                path: path.into(),
+                ..Default::default()
+            },
+        };
+        let page = super::EventPage {
+            events: vec![
+                event(1, "folder_created", "album"),
+                event(2, "file_deleted", "album/photo.example.jpg"),
+            ],
+            next: 2,
+        };
+        let (output, subscriber) = crate::test_support::logs_at(tracing::Level::INFO);
+        super::admit(&state, &peer, 0, &page)
+            .with_subscriber(subscriber)
+            .await
+            .unwrap();
+        let dependency: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM peer_inbox_dependencies WHERE peer_id='peer' AND seq=2",
+        )
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+        assert_eq!(dependency, 1);
+        let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert!(
+            logs.contains("peer=peer") && logs.contains("event_seq=2"),
+            "{logs}"
+        );
+        assert!(logs.contains("earlier overlapping peer event"), "{logs}");
+        assert!(logs.contains("after the earlier event finishes"), "{logs}");
+
+        let rejected = super::EventPage {
+            events: vec![
+                event(3, "folder_created", "new-album"),
+                event(4, "file_deleted", "new-album/photo.example.jpg"),
+                event(5, "invalid", "invalid"),
+            ],
+            next: 5,
+        };
+        let (output, subscriber) = crate::test_support::logs_at(tracing::Level::INFO);
+        assert!(
+            super::admit(&state, &peer, 2, &rejected)
+                .with_subscriber(subscriber)
+                .await
+                .is_err()
+        );
+        let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert!(!logs.contains("event_seq=4"), "{logs}");
+    }
+
+    #[tokio::test]
+    async fn retained_inventory_failure_logs_its_item_and_retry_once() {
+        use tracing::instrument::WithSubscriber;
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::state::AppState::new(
+            crate::config::Config::for_tests(dir.path()),
+            crate::db::connect(dir.path()).await.unwrap(),
+            crate::crypto::SecretBox::open_or_create(dir.path()).unwrap(),
+        )
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO peers(id,name,url,secret_enc,status,created_at) VALUES('peer','Peer','https://peer.example','unused','online',?)")
+            .bind(crate::db::now()).execute(&state.db).await.unwrap();
+        sqlx::query("INSERT INTO shares(id,name,root_id,path,peer_ids_json,enabled) VALUES('share','Archive','missing','','[\"peer\"]',1)")
+            .execute(&state.db).await.unwrap();
+        sqlx::query("INSERT INTO peer_backfill_inbox(peer_id,share_id,path,entry_json) VALUES('peer','share','photo.example.jpg',?)")
+            .bind(serde_json::json!({"path":"photo.example.jpg","size":10,"mtime_ns":0,"deleted":false,"vv":{}}).to_string())
+            .execute(&state.db).await.unwrap();
+        let peer = super::net::Peer {
+            id: "peer".into(),
+            name: "Peer".into(),
+            url: "https://peer.example".into(),
+            instance_id: Some("example".into()),
+            secret: "synthetic".into(),
+            cursor: 0,
+        };
+        let task = crate::activity::Task::start(&state, "inventory", "Inventory", "peer", None)
+            .await
+            .unwrap();
+        super::replay_inventory(&state, &peer, &task).await.unwrap();
+        let state = crate::state::AppState::new(
+            crate::config::Config::for_tests(dir.path()),
+            crate::db::connect(dir.path()).await.unwrap(),
+            crate::crypto::SecretBox::open_or_create(dir.path()).unwrap(),
+        )
+        .await
+        .unwrap();
+        let task = crate::activity::Task::start(&state, "inventory", "Inventory", "peer", None)
+            .await
+            .unwrap();
+        let (output, subscriber) = crate::test_support::logs();
+        for _ in 0..2 {
+            super::replay_inventory(&state, &peer, &task)
+                .with_subscriber(subscriber.clone())
+                .await
+                .unwrap();
+        }
+        let reason: String = sqlx::query_scalar(
+            "SELECT error FROM peer_backfill_inbox WHERE peer_id='peer' AND path='photo.example.jpg'",
+        )
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+        let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert!(
+            logs.contains("peer=peer") && logs.contains("share=share"),
+            "{logs}"
+        );
+        assert!(
+            logs.contains("photo.example.jpg") && logs.contains(&reason),
+            "{logs}"
+        );
+        assert!(
+            logs.contains("when peer inventory is next replayed"),
+            "{logs}"
+        );
+        assert_eq!(
+            logs.matches("peer inventory deferred:").count(),
+            1,
+            "{logs}"
+        );
+    }
+
+    #[tokio::test]
+    async fn retained_peer_event_failure_logs_item_and_retry_once() {
+        use tracing::instrument::WithSubscriber;
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::state::AppState::new(
+            crate::config::Config::for_tests(dir.path()),
+            crate::db::connect(dir.path()).await.unwrap(),
+            crate::crypto::SecretBox::open_or_create(dir.path()).unwrap(),
+        )
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO peers(id,name,url,secret_enc,status,created_at) VALUES('peer','Peer','https://peer.example','unused','online',?)")
+            .bind(crate::db::now()).execute(&state.db).await.unwrap();
+        sqlx::query("INSERT INTO peer_inbox(peer_id,seq,origin,origin_seq,share_name,event_json,error) VALUES('peer',7,'origin',1,'Archive','{}','Waiting for a managed operation')")
+            .execute(&state.db).await.unwrap();
+        let (output, subscriber) = crate::test_support::logs();
+        for expected in [false, false] {
+            assert_eq!(
+                super::record_error(&state, "peer", 7, "Waiting for a managed operation", None)
+                    .with_subscriber(subscriber.clone())
+                    .await
+                    .unwrap(),
+                expected
+            );
+        }
+        let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert!(
+            logs.contains("peer=peer") && logs.contains("event_seq=7"),
+            "{logs}"
+        );
+        assert!(logs.contains("Waiting for a managed operation"), "{logs}");
+        assert!(
+            logs.contains("when peer events are next replayed"),
+            "{logs}"
+        );
+        assert_eq!(logs.matches("peer effect deferred:").count(), 1, "{logs}");
+    }
 }

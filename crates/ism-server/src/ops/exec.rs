@@ -42,7 +42,11 @@ pub async fn run(state: AppState) {
             };
             let Some(id) = next else { break };
             if let Err(e) = run_operation(&state, &id).await {
-                tracing::error!(operation = %id, "operation failed: {}", e.message());
+                tracing::error!(
+                    operation = %id,
+                    next_retry = "no automatic operation retry; review recovery or submit again",
+                    "operation failed: {}", crate::error::redact(e.message())
+                );
                 let result = async {
                     let mut tx = state.db.begin().await?;
                     let updated = sqlx::query("UPDATE operations SET status = 'failed', finished_at = ? WHERE id = ? AND status IN ('queued', 'waiting_maintenance')")
@@ -170,6 +174,11 @@ async fn set_item(
     .bind(index)
     .execute(&state.db)
     .await?;
+    if matches!(status, ItemStatus::Failed | ItemStatus::RecoveryRequired)
+        && let Some((code, message)) = error
+    {
+        super::log_item_failure(id, index, code, message);
+    }
     let item = super::load_item(state, id, index).await?;
     super::record(state, id, "item", &serde_json::to_value(item)?).await?;
     Ok(())
@@ -265,6 +274,12 @@ pub async fn run_operation(state: &AppState, id: &str) -> AppResult<()> {
     }
     if !servers.is_empty() {
         set_status(state, id, OperationStatus::WaitingMaintenance).await?;
+        tracing::info!(
+            operation = %id,
+            servers = ?servers.keys().collect::<Vec<_>>(),
+            next_retry = "when the queue is paused and idle, if maintenance can be verified",
+            "operation waiting for Immich library queue maintenance"
+        );
     }
     let mut admitted: Vec<String> = Vec::new();
     for server in servers.keys() {
@@ -529,12 +544,15 @@ pub(crate) fn parse_action(raw: &str) -> AppResult<OperationAction> {
 }
 
 async fn fail_all(state: &AppState, id: &str, code: &str, message: &str) -> AppResult<()> {
-    sqlx::query("UPDATE operation_items SET status = 'failed', error_code = ?, error_message = ? WHERE operation_id = ? AND status IN ('pending', 'running')")
+    let items: Vec<i64> = sqlx::query_scalar("UPDATE operation_items SET status = 'failed', error_code = ?, error_message = ? WHERE operation_id = ? AND status IN ('pending', 'running') RETURNING idx")
         .bind(code)
         .bind(message)
         .bind(id)
-        .execute(&state.db)
+        .fetch_all(&state.db)
         .await?;
+    for item in items {
+        super::log_item_failure(id, item, code, message);
+    }
     set_status(state, id, OperationStatus::Failed).await
 }
 
@@ -4234,6 +4252,42 @@ mod tests {
         Mock, MockServer, ResponseTemplate,
         matchers::{body_json, header, method, path},
     };
+
+    #[tokio::test]
+    async fn operation_item_failure_logs_the_item_reason_and_retry() {
+        use tracing::instrument::WithSubscriber;
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new(
+            crate::config::Config::for_tests(dir.path()),
+            db::connect(dir.path()).await.unwrap(),
+            crate::crypto::SecretBox::open_or_create(dir.path()).unwrap(),
+        )
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO operations(id,idempotency_key,principal,source,request_json,status,created_at) VALUES('operation','synthetic','admin','admin','{}','running',?)")
+            .bind(db::now()).execute(&state.db).await.unwrap();
+        sqlx::query("INSERT INTO operation_items(operation_id,idx,kind,action_json,status) VALUES('operation',2,'create_folder','{}','running')")
+            .execute(&state.db).await.unwrap();
+        let (output, subscriber) = crate::test_support::logs();
+        set_item(
+            &state,
+            "operation",
+            2,
+            ItemStatus::Failed,
+            Some(("root_unavailable", "The root is unavailable")),
+            None,
+        )
+        .with_subscriber(subscriber)
+        .await
+        .unwrap();
+
+        let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert!(logs.contains("operation=operation"), "{logs}");
+        assert!(logs.contains("item=2"), "{logs}");
+        assert!(logs.contains("The root is unavailable"), "{logs}");
+        assert!(logs.contains("no automatic operation retry"), "{logs}");
+    }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]

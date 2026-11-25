@@ -473,6 +473,7 @@ async fn failed_folder_scan_keeps_uncertain_rows_but_publishes_independent_chang
 #[tokio::test]
 async fn operation_waiting_for_maintenance_does_not_hold_share_scans() {
     use ism_core::maintenance::MaintenanceState;
+    use tracing::instrument::WithSubscriber;
     let b = instance("Beta").await;
     for task in &b.tasks {
         task.abort();
@@ -541,7 +542,9 @@ async fn operation_waiting_for_maintenance_does_not_hold_share_scans() {
         .bind(&accepted.operation_id).bind(&independent.id).execute(&b.state.db).await.unwrap();
     write_old(&b.shared.join("independent.jpg"), b"photo");
 
-    let operation = crate::ops::exec::run_operation(&b.state, &accepted.operation_id);
+    let (output, subscriber) = crate::test_support::logs_at(tracing::Level::INFO);
+    let operation = crate::ops::exec::run_operation(&b.state, &accepted.operation_id)
+        .with_subscriber(subscriber);
     tokio::pin!(operation);
     let gate = &b.state.replication_operation_lock;
     tokio::select! {
@@ -578,6 +581,13 @@ async fn operation_waiting_for_maintenance_does_not_hold_share_scans() {
             assert!(waited.is_err(), "other bookkeeping must still wait");
         }
     }
+    let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+    assert!(
+        logs.contains(&format!("operation={}", accepted.operation_id))
+            && logs.contains("Immich library queue")
+            && logs.contains("when the queue is paused and idle"),
+        "{logs}"
+    );
 
     let mut blocked = MaintenanceState::default();
     blocked.block("test barrier");

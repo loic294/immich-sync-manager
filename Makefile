@@ -8,9 +8,9 @@ ISM_LISTEN ?= 127.0.0.1:8080
 
 .DEFAULT_GOAL := check
 
-.PHONY: check check-rust check-web fmt gen-api dev-server dev-web image clean
+.PHONY: check check-rust check-web check-scripts fmt gen-api dev-server dev-web image clean
 
-check: check-rust check-web
+check: check-rust check-web check-scripts
 
 check-rust:
 	cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace
@@ -18,6 +18,9 @@ check-rust:
 check-web:
 	test -d web/node_modules || npm --prefix web ci
 	npm --prefix web run check
+
+check-scripts:
+	python3 -B -m unittest discover -s scripts -p 'test_*.py'
 
 fmt:
 	cargo fmt --all && npm --prefix web run format

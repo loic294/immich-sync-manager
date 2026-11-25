@@ -1,6 +1,7 @@
 //! Copies file contents from peers during allowed hours (or under a manual override).
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
 use futures_util::StreamExt;
@@ -23,11 +24,51 @@ use crate::db;
 use crate::error::{AppError, AppResult};
 use crate::files::{self, STAGING_DIR};
 use crate::state::{AppState, ServerEvent};
+use crate::wait_log::WaitLogs;
 
 const MAX_ATTEMPTS: i64 = 8;
 const PROGRESS_EVERY: u64 = 4 * 1024 * 1024;
 const STAGING_WRITE_BUFFER: usize = 256 * 1024;
+const OFFLINE_WAIT_RECHECK: Duration = Duration::from_secs(60);
 pub(crate) const DOWNLOAD_CHUNK_SIZE: u64 = 16 * 1024 * 1024;
+
+fn wait_key(id: &str) -> String {
+    format!("transfer:{id}")
+}
+
+fn report_wait(
+    waits: &WaitLogs,
+    id: &str,
+    reason: &str,
+    next_at: Option<&str>,
+    blocked: Option<bool>,
+) {
+    if waits.take_report(&wait_key(id), reason, next_at, blocked) {
+        tracing::info!(
+            transfer = %id,
+            reason = %reason,
+            ?blocked,
+            next_retry = "when queued work is rechecked and prerequisites permit",
+            retry_not_before = next_at,
+            "transfer waiting"
+        );
+    }
+}
+
+fn report_offline(waits: &WaitLogs, peer: &str, ids: Vec<String>) {
+    let ids: Vec<_> = ids
+        .into_iter()
+        .filter(|id| waits.take_report(&wait_key(id), "Peer is not online", None, Some(true)))
+        .collect();
+    if !ids.is_empty() {
+        tracing::info!(
+            peer = %peer, transfers = ?ids,
+            reason = "Peer is not online",
+            next_retry = "when the peer is online and prerequisites permit",
+            "transfers waiting for peer"
+        );
+    }
+}
 
 fn existing_original_for_companion(
     folder: &std::path::Path,
@@ -79,13 +120,15 @@ fn existing_original_for_companion(
     }))
 }
 
-pub(crate) fn retry_at(attempts: i64, updated: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+fn retry_deadline(attempts: i64, updated: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     if attempts <= 0 {
         return None;
     }
-    db::parse_ts(updated)
-        .and_then(|at| at.checked_add_signed(chrono::Duration::minutes(attempts)))
-        .filter(|at| *at > chrono::Utc::now())
+    db::parse_ts(updated).and_then(|at| at.checked_add_signed(chrono::Duration::minutes(attempts)))
+}
+
+pub(crate) fn retry_at(attempts: i64, updated: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    retry_deadline(attempts, updated).filter(|at| *at > chrono::Utc::now())
 }
 
 fn peer_upload_file(
@@ -753,6 +796,7 @@ impl PassEvidence {
 
 async fn next(
     state: &AppState,
+    waits: &WaitLogs,
     #[cfg(test)] pause: &mut Option<EligibilityPause>,
 ) -> AppResult<Option<(Transfer, Option<String>)>> {
     let shares = super::shares(state).await?;
@@ -835,13 +879,7 @@ async fn next(
                 blocked,
             } = &eligible
             {
-                tracing::trace!(
-                    transfer = %id,
-                    reason = %reason,
-                    next_at = ?next_at,
-                    blocked = *blocked,
-                    "transfer remains queued"
-                );
+                report_wait(waits, &id, reason, next_at.as_deref(), Some(*blocked));
             }
             if let Eligibility::Ready(ov) = eligible {
                 return Ok(Some((
@@ -867,18 +905,114 @@ async fn next(
     }
 }
 
+async fn report_offline_waits(state: &AppState, waits: &WaitLogs) -> AppResult<()> {
+    let has_offline_peer: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM peers WHERE status != 'online')")
+            .fetch_one(&state.db)
+            .await?;
+    if !has_offline_peer {
+        return Ok(());
+    }
+    let mut after = i64::MIN;
+    loop {
+        let rows: Vec<(i64, String, String)> = sqlx::query_as(
+            "SELECT t.rowid,t.id,t.peer_id FROM transfers t NOT INDEXED
+             JOIN peers p ON p.id=t.peer_id
+             WHERE t.rowid>? AND t.status='queued' AND p.status!='online'
+             ORDER BY t.rowid LIMIT 256",
+        )
+        .bind(after)
+        .fetch_all(&state.db)
+        .await?;
+        let Some((last, _, _)) = rows.last() else {
+            return Ok(());
+        };
+        after = *last;
+        let mut peers = HashMap::<String, Vec<String>>::new();
+        for (_, id, peer) in rows {
+            peers.entry(peer).or_default().push(id);
+        }
+        for (peer, ids) in peers {
+            report_offline(waits, &peer, ids);
+        }
+    }
+}
+
+async fn observe_offline_waits(state: AppState, waits: Arc<WaitLogs>) {
+    let mut interval = tokio::time::interval(OFFLINE_WAIT_RECHECK);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut peer_waits_reported = false;
+    let mut recovery_waits_reported = false;
+    let mut evidence_waits_reported = false;
+    loop {
+        interval.tick().await;
+        waits.expire();
+        if let Err(error) = report_offline_waits(&state, &waits).await {
+            tracing::warn!(
+                code = %error.code(),
+                next_retry = "on the next one-minute diagnostic check",
+                "could not report transfers waiting for an offline peer: {}",
+                crate::error::redact(error.message())
+            );
+        }
+        if !peer_waits_reported {
+            match super::inbox::report_retained_waits(&state).await {
+                Ok(()) => peer_waits_reported = true,
+                Err(error) => {
+                    tracing::warn!(
+                        code = %error.code(),
+                        next_retry = "on the next one-minute diagnostic check",
+                        "could not report retained peer waits: {}",
+                        crate::error::redact(error.message())
+                    );
+                }
+            }
+        }
+        if !recovery_waits_reported {
+            match super::recovery::report_retained_waits(&state).await {
+                Ok(()) => recovery_waits_reported = true,
+                Err(error) => {
+                    tracing::warn!(
+                        code = %error.code(),
+                        next_retry = "on the next one-minute diagnostic check",
+                        "could not report retained recovery waits: {}",
+                        crate::error::redact(error.message())
+                    );
+                }
+            }
+        }
+        if !evidence_waits_reported {
+            match super::versions::report_retained_waits(&state).await {
+                Ok(()) => evidence_waits_reported = true,
+                Err(error) => {
+                    tracing::warn!(
+                        code = %error.code(),
+                        next_retry = "on the next one-minute diagnostic check",
+                        "could not report retained conflict-evidence waits: {}",
+                        crate::error::redact(error.message())
+                    );
+                }
+            }
+        }
+    }
+}
+
 pub async fn run(state: AppState) {
-    run_inner(
-        state,
-        #[cfg(test)]
-        None,
-    )
-    .await;
+    let waits = state.wait_logs.clone();
+    tokio::join!(
+        run_inner(
+            state.clone(),
+            waits.clone(),
+            #[cfg(test)]
+            None,
+        ),
+        observe_offline_waits(state, waits),
+    );
 }
 
 #[cfg(test)]
 pub(super) async fn run_paused(state: AppState, pause: EligibilityPause) {
-    run_inner(state, Some(pause)).await;
+    run_inner(state, Arc::new(WaitLogs::default()), Some(pause)).await;
 }
 
 /// One scheduler pass: the transfer it would claim next, if any.
@@ -887,10 +1021,16 @@ pub(super) async fn next_for_test(
     state: &AppState,
     mut pause: Option<EligibilityPause>,
 ) -> AppResult<Option<String>> {
-    Ok(next(state, &mut pause).await?.map(|(t, _)| t.id))
+    Ok(next(state, &WaitLogs::default(), &mut pause)
+        .await?
+        .map(|(t, _)| t.id))
 }
 
-async fn run_inner(state: AppState, #[cfg(test)] mut pause: Option<EligibilityPause>) {
+async fn run_inner(
+    state: AppState,
+    waits: Arc<WaitLogs>,
+    #[cfg(test)] mut pause: Option<EligibilityPause>,
+) {
     let tick = Duration::from_secs(state.config.tick_secs.max(1));
     let mut tasks = tokio::task::JoinSet::new();
     let mut transfers = HashMap::new();
@@ -902,6 +1042,7 @@ async fn run_inner(state: AppState, #[cfg(test)] mut pause: Option<EligibilityPa
         if tasks.len() < state.config.peer_transfer_concurrency {
             match next(
                 &state,
+                &waits,
                 #[cfg(test)]
                 &mut pause,
             )
@@ -912,7 +1053,11 @@ async fn run_inner(state: AppState, #[cfg(test)] mut pause: Option<EligibilityPa
                         Ok(true) => {}
                         Ok(false) => continue,
                         Err(e) => {
-                            tracing::error!(transfer = %t.id, "claim transfer: {}", e.message());
+                            tracing::error!(
+                                transfer = %t.id,
+                                next_retry = "on the next dispatcher check",
+                                "claim transfer: {}", crate::error::redact(e.message())
+                            );
                             tokio::time::sleep(tick).await;
                             continue;
                         }
@@ -921,8 +1066,9 @@ async fn run_inner(state: AppState, #[cfg(test)] mut pause: Option<EligibilityPa
                     state.emit(ServerEvent::SyncChanged);
                     let state = state.clone();
                     let id = t.id.clone();
+                    let waits = waits.clone();
                     let task = tasks.spawn(async move {
-                        run_claimed(&state, &t).await;
+                        run_claimed(&state, &t, &waits).await;
                     });
                     transfers.insert(task.id(), id);
                     continue;
@@ -953,68 +1099,119 @@ fn record_transfer_exit(
             transfers.remove(&task);
         }
         Err(error) => {
-            tracing::error!("transfer task: {error}");
             if let Some(id) = transfers.remove(&error.id()) {
+                tracing::error!(
+                    transfer = %id,
+                    next_retry = "no automatic retry until restart recovery or manual action",
+                    "transfer task stopped: {}", crate::error::redact(&error.to_string())
+                );
                 crate::activity::transfer_stopped(
                     state,
                     &id,
                     crate::worker_evidence::TransferStop::TaskStopped,
                 );
             } else {
-                tracing::error!("an unidentified transfer task stopped");
+                tracing::error!(
+                    next_retry = "unknown; inspect transfer state",
+                    "an unidentified transfer task stopped: {}",
+                    crate::error::redact(&error.to_string())
+                );
             }
         }
     }
 }
 
-async fn run_claimed(state: &AppState, t: &Transfer) {
+async fn run_claimed(state: &AppState, t: &Transfer, waits: &WaitLogs) {
     let result = run_one(state, t).await;
-    let deferred = matches!(result, Ok(Outcome::Deferred));
+    let deferred = matches!(result, Ok(Outcome::Deferred(_)));
     let now = db::now();
     let updated = match result {
         Ok(Outcome::Done | Outcome::Dropped) => {
+            waits.clear(&wait_key(&t.id));
             sqlx::query("DELETE FROM transfers WHERE id = ? AND status = 'running'")
                 .bind(&t.id)
                 .execute(&state.db)
                 .await
+                .map(|_| ())
         }
         Ok(Outcome::Blocked(reason)) => {
-            sqlx::query(
+            waits.clear(&wait_key(&t.id));
+            let saved = sqlx::query(
                 "UPDATE transfers SET status = 'failed', error = ?, updated_at = ? WHERE id = ? AND status = 'running'",
             )
             .bind(reason)
             .bind(&now)
             .bind(&t.id)
             .execute(&state.db)
-            .await
+            .await;
+            if saved
+                .as_ref()
+                .is_ok_and(|result| result.rows_affected() != 0)
+            {
+                tracing::warn!(
+                    transfer = %t.id,
+                    next_retry = "no automatic transfer retry; recovery may requeue it",
+                    "transfer blocked: {reason}"
+                );
+            }
+            saved.map(|_| ())
         }
-        Ok(Outcome::Deferred) => {
-            sqlx::query(
+        Ok(Outcome::Deferred(reason)) => {
+            let saved = sqlx::query(
                 "UPDATE transfers SET status = 'queued', updated_at = ? WHERE id = ? AND status = 'running'",
             )
             .bind(&now)
             .bind(&t.id)
             .execute(&state.db)
-            .await
+            .await;
+            if saved
+                .as_ref()
+                .is_ok_and(|result| result.rows_affected() != 0)
+            {
+                report_wait(waits, &t.id, &reason, None, None);
+            }
+            saved.map(|_| ())
         }
         Err(e) => {
-            tracing::warn!(transfer = %t.id, "transfer failed: {e}");
-            sqlx::query(
+            waits.clear(&wait_key(&t.id));
+            let saved: Result<Option<(i64, String)>, sqlx::Error> = sqlx::query_as(
                 "UPDATE transfers SET attempts = attempts + 1, error = ?, updated_at = ?,
                  status = CASE WHEN status = 'cancelled' THEN 'cancelled'
                                WHEN attempts + 1 >= ? THEN 'failed' ELSE 'queued' END
-                 WHERE id = ?",
+                 WHERE id = ? RETURNING attempts,status",
             )
             .bind(&e)
             .bind(&now)
             .bind(MAX_ATTEMPTS)
             .bind(&t.id)
-            .execute(&state.db)
-            .await
+            .fetch_optional(&state.db)
+            .await;
+            let (next_retry, retry_not_before) = match &saved {
+                Ok(Some((attempts, status))) if status == "queued" => (
+                    "when eligible after backoff and other prerequisites",
+                    retry_deadline(*attempts, &now).map(db::ts),
+                ),
+                Ok(Some((_, status))) if status == "failed" => {
+                    ("no automatic retry; recovery may requeue it", None)
+                }
+                Ok(Some((_, status))) if status == "cancelled" => {
+                    ("no automatic retry; transfer was cancelled", None)
+                }
+                _ => ("unknown; check the current transfer state", None),
+            };
+            tracing::warn!(
+                transfer = %t.id, next_retry, retry_not_before,
+                "transfer failed: {}", crate::error::redact(&e)
+            );
+            saved.map(|_| ())
         }
     };
     if let Err(e) = updated {
-        tracing::error!(transfer = %t.id, "record transfer outcome: {e}");
+        tracing::error!(
+            transfer = %t.id,
+            next_retry = "no automatic retry until restart recovery or manual action",
+            "record transfer outcome: {}", crate::error::redact(&e.to_string())
+        );
         crate::activity::transfer_stopped(
             state,
             &t.id,
@@ -1049,7 +1246,7 @@ enum Outcome {
     /// The remote version is gone or superseded; a newer event will follow.
     Dropped,
     Blocked(&'static str),
-    Deferred,
+    Deferred(String),
 }
 
 async fn run_one(state: &AppState, t: &Transfer) -> Result<Outcome, String> {
@@ -1072,7 +1269,7 @@ async fn run_one(state: &AppState, t: &Transfer) -> Result<Outcome, String> {
         _ => Ok(()),
     };
     let phase = match &result {
-        Ok(Outcome::Deferred) => "Attempt deferred; file remains queued for its prerequisites",
+        Ok(Outcome::Deferred(_)) => "Attempt deferred; file remains queued for its prerequisites",
         Ok(Outcome::Dropped) => "Attempt ended; transfer is no longer applicable",
         _ => "Transfer attempt finished",
     };
@@ -1111,7 +1308,9 @@ async fn run_one_reporting(
                     "peer source tree changed; a new choice is required",
                 ));
             }
-            Err(_) => return Ok(Outcome::Deferred),
+            Err(error) => {
+                return Ok(Outcome::Deferred(crate::error::redact(error.message())));
+            }
         }
     }
     // Remote-source adapters authenticate fresh version/hash evidence before local locking.
@@ -1122,11 +1321,8 @@ async fn run_one_reporting(
             sha256: t.sha256.clone(),
             size: t.size as u64,
         };
-        if super::retained::remote_check(state, &peer, token, &wanted)
-            .await
-            .is_err()
-        {
-            return Ok(Outcome::Deferred);
+        if let Err(error) = super::retained::remote_check(state, &peer, token, &wanted).await {
+            return Ok(Outcome::Deferred(crate::error::redact(error.message())));
         }
     } else if let Some(source) = &t.source_rel {
         share.root_rel(source).map_err(m)?;
@@ -1137,7 +1333,9 @@ async fn run_one_reporting(
         let evidence =
             match super::recovery::remote_evidence(state, &peer, &share, source, version).await {
                 Ok(evidence) => evidence,
-                Err(_) => return Ok(Outcome::Deferred),
+                Err(error) => {
+                    return Ok(Outcome::Deferred(crate::error::redact(error.message())));
+                }
             };
         if evidence.path != *source
             || evidence.deleted
@@ -1148,7 +1346,9 @@ async fn run_one_reporting(
                 Causality::Equal | Causality::Dominates
             )
         {
-            return Ok(Outcome::Deferred);
+            return Ok(Outcome::Deferred(
+                "Peer source evidence changed before transfer".into(),
+            ));
         }
     }
     task.waiting("Waiting for the replication-operation lock");
@@ -1156,7 +1356,7 @@ async fn run_one_reporting(
     task.phase("Verifying local file and transfer prerequisites");
     if let Err(e) = super::inbox::require_stable_transfer(state, &share, &[&t.rel], &t.id).await {
         return if matches!(e.code(), "recovery_required" | "root_unavailable") {
-            Ok(Outcome::Deferred)
+            Ok(Outcome::Deferred(crate::error::redact(e.message())))
         } else {
             Err(e.message().to_owned())
         };
@@ -1308,7 +1508,9 @@ async fn run_one_reporting(
         if status == 404 || status == 409 || status == 410 {
             drop(file);
             if t.source_rel.is_some() || t.retained_token.is_some() {
-                return Ok(Outcome::Deferred);
+                return Ok(Outcome::Deferred(format!(
+                    "Peer returned HTTP {status} for the verified source"
+                )));
             }
             let current: Option<String> =
                 sqlx::query_scalar("SELECT rel_path FROM transfers WHERE id=?")
@@ -1317,7 +1519,7 @@ async fn run_one_reporting(
                     .await
                     .map_err(|e| e.to_string())?;
             if current.as_deref() != Some(&t.rel) {
-                return Ok(Outcome::Deferred);
+                return Ok(Outcome::Deferred("The queued transfer path changed".into()));
             }
             return Ok(Outcome::Blocked(
                 "source version is no longer at the queued path; recovery will reconcile its current location",
@@ -1432,7 +1634,7 @@ async fn run_one_reporting(
     task.phase("Verifying destination and submitting safe publication");
     if let Err(e) = super::inbox::require_stable_transfer(state, &share, &[&t.rel], &t.id).await {
         return if matches!(e.code(), "recovery_required" | "root_unavailable") {
-            Ok(Outcome::Deferred)
+            Ok(Outcome::Deferred(crate::error::redact(e.message())))
         } else {
             Err(e.message().to_owned())
         };
@@ -1457,7 +1659,9 @@ async fn run_one_reporting(
         || source.2 != t.rel
         || source.3 != t.retained_token
     {
-        return Ok(Outcome::Deferred);
+        return Ok(Outcome::Deferred(
+            "The queued transfer source or destination changed".into(),
+        ));
     }
     let Some(current_share) = super::shares(state)
         .await
@@ -1715,6 +1919,277 @@ mod tests {
     use ism_core::file_settings::DEFAULT_SIDECAR_EXTENSIONS;
 
     #[tokio::test]
+    async fn offline_peer_transfers_log_their_wait_without_being_claimed() {
+        use tracing::instrument::WithSubscriber;
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::state::AppState::new(
+            crate::config::Config::for_tests(dir.path()),
+            crate::db::connect(dir.path()).await.unwrap(),
+            crate::crypto::SecretBox::open_or_create(dir.path()).unwrap(),
+        )
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO peers(id,name,url,secret_enc,status,created_at) VALUES('peer','Peer','https://peer.example','unused','offline',?)")
+            .bind(crate::db::now()).execute(&state.db).await.unwrap();
+        sqlx::query("INSERT INTO shares(id,name,root_id,path,peer_ids_json,enabled) VALUES('share','Archive','photos','','[\"peer\"]',1)")
+            .execute(&state.db).await.unwrap();
+        for id in ["one", "two"] {
+            sqlx::query("INSERT INTO transfers(id,peer_id,share_id,rel_path,sha256,size,vv_json,status,queued_at,updated_at) VALUES(?,'peer','share',?,'example',10,'{}','queued',?,?)")
+                .bind(id).bind(format!("{id}.jpg")).bind(crate::db::now()).bind(crate::db::now())
+                .execute(&state.db).await.unwrap();
+        }
+        let (output, subscriber) = crate::test_support::logs_at(tracing::Level::INFO);
+        let worker = tokio::spawn(super::run(state.clone()).with_subscriber(subscriber));
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+                if logs.contains("one")
+                    && logs.contains("two")
+                    && logs.contains("Peer is not online")
+                    && logs.contains("when the peer is online")
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("offline transfers were not reported");
+        worker.abort();
+        let _ = worker.await;
+        let queued: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM transfers WHERE status='queued'")
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+        assert_eq!(queued, 2);
+        let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            logs.matches("transfers waiting for peer").count(),
+            1,
+            "{logs}"
+        );
+    }
+
+    #[tokio::test]
+    async fn retained_recovery_and_evidence_waits_are_reported_without_retrying_them() {
+        use tracing::instrument::WithSubscriber;
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::state::AppState::new(
+            crate::config::Config::for_tests(dir.path()),
+            crate::db::connect(dir.path()).await.unwrap(),
+            crate::crypto::SecretBox::open_or_create(dir.path()).unwrap(),
+        )
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO peers(id,name,url,secret_enc,status,created_at) VALUES('peer','Peer','https://peer.example','unused','offline',?)")
+            .bind(crate::db::now()).execute(&state.db).await.unwrap();
+        sqlx::query("INSERT INTO shares(id,name,root_id,path,peer_ids_json,enabled) VALUES('share','Archive','photos','','[\"peer\"]',1)")
+            .execute(&state.db).await.unwrap();
+        sqlx::query("INSERT INTO sync_recovery(id,kind,target_id,state,code,detail,created_at,updated_at) VALUES('transfer:local','transfer','local','not_retryable','recovery_exhausted','Saved recovery failed',?,?)")
+            .bind(crate::db::now()).bind(crate::db::now()).execute(&state.db).await.unwrap();
+        let outgoing = serde_json::json!({
+            "target": {"kind": "transfer", "id": "remote", "peer_id": "peer"},
+            "title": "Recovery",
+            "state": "waiting",
+            "code": "peer_busy",
+            "detail": "Receiver unavailable",
+            "can_fix": false,
+            "can_dismiss": false,
+            "replacement_operation_id": null
+        });
+        sqlx::query("INSERT INTO outgoing_recovery_requests(peer_id,kind,target_id,state,view_json,updated_at) VALUES('peer','transfer','remote','waiting',?,?)")
+            .bind(outgoing.to_string()).bind(crate::db::now()).execute(&state.db).await.unwrap();
+        sqlx::query("INSERT INTO conflicts(id,share_id,rel_path,kind,detail,local_json,remote_json,remote_vv_json,peer_id,status,created_at) VALUES('conflict','share','photo.jpg','changed_on_both','synthetic','{}','{}','{}','peer','open',?)")
+            .bind(crate::db::now()).execute(&state.db).await.unwrap();
+        sqlx::query("UPDATE conflict_evidence_jobs SET state='blocked',error='version_evidence_too_large',error_detail='Evidence too large' WHERE target_id='conflict'")
+            .execute(&state.db).await.unwrap();
+
+        let (output, subscriber) = crate::test_support::logs_at(tracing::Level::INFO);
+        let observer = tokio::spawn(
+            super::observe_offline_waits(state.clone(), state.wait_logs.clone())
+                .with_subscriber(subscriber),
+        );
+        let observed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+                if [
+                    "Saved recovery failed",
+                    "Receiver unavailable",
+                    "Evidence too large",
+                ]
+                .iter()
+                .all(|reason| logs.contains(reason))
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        observer.abort();
+        let _ = observer.await;
+        let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert!(observed.is_ok(), "retained waits were not reported: {logs}");
+        for (id, reason) in [
+            ("transfer:local", "Saved recovery failed"),
+            ("remote", "Receiver unavailable"),
+            ("conflict", "Evidence too large"),
+        ] {
+            assert!(
+                logs.lines().any(|line| line.contains(id)
+                    && line.contains(reason)
+                    && line.contains("next_retry")),
+                "{logs}"
+            );
+        }
+        let states: (String, String, String) = sqlx::query_as(
+            "SELECT (SELECT state FROM sync_recovery WHERE id='transfer:local'),
+                    (SELECT state FROM outgoing_recovery_requests WHERE target_id='remote'),
+                    (SELECT state FROM conflict_evidence_jobs WHERE target_id='conflict')",
+        )
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+        assert_eq!(
+            states,
+            ("not_retryable".into(), "waiting".into(), "blocked".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn deferred_transfer_logs_the_specific_wait_reason() {
+        use tracing::instrument::WithSubscriber;
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::state::AppState::new(
+            crate::config::Config::for_tests(dir.path()),
+            crate::db::connect(dir.path()).await.unwrap(),
+            crate::crypto::SecretBox::open_or_create(dir.path()).unwrap(),
+        )
+        .await
+        .unwrap();
+        let secret = state
+            .secrets
+            .encrypt(super::net::SECRET_PURPOSE, "synthetic-key")
+            .unwrap();
+        sqlx::query("INSERT INTO peers(id,name,url,secret_enc,status,created_at) VALUES('peer','Peer',?,?,'online',?)")
+            .bind(server.uri()).bind(secret).bind(crate::db::now())
+            .execute(&state.db).await.unwrap();
+        sqlx::query("INSERT INTO shares(id,name,root_id,path,peer_ids_json,enabled) VALUES('share','Archive','photos','','[\"peer\"]',1)")
+            .execute(&state.db).await.unwrap();
+        sqlx::query("INSERT INTO transfers(id,peer_id,share_id,rel_path,sha256,size,vv_json,status,queued_at,updated_at) VALUES('transfer','peer','share','photo.jpg','example',10,'{}','running',?,?)")
+            .bind(crate::db::now()).bind(crate::db::now())
+            .execute(&state.db).await.unwrap();
+        let transfer = super::Transfer {
+            id: "transfer".into(),
+            peer_id: "peer".into(),
+            share_id: "share".into(),
+            rel: "photo.jpg".into(),
+            sha256: "example".into(),
+            size: 10,
+            vv: Default::default(),
+            source_rel: None,
+            source_vv: None,
+            retained_token: Some("synthetic-token".into()),
+            restore_parent: None,
+        };
+        let (output, subscriber) = crate::test_support::logs_at(tracing::Level::INFO);
+        let waits = super::WaitLogs::default();
+        for _ in 0..2 {
+            sqlx::query("UPDATE transfers SET status='running' WHERE id='transfer'")
+                .execute(&state.db)
+                .await
+                .unwrap();
+            super::run_claimed(&state, &transfer, &waits)
+                .with_subscriber(subscriber.clone())
+                .await;
+        }
+        let status: (String, i64) =
+            sqlx::query_as("SELECT status,attempts FROM transfers WHERE id='transfer'")
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+        let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert_eq!(status, ("queued".into(), 0));
+        assert!(logs.contains("transfer=transfer"), "{logs}");
+        assert!(
+            logs.contains("retained content evidence is incomplete or changed"),
+            "{logs}"
+        );
+        assert!(logs.contains("when queued work is rechecked"), "{logs}");
+        assert_eq!(logs.matches("transfer waiting").count(), 1, "{logs}");
+    }
+
+    #[tokio::test]
+    async fn transfer_failure_logs_the_persisted_retry_or_exhaustion() {
+        use tracing::instrument::WithSubscriber;
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::state::AppState::new(
+            crate::config::Config::for_tests(dir.path()),
+            crate::db::connect(dir.path()).await.unwrap(),
+            crate::crypto::SecretBox::open_or_create(dir.path()).unwrap(),
+        )
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO peers(id,name,url,secret_enc,status,created_at) VALUES('peer','Peer','https://peer.example','invalid','online',?)")
+            .bind(crate::db::now()).execute(&state.db).await.unwrap();
+        sqlx::query("INSERT INTO shares(id,name,root_id,path,peer_ids_json,enabled) VALUES('share','Archive','photos','','[\"peer\"]',1)")
+            .execute(&state.db).await.unwrap();
+
+        for (id, attempts) in [("retry", 0), ("exhausted", super::MAX_ATTEMPTS - 1)] {
+            sqlx::query("INSERT INTO transfers(id,peer_id,share_id,rel_path,sha256,size,vv_json,status,attempts,queued_at,updated_at) VALUES(?,'peer','share','photo.jpg','example',10,'{}','running',?,?,?)")
+                .bind(id).bind(attempts).bind(crate::db::now()).bind(crate::db::now())
+                .execute(&state.db).await.unwrap();
+            let transfer = super::Transfer {
+                id: id.into(),
+                peer_id: "peer".into(),
+                share_id: "share".into(),
+                rel: "photo.jpg".into(),
+                sha256: "example".into(),
+                size: 10,
+                vv: Default::default(),
+                source_rel: None,
+                source_vv: None,
+                retained_token: None,
+                restore_parent: None,
+            };
+            let (output, subscriber) = crate::test_support::logs();
+            super::run_claimed(&state, &transfer, &super::WaitLogs::default())
+                .with_subscriber(subscriber)
+                .await;
+
+            let (status, attempts, updated_at): (String, i64, String) =
+                sqlx::query_as("SELECT status,attempts,updated_at FROM transfers WHERE id=?")
+                    .bind(id)
+                    .fetch_one(&state.db)
+                    .await
+                    .unwrap();
+            let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+            assert!(logs.contains(&format!("transfer={id}")), "{logs}");
+            assert!(logs.contains("transfer failed:"), "{logs}");
+            if status == "queued" {
+                let retry = crate::db::ts(
+                    crate::db::parse_ts(&updated_at).unwrap() + chrono::Duration::minutes(attempts),
+                );
+                assert!(logs.contains(&retry), "{logs}");
+            } else {
+                assert_eq!(status, "failed");
+                assert!(logs.contains("no automatic retry"), "{logs}");
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn archive_preserves_the_final_merged_queued_version() {
         let dir = tempfile::tempdir().unwrap();
         let state = crate::state::AppState::new(
@@ -1802,7 +2277,14 @@ mod tests {
         let sibling = tasks.spawn(std::future::pending());
         transfers.insert(sibling.id(), "other".to_owned());
         let result = tasks.join_next_with_id().await.unwrap();
-        super::record_transfer_exit(&state, &mut transfers, result);
+        let (output, subscriber) = crate::test_support::logs();
+        tracing::dispatcher::with_default(&subscriber, || {
+            super::record_transfer_exit(&state, &mut transfers, result);
+        });
+        let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert!(logs.contains("transfer=transfer"), "{logs}");
+        assert!(logs.contains("synthetic transfer task failure"), "{logs}");
+        assert!(logs.contains("no automatic retry"), "{logs}");
         assert!(transfers.contains_key(&sibling.id()));
         let snapshot = crate::attention::snapshot(&state).await.unwrap();
         let failure = snapshot

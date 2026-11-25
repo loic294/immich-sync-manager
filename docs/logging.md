@@ -58,6 +58,49 @@ writes or change transaction boundaries or durability. An unfinished body's timi
 measure completion of SQLx's asynchronous rollback; BEGIN wait indicates contention, not the
 identity of the writer holding the lock.
 
+## Health summary
+
+Export timestamped, unprefixed container logs for the period you want to inspect. For Compose,
+`docker compose logs --no-color --no-log-prefix --timestamps --since=30m ism` produces a suitable
+log. Then run the summary from the repository root, supplying each instance's admin username and
+password in environment variables rather than on the command line:
+
+```sh
+python3 scripts/health_summary.py \
+  --instance east https://east.example east.log \
+  --credentials east ISM_EAST_USER ISM_EAST_PASSWORD \
+  --instance west https://west.example west.log \
+  --credentials west ISM_WEST_USER ISM_WEST_PASSWORD
+```
+
+The script checks `/healthz`, logs in, reads the current admin attention snapshot, and logs out.
+Login creates an admin session and an audit record. A failed logout is reported; the session may
+remain active until it expires. To use a previously exported attention snapshot instead of logging
+in, replace `--credentials east ...` with `--snapshot east east-attention.json`. Check its
+observation time; an exported snapshot can be stale.
+
+The summary lists attention groups, IDs, reasons and available examples, plus error, locked/busy
+and slow-query counts. Attention groups can overlap and are not distinct file totals. Up to 20
+problem groups and five examples per group are shown.
+The log's first and last entry timestamps do not prove that the export or retained logs cover the
+entire interval. In particular, this output alone cannot establish the 24-hour database criteria.
+The exit status is nonzero for unavailable or partial evidence, reported errors, locks, blocking or
+failed/stalled/unavailable attention groups, untimestamped entries, or unclassifiable slow queries.
+It reports the number of queries over one second but does not apply a daily threshold; nonblocking
+scheduled waits alone do not make it fail.
+
+Transfer, recovery, peer event and inventory, conflict-evidence, library synchronization and
+managed-operation diagnostics include the item and reason when observed, with either the earliest
+recorded retry eligibility or a description of the event or manual action needed. Eligibility is not
+a promise that a worker will start then. Unchanged waits are suppressed or logged at debug level to
+limit repetition, so an absence of new log lines is not proof that a wait cleared. Retained peer
+event and inventory errors and known waits, recovery waits, and failed or blocked conflict-evidence
+jobs are reported on the first successful startup check, even when the peer is offline. This check
+is read-only and is retried if it fails. Wait deduplication uses memory proportional to recently
+observed waits and removes expired entries. Queued transfers whose peer is not online are checked
+separately at startup and roughly once per minute, in read-only pages; they are logged in batches
+without changing transfer scheduling.
+
 ## Persistent history in the UI
 
 Runtime logs complement, rather than replace, ISM's persistent records in the database on `/data`:

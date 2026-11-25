@@ -1992,13 +1992,29 @@ async fn repeated_peer_inbox_errors_are_recorded_and_warned_only_on_change() {
 
 #[tokio::test]
 async fn content_wait_drops_a_footprint_error_once_the_footprint_is_released() {
+    use tracing::instrument::WithSubscriber;
+
     let (mut a, mut b) = pair().await;
     stop_workers(&mut a).await;
     stop_workers(&mut b).await;
     write_old(&a.shared.join("photo.jpg"), b"remote photo");
     scan(&a).await;
     let peer = super::net::peers(&b.state).await.unwrap().remove(0);
-    super::pull(&b.state, &peer).await.unwrap();
+    let (output, subscriber) = crate::test_support::logs_at(tracing::Level::INFO);
+    super::pull(&b.state, &peer)
+        .with_subscriber(subscriber)
+        .await
+        .unwrap();
+    let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+    assert!(
+        logs.contains("peer event waiting for matching file content"),
+        "{logs}"
+    );
+    assert!(logs.contains("event_seq="), "{logs}");
+    assert!(
+        logs.contains("when peer events are next replayed"),
+        "{logs}"
+    );
     let row = || {
         sqlx::query_as::<_, (String, Option<String>)>(
             "SELECT status, error FROM peer_inbox WHERE peer_id = ? AND status != 'done'",

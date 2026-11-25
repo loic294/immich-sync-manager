@@ -3316,7 +3316,188 @@ type EligibleJob = (String, String, String, Option<String>);
 /// entry is gone cannot change until new evidence arrives, so it uses the same slower recheck;
 /// Fix still requeues it at once. An unlinked conflict with a chosen resolution needs no periodic
 /// recheck while its status is `resolving`.
+const RECOVERY_RECHECK: chrono::Duration = chrono::Duration::seconds(30);
 const AWAITING_COMPLETION_RECHECK: chrono::Duration = chrono::Duration::minutes(5);
+
+fn retry_after(
+    updated_at: &str,
+    delay: chrono::Duration,
+    description: &'static str,
+) -> (&'static str, Option<String>) {
+    match db::parse_ts(updated_at).and_then(|at| at.checked_add_signed(delay)) {
+        Some(next_at) => (description, Some(db::ts(next_at))),
+        None => ("retry time unavailable; inspect the recovery record", None),
+    }
+}
+
+fn report_local_wait(
+    state: &AppState,
+    job: &str,
+    status: &str,
+    code: Option<&str>,
+    detail: Option<&str>,
+    updated_at: &str,
+) {
+    let reason = crate::error::redact(detail.unwrap_or("Waiting for recovery to finish"));
+    let code = code.unwrap_or("unknown");
+    let (next_retry, retry_not_before) = if status == "not_retryable" {
+        ("no automatic retry; manual action required", None)
+    } else if status == "needs_decision" {
+        (
+            "after a linked conflict is resolved or manually requeued",
+            None,
+        )
+    } else if code == "recovery_archive_version_missing" {
+        ("no automatic retry; investigate before using Fix", None)
+    } else {
+        let delay = if matches!(code, "awaiting_completion" | "sync_queue_entry_missing") {
+            AWAITING_COMPLETION_RECHECK
+        } else {
+            RECOVERY_RECHECK
+        };
+        retry_after(
+            updated_at,
+            delay,
+            "when eligible, or earlier if manually requeued",
+        )
+    };
+    if !state.wait_logs.take_report(
+        &format!("recovery:{job}"),
+        &format!("{status:?}:{code:?}:{reason:?}:{next_retry:?}"),
+        None,
+        None,
+    ) {
+        return;
+    }
+    if detail.is_some() {
+        tracing::warn!(
+            recovery = %job, code, next_retry, retry_not_before,
+            "recovery deferred: {reason}"
+        );
+    } else {
+        tracing::info!(
+            recovery = %job, code, next_retry, retry_not_before,
+            "recovery waiting: {reason}"
+        );
+    }
+}
+
+fn outgoing_wait_key(peer: &str, target: &str) -> String {
+    format!("outgoing-recovery:{peer:?}:{target:?}")
+}
+
+fn take_outgoing_wait(
+    state: &AppState,
+    peer: &str,
+    target: &str,
+    code: &str,
+    reason: &str,
+    next_retry: &str,
+) -> bool {
+    state.wait_logs.take_report(
+        &outgoing_wait_key(peer, target),
+        &format!("{code:?}:{reason:?}:{next_retry:?}"),
+        None,
+        None,
+    )
+}
+
+pub(super) async fn report_retained_waits(state: &AppState) -> AppResult<()> {
+    type LocalRow = (i64, String, String, Option<String>, Option<String>, String);
+    let mut after = i64::MIN;
+    loop {
+        let rows: Vec<LocalRow> = sqlx::query_as(
+            "SELECT rowid,id,state,code,detail,updated_at FROM sync_recovery NOT INDEXED
+             WHERE rowid>? AND state IN ('waiting','needs_decision','not_retryable')
+             ORDER BY rowid LIMIT 256",
+        )
+        .bind(after)
+        .fetch_all(&state.db)
+        .await?;
+        let Some(last) = rows.last() else { break };
+        after = last.0;
+        for (_, job, status, code, detail, updated_at) in rows {
+            report_local_wait(
+                state,
+                &job,
+                &status,
+                code.as_deref(),
+                detail.as_deref(),
+                &updated_at,
+            );
+        }
+    }
+
+    type OutgoingRow = (i64, String, String, String, String, String, String);
+    let mut after = i64::MIN;
+    loop {
+        let rows: Vec<OutgoingRow> = sqlx::query_as(
+            "SELECT rowid,peer_id,kind,target_id,state,view_json,updated_at
+             FROM outgoing_recovery_requests NOT INDEXED
+             WHERE rowid>? AND state IN ('waiting','accepted')
+             ORDER BY rowid LIMIT 256",
+        )
+        .bind(after)
+        .fetch_all(&state.db)
+        .await?;
+        let Some(last) = rows.last() else { break };
+        after = last.0;
+        for (_, peer, kind, id, saved_state, json, updated_at) in rows {
+            let target = format!("{kind}:{id}");
+            let item: RecoveryView = match serde_json::from_str(&json) {
+                Ok(item) => item,
+                Err(error) => {
+                    let reason =
+                        crate::error::redact(&format!("Saved recovery data is invalid: {error}"));
+                    let next_retry = "inspect the saved recovery record";
+                    if take_outgoing_wait(
+                        state,
+                        &peer,
+                        &target,
+                        "invalid_recovery",
+                        &reason,
+                        next_retry,
+                    ) {
+                        tracing::warn!(
+                            %peer, %target, next_retry,
+                            "outgoing recovery waiting: {reason}"
+                        );
+                    }
+                    continue;
+                }
+            };
+            let (next_retry, retry_not_before) = match item.state {
+                RecoveryState::Waiting => retry_after(
+                    &updated_at,
+                    RECOVERY_RECHECK,
+                    "when eligible, or earlier if manually requeued",
+                ),
+                RecoveryState::NeedsDecision => ("after the receiver's conflict is resolved", None),
+                RecoveryState::NotRetryable => {
+                    ("no automatic retry; receiver needs attention", None)
+                }
+                _ if saved_state == "waiting" => (
+                    "saved recovery state is inconsistent; inspect the record",
+                    None,
+                ),
+                _ => continue,
+            };
+            let code = item.code.as_deref().unwrap_or("not_reported");
+            let reason = item
+                .detail
+                .as_deref()
+                .map(crate::error::redact)
+                .unwrap_or_else(|| "Receiver did not provide a reason".into());
+            if take_outgoing_wait(state, &peer, &target, code, &reason, next_retry) {
+                tracing::warn!(
+                    %peer, %target, %code, next_retry, retry_not_before,
+                    "outgoing recovery waiting: {reason}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
 
 async fn eligible_jobs(
     state: &AppState,
@@ -3327,7 +3508,7 @@ async fn eligible_jobs(
     group_capacity: usize,
 ) -> AppResult<Vec<EligibleJob>> {
     let mut peers = active_peers.cloned().unwrap_or_default();
-    let cutoff = (chrono::Utc::now() - chrono::Duration::seconds(30)).to_rfc3339();
+    let cutoff = (chrono::Utc::now() - RECOVERY_RECHECK).to_rfc3339();
     let completion_cutoff = (chrono::Utc::now() - AWAITING_COMPLETION_RECHECK).to_rfc3339();
     let mut cursor: Option<(String, String)> = None;
     let mut jobs = Vec::new();
@@ -3442,7 +3623,7 @@ async fn run_job(state: &AppState, job: String, kind: String, id: String) -> App
     .bind(db::now())
     .bind(&job)
     .bind((chrono::Utc::now() - AWAITING_COMPLETION_RECHECK).to_rfc3339())
-    .bind((chrono::Utc::now() - chrono::Duration::seconds(30)).to_rfc3339())
+    .bind((chrono::Utc::now() - RECOVERY_RECHECK).to_rfc3339())
     .execute(&state.db)
     .await?;
     if claimed.rows_affected() != 1 {
@@ -3472,55 +3653,76 @@ async fn run_job(state: &AppState, job: String, kind: String, id: String) -> App
             None,
             false,
         ),
-        Err(e) => {
-            tracing::warn!(recovery = %job, code = %e.code(), "recovery deferred: {}", e.message());
-            (
-                if e.code() == "recovery_exhausted" {
-                    "not_retryable"
-                } else if matches!(e.code(), "choose_version" | "version_conflict") {
-                    "needs_decision"
-                } else {
-                    "waiting"
-                },
-                Some(e.code().to_owned()),
-                Some(e.message().to_owned()),
-                !matches!(
-                    e.code(),
-                    "recovery_required"
-                        | "maintenance_blocked"
-                        | "root_unavailable"
-                        | "peer_evidence_unavailable"
-                        | "peer_unreachable"
-                        | "peer_share_changed"
-                        | "recovery_evidence_missing"
-                        | "recovery_archive_version_missing"
-                        | "sync_queue_entry_missing"
-                        | "recovery_evidence_changed"
-                        | "recovery_plan_unchanged"
-                        | "revision_changed"
-                        | "peer_busy"
-                        | "direct_writes_unavailable"
-                        | "choose_version"
-                        | "version_conflict"
-                ),
-            )
-        }
+        Err(e) => (
+            if e.code() == "recovery_exhausted" {
+                "not_retryable"
+            } else if matches!(e.code(), "choose_version" | "version_conflict") {
+                "needs_decision"
+            } else {
+                "waiting"
+            },
+            Some(e.code().to_owned()),
+            Some(e.message().to_owned()),
+            !matches!(
+                e.code(),
+                "recovery_required"
+                    | "maintenance_blocked"
+                    | "root_unavailable"
+                    | "peer_evidence_unavailable"
+                    | "peer_unreachable"
+                    | "peer_share_changed"
+                    | "recovery_evidence_missing"
+                    | "recovery_archive_version_missing"
+                    | "sync_queue_entry_missing"
+                    | "recovery_evidence_changed"
+                    | "recovery_plan_unchanged"
+                    | "revision_changed"
+                    | "peer_busy"
+                    | "direct_writes_unavailable"
+                    | "choose_version"
+                    | "version_conflict"
+            ),
+        ),
     };
     if kind == "conflict" && status == "needs_decision" {
         super::versions::reprepare(state, &id).await?;
     }
-    sqlx::query(
+    let updated_at = chrono::Utc::now();
+    let saved = sqlx::query(
         "UPDATE sync_recovery SET state=?,code=?,detail=?,updated_at=?,attempts=attempts+?
              WHERE id=? AND state='fixing'",
     )
     .bind(status)
-    .bind(code)
+    .bind(&code)
     .bind(&detail)
-    .bind(db::now())
+    .bind(db::ts(updated_at))
     .bind(i64::from(consumes_attempt))
     .bind(&job)
     .execute(&state.db)
     .await?;
+    if saved.rows_affected() == 1 && status == "fixed" {
+        state.wait_logs.clear(&format!("recovery:{job}"));
+    } else if saved.rows_affected() == 1 {
+        report_local_wait(
+            state,
+            &job,
+            status,
+            code.as_deref(),
+            detail.as_deref(),
+            &db::ts(updated_at),
+        );
+    } else if status != "fixed" {
+        let reason = crate::error::redact(
+            detail
+                .as_deref()
+                .unwrap_or("Waiting for recovery to finish"),
+        );
+        tracing::warn!(
+            recovery = %job,
+            next_retry = "recovery changed; check its current state",
+            "recovery result was not saved: {reason}"
+        );
+    }
     state.emit(ServerEvent::SyncChanged);
     Ok(())
 }
@@ -3644,7 +3846,7 @@ async fn local_loop(state: AppState) {
 }
 
 pub(super) async fn forward_peer(state: &AppState, peer_id: &str) -> AppResult<()> {
-    let cutoff = (chrono::Utc::now() - chrono::Duration::seconds(30)).to_rfc3339();
+    let cutoff = (chrono::Utc::now() - RECOVERY_RECHECK).to_rfc3339();
     let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
     type ForwardRow = (String, String, Option<String>, String, Option<String>);
     let rows: Vec<ForwardRow> = sqlx::query_as(
@@ -3764,6 +3966,9 @@ pub(super) async fn forward_peer(state: &AppState, peer_id: &str) -> AppResult<(
     }
     .await;
     let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
+    let mut deferred = None;
+    let mut reported_waits = Vec::new();
+    let mut cleared_waits = Vec::new();
     match result {
         Ok(result) => {
             let generation: i64 = sqlx::query_scalar(
@@ -3783,29 +3988,62 @@ pub(super) async fn forward_peer(state: &AppState, peer_id: &str) -> AppResult<(
             })?;
             for mut item in result.items {
                 item.target.peer_id = Some(peer_id.to_owned());
+                let updated_at = chrono::Utc::now();
                 let status = if item.state == RecoveryState::Waiting {
                     "waiting"
                 } else {
                     "accepted"
                 };
-                sqlx::query(
+                let json = serde_json::to_string(&item)?;
+                let saved = sqlx::query(
                     "UPDATE outgoing_recovery_requests SET state=?,view_json=?,updated_at=?,
                         accepted_generation=?
                      WHERE peer_id=? AND kind=? AND target_id=? AND state='forwarding'",
                 )
                 .bind(status)
-                .bind(serde_json::to_string(&item)?)
-                .bind(db::now())
+                .bind(&json)
+                .bind(db::ts(updated_at))
                 .bind(generation)
                 .bind(peer_id)
                 .bind(kind_name(item.target.kind))
                 .bind(&item.target.id)
                 .execute(&mut *tx)
                 .await?;
+                let target = format!("{}:{}", kind_name(item.target.kind), item.target.id);
+                let retry = match item.state {
+                    RecoveryState::Waiting => Some((
+                        "when eligible, or earlier if manually requeued",
+                        Some(db::ts(updated_at + RECOVERY_RECHECK)),
+                    )),
+                    RecoveryState::NeedsDecision => {
+                        Some(("after the receiver's conflict is resolved", None))
+                    }
+                    RecoveryState::NotRetryable => {
+                        Some(("no automatic retry; receiver needs attention", None))
+                    }
+                    _ => None,
+                };
+                if saved.rows_affected() != 0 {
+                    if let Some((next_retry, retry_not_before)) = retry {
+                        reported_waits.push((
+                            target,
+                            item.code.unwrap_or_else(|| "not_reported".into()),
+                            item.detail
+                                .as_deref()
+                                .map(crate::error::redact)
+                                .unwrap_or_else(|| "Receiver did not provide a reason".into()),
+                            next_retry,
+                            retry_not_before,
+                        ));
+                    } else {
+                        cleared_waits.push(target);
+                    }
+                }
             }
         }
         Err(error) => {
-            tracing::warn!(peer=%peer_id, code=%error.code(), "outgoing recovery waiting: {}", error.message());
+            let updated_at = chrono::Utc::now();
+            let mut saved_targets = Vec::new();
             for (kind, id, _, json, _) in rows {
                 let mut item: RecoveryView = serde_json::from_str(&json)?;
                 item.state = RecoveryState::Waiting;
@@ -3813,21 +4051,56 @@ pub(super) async fn forward_peer(state: &AppState, peer_id: &str) -> AppResult<(
                 item.detail = Some(error.message().into());
                 item.can_fix = false;
                 item.can_dismiss = false;
-                sqlx::query(
+                let saved = sqlx::query(
                     "UPDATE outgoing_recovery_requests SET state='waiting',view_json=?,updated_at=?
                      WHERE peer_id=? AND kind=? AND target_id=? AND state='forwarding'",
                 )
                 .bind(serde_json::to_string(&item)?)
-                .bind(db::now())
+                .bind(db::ts(updated_at))
                 .bind(peer_id)
-                .bind(kind)
-                .bind(id)
+                .bind(&kind)
+                .bind(&id)
                 .execute(&mut *tx)
                 .await?;
+                if saved.rows_affected() != 0 {
+                    saved_targets.push(format!("{kind}:{id}"));
+                }
+            }
+            if !saved_targets.is_empty() {
+                deferred = Some((
+                    error.code().to_owned(),
+                    crate::error::redact(error.message()),
+                    saved_targets,
+                    db::ts(updated_at + RECOVERY_RECHECK),
+                ));
             }
         }
     }
     tx.commit().await?;
+    for target in cleared_waits {
+        state.wait_logs.clear(&outgoing_wait_key(peer_id, &target));
+    }
+    for (target, code, reason, next_retry, retry_not_before) in reported_waits {
+        if take_outgoing_wait(state, peer_id, &target, &code, &reason, next_retry) {
+            tracing::warn!(
+                peer = %peer_id, %target, %code, next_retry, retry_not_before,
+                "outgoing recovery waiting: {reason}"
+            );
+        }
+    }
+    if let Some((code, reason, targets, retry_not_before)) = deferred {
+        let next_retry = "when eligible, or earlier if manually requeued";
+        let targets: Vec<_> = targets
+            .into_iter()
+            .filter(|target| take_outgoing_wait(state, peer_id, target, &code, &reason, next_retry))
+            .collect();
+        if !targets.is_empty() {
+            tracing::warn!(
+                peer = %peer_id, code = %code, ?targets, %retry_not_before, next_retry,
+                "outgoing recovery waiting: {reason}"
+            );
+        }
+    }
     state.emit_ui(ServerEvent::SyncChanged);
     Ok(())
 }
@@ -3873,7 +4146,7 @@ async fn forward_loop(state: AppState) {
                  AND peer_id NOT IN (SELECT value FROM json_each(?))
                  GROUP BY peer_id ORDER BY MIN(updated_at),peer_id LIMIT ?",
             )
-            .bind((chrono::Utc::now() - chrono::Duration::seconds(30)).to_rfc3339())
+            .bind((chrono::Utc::now() - RECOVERY_RECHECK).to_rfc3339())
             .bind(excluded)
             .bind((FORWARD_CONCURRENCY - running.len()) as i64)
             .fetch_all(&state.db)
@@ -3973,6 +4246,236 @@ mod policy_tests {
 
     use super::*;
     use crate::{config::Config, crypto::SecretBox};
+
+    #[tokio::test]
+    async fn missing_transfer_recovery_logs_the_reason_and_retry_eligibility() {
+        use tracing::instrument::WithSubscriber;
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new(
+            Config::for_tests(dir.path()),
+            db::connect(dir.path()).await.unwrap(),
+            SecretBox::open_or_create(dir.path()).unwrap(),
+        )
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO sync_recovery(id,kind,target_id,state,created_at,updated_at) VALUES('transfer:missing','transfer','missing','queued',?,?)")
+            .bind(db::now()).bind(db::now()).execute(&state.db).await.unwrap();
+
+        let (output, subscriber) = crate::test_support::logs();
+        run_job(
+            &state,
+            "transfer:missing".into(),
+            "transfer".into(),
+            "missing".into(),
+        )
+        .with_subscriber(subscriber.clone())
+        .await
+        .unwrap();
+
+        let (code, updated_at): (String, String) =
+            sqlx::query_as("SELECT code,updated_at FROM sync_recovery WHERE id='transfer:missing'")
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+        let retry = db::ts(db::parse_ts(&updated_at).unwrap() + chrono::Duration::seconds(30));
+        let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert_eq!(code, "not_found");
+        assert!(logs.contains("transfer:missing"), "{logs}");
+        assert!(
+            logs.contains("transfer evidence is no longer available"),
+            "{logs}"
+        );
+        assert!(logs.contains(&retry), "{logs}");
+
+        sqlx::query("UPDATE sync_recovery SET updated_at=? WHERE id='transfer:missing'")
+            .bind(db::ts(chrono::Utc::now() - chrono::Duration::seconds(31)))
+            .execute(&state.db)
+            .await
+            .unwrap();
+        run_job(
+            &state,
+            "transfer:missing".into(),
+            "transfer".into(),
+            "missing".into(),
+        )
+        .with_subscriber(subscriber.clone())
+        .await
+        .unwrap();
+        let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert_eq!(logs.matches("recovery deferred:").count(), 1, "{logs}");
+
+        let restarted = AppState::new(
+            Config::for_tests(dir.path()),
+            state.db.clone(),
+            SecretBox::open_or_create(dir.path()).unwrap(),
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE sync_recovery SET updated_at=? WHERE id='transfer:missing'")
+            .bind(db::ts(chrono::Utc::now() - chrono::Duration::seconds(31)))
+            .execute(&state.db)
+            .await
+            .unwrap();
+        run_job(
+            &restarted,
+            "transfer:missing".into(),
+            "transfer".into(),
+            "missing".into(),
+        )
+        .with_subscriber(subscriber)
+        .await
+        .unwrap();
+        let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert_eq!(logs.matches("recovery deferred:").count(), 2, "{logs}");
+    }
+
+    #[tokio::test]
+    async fn outgoing_recovery_logs_each_waiting_target_and_retry_once() {
+        use tracing::instrument::WithSubscriber;
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new(
+            Config::for_tests(dir.path()),
+            db::connect(dir.path()).await.unwrap(),
+            SecretBox::open_or_create(dir.path()).unwrap(),
+        )
+        .await
+        .unwrap();
+        let secret = state
+            .secrets
+            .encrypt(net::SECRET_PURPOSE, "synthetic-key")
+            .unwrap();
+        sqlx::query("INSERT INTO peers(id,name,url,secret_enc,status,created_at) VALUES('peer','Peer',?,?,'online',?)")
+            .bind(server.uri()).bind(secret).bind(db::now()).execute(&state.db).await.unwrap();
+        for id in ["one", "two"] {
+            let item = RecoveryView {
+                target: RecoveryTarget {
+                    kind: RecoveryKind::Transfer,
+                    id: id.into(),
+                    peer_id: Some("peer".into()),
+                },
+                title: "Recovery".into(),
+                state: RecoveryState::Queued,
+                code: None,
+                detail: None,
+                can_fix: false,
+                can_dismiss: false,
+                replacement_operation_id: None,
+                local_instance: None,
+                peer_instance: None,
+                conflict_scope: None,
+                scopes: Vec::new(),
+            };
+            sqlx::query("INSERT INTO outgoing_recovery_requests(peer_id,kind,target_id,state,view_json,updated_at) VALUES('peer','transfer',?,'queued',?,?)")
+                .bind(id).bind(serde_json::to_string(&item).unwrap()).bind(db::now())
+                .execute(&state.db).await.unwrap();
+        }
+        let (output, subscriber) = crate::test_support::logs();
+        forward_peer(&state, "peer")
+            .with_subscriber(subscriber.clone())
+            .await
+            .unwrap();
+        let (status, updated): (String, String) = sqlx::query_as(
+            "SELECT state,updated_at FROM outgoing_recovery_requests WHERE target_id='one'",
+        )
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+        let retry = db::ts(db::parse_ts(&updated).unwrap() + RECOVERY_RECHECK);
+        let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert_eq!(status, "waiting");
+        assert!(logs.contains("one") && logs.contains("two"), "{logs}");
+        assert!(logs.contains("Receiver returned HTTP 503"), "{logs}");
+        assert!(logs.contains(&retry), "{logs}");
+
+        sqlx::query("UPDATE outgoing_recovery_requests SET updated_at=? WHERE peer_id='peer'")
+            .bind(db::ts(chrono::Utc::now() - chrono::Duration::seconds(31)))
+            .execute(&state.db)
+            .await
+            .unwrap();
+        forward_peer(&state, "peer")
+            .with_subscriber(subscriber.clone())
+            .await
+            .unwrap();
+        let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            logs.matches("outgoing recovery waiting:").count(),
+            1,
+            "{logs}"
+        );
+
+        let restarted = AppState::new(
+            Config::for_tests(dir.path()),
+            state.db.clone(),
+            SecretBox::open_or_create(dir.path()).unwrap(),
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE outgoing_recovery_requests SET updated_at=? WHERE peer_id='peer'")
+            .bind(db::ts(chrono::Utc::now() - chrono::Duration::seconds(31)))
+            .execute(&state.db)
+            .await
+            .unwrap();
+        forward_peer(&restarted, "peer")
+            .with_subscriber(subscriber.clone())
+            .await
+            .unwrap();
+        let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            logs.matches("outgoing recovery waiting:").count(),
+            2,
+            "{logs}"
+        );
+
+        server.reset().await;
+        let waiting_items: Vec<_> = ["one", "two"]
+            .into_iter()
+            .map(|id| {
+                serde_json::json!({
+                    "target": {"kind": "transfer", "id": id, "peer_id": null},
+                    "title": "Recovery",
+                    "state": "waiting",
+                    "code": "peer_busy",
+                    "detail": "The receiver is busy",
+                    "can_fix": false,
+                    "can_dismiss": false,
+                    "replacement_operation_id": null
+                })
+            })
+            .collect();
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "items": waiting_items
+            })))
+            .mount(&server)
+            .await;
+        sqlx::query("UPDATE outgoing_recovery_requests SET updated_at=? WHERE peer_id='peer'")
+            .bind(db::ts(chrono::Utc::now() - chrono::Duration::seconds(31)))
+            .execute(&state.db)
+            .await
+            .unwrap();
+        forward_peer(&state, "peer")
+            .with_subscriber(subscriber)
+            .await
+            .unwrap();
+        let updated: String = sqlx::query_scalar(
+            "SELECT updated_at FROM outgoing_recovery_requests WHERE target_id='one'",
+        )
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+        let retry = db::ts(db::parse_ts(&updated).unwrap() + RECOVERY_RECHECK);
+        let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert!(logs.contains("The receiver is busy"), "{logs}");
+        assert!(logs.contains(&retry), "{logs}");
+    }
 
     #[derive(Clone, Copy, PartialEq)]
     enum ExistingDestination {

@@ -465,6 +465,74 @@ impl Drop for EvidenceSupervisor {
     }
 }
 
+fn evidence_wait_key(id: &str) -> String {
+    format!("conflict-evidence:{id}")
+}
+
+fn report_evidence_wait(
+    state: &AppState,
+    id: &str,
+    code: &str,
+    reason: &str,
+    next_attempt: Option<&str>,
+    blocked: bool,
+) {
+    let reason = crate::error::redact(reason);
+    let (next_retry, retry_not_before) = if blocked {
+        ("no automatic retry; evidence needs attention", None)
+    } else if next_attempt.is_some_and(|time| crate::db::parse_ts(time).is_some()) {
+        (
+            "when eligible, or earlier after peer reconnect",
+            next_attempt,
+        )
+    } else {
+        ("retry time unavailable; inspect conflict evidence", None)
+    };
+    if state.wait_logs.take_report(
+        &evidence_wait_key(id),
+        &format!("{code:?}:{reason:?}:{next_retry:?}"),
+        None,
+        None,
+    ) {
+        tracing::warn!(
+            conflict_id = %id, code, next_retry, retry_not_before,
+            "conflict evidence preparation deferred: {reason}"
+        );
+    }
+}
+
+pub(super) async fn report_retained_waits(state: &AppState) -> AppResult<()> {
+    type EvidenceRow = (i64, String, String, Option<String>, Option<String>, String);
+    let mut after = i64::MIN;
+    loop {
+        let rows: Vec<EvidenceRow> = sqlx::query_as(
+            "SELECT j.rowid,j.target_id,j.state,j.error,j.error_detail,j.next_attempt
+             FROM conflict_evidence_jobs j NOT INDEXED JOIN conflicts c ON c.id=j.target_id
+             WHERE j.rowid>? AND c.status='open' AND j.state IN ('queued','blocked')
+                 AND (j.error IS NOT NULL OR j.state='blocked')
+             ORDER BY j.rowid LIMIT 256",
+        )
+        .bind(after)
+        .fetch_all(&state.db)
+        .await?;
+        let Some(last) = rows.last() else { break };
+        after = last.0;
+        for (_, id, status, code, detail, next_attempt) in rows {
+            report_evidence_wait(
+                state,
+                &id,
+                code.as_deref().unwrap_or("unknown"),
+                detail
+                    .as_deref()
+                    .unwrap_or("No failure detail was recorded"),
+                Some(&next_attempt),
+                status == "blocked",
+            );
+        }
+    }
+    Ok(())
+}
+
 async fn worker(state: AppState, name: &'static str) {
     loop {
         let notified = state.version_wake.notified();
@@ -494,6 +562,7 @@ async fn worker(state: AppState, name: &'static str) {
                 };
                 let result = within(COMPARISON_DEADLINE, get(&state, &target)).await;
                 let notify = result.is_ok() || attempts == 0;
+                let mut deferred = None;
                 let updated = match result {
                     Ok(_) => {
                         sqlx::query(
@@ -506,22 +575,24 @@ async fn worker(state: AppState, name: &'static str) {
                         .await
                     }
                     Err(error) => {
-                        if attempts == 0 {
-                            tracing::warn!(conflict_id=%id, code=%error.code(), "conflict evidence preparation deferred: {}", error.message());
-                        } else {
-                            tracing::debug!(conflict_id=%id, code=%error.code(), "conflict evidence preparation still deferred: {}", error.message());
-                        }
                         let seconds = 2_i64 << attempts.clamp(0, 7);
                         let next =
                             crate::db::ts(chrono::Utc::now() + chrono::Duration::seconds(seconds));
+                        let blocked = error.code() == "version_evidence_too_large";
+                        let reason = crate::error::redact(error.message());
+                        deferred = Some((
+                            error.code().to_owned(),
+                            reason.clone(),
+                            (!blocked).then_some(next.clone()),
+                        ));
                         sqlx::query(
                             "UPDATE conflict_evidence_jobs SET state=?,attempts=attempts+1,
                              next_attempt=?,error=?,error_detail=? WHERE target_id=? AND generation=? AND state='running'",
                         )
-                        .bind(if error.code() == "version_evidence_too_large" { "blocked" } else { "queued" })
+                        .bind(if blocked { "blocked" } else { "queued" })
                         .bind(next)
                         .bind(error.code())
-                        .bind(crate::error::redact(error.message()))
+                        .bind(reason)
                         .bind(&id)
                         .bind(generation)
                         .execute(&state.db)
@@ -529,8 +600,22 @@ async fn worker(state: AppState, name: &'static str) {
                     }
                 };
                 let retry_after_save_failure = match updated {
-                    Ok(result) if result.rows_affected() > 0 && notify => {
-                        state.version_event_wake.notify_one();
+                    Ok(result) if result.rows_affected() > 0 => {
+                        if let Some((code, reason, retry_not_before)) = &deferred {
+                            report_evidence_wait(
+                                &state,
+                                &id,
+                                code,
+                                reason,
+                                retry_not_before.as_deref(),
+                                retry_not_before.is_none(),
+                            );
+                        } else {
+                            state.wait_logs.clear(&evidence_wait_key(&id));
+                        }
+                        if notify {
+                            state.version_event_wake.notify_one();
+                        }
                         false
                     }
                     Ok(_) => false,
@@ -1499,6 +1584,108 @@ async fn preview_local(
 
 #[cfg(test)]
 mod deadline_tests {
+    #[tokio::test]
+    async fn evidence_worker_logs_the_saved_retry_time() {
+        use tracing::instrument::WithSubscriber;
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::state::AppState::new(
+            crate::config::Config::for_tests(dir.path()),
+            crate::db::connect(dir.path()).await.unwrap(),
+            crate::crypto::SecretBox::open_or_create(dir.path()).unwrap(),
+        )
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO shares(id,name,root_id,path,peer_ids_json,enabled) VALUES('share','Archive','missing','','[\"peer\"]',1)")
+            .execute(&state.db).await.unwrap();
+        sqlx::query("INSERT INTO conflicts(id,share_id,rel_path,kind,detail,local_json,remote_json,remote_vv_json,peer_id,status,created_at) VALUES('conflict','share','photo.jpg','changed_on_both','synthetic','{}','{}','{}','peer','open',?)")
+            .bind(crate::db::now()).execute(&state.db).await.unwrap();
+
+        let (output, subscriber) = crate::test_support::logs();
+        crate::activity::worker_started(
+            &state,
+            super::EVIDENCE_WORKER_ONE,
+            crate::worker_evidence::Kind::Other,
+        );
+        let task = tokio::spawn(
+            super::worker(state.clone(), super::EVIDENCE_WORKER_ONE)
+                .with_subscriber(subscriber.clone()),
+        );
+        let (next, code): (String, String) =
+            tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                loop {
+                    if let Some((next, code)) = sqlx::query_as::<_, (String, String)>(
+                        "SELECT next_attempt,error FROM conflict_evidence_jobs WHERE target_id='conflict' AND state='queued' AND error IS NOT NULL",
+                    )
+                    .fetch_optional(&state.db)
+                    .await
+                    .unwrap()
+                    {
+                        let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+                        if logs.contains("conflict_id=conflict")
+                            && logs.contains(&code)
+                            && logs.contains(&next)
+                        {
+                            break (next, code);
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+        task.abort();
+        let _ = task.await;
+        let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert!(logs.contains("conflict_id=conflict"), "{logs}");
+        assert!(logs.contains(&code), "{logs}");
+        assert!(logs.contains(&next), "{logs}");
+
+        let restarted = crate::state::AppState::new(
+            crate::config::Config::for_tests(dir.path()),
+            state.db.clone(),
+            crate::crypto::SecretBox::open_or_create(dir.path()).unwrap(),
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE conflict_evidence_jobs SET next_attempt=? WHERE target_id='conflict'")
+            .bind(crate::db::ts(
+                chrono::Utc::now() - chrono::Duration::seconds(1),
+            ))
+            .execute(&state.db)
+            .await
+            .unwrap();
+        crate::activity::worker_started(
+            &restarted,
+            super::EVIDENCE_WORKER_ONE,
+            crate::worker_evidence::Kind::Other,
+        );
+        let task = tokio::spawn(
+            super::worker(restarted, super::EVIDENCE_WORKER_ONE).with_subscriber(subscriber),
+        );
+        let reported = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+                if logs
+                    .matches("conflict evidence preparation deferred")
+                    .count()
+                    == 2
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        task.abort();
+        let _ = task.await;
+        let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert!(
+            reported.is_ok(),
+            "unchanged failure not reported after restart: {logs}"
+        );
+    }
+
     #[tokio::test]
     async fn slow_comparison_becomes_retryable_instead_of_hanging() {
         let error = super::within(
