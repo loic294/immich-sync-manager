@@ -42,6 +42,79 @@ describe('background activity', () => {
     vi.useRealTimers();
   });
 
+  it('keeps the selected status tab when running work gives way to waiting work', async () => {
+    vi.spyOn(api, 'get').mockResolvedValue(snapshot());
+    const page = await mount('ism-background-activity');
+    await vi.waitFor(() => expect(page.textContent).toContain('41 files discovered'));
+    vi.useFakeTimers();
+    live.push('/operations/background', snapshot([{ ...task, status: 'waiting' }]));
+    await vi.advanceTimersByTimeAsync(1500);
+    await vi.waitFor(() =>
+      expect(page.querySelector('#activity-tab-waiting .badge')?.textContent).toBe('1'),
+    );
+    expect(page.querySelector('[aria-selected=true]')?.textContent).toContain('Running');
+  });
+
+  it('preserves an expanded task when a different task is inserted before it', async () => {
+    vi.spyOn(api, 'get').mockResolvedValue(snapshot());
+    const page = await mount('ism-background-activity');
+    await vi.waitFor(() => expect(page.textContent).toContain('41 files discovered'));
+    const details = page.querySelector<HTMLDetailsElement>('#activity-panel li > details');
+    if (!details) throw new Error('Missing activity row');
+    details.open = true;
+    live.push(
+      '/operations/background',
+      snapshot([
+        { ...task, id: 'other', task_key: 'other', started_at: '2025-12-31T00:00:00Z' },
+        task,
+      ]),
+    );
+    await vi.waitFor(() =>
+      expect(page.querySelectorAll('#activity-panel li > details')).toHaveLength(2),
+    );
+    expect(page.querySelectorAll('#activity-panel li > details')[1]).toBe(details);
+    expect(details.open).toBe(true);
+  });
+
+  it('holds running work between steps, but settles to waiting and reports failures immediately', async () => {
+    vi.spyOn(api, 'get').mockResolvedValue(snapshot());
+    const page = await mount('ism-background-activity');
+    await vi.waitFor(() => expect(page.textContent).toContain('41 files discovered'));
+    vi.useFakeTimers();
+    live.push('/operations/background', snapshot([]));
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(page.querySelectorAll('#activity-panel li > details')).toHaveLength(1);
+    live.push('/operations/background', snapshot([{ ...task, id: 'next-step', done: 42 }]));
+    await vi.advanceTimersByTimeAsync(500);
+    expect(page.textContent).toContain('42 files discovered');
+    live.push('/operations/background', snapshot([{ ...task, status: 'waiting' }]));
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(page.querySelector('#activity-tab-running .badge')?.textContent).toBe('1');
+    live.push('/operations/background', snapshot([{ ...task, status: 'waiting' }]));
+    await vi.advanceTimersByTimeAsync(500);
+    expect(page.querySelector('#activity-tab-running .badge')?.textContent).toBe('0');
+    expect(page.querySelector('#activity-tab-waiting .badge')?.textContent).toBe('1');
+    live.push('/operations/background', snapshot([task]));
+    await vi.advanceTimersByTimeAsync(0);
+    live.push('/operations/background', snapshot([{ ...task, status: 'failed' }]));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(page.querySelector('#activity-tab-attention .badge')?.textContent).toBe('1');
+    expect(page.querySelector('#activity-tab-running .badge')?.textContent).toBe('0');
+  });
+
+  it.each(['running', 'waiting'] as const)(
+    'shows completed / all files for a %s batch',
+    async (status) => {
+      vi.spyOn(api, 'get').mockResolvedValue(
+        snapshot([{ ...task, status, done: 2, total: 5, unit: 'files completed' }]),
+      );
+      const page = await mount('ism-background-activity');
+      await vi.waitFor(() => expect(page.textContent).toContain('2 / 5 files completed'));
+      expect(page.querySelectorAll('#activity-panel li > details')).toHaveLength(1);
+      expect(page.querySelector('#activity-panel progress') !== null).toBe(status === 'running');
+    },
+  );
+
   it('shows unknown totals honestly, refreshes measured progress, and keeps tasks across history pagination', async () => {
     const get = vi.spyOn(api, 'get').mockResolvedValue(snapshot());
     const page = await mount('ism-background-activity');

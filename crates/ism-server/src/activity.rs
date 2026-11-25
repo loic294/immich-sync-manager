@@ -533,7 +533,9 @@ pub async fn page(state: &AppState, limit: i64, offset: i64) -> AppResult<Backgr
         })
         .map(|a| a.task_key.clone())
         .collect();
+    current.retain(|a| a.status != BackgroundStatus::Completed || !keys.contains(&a.task_key));
     current.extend(blockers.into_iter().filter(|a| !keys.contains(&a.task_key)));
+    group_transfer_batches(state, &mut current).await?;
     current.sort_by(|a, b| a.started_at.cmp(&b.started_at).then(a.id.cmp(&b.id)));
     Ok(BackgroundActivityPage {
         current,
@@ -542,6 +544,115 @@ pub async fn page(state: &AppState, limit: i64, offset: i64) -> AppResult<Backgr
         observed_at: db::now(),
         warnings,
     })
+}
+
+async fn group_transfer_batches(
+    state: &AppState,
+    current: &mut Vec<BackgroundActivity>,
+) -> AppResult<()> {
+    use sqlx::Row;
+    let observed_ids: Vec<_> = current
+        .iter()
+        .filter_map(|row| row.task_key.strip_prefix("transfer:"))
+        .collect();
+    let batches = sqlx::query(
+        "WITH active_runs AS (
+            SELECT DISTINCT peer_id,share_id,run_id FROM transfers
+            UNION
+            SELECT h.peer_id,h.share_id,h.run_id FROM transfer_history h
+            JOIN operations o ON o.id=h.operation_id
+            WHERE o.status NOT IN ('completed','cancelled')
+         ), items AS (
+            SELECT t.id,t.peer_id,t.share_id,t.run_id,t.queued_at,0 AS completed,
+                   0 AS publishing,0 AS publishing_running
+            FROM transfers t
+            UNION ALL
+            SELECT h.id,h.peer_id,h.share_id,h.run_id,h.queued_at,
+                   CASE WHEN h.operation_id IS NULL OR o.status='completed' THEN 1 ELSE 0 END,
+                   CASE WHEN o.status IN ('queued','running','waiting_maintenance') THEN 1 ELSE 0 END,
+                   CASE WHEN o.status='running' THEN 1 ELSE 0 END
+            FROM transfer_history h LEFT JOIN operations o ON o.id=h.operation_id
+         )
+         SELECT i.peer_id,i.share_id,i.run_id,p.name AS peer_name,s.name AS share_name,
+                COUNT(*) AS total,SUM(i.completed) AS done,MIN(i.queued_at) AS first_at,
+                json_group_array(i.id) FILTER (
+                    WHERE i.id IN (SELECT value FROM json_each(?))
+                ) AS ids,SUM(i.publishing) AS publishing,
+                SUM(i.publishing_running) AS publishing_running
+         FROM items i JOIN active_runs a
+           ON a.peer_id=i.peer_id AND a.share_id=i.share_id AND a.run_id=i.run_id
+         JOIN peers p ON p.id=i.peer_id JOIN shares s ON s.id=i.share_id
+         GROUP BY i.peer_id,i.share_id,i.run_id,p.name,s.name",
+    )
+    .bind(serde_json::to_string(&observed_ids)?)
+    .fetch_all(&state.db)
+    .await?;
+    for batch in batches {
+        let peer: String = batch.try_get("peer_id")?;
+        let share: String = batch.try_get("share_id")?;
+        let ids: Vec<String> = serde_json::from_str(&batch.try_get::<String, _>("ids")?)?;
+        let keys: HashSet<_> = ids.iter().map(|id| format!("transfer:{id}")).collect();
+        let queue = format!("transfer-queue:{peer}:{share}");
+        let belongs = |a: &BackgroundActivity| {
+            (keys.contains(&a.task_key) || a.task_key == queue)
+                && matches!(
+                    a.status,
+                    BackgroundStatus::Running
+                        | BackgroundStatus::Waiting
+                        | BackgroundStatus::Completed
+                )
+        };
+        let observed = current
+            .iter()
+            .filter(|a| belongs(a) && a.status != BackgroundStatus::Completed)
+            .max_by_key(|a| {
+                (
+                    a.status == BackgroundStatus::Running,
+                    a.status == BackgroundStatus::Waiting,
+                    a.updated_at.clone(),
+                )
+            })
+            .cloned();
+        let mut row = match observed {
+            Some(row) => row,
+            None if batch.try_get::<i64, _>("publishing")? > 0 => super::activity_blockers::entry(
+                String::new(),
+                "Peer file transfer",
+                String::new(),
+                "Waiting for the related managed operation to finish".into(),
+                "/sync",
+            ),
+            None => continue,
+        };
+        if row.status == BackgroundStatus::Waiting
+            && batch.try_get::<i64, _>("publishing_running")? > 0
+        {
+            row.status = BackgroundStatus::Running;
+            row.phase = "Waiting for the related managed operation to finish".into();
+        }
+        // Failures remain separate and visible; only active steps and their queue share a row.
+        current.retain(|a| !belongs(a));
+        row.task_key = format!(
+            "transfer-batch:{peer}:{share}:{}",
+            batch.try_get::<String, _>("run_id")?
+        );
+        row.id = format!("state:{}", row.task_key);
+        row.title = "Peer file transfer".into();
+        row.resource = format!(
+            "{} / {}",
+            batch.try_get::<String, _>("peer_name")?,
+            batch.try_get::<String, _>("share_name")?
+        );
+        row.done = batch.try_get::<i64, _>("done")?.max(0) as u64;
+        row.total = Some(batch.try_get::<i64, _>("total")?.max(0) as u64);
+        row.count = row.total.unwrap_or(0);
+        row.unit = "files completed".into();
+        row.started_at = batch.try_get("first_at")?;
+        row.finished_at = None;
+        row.operation_id = None;
+        current.push(row);
+    }
+    Ok(())
 }
 
 pub(crate) fn worker_started(state: &AppState, name: &str, kind: crate::worker_evidence::Kind) {
@@ -648,6 +759,222 @@ mod tests {
         .await
         .unwrap();
         (dir, state)
+    }
+
+    #[tokio::test]
+    async fn transfer_batch_keeps_one_row_and_counts_only_published_files_as_complete() {
+        let (_dir, state) = harness().await;
+        sqlx::query(
+            "INSERT INTO peers(id,name,url,secret_enc,status,created_at)
+                    VALUES ('peer','Example peer','https://peer.example','unused','online',?)",
+        )
+        .bind(db::now())
+        .execute(&state.db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO shares(id,name,root_id,path,peer_ids_json,enabled)
+                    VALUES ('share','Archive','photos','','[]',1)",
+        )
+        .execute(&state.db)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO operations(id,idempotency_key,principal,source,request_json,status,created_at)
+                    VALUES ('publish','publish','admin','admin','{}','running',?)")
+            .bind(db::now()).execute(&state.db).await.unwrap();
+        for (id, status) in [
+            ("first", "running"),
+            ("next", "queued"),
+            ("failed", "failed"),
+        ] {
+            sqlx::query("INSERT INTO transfers(id,peer_id,share_id,rel_path,sha256,size,vv_json,status,queued_at,updated_at,run_id)
+                        VALUES (?,'peer','share',?,'example',100,'{}',?,?,?,'batch')")
+                .bind(id).bind(format!("{id}.example.jpg")).bind(status).bind(db::now()).bind(db::now())
+                .execute(&state.db).await.unwrap();
+        }
+        for (id, operation) in [("done", None), ("publishing", Some("publish"))] {
+            sqlx::query("INSERT INTO transfer_history(id,peer_id,share_id,rel_path,sha256,size,queued_at,finished_at,operation_id,run_id)
+                        VALUES (?,'peer','share',?,'example',100,?,?,?,'batch')")
+                .bind(id).bind(format!("{id}.example.jpg")).bind(db::now()).bind(db::now()).bind(operation)
+                .execute(&state.db).await.unwrap();
+        }
+        let make = |key: &str, status| {
+            let mut row = super::super::activity_blockers::entry(
+                key.into(),
+                "Peer file transfer",
+                "Archive".into(),
+                "Checking files".into(),
+                "/sync",
+            );
+            row.status = status;
+            row
+        };
+        let mut rows = vec![
+            make("transfer:first", BackgroundStatus::Running),
+            make("transfer-queue:peer:share", BackgroundStatus::Waiting),
+            make("transfer:failed", BackgroundStatus::Blocked),
+        ];
+        group_transfer_batches(&state, &mut rows).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        let batch = rows
+            .iter()
+            .find(|row| row.status == BackgroundStatus::Running)
+            .unwrap();
+        assert_eq!((batch.done, batch.total), (1, Some(5)));
+        assert_eq!(batch.unit, "files completed");
+        let key = batch.task_key.clone();
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.status == BackgroundStatus::Waiting)
+                .count(),
+            0
+        );
+
+        sqlx::query("INSERT INTO transfer_history(id,peer_id,share_id,rel_path,sha256,size,queued_at,finished_at,run_id)
+                    SELECT id,peer_id,share_id,rel_path,sha256,size,queued_at,updated_at,run_id
+                    FROM transfers WHERE id='first'")
+            .execute(&state.db).await.unwrap();
+        sqlx::query("DELETE FROM transfers WHERE id='first'")
+            .execute(&state.db)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE transfers SET status='running' WHERE id='next'")
+            .execute(&state.db)
+            .await
+            .unwrap();
+        let mut next = vec![make("transfer:next", BackgroundStatus::Running)];
+        group_transfer_batches(&state, &mut next).await.unwrap();
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].task_key, key);
+        assert_eq!((next[0].done, next[0].total), (2, Some(5)));
+        sqlx::query("DELETE FROM transfers WHERE id='next'")
+            .execute(&state.db)
+            .await
+            .unwrap();
+        let mut publishing = Vec::new();
+        group_transfer_batches(&state, &mut publishing)
+            .await
+            .unwrap();
+        assert_eq!(publishing.len(), 1);
+        assert_eq!(publishing[0].task_key, key);
+        assert_eq!(publishing[0].status, BackgroundStatus::Running);
+        assert_eq!((publishing[0].done, publishing[0].total), (2, Some(4)));
+        sqlx::query("UPDATE operations SET status='completed' WHERE id='publish'")
+            .execute(&state.db)
+            .await
+            .unwrap();
+        let mut finished = Vec::new();
+        group_transfer_batches(&state, &mut finished).await.unwrap();
+        assert!(finished.is_empty());
+    }
+
+    #[tokio::test]
+    async fn outgoing_files_share_one_progress_row_across_receiver_states() {
+        let (_dir, state) = harness().await;
+        sqlx::query(
+            "INSERT INTO peers(id,name,url,secret_enc,status,created_at)
+                    VALUES ('peer','Example peer','https://peer.example','unused','online',?)",
+        )
+        .bind(db::now())
+        .execute(&state.db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO peer_sync_state(peer_id,cursor,progress_json,updated_at)
+                    VALUES ('peer',0,?,?)",
+        )
+        .bind(serde_json::to_string(&ism_core::dto::SyncProgress::default()).unwrap())
+        .bind(db::now())
+        .execute(&state.db)
+        .await
+        .unwrap();
+        for (i, status) in ["completed", "running", "publishing", "queued", "failed"]
+            .into_iter()
+            .enumerate()
+        {
+            let activity = ism_core::dto::SyncActivity {
+                id: format!("file-{i}"),
+                outgoing: true,
+                peer_id: "peer".into(),
+                share_name: "Archive".into(),
+                relative_path: format!("photo-{i}.example.jpg"),
+                location: ism_core::dto::Location {
+                    root_id: "photos".into(),
+                    path: format!("photo-{i}.example.jpg"),
+                },
+                source: "ISM: Local".into(),
+                destination: "ISM: Example peer".into(),
+                destination_path: format!("photo-{i}.example.jpg"),
+                status: status.into(),
+                size: 100,
+                bytes_done: 100,
+                error: (status == "failed").then(|| "receiver disk full".into()),
+                queued_at: db::now(),
+                finished_at: None,
+                operation_id: None,
+                readd_available: false,
+                recovery: None,
+            };
+            sqlx::query("INSERT INTO outgoing_sync(peer_id,id,activity_json) VALUES ('peer',?,?)")
+                .bind(&activity.id)
+                .bind(serde_json::to_string(&activity).unwrap())
+                .execute(&state.db)
+                .await
+                .unwrap();
+        }
+        let page = page(&state, 25, 0).await.unwrap();
+        let rows: Vec<_> = page
+            .current
+            .iter()
+            .filter(|row| row.title == "Outgoing peer synchronization")
+            .collect();
+        assert_eq!(rows.len(), 2);
+        let active = rows
+            .iter()
+            .find(|row| row.status == BackgroundStatus::Running)
+            .unwrap();
+        assert_eq!((active.done, active.total), (1, Some(5)));
+        assert_eq!(active.unit, "files completed");
+        assert_eq!(active.task_key, "outgoing:peer:Archive:transfer");
+        assert!(
+            rows.iter()
+                .all(|row| row.status != BackgroundStatus::Waiting)
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.status == BackgroundStatus::Blocked)
+        );
+    }
+
+    #[tokio::test]
+    async fn next_step_replaces_the_completed_step_before_the_next_flush() {
+        let (_dir, state) = harness().await;
+        let first = Task::start(
+            &state,
+            "share:archive",
+            "Share inventory scan",
+            "Archive",
+            None,
+        )
+        .await
+        .unwrap();
+        first.finish(&Ok(())).await.unwrap();
+        let next = Task::start(
+            &state,
+            "share:archive",
+            "Share inventory scan",
+            "Archive",
+            None,
+        )
+        .await
+        .unwrap();
+        let current = page(&state, 25, 0).await.unwrap().current;
+        assert_eq!(current.len(), 1);
+        assert_eq!(current[0].id, next.id);
+        assert_eq!(current[0].status, BackgroundStatus::Running);
+        next.finish(&Ok(())).await.unwrap();
+        flush(&state).await.unwrap();
+        assert_eq!(page(&state, 25, 0).await.unwrap().history.len(), 2);
     }
 
     #[tokio::test]
@@ -1794,7 +2121,7 @@ mod tests {
         let transfer = p
             .current
             .iter()
-            .find(|a| a.task_key == "transfer-queue:peer:share")
+            .find(|a| a.task_key == "transfer-batch:peer:share:")
             .unwrap();
         assert!(transfer.phase.contains("backoff"));
         assert!(transfer.next_at.is_some());
@@ -1883,9 +2210,9 @@ mod tests {
         let queued = snapshot
             .current
             .iter()
-            .find(|activity| activity.task_key == "transfer-queue:peer:share")
+            .find(|activity| activity.task_key == "transfer-batch:peer:share:")
             .unwrap();
-        assert_eq!(queued.count, 11);
+        assert_eq!((queued.done, queued.total), (0, Some(21)));
         assert_ne!(queued.status, BackgroundStatus::Blocked);
     }
 
@@ -1997,9 +2324,9 @@ mod tests {
         let queue = snapshot
             .current
             .iter()
-            .find(|a| a.task_key == "transfer-queue:peer:share")
+            .find(|a| a.task_key == "transfer-batch:peer:share:")
             .unwrap();
-        assert_eq!(queue.count, n);
+        assert_eq!((queue.done, queue.total), (0, Some(n * 2)));
         assert!(!queue.phase.is_empty());
     }
 

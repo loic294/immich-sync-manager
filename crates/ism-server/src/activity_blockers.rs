@@ -8,7 +8,7 @@ use crate::db;
 use crate::error::{AppResult, redact};
 use crate::state::AppState;
 
-fn entry(
+pub(crate) fn entry(
     key: String,
     title: &str,
     resource: String,
@@ -374,6 +374,13 @@ pub async fn get(state: &AppState) -> AppResult<(Vec<BackgroundActivity>, Vec<St
                 peer.name
             ));
         }
+        let mut totals = peer.completed.clone();
+        for group in &peer.groups {
+            *totals
+                .entry((group.share_name.clone(), group.managed_operation))
+                .or_default() += group.count;
+        }
+        let mut active = HashMap::<(String, bool), BackgroundActivity>::new();
         for group in peer.groups {
             let (phase, status) = match group.status.as_str() {
                 "queued" => ("Queued on the receiving ISM", BackgroundStatus::Waiting),
@@ -439,8 +446,51 @@ pub async fn get(state: &AppState) -> AppResult<(Vec<BackgroundActivity>, Vec<St
                     row.error = None;
                 }
             }
-            out.push(row);
+            if matches!(group.status.as_str(), "queued" | "running" | "publishing") {
+                let key = (group.share_name.clone(), group.managed_operation);
+                let completed = peer.completed.get(&key).copied().unwrap_or(0);
+                match active.get_mut(&key) {
+                    Some(batch) => {
+                        batch.examples.extend(row.examples);
+                        batch.examples.truncate(EXAMPLES);
+                        if row.started_at < batch.started_at {
+                            batch.started_at = row.started_at;
+                        }
+                        if row.status == BackgroundStatus::Running {
+                            batch.status = row.status;
+                            batch.phase = row.phase;
+                        }
+                    }
+                    None => {
+                        row.task_key = format!(
+                            "outgoing:{}:{}:{}",
+                            peer.id,
+                            group.share_name,
+                            if group.managed_operation {
+                                "operation"
+                            } else {
+                                "transfer"
+                            }
+                        );
+                        row.id = format!("state:{}", row.task_key);
+                        row.resource = format!("{} / {}", peer.name, group.share_name);
+                        row.done = completed;
+                        row.total = totals.get(&key).copied();
+                        row.count = row.total.unwrap_or(0);
+                        row.unit = if group.managed_operation {
+                            "steps completed"
+                        } else {
+                            "files completed"
+                        }
+                        .into();
+                        active.insert(key, row);
+                    }
+                }
+            } else {
+                out.push(row);
+            }
         }
+        out.extend(active.into_values());
     }
     let share_name = |id: &str| {
         shares

@@ -1005,7 +1005,7 @@ async fn attention_reports_queue_scope_and_invalid_schedule_without_guessing_sta
         .as_array()
         .unwrap()
         .iter()
-        .find(|item| item["task_key"] == "transfer-queue:override-peer:share")
+        .find(|item| item["task_key"] == "transfer-batch:override-peer:share:")
         .unwrap();
     assert_eq!(override_row["status"], "waiting");
 

@@ -1,4 +1,5 @@
 import { html, nothing } from 'lit';
+import { repeat } from 'lit/directives/repeat.js';
 import { events } from '@/api/events';
 import type { BackgroundActivity } from '@/api/generated/BackgroundActivity';
 import type { BackgroundActivityPage } from '@/api/generated/BackgroundActivityPage';
@@ -10,6 +11,7 @@ import '@/components/ism-icon';
 import '@/components/ism-pagination';
 
 type Filter = 'attention' | 'running' | 'waiting' | 'all';
+const SETTLE_MS = 1500;
 const RESTARTED =
   'ISM restarted before this run reported an outcome; queued work is recovered separately';
 const FILTERS: readonly [Filter, string][] = [
@@ -254,6 +256,13 @@ function matches(filter: Filter, task: BackgroundActivity) {
   return task.status === filter;
 }
 
+function rowKeys(rows: BackgroundActivity[]) {
+  const counts = new Map<string, number>();
+  for (const task of rows) counts.set(task.task_key, (counts.get(task.task_key) ?? 0) + 1);
+  return (task: BackgroundActivity) =>
+    (counts.get(task.task_key) ?? 0) > 1 ? task.id : task.task_key;
+}
+
 function ago(value: string, now: number) {
   const seconds = (now - Date.parse(value)) / 1000;
   if (Number.isNaN(seconds)) return '—';
@@ -267,18 +276,23 @@ export class IsmBackgroundActivity extends IsmPage {
     filter: { state: true },
     limit: { state: true },
     offset: { state: true },
+    current: { state: true },
   };
   declare snapshot: BackgroundActivityPage | undefined;
   declare filter: Filter | undefined;
   declare limit: number;
   declare offset: number;
+  declare current: BackgroundActivity[];
   private timer: number | undefined;
+  private settleTimer: number | undefined;
+  private transitions = new Map<string, number>();
 
   constructor() {
     super();
     this.filter = undefined;
     this.limit = 25;
     this.offset = 0;
+    this.current = [];
   }
 
   override connectedCallback() {
@@ -291,6 +305,8 @@ export class IsmBackgroundActivity extends IsmPage {
   override disconnectedCallback() {
     super.disconnectedCallback();
     window.clearInterval(this.timer);
+    window.clearTimeout(this.settleTimer);
+    this.transitions.clear();
   }
 
   protected override async load() {
@@ -298,10 +314,42 @@ export class IsmBackgroundActivity extends IsmPage {
     const snapshot = await this.data.backgroundActivity(limit, offset);
     if (limit !== this.limit || offset !== this.offset) return;
     this.snapshot = snapshot;
+    this.reconcileCurrent();
+    if (!this.filter) this.filter = this.activeFilter(snapshot.current);
     if (offset > 0 && offset >= snapshot.total) {
       this.offset = Math.max(0, Math.ceil(snapshot.total / limit) - 1) * limit;
       void this.reload();
     }
+  }
+
+  private reconcileCurrent() {
+    window.clearTimeout(this.settleTimer);
+    const now = Date.now();
+    const tasks = this.snapshot?.current ?? [];
+    const incomingKey = rowKeys(tasks);
+    const previousKey = rowKeys(this.current);
+    const incoming = new Map(tasks.map((task) => [incomingKey(task), task]));
+    let next = Infinity;
+    for (const previous of this.current) {
+      const key = previousKey(previous);
+      const task = incoming.get(key);
+      if (
+        previous.status === 'running' &&
+        (!task || task.status === 'waiting' || task.status === 'completed')
+      ) {
+        const deadline = this.transitions.get(key) ?? now + SETTLE_MS;
+        if (now < deadline) {
+          this.transitions.set(key, deadline);
+          incoming.set(key, previous);
+          next = Math.min(next, deadline);
+          continue;
+        }
+      }
+      this.transitions.delete(key);
+    }
+    this.current = [...incoming.values()];
+    if (Number.isFinite(next))
+      this.settleTimer = window.setTimeout(() => this.reconcileCurrent(), next - now);
   }
 
   /** The chosen tab, else the most urgent one that has something in it. */
@@ -345,11 +393,11 @@ export class IsmBackgroundActivity extends IsmPage {
   private aside(task: BackgroundActivity, now: number) {
     const { bytes, fmt, unit, measured } = this.measure(task);
     const items =
-      task.count > 1
+      task.count > 1 && task.unit !== 'files completed' && task.unit !== 'steps completed'
         ? `${task.count.toLocaleString()} ${bytes ? 'files' : task.unit === 'conflicts' ? 'conflicts' : 'items'}`
         : '';
     let amount = '';
-    if (task.status === 'running' && measured)
+    if (measured && (!bytes || task.status === 'running'))
       amount = `${fmt(task.done)} / ${fmt(task.total ?? 0)} ${unit}`;
     else if (bytes && measured) amount = fmt(task.total ?? 0);
     else if (task.done > 0) amount = `${fmt(task.done)} ${unit}`;
@@ -432,9 +480,12 @@ export class IsmBackgroundActivity extends IsmPage {
     </div>`;
   }
 
-  private rows(rows: BackgroundActivity[], now: number) {
+  private rows(rows: BackgroundActivity[], now: number, current = false) {
+    const key = rowKeys(this.current);
     return html`<ul class="divide-y divide-base-300">
-      ${rows.map(
+      ${repeat(
+        rows,
+        (task) => (current ? key(task) : task.id),
         (task) => html`<li>
           <details class="group">
             <summary class="grid cursor-pointer list-none grid-cols-[1.25rem_minmax(0,1fr)_auto] items-center gap-x-3 rounded-field px-3 py-3 hover:bg-base-200 focus-visible:outline-2 focus-visible:outline-primary [&::-webkit-details-marker]:hidden">
@@ -478,7 +529,7 @@ export class IsmBackgroundActivity extends IsmPage {
 
   protected override render() {
     const now = Date.now();
-    const current = this.snapshot?.current ?? [];
+    const current = this.current;
     const filter = this.activeFilter(current);
     const order = (t: BackgroundActivity) =>
       needsAttention(t) ? 0 : t.status === 'running' ? 1 : 2;
@@ -486,7 +537,9 @@ export class IsmBackgroundActivity extends IsmPage {
       .filter((t) => matches(filter, t))
       .sort(
         (a, b) =>
-          order(a) - order(b) || b.count - a.count || a.started_at.localeCompare(b.started_at),
+          order(a) - order(b) ||
+          a.started_at.localeCompare(b.started_at) ||
+          a.task_key.localeCompare(b.task_key),
       );
     const counts = Object.fromEntries(
       FILTERS.map(([f]) => [f, current.filter((t) => matches(f, t)).length]),
@@ -523,7 +576,7 @@ export class IsmBackgroundActivity extends IsmPage {
           this.loading && !this.snapshot
             ? this.skeleton()
             : visible.length > 0
-              ? this.rows(visible, now)
+              ? this.rows(visible, now, true)
               : html`<p class="px-3 py-6 text-sm text-base-content/70">${
                   this.snapshot
                     ? filter === 'attention'

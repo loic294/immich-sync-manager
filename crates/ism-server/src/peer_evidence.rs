@@ -41,6 +41,7 @@ pub(crate) struct Peer {
     pub cached_count: u64,
     pub invalid_count: u64,
     pub groups: Vec<Group>,
+    pub completed: HashMap<(String, bool), u64>,
 }
 
 pub(crate) struct Snapshot {
@@ -167,6 +168,7 @@ pub(crate) async fn snapshot(state: &AppState) -> AppResult<Snapshot> {
                 cached_count: 0,
                 invalid_count: 0,
                 groups: Vec::new(),
+                completed: HashMap::new(),
             }
         })
         .collect();
@@ -188,7 +190,14 @@ pub(crate) async fn snapshot(state: &AppState) -> AppResult<Snapshot> {
             peer.invalid_count += 1;
             continue;
         };
-        if matches!(activity.status.as_str(), "completed" | "cancelled") {
+        if activity.status == "completed" {
+            *peer
+                .completed
+                .entry((activity.share_name, activity.id.starts_with("operation:")))
+                .or_default() += 1;
+            continue;
+        }
+        if activity.status == "cancelled" {
             continue;
         }
         let status = if peer.fresh {

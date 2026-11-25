@@ -76,6 +76,12 @@ These records survive container replacement as long as the `/data` volume is pre
 that volume backed up; do not delete it to clear a log or to recover a blocked operation.
 
 Background runs retain their current phase, measured counters, resource, and timestamps.
+Transfer batches keep one row per peer, share and sync run across downloading and publication,
+with completed files / all files; files awaiting safe publication are not complete. Outgoing
+batches combine the receiver's queued, downloading and publishing files; failures stay separate.
+The selected status tab does not switch automatically, and expanded rows survive live updates.
+Running-to-waiting or disappearing rows settle for 1.5 seconds between steps; renewed running
+work and failures appear immediately. This presentation delay never changes worker scheduling.
 Unknown totals show counts or a phase, not an invented percentage or ETA. Counters are scoped to
 the displayed phase (for example bytes hashed versus files reconciled); progress writes and
 notifications are coalesced to a one-second cadence. No progress update is not proof of a hang.
