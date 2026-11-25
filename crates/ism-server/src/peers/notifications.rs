@@ -13,6 +13,7 @@ use crate::state::AppState;
 const RETRY: Duration = Duration::from_secs(5);
 const READ_TIMEOUT: Duration = Duration::from_secs(45);
 const FRESHNESS: Duration = Duration::from_secs(30);
+const SNAPSHOT_WRITE_INTERVAL: chrono::Duration = chrono::Duration::seconds(20);
 const COALESCE: Duration = Duration::from_secs(1);
 /// Activity may trail newer hints by at most this long; hints can outpace any single fetch.
 const HINT_LAG: Duration = Duration::from_secs(10);
@@ -103,11 +104,11 @@ pub(crate) fn snapshot_fresh(state: &AppState, peer: &str, updated: Option<&str>
         .unwrap_or(age <= chrono::Duration::seconds(30))
 }
 
-/// Unchanged snapshots skip their timestamp write while it is well within legacy freshness.
+/// Unchanged snapshots skip timestamp writes for 20s, leaving a 10s freshness margin.
 pub(super) fn snapshot_recent(updated: Option<&str>) -> bool {
     updated.and_then(crate::db::parse_ts).is_some_and(|at| {
         let age = chrono::Utc::now() - at;
-        age >= chrono::Duration::zero() && age < chrono::Duration::seconds(10)
+        age >= chrono::Duration::zero() && age < SNAPSHOT_WRITE_INTERVAL
     })
 }
 
@@ -441,6 +442,17 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+
+    #[test]
+    fn unchanged_snapshot_write_interval_stays_inside_freshness_window() {
+        let nineteen_seconds_ago =
+            crate::db::ts(chrono::Utc::now() - chrono::Duration::seconds(19));
+        let twenty_one_seconds_ago =
+            crate::db::ts(chrono::Utc::now() - chrono::Duration::seconds(21));
+
+        assert!(snapshot_recent(Some(&nineteen_seconds_ago)));
+        assert!(!snapshot_recent(Some(&twenty_one_seconds_ago)));
+    }
 
     #[test]
     fn stale_or_failed_refresh_cannot_verify_a_new_connection() {
