@@ -233,7 +233,7 @@ export class IsmRecoveryList extends IsmPage {
     const issueTypes = this.issueTypes
       .map((code) => (code === null ? 'none' : `code:${code}`))
       .sort((a, b) => issueTypeLabel(a).localeCompare(issueTypeLabel(b)));
-    return html`<div id="recovery-filters" class="grid w-full grid-cols-1 items-end gap-3 rounded-box border border-base-300 bg-base-100 p-3 sm:grid-cols-2 lg:grid-cols-3">
+    return html`<div id="recovery-filters" class="grid w-full grid-cols-1 items-end gap-3 rounded-box border border-base-300 bg-base-100 p-3 sm:grid-cols-2 lg:grid-cols-5">
       <label class="flex min-w-0 flex-col gap-1 text-sm">
         Share
         <select class="select select-sm w-full max-sm:min-h-11" aria-label="Filter by share" ?disabled=${!!this.busy}
@@ -279,7 +279,7 @@ export class IsmRecoveryList extends IsmPage {
           <option value="operation" ?selected=${this.kind === 'operation'}>Operation</option>
         </select>
       </label>
-      <button type="button" class="btn btn-ghost btn-sm max-sm:min-h-11" ?disabled=${!!this.busy || !this.filterCount()}
+      <button type="button" class="btn btn-ghost btn-sm max-sm:min-h-11 lg:col-start-5" ?disabled=${!!this.busy || !this.filterCount()}
         @click=${() => this.updateFilters({ share: '', folder: '', issue_type: '', status: '', kind: '' })}>Clear filters</button>
       <p class="col-span-full text-xs text-base-content/70">Folders include their subfolders. Changing filters clears the selection. Issues without a known location only appear without location filters.</p>
     </div>`;
