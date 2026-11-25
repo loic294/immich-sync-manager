@@ -1537,7 +1537,7 @@ async fn require_unresolved_transfers_except(
     }) {
         return Err(AppError::conflict(
             "recovery_required",
-            "peer footprint waits for a failed companion transfer",
+            "A related file failed to sync. Retry or skip it in Sync issues.",
         ));
     }
     Ok(())

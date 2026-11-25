@@ -92,8 +92,8 @@ function explain(message: string): string {
       'An earlier change to this file must finish first. Check Sync issues if it needs attention.',
     'peer footprint waits for unresolved managed operations':
       'An earlier change to this file must finish first. Check Sync issues if it needs attention.',
-    'peer footprint waits for a failed companion transfer':
-      "A file needed for this change couldn't sync. Open Sync issues for details.",
+    'Waiting for unresolved work that overlaps this file':
+      'An earlier change to this file must finish first. Check Sync issues if it needs attention.',
     'peer bookkeeping waits for active managed operations':
       'Waiting for another file change to finish. Check Operations if it stays here.',
     'Peer bookkeeping waits for active managed operations':
