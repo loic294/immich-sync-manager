@@ -238,9 +238,12 @@ pub async fn events_for(
     peer_instance: &str,
     after: i64,
 ) -> AppResult<EventPage> {
-    type Row = (i64, String, i64, String, String, String);
+    type Row = (i64, String, i64, String, String, String, bool);
     let rows: Vec<Row> = sqlx::query_as(
-        "SELECT seq, origin, origin_seq, share_name, kind, data_json FROM event_log WHERE seq > ? ORDER BY seq LIMIT ?",
+        "SELECT e.seq, e.origin, e.origin_seq, e.share_name, e.kind, e.data_json,
+                COALESCE(e.seq > s.event_start_seq, 0)
+         FROM event_log e LEFT JOIN shares s ON s.name = e.share_name
+         WHERE e.seq > ? ORDER BY e.seq LIMIT ?",
     )
     .bind(after)
     .bind(EVENT_BATCH)
@@ -255,8 +258,8 @@ pub async fn events_for(
     let next = rows.last().map_or(after, |r| r.0);
     let mut events = rows
         .into_iter()
-        .filter(|r| r.1 != peer_instance && allowed.contains(r.3.as_str()))
-        .map(|(seq, origin, origin_seq, share, kind, data)| {
+        .filter(|r| r.1 != peer_instance && allowed.contains(r.3.as_str()) && r.6)
+        .map(|(seq, origin, origin_seq, share, kind, data, _)| {
             Ok(PeerEvent {
                 seq,
                 origin,

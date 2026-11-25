@@ -467,15 +467,18 @@ pub async fn create_share(state: &AppState, input: ShareInput) -> AppResult<Shar
     let (name, path) = validate_share(state, None, &input).await?;
     let id = crate::crypto::new_id("share");
     let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
-    sqlx::query("INSERT INTO shares (id, name, root_id, path, peer_ids_json, enabled) VALUES (?, ?, ?, ?, ?, ?)")
-        .bind(&id)
-        .bind(&name)
-        .bind(&input.location.root_id)
-        .bind(&path)
-        .bind(serde_json::to_string(&input.peer_ids)?)
-        .bind(input.enabled as i64)
-        .execute(&mut *tx)
-        .await?;
+    sqlx::query(
+        "INSERT INTO shares (id, name, root_id, path, peer_ids_json, enabled, event_start_seq)
+        VALUES (?, ?, ?, ?, ?, ?, (SELECT COALESCE(MAX(seq), 0) FROM event_log))",
+    )
+    .bind(&id)
+    .bind(&name)
+    .bind(&input.location.root_id)
+    .bind(&path)
+    .bind(serde_json::to_string(&input.peer_ids)?)
+    .bind(input.enabled as i64)
+    .execute(&mut *tx)
+    .await?;
     if input.enabled {
         super::request_backfill_in(&mut tx, &state.instance_id, &id, &name, &input.peer_ids)
             .await?;
