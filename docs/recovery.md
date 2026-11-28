@@ -158,6 +158,10 @@ single matching event cannot establish their merged history. Those publications 
 retry. **Fix** rechecks the evidence but cannot complete the
 publication while the original vector is unavailable.
 
+Unresolved recoveries hold only the files they touch; planning for other files on the same server
+continues. While any recovery is unresolved ISM keeps Immich's library queue paused, so Immich's own
+scans stay stopped until the recoveries are resolved.
+
 On restart, interrupted recovery jobs are requeued. An untouched peer upload can resume only when
 its staging still matches the saved request; other interrupted work retains its evidence and any
 maintenance barrier. Corrupt maintenance state or failed restart bookkeeping prevents startup

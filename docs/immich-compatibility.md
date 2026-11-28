@@ -77,7 +77,7 @@ and show this alert after upgrading.
 
 Before each managed operation, ISM:
 
-1. reads the system config and refuses (blocking the server) if watching or scheduled scans are on;
+1. reads the system config and refuses (holding Immich-linked writes for that server until the safe settings are reapplied) if watching or scheduled scans are on;
 2. pauses Immich's `library` queue through the jobs API and waits until the queue reports itself
    paused with **no active job** on three consecutive reads. Jobs queued meanwhile (for example a
    scan an admin starts from Immich's UI) show as *waiting* and are held by the paused queue until
@@ -85,9 +85,13 @@ Before each managed operation, ISM:
 3. admits the operation. Overlapping operations share one pause with a persisted reference count;
 4. resumes the queue when the last operation finishes, after which due library scans may start.
 
-If the queue cannot be paused, confirmed idle or resumed, the server is blocked and the Servers page
-shows how to recover. After a restart, a queue ISM had paused is resumed when no operation is
-running; interrupted operations still require recovery.
+If Immich cannot be reached, or its queue cannot be paused or confirmed idle, the operation is put
+back in the queue and retried later with a growing delay (15 s doubling to 8 min). A per-server
+breaker makes other operations for that server fail fast during the outage; operations on other
+servers, local folder scans and replication-operation work are never held. If ISM cannot resume a
+queue it paused, it keeps retrying the resume rather than blocking the server. After a restart, a
+queue ISM had paused is resumed when no operation is running; interrupted operations still require
+recovery.
 
 Only the `library` queue imports files or marks them offline, so it is the only queue paused.
 Sidecar and metadata-extraction jobs may keep running: they read assets by their database path, and
@@ -101,8 +105,8 @@ until resume, a managed move through `pg.rs` keeps the asset ID, album membershi
 library scans ignore assets in Immich's trash. The end-to-end proof (`docker/immich-proof/`, results in
 `docker/immich-proof/RESULTS.md`) also checks that the sidecar path, online state and restore with the
 same ID survive, and that nothing is auto-imported while watching and scheduled scans are off. ISM
-therefore admits Immich-linked writes; if the barrier cannot be taken, the operation fails closed with
-`maintenance_blocked`.
+therefore admits Immich-linked writes; if the barrier cannot be taken, the operation is deferred
+(`immich_unavailable`) and retried, and nothing is changed.
 
 ## Limited disposable-database check
 
