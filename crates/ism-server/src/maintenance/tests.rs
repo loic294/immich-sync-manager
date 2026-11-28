@@ -231,13 +231,14 @@ async fn a_queue_that_does_not_report_paused_blocks() {
     let (_dir, state, _server, fake) = setup().await;
     *fake.ignore_pause.lock().unwrap() = true;
     let err = acquire(&state, "s1").await.unwrap_err();
-    assert_eq!(err.code(), "maintenance_blocked");
+    assert_eq!(err.code(), UNAVAILABLE);
     assert!(
         err.message().contains("did not stay paused"),
         "{}",
         err.message()
     );
-    assert_eq!(maintenance(&state).await.phase, Phase::Blocked);
+    assert_eq!(maintenance(&state).await.phase, Phase::Idle);
+    assert!(paused(&fake).is_empty());
 }
 
 #[tokio::test]
@@ -250,33 +251,35 @@ async fn waits_for_the_active_library_job_to_finish() {
 }
 
 #[tokio::test]
-async fn a_job_that_never_finishes_blocks_and_leaves_the_queue_running() {
+async fn a_job_that_never_finishes_defers_work_and_leaves_the_queue_running() {
     let (_dir, state, _server, fake) = setup().await;
     *fake.busy_reads.lock().unwrap() = u32::MAX;
     let err = acquire(&state, "s1").await.unwrap_err();
-    assert_eq!(err.code(), "maintenance_blocked");
+    assert_eq!(err.code(), UNAVAILABLE);
     let m = maintenance(&state).await;
-    assert_eq!(m.phase, Phase::Blocked, "{m:?}");
+    assert_eq!(m.phase, Phase::Idle, "{m:?}");
     assert!(!m.queue_paused_by_ism);
     assert!(paused(&fake).is_empty());
-    // A blocked server keeps refusing work until an admin retries.
-    assert!(acquire(&state, "s1").await.is_err());
+    // The breaker answers right away while Immich is unavailable, then later attempts succeed.
+    let again = acquire(&state, "s1").await.unwrap_err();
+    assert_eq!(again.code(), UNAVAILABLE);
     *fake.busy_reads.lock().unwrap() = 0;
-    retry(&state, "s1").await.unwrap();
+    close_breaker(&state, "s1");
     acquire(&state, "s1").await.unwrap();
 }
 
 #[tokio::test]
-async fn an_unpausable_queue_blocks() {
+async fn an_unpausable_queue_defers_work_without_blocking_the_server() {
     let (_dir, state, _server, fake) = setup().await;
     *fake.fail_pause.lock().unwrap() = true;
     let err = acquire(&state, "s1").await.unwrap_err();
+    assert_eq!(err.code(), UNAVAILABLE);
     assert!(
         err.message().contains("could not pause"),
         "{}",
         err.message()
     );
-    assert_eq!(maintenance(&state).await.phase, Phase::Blocked);
+    assert_ne!(maintenance(&state).await.phase, Phase::Blocked);
 }
 
 #[tokio::test]
@@ -351,17 +354,15 @@ async fn restart_resumes_a_pause_no_operation_holds() {
 }
 
 #[tokio::test]
-async fn a_failed_resume_blocks_and_retry_resumes() {
+async fn a_failed_resume_keeps_retrying_instead_of_blocking() {
     let (_dir, state, _server, fake) = setup().await;
     acquire(&state, "s1").await.unwrap();
     *fake.fail_pause.lock().unwrap() = true;
     release(&state, "s1").await.unwrap();
     let m = maintenance(&state).await;
-    assert_eq!(m.phase, Phase::Blocked);
+    assert_eq!(m.phase, Phase::Resuming);
     assert!(m.queue_paused_by_ism);
     *fake.fail_pause.lock().unwrap() = false;
-    retry(&state, "s1").await.unwrap();
-    assert_eq!(maintenance(&state).await.phase, Phase::Resuming);
     step(&state, &mut HashMap::new()).await.unwrap();
     assert!(paused(&fake).is_empty());
     assert_eq!(maintenance(&state).await.phase, Phase::Idle);

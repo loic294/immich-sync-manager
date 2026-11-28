@@ -82,6 +82,9 @@ pub struct Inner {
     pub pg_pools: Mutex<HashMap<String, PgPool>>,
     /// Serialises read-modify-write of the per-server maintenance state.
     pub maintenance_lock: Mutex<()>,
+    /// Immich servers that recently failed to answer, so work for them is put off right away
+    /// instead of every operation waiting for its own timeout.
+    pub(crate) immich_breaker: std::sync::Mutex<HashMap<String, crate::maintenance::Breaker>>,
     /// Serializes replica bookkeeping with managed operations.
     /// Operations stay registered while running and exclude scans only while changing files
     /// (`admission.rs`).
@@ -153,6 +156,7 @@ impl AppState {
             share_wake: Notify::new(),
             pg_pools: Mutex::new(HashMap::new()),
             maintenance_lock: Mutex::new(()),
+            immich_breaker: std::sync::Mutex::new(HashMap::new()),
             replication_operation_lock,
             shared_settings: std::sync::RwLock::new(Arc::new(crate::settings::Snapshot::new(
                 shared_settings,

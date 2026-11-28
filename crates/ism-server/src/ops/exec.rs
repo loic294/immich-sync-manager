@@ -117,8 +117,10 @@ pub async fn run(state: AppState) {
 async fn dispatch(state: &AppState, running: &std::sync::Arc<Running>) {
     let queued: Vec<(String, String)> = match sqlx::query_as(
         "SELECT id, source FROM operations WHERE status = 'queued'
+           AND (retry_after IS NULL OR retry_after <= ?)
          ORDER BY CASE WHEN source = 'opm' THEN 0 ELSE 1 END, created_at, rowid LIMIT 500",
     )
+    .bind(db::now())
     .fetch_all(&state.db)
     .await
     {
@@ -374,6 +376,31 @@ async fn set_item(
     Ok(())
 }
 
+/// Puts an operation that has changed nothing back in the queue to try again later. Other
+/// operations keep running meanwhile.
+async fn defer_operation(state: &AppState, id: &str, reason: &str) -> AppResult<()> {
+    let deferrals: i64 = sqlx::query_scalar("SELECT deferrals FROM operations WHERE id = ?")
+        .bind(id)
+        .fetch_one(&state.db)
+        .await?;
+    let wait = std::time::Duration::from_secs((15u64 << deferrals.clamp(0, 5)).min(480));
+    let retry_after = db::ts(chrono::Utc::now() + wait);
+    sqlx::query("UPDATE operations SET status = 'queued', retry_after = ?, deferrals = deferrals + 1 WHERE id = ? AND status = 'waiting_maintenance'")
+        .bind(&retry_after)
+        .bind(id)
+        .execute(&state.db)
+        .await?;
+    tracing::warn!(
+        operation = %id,
+        next_retry = %retry_after,
+        "operation put off until Immich answers: {}", crate::error::redact(reason)
+    );
+    state.emit(ServerEvent::OperationUpdated {
+        operation_id: id.to_owned(),
+    });
+    Ok(())
+}
+
 pub async fn run_operation(state: &AppState, id: &str) -> AppResult<()> {
     let admitted_exclusively = state.replication_operation_lock.lock_operation(id).await;
     let claimed = sqlx::query(
@@ -476,6 +503,10 @@ pub async fn run_operation(state: &AppState, id: &str) -> AppResult<()> {
         if let Err(e) = crate::maintenance::acquire(state, server).await {
             for server in &admitted {
                 crate::maintenance::release(state, server).await?;
+            }
+            if e.code() == crate::maintenance::UNAVAILABLE {
+                defer_operation(state, id, e.message()).await?;
+                return Ok(());
             }
             fail_all(state, id, e.code(), e.message()).await?;
             return Ok(());
@@ -4553,6 +4584,30 @@ mod tests {
         let started = running.started();
         assert!(started.contains_key("opm"));
         assert!(!started.contains_key("sync"));
+    }
+
+    #[tokio::test]
+    async fn deferred_operations_wait_for_their_retry_time_without_holding_others() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new(
+            crate::config::Config::for_tests(dir.path()),
+            db::connect(dir.path()).await.unwrap(),
+            crate::crypto::SecretBox::open_or_create(dir.path()).unwrap(),
+        )
+        .await
+        .unwrap();
+        let later = db::ts(chrono::Utc::now() + std::time::Duration::from_secs(600));
+        for (id, retry_after) in [("deferred", Some(later)), ("ready", None)] {
+            let request = serde_json::json!({"root_id": "root", "path": id}).to_string();
+            sqlx::query("INSERT INTO operations(id,idempotency_key,principal,source,request_json,status,created_at,retry_after) VALUES(?,?,'admin','peer',?,'queued',?,?)")
+                .bind(id).bind(id).bind(request).bind(db::now()).bind(retry_after)
+                .execute(&state.db).await.unwrap();
+        }
+        let running = std::sync::Arc::new(Running::default());
+        dispatch(&state, &running).await;
+        let started = running.started();
+        assert!(started.contains_key("ready"));
+        assert!(!started.contains_key("deferred"));
     }
 
     #[test]

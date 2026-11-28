@@ -30,6 +30,55 @@ use crate::state::{AppState, ServerEvent};
 /// The queue the barrier pauses.
 pub const LIBRARY_QUEUE: &str = "library";
 
+/// Error code for "this Immich server cannot take changes right now". Callers put the work off
+/// and retry later; it never blocks work for other files or servers.
+pub const UNAVAILABLE: &str = "immich_unavailable";
+
+/// The longest one operation waits for a server to become ready before putting itself off, so
+/// a slow or offline Immich cannot keep an executor slot for long.
+const MAX_ADMISSION_WAIT: Duration = Duration::from_secs(60);
+
+/// Remembers that a server just failed to answer.
+#[derive(Default)]
+pub(crate) struct Breaker {
+    failures: u32,
+    until: Option<tokio::time::Instant>,
+}
+
+fn unavailable(message: impl Into<String>) -> AppError {
+    AppError::conflict(UNAVAILABLE, message)
+}
+
+fn breaker_open(state: &AppState, server_id: &str) -> bool {
+    let breakers = state
+        .immich_breaker
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    breakers
+        .get(server_id)
+        .and_then(|breaker| breaker.until)
+        .is_some_and(|until| tokio::time::Instant::now() < until)
+}
+
+fn trip_breaker(state: &AppState, server_id: &str) {
+    let mut breakers = state
+        .immich_breaker
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let breaker = breakers.entry(server_id.to_owned()).or_default();
+    breaker.failures = breaker.failures.saturating_add(1);
+    let wait = Duration::from_secs(5 << breaker.failures.min(5));
+    breaker.until = Some(tokio::time::Instant::now() + wait.min(Duration::from_secs(120)));
+}
+
+fn close_breaker(state: &AppState, server_id: &str) {
+    state
+        .immich_breaker
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(server_id);
+}
+
 async fn update<T>(
     state: &AppState,
     server_id: &str,
@@ -72,7 +121,20 @@ async fn acquire_inner(
     server_id: &str,
     recovery_operation: Option<&str>,
 ) -> AppResult<()> {
-    let deadline = tokio::time::Instant::now() + state.config.timing.admission_timeout;
+    let deadline = tokio::time::Instant::now()
+        + state
+            .config
+            .timing
+            .admission_timeout
+            .min(MAX_ADMISSION_WAIT);
+    if recovery_operation.is_none()
+        && breaker_open(state, server_id)
+        && registry::server(state, server_id).await?.maintenance.phase == Phase::Idle
+    {
+        return Err(unavailable(
+            "Immich did not answer recently; this will be retried later",
+        ));
+    }
     loop {
         let admission = match recovery_operation {
             Some(operation_id) => recovery_admission(state, server_id, operation_id).await?,
@@ -96,7 +158,9 @@ async fn acquire_inner(
             Admission::Deny(message) => return Err(blocked(message)),
             Admission::Wait => {
                 if tokio::time::Instant::now() >= deadline {
-                    return Err(blocked("Immich did not become ready for changes in time"));
+                    return Err(unavailable(
+                        "Immich did not become ready for changes in time",
+                    ));
                 }
                 state.maintenance_wake.notify_waiters();
                 tokio::time::sleep(state.config.timing.poll).await;
@@ -244,6 +308,7 @@ async fn prepare_reporting(
                 update(state, server_id, MaintenanceState::prepared).await?;
             }
             tracing::info!(server = %server.name, "library queue paused; changes admitted");
+            close_breaker(state, server_id);
             Ok(())
         }
         Err((api, PauseError::Drift(message))) => {
@@ -263,14 +328,19 @@ async fn prepare_reporting(
         Err((api, PauseError::Other(e))) => {
             let message = format!("could not pause Immich safely: {}", e.message());
             let resumed = resume_queue(api.as_ref()).await;
+            // An unreachable or busy Immich is not a lasting fault: later attempts try again,
+            // and the maintenance worker keeps trying to resume a queue it could not resume.
             update(state, server_id, |m| {
                 if resumed {
-                    m.queue_paused_by_ism = false;
+                    m.resumed();
+                } else {
+                    m.phase = Phase::Resuming;
+                    m.message = Some(message.clone());
                 }
-                m.block(message.clone());
             })
             .await?;
-            Err(blocked(message))
+            trip_breaker(state, server_id);
+            Err(unavailable(message))
         }
     }
 }
@@ -495,8 +565,8 @@ async fn resume_inner(state: &AppState, server_id: &str) -> AppResult<()> {
             tracing::warn!(server = %server.name, "cannot resume the library queue: {}", e.message());
             update(state, server_id, |m| {
                 if m.phase == Phase::Resuming {
-                    m.block(format!(
-                        "could not resume Immich's library queue: {}; retry",
+                    m.message = Some(format!(
+                        "could not resume Immich's library queue yet: {}; retrying",
                         e.message()
                     ));
                 }

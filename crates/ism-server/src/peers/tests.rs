@@ -9691,14 +9691,14 @@ async fn incoming_empty_folder_is_not_created_without_queue_access() {
         .await
         .unwrap();
     let (operation, _) = crate::ops::load(&b.state, &operation_id).await.unwrap();
-    assert_eq!(operation.status, ism_core::dto::OperationStatus::Failed);
-    assert_eq!(
-        operation.items[0]
-            .error
-            .as_ref()
-            .map(|error| error.code.as_str()),
-        Some("maintenance_blocked")
-    );
+    assert_eq!(operation.status, ism_core::dto::OperationStatus::Queued);
+    let retry_after: Option<String> =
+        sqlx::query_scalar("SELECT retry_after FROM operations WHERE id = ?")
+            .bind(&operation_id)
+            .fetch_one(&b.state.db)
+            .await
+            .unwrap();
+    assert!(retry_after.is_some());
     assert!(!b.shared.join("new-folder").exists());
     assert_eq!(
         super::net::peer(&b.state, &peer.id).await.unwrap().cursor,
