@@ -1566,7 +1566,8 @@ pub(super) async fn accept_dominating_decision(
     share: &Share,
     event: &super::PeerEvent,
 ) -> AppResult<()> {
-    if event.kind != "file_changed" {
+    // Ignored names are never replicated, so an old conflict on one cannot be decided here.
+    if event.kind != "file_changed" || super::excluded_path(&event.data.path, &share.junk) {
         return Ok(());
     }
     let conflicts: Vec<(String, String)> = sqlx::query_as(

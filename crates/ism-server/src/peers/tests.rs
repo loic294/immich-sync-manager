@@ -2350,6 +2350,45 @@ async fn awaited_content_moved_to_an_ignored_name_completes_instead_of_failing()
 }
 
 #[tokio::test]
+async fn open_conflict_on_an_ignored_name_does_not_fail_incoming_events() {
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    let peer = super::net::peers(&b.state).await.unwrap().remove(0);
+    let share = super::shares(&b.state).await.unwrap().remove(0);
+    let side = serde_json::json!({
+        "instance": "Example", "sha256": null, "size": null, "modified_at": null, "deleted": false,
+    })
+    .to_string();
+    sqlx::query(
+        "INSERT INTO conflicts(id,share_id,rel_path,kind,detail,local_json,remote_json,remote_vv_json,peer_id,status,created_at)
+         VALUES('ignored-conflict',?,'@eaDir/photo.jpg','changed_on_both','',?,?,'{}',?,'open',?)",
+    )
+    .bind(&share.id)
+    .bind(&side)
+    .bind(&side)
+    .bind(&peer.id)
+    .bind(crate::db::now())
+    .execute(&b.state.db)
+    .await
+    .unwrap();
+    let event = super::PeerEvent {
+        seq: 1,
+        origin: "later-source".into(),
+        origin_seq: 1,
+        share: share.name.clone(),
+        kind: "file_changed".into(),
+        data: super::EventData {
+            path: "@eaDir/photo.jpg".into(),
+            ..Default::default()
+        },
+    };
+    super::admin::accept_dominating_decision(&b.state, &peer, &share, &event)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn independent_transfer_candidate_cost_grows_linearly_with_unrelated_conflicts() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
