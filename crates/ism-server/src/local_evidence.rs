@@ -162,7 +162,7 @@ pub(crate) async fn selected_snapshot(
                 }
                 Phase::RecoveryRequired => {
                     item.title = format!("Resolve file recovery: {}", server.name);
-                    item.message = "Some file changes could not be verified. Resolve their recovery in Operations before file changes can continue.".into();
+                    item.message = "Some file changes could not be verified. Only those files are held; resolve them in Operations. Other files keep syncing.".into();
                     item.href = "/operations".into();
                 }
                 Phase::Preparing | Phase::Active | Phase::Resuming => {

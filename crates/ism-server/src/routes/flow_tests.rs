@@ -3273,6 +3273,27 @@ async fn immich_writes_are_enabled_for_a_ready_server() {
 }
 
 #[tokio::test]
+async fn unresolved_recoveries_do_not_refuse_other_changes_on_the_server() {
+    let mut maintenance = ism_core::maintenance::MaintenanceState::default();
+    maintenance.phase = ism_core::maintenance::Phase::RecoveryRequired;
+    maintenance.unresolved_recoveries = 3;
+    let server = crate::immich::registry::Server {
+        id: "server".into(),
+        name: "Example".into(),
+        url: "https://immich.example".into(),
+        database_url_enc: Some("encrypted".into()),
+        direct_writes_enabled: true,
+        external_library_move_mode: ism_core::dto::ImmichMoveMode::ApiWithDbFallback,
+        external_library_api_capable: Some(true),
+        version: Some("3.4.1".into()),
+        compatible: true,
+        compatibility_detail: None,
+        maintenance,
+    };
+    assert_eq!(crate::immich::registry::write_block(&server), None);
+}
+
+#[tokio::test]
 async fn immich_move_mode_controls_direct_write_requirement() {
     let server = crate::immich::registry::Server {
         id: "server".into(),

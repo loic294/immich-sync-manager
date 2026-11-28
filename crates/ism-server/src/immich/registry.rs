@@ -152,11 +152,9 @@ pub fn write_block(server: &Server) -> Option<(DirectWritesReason, String)> {
     if let Some(drift) = &m.drift {
         return Some((DirectWritesReason::Drift, drift.clone()));
     }
+    // An unresolved recovery only holds its own files (path footprints); it never refuses
+    // other changes on the server.
     match m.phase {
-        Phase::RecoveryRequired => Some((
-            DirectWritesReason::RecoveryRequired,
-            detail("a change needs an admin to resolve it"),
-        )),
         Phase::Blocked => Some((
             DirectWritesReason::Maintenance,
             detail("Immich's library queue could not be paused or resumed"),
