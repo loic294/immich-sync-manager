@@ -161,6 +161,57 @@ impl Drop for WriterClock {
     }
 }
 
+/// The WAL file is truncated back to this size whenever a checkpoint empties it.
+const WAL_SIZE_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
+/// Above this many WAL pages (4 KiB each, about 128 MiB) the checkpointer asks for a full reset.
+const WAL_RESET_PAGES: i64 = 32 * 1024;
+const WAL_CHECKPOINT_EVERY: Duration = Duration::from_secs(60);
+
+/// Moves the write-ahead log into the database file. Long readers can stop the automatic
+/// checkpoint from ever finishing, which lets the log grow without bound (it reached 3.3 GB).
+/// The passive pass never blocks anyone; the reset only runs when the log is large, and waits
+/// at most one second for readers so writers are never held back for longer.
+pub async fn checkpoint_wal(pool: &SqlitePool) -> sqlx::Result<()> {
+    checkpoint_wal_above(pool, WAL_RESET_PAGES).await
+}
+
+async fn checkpoint_wal_above(pool: &SqlitePool, reset_pages: i64) -> sqlx::Result<()> {
+    let mut conn = pool.acquire().await?;
+    let (_, log_pages, _): (i64, i64, i64) = sqlx::query_as("PRAGMA wal_checkpoint(PASSIVE)")
+        .fetch_one(&mut *conn)
+        .await?;
+    if log_pages < reset_pages {
+        return Ok(());
+    }
+    sqlx::query("PRAGMA busy_timeout = 1000")
+        .execute(&mut *conn)
+        .await?;
+    let reset: sqlx::Result<(i64, i64, i64)> = sqlx::query_as("PRAGMA wal_checkpoint(TRUNCATE)")
+        .fetch_one(&mut *conn)
+        .await;
+    sqlx::query("PRAGMA busy_timeout = 10000")
+        .execute(&mut *conn)
+        .await?;
+    match reset {
+        Ok((0, ..)) => tracing::info!(log_pages, "SQLite write-ahead log reset"),
+        Ok(_) => tracing::debug!(
+            log_pages,
+            "SQLite write-ahead log reset skipped: readers busy"
+        ),
+        Err(e) => tracing::warn!(error = %e, "SQLite write-ahead log reset failed"),
+    }
+    Ok(())
+}
+
+pub async fn run_wal_checkpointer(pool: SqlitePool) {
+    loop {
+        tokio::time::sleep(WAL_CHECKPOINT_EVERY).await;
+        if let Err(e) = checkpoint_wal(&pool).await {
+            tracing::warn!(error = %e, "SQLite checkpoint failed");
+        }
+    }
+}
+
 pub async fn connect(data_dir: &Path) -> anyhow::Result<SqlitePool> {
     let path = data_dir.join("ism.sqlite");
     let options = SqliteConnectOptions::from_str(&format!("sqlite://{}", path.display()))?
@@ -168,9 +219,10 @@ pub async fn connect(data_dir: &Path) -> anyhow::Result<SqlitePool> {
         .journal_mode(SqliteJournalMode::Wal)
         .synchronous(SqliteSynchronous::Full)
         .foreign_keys(true)
+        .pragma("journal_size_limit", WAL_SIZE_LIMIT_BYTES.to_string())
         .busy_timeout(std::time::Duration::from_secs(10));
     let pool = SqlitePoolOptions::new()
-        .max_connections(8)
+        .max_connections(16)
         .connect_with(options)
         .await?;
     sqlx::migrate!("./migrations").run(&pool).await?;
@@ -287,6 +339,32 @@ mod tests {
         for logs in [slow, fast, waited, short_wait] {
             assert_eq!(logs.lines().count(), 1, "{logs}");
         }
+    }
+
+    #[tokio::test]
+    async fn checkpointer_empties_a_large_write_ahead_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = super::connect(dir.path()).await.unwrap();
+        // Keep the automatic checkpoint from running so the log grows like it does under readers.
+        sqlx::query("PRAGMA wal_autocheckpoint = 0")
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE wal_probe (id INTEGER PRIMARY KEY, payload BLOB)")
+            .execute(&db)
+            .await
+            .unwrap();
+        for _ in 0..200 {
+            sqlx::query("INSERT INTO wal_probe (payload) VALUES (zeroblob(8192))")
+                .execute(&db)
+                .await
+                .unwrap();
+        }
+        let wal = dir.path().join("ism.sqlite-wal");
+        assert!(std::fs::metadata(&wal).unwrap().len() > 100_000);
+        super::checkpoint_wal_above(&db, 1).await.unwrap();
+        assert_eq!(std::fs::metadata(&wal).unwrap().len(), 0);
+        db.close().await;
     }
 
     #[tokio::test]

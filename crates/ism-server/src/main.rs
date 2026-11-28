@@ -123,6 +123,12 @@ async fn main() -> anyhow::Result<()> {
         worker_evidence::Kind::Other,
         watch::scheduler::run(state.clone()),
     );
+    activity::spawn(
+        &state,
+        "Database checkpointer",
+        worker_evidence::Kind::Other,
+        db::run_wal_checkpointer(state.db.clone()),
+    );
     let janitor = state.clone();
     activity::spawn(
         &state,
