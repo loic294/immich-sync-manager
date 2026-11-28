@@ -1563,8 +1563,8 @@ pub(super) fn share_path(share: &Share, location: &Location) -> Option<String> {
     }
 }
 
-/// Failed operations retain only their source/target/companion footprint. An unresolved
-/// admitted maintenance barrier additionally protects its server, never every server.
+/// Unresolved and active operations protect only their own source/target/companion paths; an
+/// unresolved recovery never blocks a whole share or server.
 async fn operation_footprints(
     state: &AppState,
     share: &Share,
@@ -1664,8 +1664,8 @@ async fn operation_footprints_for(
                 format!("operation {id} has an unverifiable footprint"),
             ));
         }
-        let servers: Vec<String> = match serde_json::from_str(&admitted) {
-            Ok(servers) => servers,
+        match serde_json::from_str::<Vec<String>>(&admitted) {
+            Ok(_) => {}
             Err(_) => {
                 let planned: Vec<String> = serde_json::from_str(&planned_servers)?;
                 let mut affected = locations.iter().any(|loc| loc.root_id == share.root_id)
@@ -1688,10 +1688,6 @@ async fn operation_footprints_for(
                 continue;
             }
         };
-        if barrier != 0 && server.as_ref().is_some_and(|s| servers.contains(s)) {
-            blocked.push(String::new());
-            continue;
-        }
         blocked.extend(locations.iter().filter_map(|loc| share_path(share, loc)));
     }
     Ok(blocked)

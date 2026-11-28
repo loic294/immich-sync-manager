@@ -244,13 +244,23 @@ async fn unresolved_server_barrier_does_not_protect_an_independent_server() {
     for admitted in ["[\"one\"]", "not-json", "{}"] {
         sqlx::query("UPDATE operations SET status='recovery_required',server_ids_json='[\"one\"]',admitted_server_ids_json=? WHERE id=?")
             .bind(admitted).bind(&accepted.operation_id).execute(&b.state.db).await.unwrap();
+        let path = if admitted == "[\"one\"]" {
+            "uncertain/photo.jpg"
+        } else {
+            "unrelated.jpg"
+        };
         assert_eq!(
-            peers::require_stable_share(&b.state, &family, &["unrelated.jpg"])
+            peers::require_stable_share(&b.state, &family, &[path])
                 .await
                 .unwrap_err()
                 .code(),
             "recovery_required"
         );
+        if admitted == "[\"one\"]" {
+            peers::require_stable_share(&b.state, &family, &["unrelated.jpg"])
+                .await
+                .unwrap();
+        }
         peers::require_stable_share(&b.state, &independent, &["available.jpg"])
             .await
             .unwrap();

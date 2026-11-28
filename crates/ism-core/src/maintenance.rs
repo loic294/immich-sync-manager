@@ -107,6 +107,16 @@ impl MaintenanceState {
         }
     }
 
+    /// Admission for ordinary new work. Unverified recoveries keep the library queue paused but
+    /// never stop unrelated operations from joining that pause.
+    pub fn join_admission(&self) -> Admission {
+        if self.drift.is_none() && self.phase == Phase::RecoveryRequired && self.queue_paused_by_ism
+        {
+            return Admission::Admit;
+        }
+        self.admission()
+    }
+
     /// Starts pausing. The pause intent is recorded first so a crash mid-way still resumes.
     pub fn begin_prepare(&mut self) {
         self.phase = Phase::Preparing;
@@ -285,6 +295,7 @@ mod tests {
         s.require_recovery("broken");
         assert!(!s.settle(), "a recovery never resumes the queue by itself");
         assert!(matches!(s.admission(), Admission::Deny(_)));
+        assert_eq!(s.join_admission(), Admission::Admit);
         s.resolve_one();
         assert_eq!(s.phase, Phase::Resuming);
     }

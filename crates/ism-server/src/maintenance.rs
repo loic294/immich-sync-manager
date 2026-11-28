@@ -78,7 +78,7 @@ async fn acquire_inner(
             Some(operation_id) => recovery_admission(state, server_id, operation_id).await?,
             None => {
                 update(state, server_id, |m| {
-                    let admission = m.admission();
+                    let admission = m.join_admission();
                     match admission {
                         Admission::Admit => m.admit(),
                         Admission::Prepare => m.begin_prepare(),

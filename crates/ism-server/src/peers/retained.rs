@@ -97,10 +97,7 @@ async fn stable(state: &AppState, share: &Share, wanted: &Wanted) -> AppResult<R
         let maintenance = crate::immich::registry::server(state, server)
             .await?
             .maintenance;
-        if matches!(
-            maintenance.phase,
-            ism_core::maintenance::Phase::Blocked | ism_core::maintenance::Phase::RecoveryRequired
-        ) || maintenance.drift.is_some()
+        if maintenance.phase == ism_core::maintenance::Phase::Blocked || maintenance.drift.is_some()
         {
             return Err(unverified());
         }
