@@ -689,3 +689,104 @@ async fn active_operation_without_a_registration_fails_scans_closed() {
     let error = scan.await.expect("scan must not hang").unwrap_err();
     assert_eq!(error.code(), "recovery_required", "{error:?}");
 }
+
+#[tokio::test]
+async fn running_operation_blocks_only_its_own_paths() {
+    let (_a, b, _peer, _) = pending_folder_fixture().await;
+    let family = peers::shares(&b.state).await.unwrap().remove(0);
+    let accepted = crate::ops::submit(
+        &b.state,
+        &Principal::Admin {
+            username: "test".into(),
+        },
+        OperationRequest {
+            idempotency_key: "scoped-running".into(),
+            label: None,
+            actions: vec![OperationAction::CreateFolder {
+                target: loc("shared/busy"),
+            }],
+            allow_owner_transfer: false,
+            allow_partial: false,
+        },
+    )
+    .await
+    .unwrap();
+    for status in ["running", "waiting_maintenance"] {
+        sqlx::query("UPDATE operations SET status = ? WHERE id = ?")
+            .bind(status)
+            .bind(&accepted.operation_id)
+            .execute(&b.state.db)
+            .await
+            .unwrap();
+        peers::require_stable_share(&b.state, &family, &["unrelated.jpg"])
+            .await
+            .unwrap();
+        assert_eq!(
+            peers::require_stable_share(&b.state, &family, &["busy/photo.jpg"])
+                .await
+                .unwrap_err()
+                .code(),
+            "recovery_required",
+            "{status}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn abandoned_operations_are_settled_instead_of_staying_active() {
+    let (_a, b, _peer, _) = pending_folder_fixture().await;
+    let mut ids = Vec::new();
+    for key in ["finished", "unfinished", "waiting"] {
+        let accepted = crate::ops::submit(
+            &b.state,
+            &Principal::Admin {
+                username: "test".into(),
+            },
+            OperationRequest {
+                idempotency_key: key.into(),
+                label: None,
+                actions: vec![OperationAction::CreateFolder {
+                    target: loc(&format!("shared/{key}")),
+                }],
+                allow_owner_transfer: false,
+                allow_partial: false,
+            },
+        )
+        .await
+        .unwrap();
+        ids.push(accepted.operation_id);
+    }
+    for (id, status, item) in [
+        (&ids[0], "running", "done"),
+        (&ids[1], "running", "running"),
+        (&ids[2], "waiting_maintenance", "pending"),
+    ] {
+        sqlx::query("UPDATE operations SET status = ? WHERE id = ?")
+            .bind(status)
+            .bind(id)
+            .execute(&b.state.db)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE operation_items SET status = ? WHERE operation_id = ?")
+            .bind(item)
+            .bind(id)
+            .execute(&b.state.db)
+            .await
+            .unwrap();
+    }
+    crate::ops::exec::settle_abandoned_operations(&b.state)
+        .await
+        .unwrap();
+    for (id, expected) in [
+        (&ids[0], "completed"),
+        (&ids[1], "recovery_required"),
+        (&ids[2], "queued"),
+    ] {
+        let status: String = sqlx::query_scalar("SELECT status FROM operations WHERE id = ?")
+            .bind(id)
+            .fetch_one(&b.state.db)
+            .await
+            .unwrap();
+        assert_eq!(status, expected);
+    }
+}

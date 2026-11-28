@@ -204,21 +204,6 @@ pub async fn snapshot(state: &AppState) -> AppResult<AttentionSnapshot> {
             item.href = "/peers".into();
             items.push(item);
         }
-        if queues.active_operation {
-            let mut item = evidence.clone();
-            item.id = format!("transfer-operation:{}:{}", group.peer_id, group.share_id);
-            item.code = AttentionCode::TransferDependency;
-            item.state = AttentionState::Waiting;
-            item.blocks_work = true;
-            item.title = "Transfers wait for a managed operation".into();
-            item.message =
-                "Peer bookkeeping waits while a managed operation runs or enters maintenance."
-                    .into();
-            item.href = "/operations".into();
-            item.unresolved = Some(true);
-            item.completeness = AttentionCompleteness::Complete;
-            items.push(item);
-        }
         if group.root_available == Some(false) {
             let mut item = evidence.clone();
             item.id = format!("transfer-root:{}:{}", group.peer_id, group.share_id);

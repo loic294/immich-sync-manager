@@ -708,6 +708,22 @@ pub async fn recover_after_restart(state: &AppState) -> AppResult<()> {
         if resumable.contains_key(op_id) {
             continue;
         }
+        let finished: bool = sqlx::query_scalar(
+            "SELECT COALESCE(count(*) > 0 AND SUM(status != 'done') = 0, 0) FROM operation_items WHERE operation_id = ?",
+        )
+        .bind(op_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if finished {
+            // Every action finished and was verified; only the final status was never saved.
+            sqlx::query("UPDATE operations SET status = 'completed', finished_at = ? WHERE id = ?")
+                .bind(crate::db::now())
+                .bind(op_id)
+                .execute(&mut *tx)
+                .await?;
+            tracing::warn!(operation = %op_id, "operation finished before restart; marked completed");
+            continue;
+        }
         for server_id in serde_json::from_str::<Vec<String>>(admitted_servers)? {
             let m = servers.get_mut(&server_id).ok_or_else(|| {
                 AppError::internal(format!(

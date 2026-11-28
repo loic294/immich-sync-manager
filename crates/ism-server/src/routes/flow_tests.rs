@@ -1163,43 +1163,23 @@ async fn attention_reports_queue_scope_and_invalid_schedule_without_guessing_sta
     .execute(&h.state.db)
     .await
     .unwrap();
-    let snapshot = send(&h.app, get("/api/admin/attention", &auth))
-        .await
-        .json();
-    let gate = snapshot["items"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|item| item["code"] == "transfer_dependency" && item["peer_id"] == "ordinary-peer")
-        .unwrap();
-    assert_eq!(gate["count"], 15);
-    assert_eq!(gate["attention"], "none");
-    assert_eq!(gate["blocks_work"], true);
-    assert_eq!(gate["state"], "waiting");
-    assert_eq!(gate["href"], "/operations");
-    sqlx::query("UPDATE operations SET status='waiting_maintenance' WHERE id='active'")
-        .execute(&h.state.db)
-        .await
-        .unwrap();
-    let snapshot = send(&h.app, get("/api/admin/attention", &auth))
-        .await
-        .json();
-    assert!(snapshot["items"].as_array().unwrap().iter().any(|item| {
-        item["code"] == "transfer_dependency"
-            && item["peer_id"] == "ordinary-peer"
-            && item["title"] == "Transfers wait for a managed operation"
-    }));
-    sqlx::query("UPDATE operations SET status='queued' WHERE id='active'")
-        .execute(&h.state.db)
-        .await
-        .unwrap();
-    let snapshot = send(&h.app, get("/api/admin/attention", &auth))
-        .await
-        .json();
-    assert!(!snapshot["items"].as_array().unwrap().iter().any(|item| {
-        item["code"] == "transfer_dependency"
-            && item["title"] == "Transfers wait for a managed operation"
-    }));
+    let waits_for_operation = |snapshot: &serde_json::Value| {
+        snapshot["items"].as_array().unwrap().iter().any(|item| {
+            item["code"] == "transfer_dependency"
+                && item["title"] == "Transfers wait for a managed operation"
+        })
+    };
+    for status in ["running", "waiting_maintenance"] {
+        sqlx::query("UPDATE operations SET status=? WHERE id='active'")
+            .bind(status)
+            .execute(&h.state.db)
+            .await
+            .unwrap();
+        let snapshot = send(&h.app, get("/api/admin/attention", &auth))
+            .await
+            .json();
+        assert!(!waits_for_operation(&snapshot), "{status}");
+    }
 }
 
 #[tokio::test]

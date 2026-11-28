@@ -600,8 +600,6 @@ pub async fn get(state: &AppState) -> AppResult<(Vec<BackgroundActivity>, Vec<St
             "Waiting for the peer to come online".into()
         } else if group.peer_status != "online" {
             "Waiting for the peer connection to be verified".into()
-        } else if queues.active_operation {
-            "Peer bookkeeping waits for active managed operations".into()
         } else if group.root_available == Some(false) {
             row.status = BackgroundStatus::Blocked;
             if group.root_configured {

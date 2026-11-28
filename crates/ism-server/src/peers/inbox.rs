@@ -1588,7 +1588,8 @@ async fn operation_footprints_for(
         "SELECT id, request_json, admitted_server_ids_json, server_ids_json,
                 CASE WHEN recovery_resolved = 0 AND status IN ('partial','recovery_required') THEN 1 ELSE 0 END
          FROM operations o WHERE
-             (recovery_resolved = 0 AND status IN ('queued','failed','cancelled','partial','recovery_required'))
+             status IN ('running','waiting_maintenance')
+             OR (recovery_resolved = 0 AND status IN ('queued','failed','cancelled','partial','recovery_required'))
              OR EXISTS(SELECT 1 FROM pending_peer_ops WHERE operation_id = o.id)
              OR EXISTS(SELECT 1 FROM pending_peer_events WHERE operation_id = o.id)",
     ).fetch_all(&state.db).await?;
@@ -1694,21 +1695,6 @@ async fn operation_footprints_for(
         blocked.extend(locations.iter().filter_map(|loc| share_path(share, loc)));
     }
     Ok(blocked)
-}
-
-pub(crate) async fn require_no_active_operations(state: &AppState) -> AppResult<()> {
-    let active: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM operations WHERE status IN ('running','waiting_maintenance'))",
-    )
-    .fetch_one(&state.db)
-    .await?;
-    if active {
-        return Err(AppError::conflict(
-            "recovery_required",
-            "peer bookkeeping waits for active managed operations",
-        ));
-    }
-    Ok(())
 }
 
 /// Whether a share scan may run now: active operations must be registered in this process (rows
@@ -1832,7 +1818,6 @@ async fn require_operations_stable_except(
     recovery_parents: &[String],
     retained_transfers: &[String],
 ) -> AppResult<()> {
-    require_no_active_operations(state).await?;
     let blocked = operation_footprints(state, share, recovery_parents).await?;
     if blocked
         .iter()
@@ -2015,7 +2000,6 @@ pub(crate) async fn require_stable_transfer(
     transfer_id: &str,
 ) -> AppResult<()> {
     if let Some(parent) = super::admin::restore_transfer_parent(state, transfer_id).await? {
-        require_no_active_operations(state).await?;
         let blocked = operation_footprints_for(state, share, &[], Some(&parent)).await?;
         if blocked
             .iter()

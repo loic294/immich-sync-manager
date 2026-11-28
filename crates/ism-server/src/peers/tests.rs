@@ -2795,13 +2795,10 @@ async fn transfer_scan_pass_rechecks_evidence_that_changes_after_it_was_read() {
         }
     };
 
-    // An unrelated operation becomes active.
+    // An unrelated active operation does not hold the row back.
     let unrelated = operation("scan-race-active", "shared/elsewhere").await;
-    assert_eq!(next().await.unwrap().as_deref(), Some(ready.as_str()));
-    let (pass, resume) = paused_scan_pass(&state).await;
     set_status(unrelated.clone(), "running").await;
-    resume.send(()).unwrap();
-    assert_eq!(pass.await.unwrap(), None, "active operation");
+    assert_eq!(next().await.unwrap().as_deref(), Some(ready.as_str()));
     set_status(unrelated, "completed").await;
     assert_eq!(next().await.unwrap().as_deref(), Some(ready.as_str()));
 

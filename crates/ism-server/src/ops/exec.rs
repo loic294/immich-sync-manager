@@ -27,6 +27,9 @@ pub async fn run(state: AppState) {
     let tick = std::time::Duration::from_secs(state.config.tick_secs.max(1));
     loop {
         loop {
+            if let Err(e) = settle_abandoned_operations(&state).await {
+                tracing::error!("executor: cannot settle abandoned operations: {e}");
+            }
             let next: Option<String> = match sqlx::query_scalar(
                 "SELECT id FROM operations WHERE status = 'queued'
                  ORDER BY CASE WHEN source = 'opm' THEN 0 ELSE 1 END, created_at, rowid LIMIT 1",
@@ -72,6 +75,67 @@ pub async fn run(state: AppState) {
             () = state.ops_wake.notified() => {}
         }
     }
+}
+
+/// Only this loop runs operations, so a row still marked active that the process no longer tracks
+/// has lost its owner (an error or panic escaped before the final status was saved). Left alone it
+/// would hold the Immich pause and block unrelated work forever.
+pub(crate) async fn settle_abandoned_operations(state: &AppState) -> AppResult<()> {
+    let rows: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT id, status, admitted_server_ids_json FROM operations
+         WHERE status IN ('running', 'waiting_maintenance')",
+    )
+    .fetch_all(&state.db)
+    .await?;
+    for (id, status, admitted) in rows {
+        if state.replication_operation_lock.is_registered(&id) {
+            continue;
+        }
+        if status == "waiting_maintenance" {
+            // It never started changing files.
+            sqlx::query(
+                "UPDATE operations SET status = 'queued' WHERE id = ? AND status = 'waiting_maintenance'",
+            )
+            .bind(&id)
+            .execute(&state.db)
+            .await?;
+            tracing::warn!(operation = %id, "requeued an operation that was left waiting for maintenance");
+            continue;
+        }
+        let servers: Vec<String> = serde_json::from_str(&admitted).unwrap_or_default();
+        let finished: bool = sqlx::query_scalar(
+            "SELECT COALESCE(count(*) > 0 AND SUM(status != 'done') = 0, 0) FROM operation_items WHERE operation_id = ?",
+        )
+        .bind(&id)
+        .fetch_one(&state.db)
+        .await?;
+        if finished {
+            tracing::warn!(operation = %id, "completed an operation whose final status was never saved");
+            set_status(state, &id, OperationStatus::Completed).await?;
+        } else {
+            sqlx::query("UPDATE operation_items SET status = 'recovery_required' WHERE operation_id = ? AND status = 'running'")
+                .bind(&id)
+                .execute(&state.db)
+                .await?;
+            for server in &servers {
+                crate::maintenance::report_recovery(
+                    state,
+                    server,
+                    &format!("operation {id} stopped before it finished"),
+                )
+                .await?;
+            }
+            tracing::warn!(operation = %id, "operation stopped before it finished; recovery required");
+            set_status(state, &id, OperationStatus::RecoveryRequired).await?;
+        }
+        for server in &servers {
+            crate::maintenance::release(state, server).await?;
+        }
+        state.emit(ServerEvent::OperationUpdated {
+            operation_id: id.clone(),
+        });
+    }
+    Ok(())
 }
 
 /// Rebuilds the principal that submitted an operation; revoked tokens lose their rights.

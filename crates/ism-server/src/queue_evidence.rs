@@ -53,7 +53,6 @@ pub(crate) struct FailedGroup {
 pub(crate) struct Snapshot {
     pub queued: Vec<QueueGroup>,
     pub failed: Vec<FailedGroup>,
-    pub active_operation: bool,
     pub running: i64,
 }
 
@@ -184,11 +183,6 @@ pub(crate) async fn snapshot(state: &AppState) -> AppResult<Snapshot> {
     .bind(&now_string)
     .fetch_all(&mut *tx)
     .await?;
-    let active_operation: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM operations WHERE status IN ('running','waiting_maintenance'))",
-    )
-    .fetch_one(&mut *tx)
-    .await?;
     let running: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM transfers WHERE status='running'")
         .fetch_one(&mut *tx)
         .await?;
@@ -299,7 +293,6 @@ pub(crate) async fn snapshot(state: &AppState) -> AppResult<Snapshot> {
     Ok(Snapshot {
         queued,
         failed,
-        active_operation,
         running,
     })
 }
