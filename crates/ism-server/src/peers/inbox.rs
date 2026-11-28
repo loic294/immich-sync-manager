@@ -475,7 +475,7 @@ async fn replay_inventory(
         task.waiting("Waiting for the replication-operation lock before applying inventory");
         // Admitted per entry, like event replay: recovery and queued managed operations must be
         // able to claim the gate between entries. The row and shares are re-read under the guard.
-        let _guard = state.replication_operation_lock.lock().await;
+        let _guard = state.replication_operation_lock.lock_scoped().await;
         task.phase("Applying inventory entries");
         task.progress(done as u64, Some(total), "inventory entries checked");
         let row: Option<(String, Option<String>)> = sqlx::query_as(
@@ -645,7 +645,7 @@ async fn apply_inventory(
     Ok(accepted.is_none() && !ignored)
 }
 
-pub(super) fn overlaps(a: &str, b: &str) -> bool {
+pub(crate) fn overlaps(a: &str, b: &str) -> bool {
     a.is_empty()
         || b.is_empty()
         || a == b
@@ -1078,7 +1078,7 @@ async fn replay(
         task.waiting("Waiting for the replication-operation lock before applying events");
         // Admitted per event, not per batch: queued managed operations (which the footprint
         // checks below wait for) must be able to claim the gate between events.
-        let _guard = state.replication_operation_lock.lock().await;
+        let _guard = state.replication_operation_lock.lock_scoped().await;
         task.phase("Verifying and applying received events");
         task.progress(done as u64, Some(total), "events checked");
         let row: Option<(String, Option<String>, String)> = sqlx::query_as(
@@ -1578,6 +1578,61 @@ pub(super) fn share_path(share: &Share, location: &Location) -> Option<String> {
     }
 }
 
+/// Every library location a stored operation request may change, including upload targets and
+/// trash entries named by its actions.
+pub(crate) async fn request_locations(
+    state: &AppState,
+    request: &Value,
+) -> AppResult<Vec<Location>> {
+    let mut locations = Vec::new();
+    collect_locations(request, &mut locations)?;
+    if let Some(actions) = request.get("actions").and_then(Value::as_array) {
+        for action in actions {
+            if let Some(upload_id) = action.get("upload_id").and_then(Value::as_str) {
+                let raw: String =
+                    sqlx::query_scalar("SELECT request_json FROM uploads WHERE id = ?")
+                        .bind(upload_id)
+                        .fetch_one(&state.db)
+                        .await?;
+                let upload: Value = serde_json::from_str(&raw)?;
+                let target: Location =
+                    serde_json::from_value(upload.get("target").cloned().ok_or_else(|| {
+                        AppError::conflict("recovery_required", "upload has no verifiable target")
+                    })?)?;
+                let specs = upload
+                    .get("files")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| {
+                        AppError::conflict("recovery_required", "upload has no verifiable files")
+                    })?;
+                for spec in specs.iter().chain(upload.get("existing_original")) {
+                    if let Some(name) = spec.get("name").and_then(Value::as_str) {
+                        let path = if target.path.is_empty() {
+                            name.to_owned()
+                        } else {
+                            format!("{}/{name}", target.path)
+                        };
+                        files::parse_rel(&path)?;
+                        locations.push(Location {
+                            root_id: target.root_id.clone(),
+                            path,
+                        });
+                    }
+                }
+            }
+            if let Some(trash_id) = action.get("trash_id").and_then(Value::as_str) {
+                let (root_id, path): (String, String) =
+                    sqlx::query_as("SELECT root_id, path FROM trash WHERE id = ?")
+                        .bind(trash_id)
+                        .fetch_one(&state.db)
+                        .await?;
+                locations.push(Location { root_id, path });
+            }
+        }
+    }
+    Ok(locations)
+}
+
 /// Unresolved and active operations protect only their own source/target/companion paths; an
 /// unresolved recovery never blocks a whole share or server.
 async fn operation_footprints(
@@ -1619,59 +1674,7 @@ async fn operation_footprints_for(
             continue;
         }
         let request: Value = serde_json::from_str(&request)?;
-        let mut locations = Vec::new();
-        collect_locations(&request, &mut locations)?;
-        if let Some(actions) = request.get("actions").and_then(Value::as_array) {
-            for action in actions {
-                if let Some(upload_id) = action.get("upload_id").and_then(Value::as_str) {
-                    let raw: String =
-                        sqlx::query_scalar("SELECT request_json FROM uploads WHERE id = ?")
-                            .bind(upload_id)
-                            .fetch_one(&state.db)
-                            .await?;
-                    let upload: Value = serde_json::from_str(&raw)?;
-                    let target: Location = serde_json::from_value(
-                        upload.get("target").cloned().ok_or_else(|| {
-                            AppError::conflict(
-                                "recovery_required",
-                                "upload has no verifiable target",
-                            )
-                        })?,
-                    )?;
-                    let specs = upload
-                        .get("files")
-                        .and_then(Value::as_array)
-                        .ok_or_else(|| {
-                            AppError::conflict(
-                                "recovery_required",
-                                "upload has no verifiable files",
-                            )
-                        })?;
-                    for spec in specs.iter().chain(upload.get("existing_original")) {
-                        if let Some(name) = spec.get("name").and_then(Value::as_str) {
-                            let path = if target.path.is_empty() {
-                                name.to_owned()
-                            } else {
-                                format!("{}/{name}", target.path)
-                            };
-                            files::parse_rel(&path)?;
-                            locations.push(Location {
-                                root_id: target.root_id.clone(),
-                                path,
-                            });
-                        }
-                    }
-                }
-                if let Some(trash_id) = action.get("trash_id").and_then(Value::as_str) {
-                    let (root_id, path): (String, String) =
-                        sqlx::query_as("SELECT root_id, path FROM trash WHERE id = ?")
-                            .bind(trash_id)
-                            .fetch_one(&state.db)
-                            .await?;
-                    locations.push(Location { root_id, path });
-                }
-            }
-        }
+        let locations = request_locations(state, &request).await?;
         // Malformed persisted requests must not silently lose their safety footprint.
         if locations.is_empty() {
             return Err(AppError::conflict(
@@ -1706,24 +1709,6 @@ async fn operation_footprints_for(
         blocked.extend(locations.iter().filter_map(|loc| share_path(share, loc)));
     }
     Ok(blocked)
-}
-
-/// Whether a share scan may run now: active operations must be registered in this process (rows
-/// left active by a restart or panic count as changing files) and none may be changing files.
-pub(crate) async fn require_scannable(state: &AppState) -> AppResult<()> {
-    let active: Vec<String> = sqlx::query_scalar(
-        "SELECT id FROM operations WHERE status IN ('running','waiting_maintenance')",
-    )
-    .fetch_all(&state.db)
-    .await?;
-    let gate = &state.replication_operation_lock;
-    if gate.mutating() || active.iter().any(|id| !gate.is_registered(id)) {
-        return Err(AppError::conflict(
-            "recovery_required",
-            "peer bookkeeping waits for active managed operations",
-        ));
-    }
-    Ok(())
 }
 
 pub(super) async fn require_operations_stable(

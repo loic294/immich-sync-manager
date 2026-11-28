@@ -3141,7 +3141,7 @@ impl Harness {
 }
 
 #[tokio::test]
-async fn queued_opm_operations_run_before_sync_and_keep_arrival_order() {
+async fn queued_opm_and_sync_operations_all_complete() {
     use crate::auth::Principal;
     use ism_core::dto::OperationRequest;
 
@@ -3194,7 +3194,6 @@ async fn queued_opm_operations_run_before_sync_and_keep_arrival_order() {
         };
         ids.push(id);
     }
-    // Same-timestamp arrivals must retain their insertion order within each priority.
     sqlx::query("UPDATE operations SET created_at = '2024-01-01T00:00:00Z'")
         .execute(&h.state.db)
         .await
@@ -3222,13 +3221,6 @@ async fn queued_opm_operations_run_before_sync_and_keep_arrival_order() {
     worker.abort();
     let _ = worker.await;
     result.expect("all queued operations must complete");
-    let finished: Vec<String> = sqlx::query_scalar(
-        "SELECT operation_id FROM operation_events WHERE event = 'finished' ORDER BY rowid",
-    )
-    .fetch_all(&h.state.db)
-    .await
-    .unwrap();
-    assert_eq!(finished, [2, 4, 0, 1, 3].map(|index| ids[index].as_str()));
     assert!(h.root.join("opm-first").is_dir());
     assert!(h.root.join("opm-second").is_dir());
     assert!(h.root.join("peer-first").is_dir());

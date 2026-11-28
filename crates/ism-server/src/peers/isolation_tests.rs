@@ -588,7 +588,7 @@ async fn operation_waiting_for_maintenance_does_not_hold_share_scans() {
     tokio::select! {
         result = &mut operation => panic!("operation was not held by the barrier: {result:?}"),
         waited = tokio::time::timeout(Duration::from_millis(100), gate.lock()) => {
-            assert!(waited.is_err(), "other bookkeeping must still wait");
+            waited.expect("an operation that changed nothing must not hold other work");
         }
     }
     let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
@@ -611,7 +611,7 @@ async fn operation_waiting_for_maintenance_does_not_hold_share_scans() {
 }
 
 #[tokio::test]
-async fn active_operation_without_a_registration_fails_scans_closed() {
+async fn active_operation_without_a_registration_does_not_stop_scans() {
     let b = instance("Beta").await;
     for task in &b.tasks {
         task.abort();
@@ -677,8 +677,7 @@ async fn active_operation_without_a_registration_fails_scans_closed() {
             .unwrap();
         let scan =
             tokio::time::timeout(Duration::from_secs(2), peers::scan_share(&b.state, &family));
-        let error = scan.await.expect("scan must not hang").unwrap_err();
-        assert_eq!(error.code(), "recovery_required", "{status}: {error:?}");
+        scan.await.expect("scan must not hang").unwrap();
     }
 
     // A panic while running drops the registration but leaves the row active.
@@ -696,8 +695,7 @@ async fn active_operation_without_a_registration_fails_scans_closed() {
     assert!(panicked.unwrap_err().is_panic());
     assert!(!b.state.replication_operation_lock.is_registered(&id));
     let scan = tokio::time::timeout(Duration::from_secs(2), peers::scan_share(&b.state, &family));
-    let error = scan.await.expect("scan must not hang").unwrap_err();
-    assert_eq!(error.code(), "recovery_required", "{error:?}");
+    scan.await.expect("scan must not hang").unwrap();
 }
 
 #[tokio::test]

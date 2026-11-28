@@ -10583,7 +10583,6 @@ async fn full_scans_wait_for_a_peer_transfer_backlog() {
     .await
     .unwrap();
 
-    assert!(super::full_scan_allowed(&b.state).await.unwrap());
     assert!(
         super::blocked_footprints(&b.state, &share)
             .await
@@ -10608,10 +10607,6 @@ async fn full_scans_wait_for_a_peer_transfer_backlog() {
         .execute(&b.state.db)
         .await
         .unwrap();
-    assert!(
-        super::full_scan_allowed(&b.state).await.unwrap(),
-        "the safety scan must resume after peer work drains"
-    );
 }
 
 #[tokio::test]

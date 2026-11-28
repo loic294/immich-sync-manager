@@ -5,7 +5,7 @@
 //! last step, so a committed item never needs undoing. When undoing fails, the item and its
 //! servers are marked `recovery_required` and Immich watchers stay off.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 
 use crate::peers::LocalChange;
@@ -23,56 +23,173 @@ use crate::files;
 use crate::immich::{pg, registry};
 use crate::state::{AppState, ServerEvent};
 
+/// Operations that may run at the same time on each lane. Operations from the OPM have their
+/// own lane, so a backlog of synchronization work never delays them.
+const OPM_LANE: usize = 4;
+const SYNC_LANE: usize = 4;
+
+/// The library locations an operation may change. Operations whose footprints do not overlap
+/// run at the same time; everything else about them is independent.
+#[derive(Clone)]
+enum Footprint {
+    Paths(Vec<ism_core::dto::Location>),
+    /// The request could not be understood, so it may only run alone.
+    Everything,
+}
+
+impl Footprint {
+    fn conflicts(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Paths(a), Self::Paths(b)) => a.iter().any(|a| {
+                b.iter().any(|b| {
+                    a.root_id == b.root_id && crate::peers::inbox::overlaps(&a.path, &b.path)
+                })
+            }),
+            _ => true,
+        }
+    }
+}
+
+async fn footprint(state: &AppState, id: &str) -> Footprint {
+    let raw: Result<String, _> =
+        sqlx::query_scalar("SELECT request_json FROM operations WHERE id = ?")
+            .bind(id)
+            .fetch_one(&state.db)
+            .await;
+    let Ok(raw) = raw else {
+        return Footprint::Everything;
+    };
+    let Ok(request) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return Footprint::Everything;
+    };
+    match crate::peers::inbox::request_locations(state, &request).await {
+        Ok(locations) if !locations.is_empty() => Footprint::Paths(locations),
+        _ => Footprint::Everything,
+    }
+}
+
+#[derive(Default)]
+struct Running {
+    started: std::sync::Mutex<BTreeMap<String, (bool, Footprint)>>,
+    finished: tokio::sync::Notify,
+}
+
+impl Running {
+    fn started(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, (bool, Footprint)>> {
+        self.started
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// Frees the lane slot when an operation task ends, including after a panic.
+struct Slot {
+    running: std::sync::Arc<Running>,
+    id: String,
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.running.started().remove(&self.id);
+        self.running.finished.notify_one();
+    }
+}
+
 pub async fn run(state: AppState) {
     let tick = std::time::Duration::from_secs(state.config.tick_secs.max(1));
+    let running = std::sync::Arc::new(Running::default());
     loop {
-        loop {
-            if let Err(e) = settle_abandoned_operations(&state).await {
-                tracing::error!("executor: cannot settle abandoned operations: {e}");
-            }
-            let next: Option<String> = match sqlx::query_scalar(
-                "SELECT id FROM operations WHERE status = 'queued'
-                 ORDER BY CASE WHEN source = 'opm' THEN 0 ELSE 1 END, created_at, rowid LIMIT 1",
-            )
-            .fetch_optional(&state.db)
-            .await
-            {
-                Ok(next) => next,
-                Err(e) => {
-                    tracing::error!("executor: {e}");
-                    None
-                }
-            };
-            let Some(id) = next else { break };
-            if let Err(e) = run_operation(&state, &id).await {
-                tracing::error!(
-                    operation = %id,
-                    next_retry = "no automatic operation retry; review recovery or submit again",
-                    "operation failed: {}", crate::error::redact(e.message())
-                );
-                let result = async {
-                    let mut tx = state.db.begin().await?;
-                    let updated = sqlx::query("UPDATE operations SET status = 'failed', finished_at = ? WHERE id = ? AND status IN ('queued', 'waiting_maintenance')")
-                        .bind(db::now())
-                        .bind(&id)
-                        .execute(&mut *tx)
-                        .await?;
-                    if updated.rows_affected() != 0 {
-                        sqlx::query("UPDATE uploads SET status = 'failed' WHERE operation_id = ? AND status = 'publishing'")
-                            .bind(&id)
-                            .execute(&mut *tx)
-                            .await?;
-                    }
-                    tx.commit().await
-                }.await;
-                if let Err(error) = result {
-                    tracing::error!(operation = %id, "could not record operation failure: {error}");
-                }
-            }
+        let live: BTreeSet<String> = running.started().keys().cloned().collect();
+        if let Err(e) = settle_abandoned_operations_except(&state, &live).await {
+            tracing::error!("executor: cannot settle abandoned operations: {e}");
         }
+        dispatch(&state, &running).await;
         tokio::select! {
             () = tokio::time::sleep(tick) => {}
             () = state.ops_wake.notified() => {}
+            () = running.finished.notified() => {}
+        }
+    }
+}
+
+/// Starts every queued operation that has a free lane slot and does not overlap the files of a
+/// running operation. A blocked operation never holds back the ones behind it.
+async fn dispatch(state: &AppState, running: &std::sync::Arc<Running>) {
+    let queued: Vec<(String, String)> = match sqlx::query_as(
+        "SELECT id, source FROM operations WHERE status = 'queued'
+         ORDER BY CASE WHEN source = 'opm' THEN 0 ELSE 1 END, created_at, rowid LIMIT 500",
+    )
+    .fetch_all(&state.db)
+    .await
+    {
+        Ok(queued) => queued,
+        Err(e) => {
+            tracing::error!("executor: {e}");
+            return;
+        }
+    };
+    for (id, source) in queued {
+        let opm = source == "opm";
+        let (used, limit) = {
+            let started = running.started();
+            if started.contains_key(&id) {
+                continue;
+            }
+            (
+                started.values().filter(|(lane, _)| *lane == opm).count(),
+                if opm { OPM_LANE } else { SYNC_LANE },
+            )
+        };
+        if used >= limit {
+            continue;
+        }
+        let footprint = footprint(state, &id).await;
+        {
+            let mut started = running.started();
+            if started
+                .values()
+                .any(|(_, other)| footprint.conflicts(other))
+            {
+                continue;
+            }
+            started.insert(id.clone(), (opm, footprint));
+        }
+        let state = state.clone();
+        let slot = Slot {
+            running: running.clone(),
+            id,
+        };
+        tokio::spawn(async move {
+            run_and_record(&state, &slot.id).await;
+            drop(slot);
+        });
+    }
+}
+
+async fn run_and_record(state: &AppState, id: &str) {
+    if let Err(e) = run_operation(state, id).await {
+        tracing::error!(
+            operation = %id,
+            next_retry = "no automatic operation retry; review recovery or submit again",
+            "operation failed: {}", crate::error::redact(e.message())
+        );
+        let result = async {
+            let mut tx = state.db.begin().await?;
+            let updated = sqlx::query("UPDATE operations SET status = 'failed', finished_at = ? WHERE id = ? AND status IN ('queued', 'waiting_maintenance')")
+                .bind(db::now())
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            if updated.rows_affected() != 0 {
+                sqlx::query("UPDATE uploads SET status = 'failed' WHERE operation_id = ? AND status = 'publishing'")
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            tx.commit().await
+        }.await;
+        if let Err(error) = result {
+            tracing::error!(operation = %id, "could not record operation failure: {error}");
         }
     }
 }
@@ -80,7 +197,16 @@ pub async fn run(state: AppState) {
 /// Only this loop runs operations, so a row still marked active that the process no longer tracks
 /// has lost its owner (an error or panic escaped before the final status was saved). Left alone it
 /// would hold the Immich pause and block unrelated work forever.
+#[cfg(test)]
 pub(crate) async fn settle_abandoned_operations(state: &AppState) -> AppResult<()> {
+    settle_abandoned_operations_except(state, &BTreeSet::new()).await
+}
+
+/// `live` holds operations the executor has started but that may not be registered yet.
+async fn settle_abandoned_operations_except(
+    state: &AppState,
+    live: &BTreeSet<String>,
+) -> AppResult<()> {
     let rows: Vec<(String, String, String)> = sqlx::query_as(
         "SELECT id, status, admitted_server_ids_json FROM operations
          WHERE status IN ('running', 'waiting_maintenance')",
@@ -88,7 +214,7 @@ pub(crate) async fn settle_abandoned_operations(state: &AppState) -> AppResult<(
     .fetch_all(&state.db)
     .await?;
     for (id, status, admitted) in rows {
-        if state.replication_operation_lock.is_registered(&id) {
+        if live.contains(&id) || state.replication_operation_lock.is_registered(&id) {
             continue;
         }
         if status == "waiting_maintenance" {
@@ -4351,6 +4477,96 @@ mod tests {
         assert!(logs.contains("item=2"), "{logs}");
         assert!(logs.contains("The root is unavailable"), "{logs}");
         assert!(logs.contains("no automatic operation retry"), "{logs}");
+    }
+
+    #[tokio::test]
+    async fn dispatcher_skips_only_operations_that_overlap_running_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new(
+            crate::config::Config::for_tests(dir.path()),
+            db::connect(dir.path()).await.unwrap(),
+            crate::crypto::SecretBox::open_or_create(dir.path()).unwrap(),
+        )
+        .await
+        .unwrap();
+        let queue = |id: &'static str, path: &'static str| {
+            let state = state.clone();
+            async move {
+                let request = serde_json::json!({"root_id": "root", "path": path}).to_string();
+                sqlx::query("INSERT INTO operations(id,idempotency_key,principal,source,request_json,status,created_at) VALUES(?,?,'admin','peer',?,'queued',?)")
+                    .bind(id).bind(id).bind(request).bind(db::now())
+                    .execute(&state.db).await.unwrap();
+            }
+        };
+        queue("overlapping", "album/photo.jpg").await;
+        queue("unrelated", "other/photo.jpg").await;
+        let running = std::sync::Arc::new(Running::default());
+        running.started().insert(
+            "busy".to_owned(),
+            (
+                false,
+                Footprint::Paths(vec![Location {
+                    root_id: "root".to_owned(),
+                    path: "album".to_owned(),
+                }]),
+            ),
+        );
+        dispatch(&state, &running).await;
+        let started = running.started();
+        assert!(started.contains_key("unrelated"));
+        assert!(!started.contains_key("overlapping"));
+    }
+
+    #[tokio::test]
+    async fn opm_operations_start_while_the_sync_lane_is_full() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new(
+            crate::config::Config::for_tests(dir.path()),
+            db::connect(dir.path()).await.unwrap(),
+            crate::crypto::SecretBox::open_or_create(dir.path()).unwrap(),
+        )
+        .await
+        .unwrap();
+        for (id, source, path) in [
+            ("sync", "peer", "sync-folder"),
+            ("opm", "opm", "opm-folder"),
+        ] {
+            let request = serde_json::json!({"root_id": "root", "path": path}).to_string();
+            sqlx::query("INSERT INTO operations(id,idempotency_key,principal,source,request_json,status,created_at) VALUES(?,?,'admin',?,?,'queued',?)")
+                .bind(id).bind(id).bind(source).bind(request).bind(db::now())
+                .execute(&state.db).await.unwrap();
+        }
+        let running = std::sync::Arc::new(Running::default());
+        for index in 0..SYNC_LANE {
+            running.started().insert(
+                format!("busy-{index}"),
+                (
+                    false,
+                    Footprint::Paths(vec![Location {
+                        root_id: "root".to_owned(),
+                        path: format!("busy-{index}"),
+                    }]),
+                ),
+            );
+        }
+        dispatch(&state, &running).await;
+        let started = running.started();
+        assert!(started.contains_key("opm"));
+        assert!(!started.contains_key("sync"));
+    }
+
+    #[test]
+    fn unreadable_footprints_run_alone_and_disjoint_ones_together() {
+        let at = |path: &str| {
+            Footprint::Paths(vec![Location {
+                root_id: "root".to_owned(),
+                path: path.to_owned(),
+            }])
+        };
+        assert!(!at("a/one.jpg").conflicts(&at("b/two.jpg")));
+        assert!(at("a").conflicts(&at("a/one.jpg")));
+        assert!(Footprint::Everything.conflicts(&at("a")));
+        assert!(at("a").conflicts(&Footprint::Everything));
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

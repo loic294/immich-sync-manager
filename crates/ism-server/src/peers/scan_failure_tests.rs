@@ -420,7 +420,7 @@ async fn share_scan_failure_does_not_publish_or_clear_after_disable_while_waitin
 }
 
 #[tokio::test]
-async fn share_scan_failure_does_not_misclassify_global_operation_recovery() {
+async fn running_operation_does_not_make_a_share_scan_fail() {
     let (local, share) = fixture().await;
     let accepted = crate::ops::submit(
         &local.state,
@@ -444,40 +444,10 @@ async fn share_scan_failure_does_not_misclassify_global_operation_recovery() {
         .execute(&local.state.db)
         .await
         .unwrap();
-    assert_eq!(
-        super::super::scan_share(&local.state, &share)
-            .await
-            .unwrap_err()
-            .code(),
-        "recovery_required"
-    );
+    super::super::scan_share(&local.state, &share)
+        .await
+        .unwrap();
     assert!(failure(&local.state, &share.id).await.is_none());
-
-    sqlx::query("UPDATE operations SET status='failed' WHERE id=?")
-        .bind(&accepted.operation_id)
-        .execute(&local.state.db)
-        .await
-        .unwrap();
-    std::fs::remove_dir(&local.shared).unwrap();
-    assert!(
-        super::super::scan_share(&local.state, &share)
-            .await
-            .is_err()
-    );
-    let before = failure(&local.state, &share.id).await.unwrap();
-    sqlx::query("UPDATE operations SET status='running' WHERE id=?")
-        .bind(&accepted.operation_id)
-        .execute(&local.state.db)
-        .await
-        .unwrap();
-    assert_eq!(
-        super::super::scan_share(&local.state, &share)
-            .await
-            .unwrap_err()
-            .code(),
-        "recovery_required"
-    );
-    assert_eq!(failure(&local.state, &share.id).await.unwrap(), before);
 }
 
 #[tokio::test]
@@ -495,7 +465,7 @@ async fn share_scan_failure_healthy_clear_performs_no_writes() {
         )
         .await
         .unwrap();
-    let _guard = local.state.replication_operation_lock.lock_scan().await;
+    let _guard = local.state.replication_operation_lock.lock_scoped().await;
     assert_eq!(
         super::super::clear_scan_failure(&read_only, &share.id)
             .await

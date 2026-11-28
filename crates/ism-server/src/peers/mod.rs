@@ -640,7 +640,6 @@ async fn share_scan_batch<'a>(
         return Ok(None);
     };
     task.phase("Checking active operations and uncertain paths");
-    inbox::require_scannable(state).await?;
     let mut blocked = blocked_footprints(state, &current).await?;
     blocked.extend(admin::move_decision_footprints(state, &current).await?);
     current.root_rel("")?;
@@ -996,7 +995,6 @@ pub async fn verify_share_content(state: &AppState, share: &Share) -> AppResult<
                 else {
                     return Ok(());
                 };
-                inbox::require_scannable(state).await?;
                 let mut blocked = blocked_footprints(state, &share).await?;
                 blocked.extend(admin::move_decision_footprints(state, &share).await?);
                 let root = files::root(&state.db, &share.root_id).await?;
@@ -2868,8 +2866,9 @@ async fn replicate(state: AppState) {
     }
 }
 
-/// Scan reconciliation never overlaps a managed mutation, so half-done moves are not treated as
-/// deletions. Enumeration can overlap a mutation and is rechecked before reconciliation.
+/// Share scans never wait for managed operations. Each batch skips the paths that active
+/// operations may change, so half-done moves are not treated as deletions. Enumeration can
+/// overlap a mutation and is rechecked before reconciliation.
 /// Rescans shares: soon after the file watcher saw an outside change below one (once the
 /// change had time to settle), and every `scan_interval_secs` as a safety net.
 pub async fn scan_worker(state: AppState) {
@@ -2879,17 +2878,7 @@ pub async fn scan_worker(state: AppState) {
     loop {
         let now = std::time::Instant::now();
         let full_due = tokio::time::Instant::now() >= next_full;
-        let full = if full_due {
-            match full_scan_allowed(&state).await {
-                Ok(allowed) => allowed,
-                Err(error) => {
-                    tracing::warn!("full share scan check skipped: {}", error.message());
-                    false
-                }
-            }
-        } else {
-            false
-        };
+        let full = full_due;
         let due: Vec<String> = match state.share_changes.lock() {
             Ok(mut map) => {
                 let due: Vec<String> = map
@@ -2936,12 +2925,6 @@ pub async fn scan_worker(state: AppState) {
             () = state.share_wake.notified() => {}
         }
     }
-}
-
-async fn full_scan_allowed(state: &AppState) -> AppResult<bool> {
-    // Each share scan excludes uncertain footprints, including queued transfers.
-    inbox::require_scannable(state).await?;
-    Ok(true)
 }
 
 /// Paths relative to a share, for the admin UI.

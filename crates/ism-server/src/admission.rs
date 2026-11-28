@@ -1,18 +1,18 @@
-//! Admission between managed operations and replica bookkeeping.
+//! Short mutual exclusion between managed operations and replica bookkeeping.
 //!
-//! Every participant takes the same mutex to be admitted. An operation is admitted exclusively
-//! and registers itself as *pending* before it releases the mutex to wait for the maintenance
-//! barrier; it changes no files in that phase. Share scans (which change no library files either)
-//! may run beside pending operations. Before its first change the operation re-takes the mutex,
-//! which waits for any admitted scan, and becomes *mutating*; scans then wait until it finishes.
-//! Every other participant waits until no operation is registered, as before.
+//! The mutex only makes a check-then-act step atomic; it is never held while waiting for
+//! Immich or for another operation. Operations register as *pending* (they change no files, for
+//! example while they wait for the Immich queue) and become *mutating* just before their first
+//! change. Any number of operations can be registered together. Bookkeeping and scans do not
+//! wait for operations at all: they skip the paths that active operations may change, using the
+//! operation footprints stored in the database.
 //!
 //! Registrations live only in memory: after a restart or panic, operation rows left `running` or
 //! `waiting_maintenance` have none and must be treated as mutating.
 
 use std::pin::pin;
 use std::sync::PoisonError;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{Mutex, MutexGuard, Notify, broadcast};
@@ -34,7 +34,19 @@ pub struct OperationGate {
     released: Notify,
     reporting: std::sync::Mutex<Reporting>,
     sequence: AtomicU64,
+    /// Exclusive bookkeeping sections waiting for mutating operations to end. New mutation
+    /// waits for them, so a steady stream of operations cannot starve them.
+    exclusive_waiting: AtomicUsize,
     events: Option<broadcast::Sender<ServerEvent>>,
+}
+
+struct ExclusiveWaiting<'a>(&'a OperationGate);
+
+impl Drop for ExclusiveWaiting<'_> {
+    fn drop(&mut self) {
+        self.0.exclusive_waiting.fetch_sub(1, Ordering::SeqCst);
+        self.0.released.notify_waiters();
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -169,7 +181,7 @@ impl OperationGate {
         });
         let waiter = Waiter { gate: self, token };
         self.changed();
-        let acquisition = self.lock_when(|ops| ops.is_empty(), Holder::Unknown, Some(token));
+        let acquisition = self.lock_when(|_| true, Holder::Unknown, Some(token), false);
         tokio::pin!(acquisition);
         let guard = tokio::select! {
             biased;
@@ -192,31 +204,33 @@ impl OperationGate {
         }
     }
 
-    /// Exclusive admission: waits until no managed operation is registered.
+    /// Admission for legacy recovery sections that assume no operation is changing files: waits
+    /// only for mutating operations (pending ones, for example waiting for Immich, never block
+    /// it). No operation can start changing files until the guard is dropped.
     pub async fn lock(&self) -> GateGuard<'_> {
-        self.lock_when(|ops| ops.is_empty(), Holder::Unknown, None)
-            .await
-    }
-
-    /// Admission for share scans: waits only for operations that may be changing files. No
-    /// operation can start changing files until the guard is dropped.
-    #[cfg(test)]
-    pub async fn lock_scan(&self) -> GateGuard<'_> {
         self.lock_when(
             |ops| ops.iter().all(|(_, phase)| *phase == Phase::Pending),
             Holder::Unknown,
             None,
+            true,
         )
         .await
     }
 
+    /// Admission for a check-then-act step on specific paths. It never waits for operations:
+    /// the caller must skip paths covered by an active operation's footprint.
+    pub(crate) async fn lock_scoped(&self) -> GateGuard<'_> {
+        self.lock_when(|_| true, Holder::Unknown, None, false).await
+    }
+
     pub(crate) async fn lock_share_scan(&self, share_id: &str) -> GateGuard<'_> {
         self.lock_when(
-            |ops| ops.iter().all(|(_, phase)| *phase == Phase::Pending),
+            |_| true,
             Holder::Scan {
                 share_id: share_id.to_owned(),
             },
             None,
+            false,
         )
         .await
     }
@@ -226,7 +240,12 @@ impl OperationGate {
         admit: impl Fn(&[(String, Phase)]) -> bool,
         holder: Holder,
         waiter: Option<u64>,
+        priority: bool,
     ) -> GateGuard<'_> {
+        let _priority = priority.then(|| {
+            self.exclusive_waiting.fetch_add(1, Ordering::SeqCst);
+            ExclusiveWaiting(self)
+        });
         loop {
             let guard = self.mutex.lock().await;
             // Registered before checking, so a change in between still wakes us.
@@ -278,6 +297,7 @@ impl OperationGate {
     }
 
     /// Whether a registered operation may be changing files (a snapshot, for reporting only).
+    #[cfg(test)]
     pub fn mutating(&self) -> bool {
         self.operations()
             .iter()
@@ -292,15 +312,24 @@ pub struct Registration<'a> {
 }
 
 impl Registration<'_> {
-    /// Waits for admitted scans to finish, then marks the operation as changing files.
+    /// Waits for admitted bookkeeping to finish, then marks the operation as changing files.
     pub async fn begin_mutating(&self) {
-        let _admitted = self.gate.mutex.lock().await;
-        for (id, phase) in self.gate.operations().iter_mut() {
-            if *id == self.operation_id {
-                *phase = Phase::Mutating;
+        loop {
+            let admitted = self.gate.mutex.lock().await;
+            let mut released = pin!(self.gate.released.notified());
+            released.as_mut().enable();
+            if self.gate.exclusive_waiting.load(Ordering::SeqCst) == 0 {
+                for (id, phase) in self.gate.operations().iter_mut() {
+                    if *id == self.operation_id {
+                        *phase = Phase::Mutating;
+                    }
+                }
+                self.gate.changed();
+                return;
             }
+            drop(admitted);
+            released.await;
         }
-        self.gate.changed();
     }
 }
 
@@ -327,36 +356,84 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scans_run_beside_pending_operations_but_never_beside_mutation() {
+    async fn operations_register_together_and_never_wait_for_each_other() {
         let gate = OperationGate::default();
-        let exclusive = gate.lock().await;
+        let first = gate.lock_operation("first").await;
+        let first_registration = gate.register(&first, "first");
+        drop(first);
+        assert!(admitted(gate.lock_operation("second")).await);
+        let second = gate.lock_operation("second").await;
+        let second_registration = gate.register(&second, "second");
+        drop(second);
+        assert!(gate.is_registered("first") && gate.is_registered("second"));
+        assert!(gate.waiting().is_empty());
+        drop((first_registration, second_registration));
+    }
+
+    #[tokio::test]
+    async fn bookkeeping_and_scans_never_wait_for_operations() {
+        let gate = OperationGate::default();
+        let exclusive = gate.lock_operation("op").await;
+        let operation = gate.register(&exclusive, "op");
+        drop(exclusive);
+        operation.begin_mutating().await;
+        assert!(gate.mutating());
+        assert!(admitted(gate.lock_scoped()).await);
+        assert!(admitted(gate.lock_share_scan("share-example")).await);
+        assert!(
+            !admitted(gate.lock()).await,
+            "legacy recovery sections still wait for mutation"
+        );
+        drop(operation);
+        assert!(admitted(gate.lock()).await);
+    }
+
+    #[tokio::test]
+    async fn pending_operations_never_block_recovery_sections() {
+        let gate = OperationGate::default();
+        let exclusive = gate.lock_operation("op").await;
         let operation = gate.register(&exclusive, "op");
         drop(exclusive);
         assert!(gate.is_registered("op") && !gate.mutating());
-
-        let scan = gate.lock_scan().await;
-        assert!(!admitted(gate.lock()).await, "other bookkeeping waits");
+        let section = gate.lock().await;
         {
             let mutating = operation.begin_mutating();
             let mut mutating = pin!(mutating);
             assert!(
                 !admitted(mutating.as_mut()).await,
-                "mutation waits for the admitted scan"
+                "mutation waits for the admitted section"
             );
-            assert!(!gate.mutating());
-            drop(scan);
+            drop(section);
             assert!(admitted(mutating).await);
         }
         assert!(gate.mutating());
-        assert!(!admitted(gate.lock_scan()).await);
+    }
 
-        let waiting = gate.lock_scan();
-        let mut waiting = pin!(waiting);
-        assert!(!admitted(waiting.as_mut()).await);
-        drop(operation);
-        assert!(admitted(waiting).await);
-        assert!(!gate.is_registered("op"));
-        assert!(admitted(gate.lock()).await);
+    #[tokio::test]
+    async fn waiting_recovery_section_has_priority_over_new_mutation() {
+        let gate = OperationGate::default();
+        let first = gate.lock_operation("first").await;
+        let first_registration = gate.register(&first, "first");
+        drop(first);
+        let second = gate.lock_operation("second").await;
+        let second_registration = gate.register(&second, "second");
+        drop(second);
+        first_registration.begin_mutating().await;
+
+        let section = gate.lock();
+        let mut section = pin!(section);
+        assert!(!admitted(section.as_mut()).await);
+        let mutating = second_registration.begin_mutating();
+        let mut mutating = pin!(mutating);
+        assert!(
+            !admitted(mutating.as_mut()).await,
+            "new mutation yields to the waiting section"
+        );
+        drop(first_registration);
+        let section = section.await;
+        assert!(!admitted(mutating.as_mut()).await);
+        drop(section);
+        assert!(admitted(mutating).await);
     }
 
     #[tokio::test]
@@ -382,9 +459,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn operation_wait_tracks_registered_and_unknown_holders_and_cancellation() {
+    async fn operation_wait_tracks_unknown_holders_and_cancellation() {
         let gate = OperationGate::default();
-        let unknown = gate.lock().await;
+        let unknown = gate.lock_scoped().await;
         {
             let waiting = gate.lock_operation("operation-example");
             tokio::pin!(waiting);
@@ -392,60 +469,7 @@ mod tests {
             assert_eq!(gate.waiting()[0].holder, Holder::Unknown);
         }
         assert!(gate.waiting().is_empty());
-        let registered = gate.register(&unknown, "holding-operation");
         drop(unknown);
-        {
-            let waiting = gate.lock_operation("operation-example");
-            tokio::pin!(waiting);
-            assert!(!admitted(waiting.as_mut()).await);
-            assert_eq!(
-                gate.waiting()[0].holder,
-                Holder::Operation {
-                    id: "holding-operation".into(),
-                    phase: Phase::Pending
-                }
-            );
-            drop(registered);
-            let acquired = waiting.await;
-            assert!(gate.waiting().is_empty());
-            drop(acquired);
-        }
-    }
-
-    #[tokio::test]
-    async fn operation_wait_reports_holder_change_without_changing_admission() {
-        let (events, mut receiver) = tokio::sync::broadcast::channel(32);
-        let gate = OperationGate::with_events(events);
-        let exclusive = gate.lock().await;
-        let registered = gate.register(&exclusive, "other-operation");
-        drop(exclusive);
-        let scan = gate.lock_share_scan("share-example").await;
-        let waiting = gate.lock_operation("operation-example");
-        tokio::pin!(waiting);
-        assert!(!admitted(waiting.as_mut()).await);
-        assert_eq!(
-            gate.waiting()[0].holder,
-            Holder::Operation {
-                id: "other-operation".into(),
-                phase: Phase::Pending
-            }
-        );
-        let before = gate.waiting().remove(0);
-        while receiver.try_recv().is_ok() {}
-        drop(registered);
-        assert!(receiver.try_recv().is_ok());
-        assert_eq!(
-            gate.waiting()[0].holder,
-            Holder::Scan {
-                share_id: "share-example".into()
-            }
-        );
-        assert!(!gate.still_waiting(&before));
-        assert!(gate.still_waiting(&gate.waiting()[0]));
-        drop(scan);
-        let acquired = waiting.await;
-        assert!(gate.waiting().is_empty());
-        drop(acquired);
     }
 
     #[tokio::test]
