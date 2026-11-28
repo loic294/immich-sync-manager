@@ -1419,6 +1419,15 @@ async fn conflict_decision(
     Ok(None)
 }
 
+/// The awaited file is now under an ignored name: nothing is left to replicate, so the event
+/// completes instead of failing on every replay.
+async fn finish_ignored(state: &AppState, peer: &net::Peer, event: &PeerEvent) -> AppResult<bool> {
+    let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
+    done_in(&mut tx, &peer.id, event, false).await?;
+    tx.commit().await?;
+    Ok(true)
+}
+
 pub(super) async fn verify_content(
     state: &AppState,
     peer: &net::Peer,
@@ -1431,6 +1440,9 @@ pub(super) async fn verify_content(
     else {
         return Ok(false);
     };
+    if super::excluded_path(&event.data.path, &share.junk) {
+        return finish_ignored(state, peer, event).await;
+    }
     let mut current = event.data.path.clone();
     let root = files::root(&state.db, &share.root_id).await?;
     root.ensure_available()?;
@@ -1456,6 +1468,9 @@ pub(super) async fn verify_content(
                 current = format!("{}{}", movement.data.path, &current[from.len()..]);
             }
         }
+    }
+    if super::excluded_path(&current, &share.junk) {
+        return finish_ignored(state, peer, event).await;
     }
     require_operations_stable(state, share, &[&current]).await?;
     match root.abs(&share.root_rel(&current)?)?.metadata() {

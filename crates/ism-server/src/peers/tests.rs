@@ -2315,6 +2315,41 @@ async fn absent_content_verification_follows_later_moves_and_rejects_malformed_e
 }
 
 #[tokio::test]
+async fn awaited_content_moved_to_an_ignored_name_completes_instead_of_failing() {
+    let (mut a, mut b) = pair().await;
+    stop_workers(&mut a).await;
+    stop_workers(&mut b).await;
+    write_old(&a.shared.join("photo.jpg"), b"remote photo");
+    scan(&a).await;
+    let peer = super::net::peers(&b.state).await.unwrap().remove(0);
+    super::pull(&b.state, &peer).await.unwrap();
+    let state = &b.state;
+    let event = awaiting_content_event(state, &peer.id).await;
+    let all = super::shares(state).await.unwrap();
+    insert_later_inbox_row(
+        state,
+        &peer.id,
+        event.seq + 1,
+        &event.share,
+        &later_move(event.seq + 1, &event.share, "photo.jpg", "@eaDir/photo.jpg"),
+    )
+    .await;
+    assert!(
+        super::inbox::verify_content(state, &peer, &all, &event)
+            .await
+            .unwrap()
+    );
+    let status: Option<String> =
+        sqlx::query_scalar("SELECT status FROM peer_inbox WHERE peer_id = ? AND seq = ?")
+            .bind(&peer.id)
+            .bind(event.seq)
+            .fetch_optional(&state.db)
+            .await
+            .unwrap();
+    assert!(status.is_none_or(|s| s == "done"));
+}
+
+#[tokio::test]
 async fn independent_transfer_candidate_cost_grows_linearly_with_unrelated_conflicts() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
